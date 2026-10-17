@@ -18,16 +18,6 @@ Runs on Windows 10/11 x86_64, macOS 13 or later (Intel and Apple Silicon), and L
 
 Multi-track downloads are muxed with ffmpeg when ffmpeg is on PATH or beside the exe. Single-track downloads do not need it. The app never downloads ffmpeg at runtime.
 
-## Screenshots
-
-| Downloads | Options |
-|---|---|
-| ![Downloads](docs/screenshots/downloads.png) | ![Options](docs/screenshots/options.png) |
-
-| Site Grabber | Downloads at a narrow window size |
-|---|---|
-| ![Site Grabber](docs/screenshots/site-grabber.png) | ![Downloads at a narrow window size](docs/screenshots/downloads-narrow.png) |
-
 ## Build
 
 ```bash

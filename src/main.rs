@@ -98,6 +98,7 @@ fn main() {
         if let Ok(txt) = std::fs::read_to_string(&lock) {
             if let Ok(pid) = txt.trim().parse::<u32>() {
                 if pid != std::process::id() && process_alive(pid) {
+                    let _ = std::fs::write(platform::config_dir().join("show.request"), "show");
                     for a in &args[1..] {
                         if a.starts_with("http://") || a.starts_with("https://") || a.starts_with("downloadcraft://") {
                             let f = platform::inbox_dir().join(format!("fwd-{}.txt", model::new_id()));
@@ -149,6 +150,7 @@ pub fn run_host_handshake(host: &std::path::Path) -> Result<(), String> {
 }
 
 fn run_gui(initial_urls: Vec<String>, hidden: bool) {
+    platform::spawn_show_watcher();
     // Register native messaging hosts on every launch: host exe path can move (portable/update), stale manifest = dead extension.
     let _ = platform::register_native_hosts(&sibling_host_path());
     let _ = platform::register_protocol();

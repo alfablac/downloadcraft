@@ -12,6 +12,38 @@ pub fn data_dir() -> PathBuf { directories::ProjectDirs::from("", "", "downloadc
 pub fn cache_dir() -> PathBuf { directories::ProjectDirs::from("", "", "downloadcraft").map(|d| d.cache_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".downloadcraft-cache")) }
 pub fn default_download_dir() -> PathBuf { directories::UserDirs::new().and_then(|u| u.download_dir().map(|p| p.to_path_buf())).unwrap_or_else(|| std::env::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("Downloads")) }
 pub fn state_path() -> PathBuf { config_dir().join("state.json") }
+
+/// Restore this process window when another launch writes `show.request`.
+/// Hidden viewport stops egui update, so request cannot be handled by app poll on Windows.
+pub fn spawn_show_watcher() {
+    #[cfg(windows)]
+    std::thread::spawn(|| {
+        type Hwnd = *mut core::ffi::c_void;
+        type Bool = i32;
+        extern "system" {
+            fn EnumWindows(cb: extern "system" fn(Hwnd, isize) -> Bool, p: isize) -> Bool;
+            fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
+            fn ShowWindow(hwnd: Hwnd, cmd: i32) -> Bool;
+            fn SetForegroundWindow(hwnd: Hwnd) -> Bool;
+        }
+        extern "system" fn show(hwnd: *mut core::ffi::c_void, _: isize) -> i32 {
+            unsafe {
+                let mut pid = 0;
+                GetWindowThreadProcessId(hwnd, &mut pid);
+                if pid == std::process::id() { ShowWindow(hwnd, 9); SetForegroundWindow(hwnd); }
+            }
+            1
+        }
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let req = config_dir().join("show.request");
+            if req.exists() {
+                let _ = std::fs::remove_file(req);
+                unsafe { EnumWindows(show, 0); }
+            }
+        }
+    });
+}
 pub fn inbox_dir() -> PathBuf { config_dir().join("inbox") }
 pub fn ensure_dirs() -> std::io::Result<()> { for d in [config_dir(), data_dir(), cache_dir(), inbox_dir()] { std::fs::create_dir_all(d)?; } Ok(()) }
 

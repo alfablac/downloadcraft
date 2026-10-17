@@ -292,6 +292,14 @@ impl DownloadApp {
             "quit" => { self.allow_close = true; self.rt.lock().unwrap().save(); ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
             _ => {}
         }
+        let show_request = crate::platform::config_dir().join("show.request");
+        if show_request.exists() {
+            let _ = std::fs::remove_file(&show_request);
+            self.hidden = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         crate::drain_inbox(&self.rt);
         self.sample_rates();
         self.update_smooth_rates();
