@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-VERSION="${1:-0.1.0}"
+VERSION="${1:-0.2.0}"
 mkdir -p dist "downloadcraft.app/Contents/MacOS" "downloadcraft.app/Contents/Resources"
 # universal binary built by workflow via lipo into target/universal; fallback to release dir
 if [ -f target/universal/downloadcraft ]; then SRC=target/universal; else SRC=target/release; fi

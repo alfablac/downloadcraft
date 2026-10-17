@@ -423,7 +423,7 @@ impl eframe::App for DownloadApp {
         egui::TopBottomPanel::top("topbar").frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::symmetric(8.0, 4.0))).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("downloadcraft").color(theme::TEXT).strong().size(17.0));
-                theme::chip(ui, "v0.1.0", theme::TEAL_500);
+                theme::chip(ui, "v0.2.0", theme::TEAL_500);
                 ui.add_space(14.0);
                 egui::menu::bar(ui, |ui| {
                     ui.menu_button("Tasks", |ui| {
@@ -536,7 +536,7 @@ impl eframe::App for DownloadApp {
 
         if self.show_about {
             egui::Window::new("About downloadcraft").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-                ui.label("downloadcraft 0.1.0 — clean-room cross-platform download manager.");
+                ui.label("downloadcraft 0.2.0 — clean-room cross-platform download manager.");
                 ui.label("Rust + egui. Segmented downloads, DASH/HLS, queues, scheduler, Site Grabber.");
                 ui.label("No proprietary code, binaries, icons, or activation logic.");
                 if ui.button("Close").clicked() { self.show_about = false; }
@@ -1145,7 +1145,7 @@ impl DownloadApp {
                     _ => {
                         ui.label(egui::RichText::new("About").strong());
                         ui.separator();
-                        ui.label("downloadcraft 0.1.0 — clean-room cross-platform download manager.");
+                        ui.label("downloadcraft 0.2.0 — clean-room cross-platform download manager.");
                         ui.label("Rust + egui. No proprietary IDM code, binaries, icons, or licensing logic.");
                         ui.label(egui::RichText::new("Sounds / Dial-Up / VPN tabs from IDM not cloned: desktop notifications use OS defaults; dial-up/VPN obsolete on target OSes.").color(theme::TEXT_FAINT).small());
                     }

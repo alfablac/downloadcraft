@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-VERSION="${1:-0.1.0}"
+VERSION="${1:-0.2.0}"
 ROOT="$(pwd)"
 mkdir -p dist staging/usr/bin staging/usr/share/applications staging/usr/share/icons/hicolor/512x512/apps staging/DEBIAN
 cp target/release/downloadcraft staging/usr/bin/
