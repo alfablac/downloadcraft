@@ -2,7 +2,7 @@ mod app;
 #[allow(dead_code)]
 mod icons;
 mod theme;
-use idmcraft_lib::{engine, grabber, model, platform, queue, scheduler, stream};
+use downloadcraft_lib::{engine, grabber, model, platform, queue, scheduler, stream};
 use model::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -17,6 +17,7 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn load() -> Self {
+        platform::migrate_legacy();
         let _ = platform::ensure_dirs();
         let mut state = load_state();
         if state.queues.is_empty() { state.queues.push(Queue::default()); }
@@ -109,15 +110,15 @@ fn main() {
     let autostart = args.iter().any(|a| a == "--autostart");
     // Inbox: files dropped by native host
     let mut initial_urls: Vec<String> = Vec::new();
-    for a in &args[1..] { if a.starts_with("http://") || a.starts_with("https://") || a.starts_with("idmcraft://") { initial_urls.push(a.clone()); } }
+    for a in &args[1..] { if a.starts_with("http://") || a.starts_with("https://") || a.starts_with("downloadcraft://") { initial_urls.push(a.clone()); } }
     let hidden = autostart || load_state().settings.start_minimized;
     run_gui(initial_urls, hidden);
 }
 
 pub fn sibling_host_path() -> std::path::PathBuf {
-    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("idmcraft"));
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("downloadcraft"));
     let dir = exe.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    dir.join(if cfg!(windows) { "idmcraft-host.exe" } else { "idmcraft-host" })
+    dir.join(if cfg!(windows) { "downloadcraft-host.exe" } else { "downloadcraft-host" })
 }
 
 pub fn run_host_handshake(host: &std::path::Path) -> Result<(), String> {
@@ -144,16 +145,19 @@ pub fn run_host_handshake(host: &std::path::Path) -> Result<(), String> {
 }
 
 fn run_gui(initial_urls: Vec<String>, hidden: bool) {
+    // Register native messaging hosts on every launch: host exe path can move (portable/update), stale manifest = dead extension.
+    let _ = platform::register_native_hosts(&sibling_host_path());
+    let _ = platform::register_protocol();
     let rt = Arc::new(Mutex::new(Runtime::load()));
     for u in &initial_urls {
-        let clean = u.strip_prefix("idmcraft://add?url=").map(url_decode).unwrap_or_else(|| u.clone());
+        let clean = u.strip_prefix("downloadcraft://add?url=").map(url_decode).unwrap_or_else(|| u.clone());
         rt.lock().unwrap().add_url(&clean, "main", "", "");
     }
     // drain inbox
     drain_inbox(&rt);
     let rt_clone = rt.clone();
-    let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_inner_size([980.0, 640.0]).with_title("idmcraft").with_visible(!hidden), ..Default::default() };
-    let _ = eframe::run_native("idmcraft", options, Box::new(move |cc| Ok(Box::new(app::IdmApp::new(cc, rt_clone, hidden)))));
+    let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_inner_size([980.0, 640.0]).with_title("downloadcraft").with_visible(!hidden), ..Default::default() };
+    let _ = eframe::run_native("downloadcraft", options, Box::new(move |cc| Ok(Box::new(app::DownloadApp::new(cc, rt_clone, hidden)))));
 }
 
 fn process_alive(pid: u32) -> bool {

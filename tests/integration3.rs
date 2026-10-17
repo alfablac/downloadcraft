@@ -1,6 +1,6 @@
-use idmcraft_lib::engine::{build_client, Controls};
-use idmcraft_lib::model::*;
-use idmcraft_lib::stream::download_url;
+use downloadcraft_lib::engine::{build_client, Controls};
+use downloadcraft_lib::model::*;
+use downloadcraft_lib::stream::download_url;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -45,15 +45,15 @@ fn serve(routes: Vec<(String, Vec<u8>, String)>, dynamic_mpd: bool) -> String {
     });
     format!("http://127.0.0.1:{port}")
 }
-fn tmpdir(name: &str) -> std::path::PathBuf { let d = std::env::temp_dir().join(format!("idmcraft-it3-{name}-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).unwrap(); d }
+fn tmpdir(name: &str) -> std::path::PathBuf { let d = std::env::temp_dir().join(format!("downloadcraft-it3-{name}-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).unwrap(); d }
 
 #[tokio::test]
 async fn kill_resume_preseeded_parts() {
     let body: Vec<u8> = (0..100_000u32).map(|i| (i % 253) as u8).collect();
     let base = serve(vec![("/file.bin".into(), body.clone(), "application/octet-stream".into())], false);
     let dir = tmpdir("resume");
-    // pre-seed .idmcraft-r1/part0 complete part1 partial using plan: 2 segments via segments=2 -> ranges [0,49999],[50000,99999]
-    let part_dir = dir.join(".idmcraft-r1");
+    // pre-seed .downloadcraft-r1/part0 complete part1 partial using plan: 2 segments via segments=2 -> ranges [0,49999],[50000,99999]
+    let part_dir = dir.join(".downloadcraft-r1");
     std::fs::create_dir_all(&part_dir).unwrap();
     std::fs::write(part_dir.join("part0"), &body[0..50_000]).unwrap();
     std::fs::write(part_dir.join("part1"), &body[50_000..60_000]).unwrap();
@@ -122,19 +122,21 @@ async fn mirror_site_e2e() {
     ], false);
     let host = "127.0.0.1".to_string();
     let out = tmpdir("mirror");
-    let proj = idmcraft_lib::grabber::GrabberProject { start_url: format!("{base}/index.html"), depth: 2, scope: 0, max_pages: 50, ..Default::default() };
-    let files = idmcraft_lib::grabber::mirror_site(&build_client(""), &proj, &out).await.unwrap();
+    let proj = downloadcraft_lib::grabber::GrabberProject { start_url: format!("{base}/index.html"), depth: 2, scope: 0, max_pages: 50, ..Default::default() };
+    let files = downloadcraft_lib::grabber::mirror_site(&build_client(""), &proj, &out).await.unwrap();
     assert!(!files.is_empty(), "{files:?}");
     let index_path = out.join(&host).join("index.html");
     assert!(index_path.exists(), "files={files:?} out={out:?}");
     assert!(out.join(&host).join("pic.png").exists());
     let html = std::fs::read_to_string(&index_path).unwrap();
-    assert!(html.contains("<base href="), "{html}");
+    assert!(html.contains("page2.html"), "{html}");
+    assert!(html.contains("pic.png"), "{html}");
+    assert!(!html.contains("<base href="), "{html}");
 }
 
 #[tokio::test]
 async fn mirror_helpers() {
-    use idmcraft_lib::grabber::{mirror_rel_path, rewrite_links};
+    use downloadcraft_lib::grabber::{mirror_rel_path, rewrite_links};
     let root = url::Url::parse("https://example.com/").unwrap();
     let u = url::Url::parse("https://example.com/a/b/page.html").unwrap();
     assert_eq!(mirror_rel_path(&root, &u), "example.com/a/b/page.html");
@@ -142,4 +144,36 @@ async fn mirror_helpers() {
     map.insert("https://example.com/a/b/page.html".to_string(), "a/b/page.html".to_string());
     let out = rewrite_links("<a href=\"https://example.com/a/b/page.html\">x</a>", &u, &map, std::path::Path::new("/tmp"), "index.html");
     assert!(out.contains("a/b/page.html"));
+}
+
+#[tokio::test]
+async fn progress_live_then_cancel_stops() {
+    // Trickle server: headers + first chunk, pause, rest. Progress must move before EOF; cancel must end task as Paused, not Complete/Error-retry.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut s in listener.incoming().flatten() {
+            let mut buf = vec![0u8; 4096];
+            let _ = s.read(&mut buf);
+            let body1 = vec![7u8; 5000];
+            let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", 100_000).as_bytes());
+            let _ = s.write_all(&body1);
+            let _ = s.flush();
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            let _ = s.write_all(&vec![7u8; 95_000]);
+        }
+    });
+    let dir = tmpdir("cancel");
+    let task = DownloadTask { id: "cx1".into(), url: format!("http://127.0.0.1:{port}/v.mp4"), filename: "v.mp4".into(), dest_dir: dir.clone(), ..Default::default() };
+    let ctrl = Arc::new(Controls::new(0));
+    let c2 = ctrl.clone();
+    let handle = tokio::spawn(async move { downloadcraft_lib::engine::download_media(build_client(""), task, c2, vec![("video".into(), vec![(None, format!("http://127.0.0.1:{port}/v.mp4"))])]).await });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let mid = ctrl.downloaded.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(mid >= 5000, "progress frozen mid-download: ctrl.downloaded={mid}");
+    ctrl.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+    let done = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await.expect("cancel did not stop download").unwrap().unwrap();
+    assert_eq!(done.status, TaskStatus::Paused, "cancelled download must stay Paused, got {:?} err={}", done.status, done.error);
+    assert!(!dir.join("v.mp4").exists() || done.status != TaskStatus::Complete);
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -7,7 +7,7 @@ rustc-ice-*.txt
 dist/
 staging/
 AppDir/
-idmcraft.app/
+downloadcraft.app/
 *.zip
 *.tar.gz
 *.dmg

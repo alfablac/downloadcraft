@@ -1,6 +1,6 @@
-use idmcraft_lib::engine::{build_client, Controls};
-use idmcraft_lib::model::*;
-use idmcraft_lib::stream::download_url;
+use downloadcraft_lib::engine::{build_client, Controls};
+use downloadcraft_lib::model::*;
+use downloadcraft_lib::stream::download_url;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -46,7 +46,7 @@ fn serve(routes: Vec<(String, Vec<u8>, String)>) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf { let d = std::env::temp_dir().join(format!("idmcraft-it-{name}-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).unwrap(); d }
+fn tmpdir(name: &str) -> std::path::PathBuf { let d = std::env::temp_dir().join(format!("downloadcraft-it-{name}-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).unwrap(); d }
 
 fn make_mp4_like(dest: &std::path::Path, secs: u8) -> Vec<u8> {
     // Use ffmpeg if available to make real playable segments; fallback to bytes (test that needs ffprobe skips then)
@@ -143,8 +143,8 @@ async fn grabber_fixture_site() {
         ("/files/movie.mp4".into(), b"MP4".to_vec(), "video/mp4".into()),
         ("/robots.txt".into(), b"User-agent: *\nAllow: /\n".to_vec(), "text/plain".into()),
     ]);
-    let proj = idmcraft_lib::grabber::GrabberProject { start_url: format!("{base}/index.html"), depth: 2, scope: 0, max_pages: 50, ..Default::default() };
-    let crawler = idmcraft_lib::grabber::Crawler { project: proj };
+    let proj = downloadcraft_lib::grabber::GrabberProject { start_url: format!("{base}/index.html"), depth: 2, scope: 0, max_pages: 50, ..Default::default() };
+    let crawler = downloadcraft_lib::grabber::Crawler { project: proj };
     let (_pages, files) = crawler.crawl(&build_client("")).await.unwrap();
     let mut urls: Vec<String> = files.iter().map(|f| f.url.clone()).collect(); urls.sort();
     assert!(urls.iter().any(|u| u.ends_with("/files/doc.pdf")), "{urls:?}");
@@ -152,7 +152,7 @@ async fn grabber_fixture_site() {
     assert!(urls.iter().any(|u| u.ends_with("/files/movie.mp4")), "{urls:?}");
     assert_eq!(urls.iter().filter(|u| u.ends_with("/files/doc.pdf")).count(), 1, "dedupe: {urls:?}");
     // extension filter
-    let proj2 = idmcraft_lib::grabber::GrabberProject { start_url: format!("{base}/index.html"), depth: 2, scope: 0, max_pages: 50, extensions: vec!["pdf".into()], ..Default::default() };
-    let (_p, files2) = idmcraft_lib::grabber::Crawler { project: proj2 }.crawl(&build_client("")).await.unwrap();
+    let proj2 = downloadcraft_lib::grabber::GrabberProject { start_url: format!("{base}/index.html"), depth: 2, scope: 0, max_pages: 50, extensions: vec!["pdf".into()], ..Default::default() };
+    let (_p, files2) = downloadcraft_lib::grabber::Crawler { project: proj2 }.crawl(&build_client("")).await.unwrap();
     assert!(files2.iter().all(|f| f.url.ends_with(".pdf")), "{files2:?}");
 }

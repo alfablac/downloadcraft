@@ -1,5 +1,5 @@
-// idmcraft Chromium MV3 background. Native host: com.idmcraft.host
-const HOST = "com.idmcraft.host";
+// downloadcraft Chromium MV3 background. Native host: com.downloadcraft.host
+const HOST = "com.downloadcraft.host";
 // Native messaging: single in-flight queue. Host originally replied without
 // an id, so sends are serialized and the first reply settles the in-flight
 // send. New host echoes `id`; a mismatched id is ignored. 4s timeout rejects.
@@ -91,16 +91,16 @@ function filenameFromUrl(u) {
 }
 const MEDIA_EXT = /\.(mp4|webm|mkv|mp3|mp4|zip|rar|7z|gz|pdf|exe|msi|dmg|deb|iso|tar|mpd|m3u8)(\?|#|$)/i;
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.contextMenus.create({ id: "idmcraft-link", title: "Download with idmcraft", contexts: ["link"] });
-  chrome.contextMenus.create({ id: "idmcraft-media", title: "Download media with idmcraft", contexts: ["video", "audio", "image"] });
-  chrome.contextMenus.create({ id: "idmcraft-page", title: "Download all links with idmcraft", contexts: ["page"] });
+  chrome.contextMenus.create({ id: "downloadcraft-link", title: "Download with downloadcraft", contexts: ["link"] });
+  chrome.contextMenus.create({ id: "downloadcraft-media", title: "Download media with downloadcraft", contexts: ["video", "audio", "image"] });
+  chrome.contextMenus.create({ id: "downloadcraft-page", title: "Download all links with downloadcraft", contexts: ["page"] });
 });
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (info.menuItemId === "idmcraft-link" && info.linkUrl) sendDownload(info.linkUrl, tab);
-  else if (info.menuItemId === "idmcraft-media" && info.srcUrl) sendDownload(info.srcUrl, tab);
-  else if (info.menuItemId === "idmcraft-page" && tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "idmcraft-grab-all" });
+  if (info.menuItemId === "downloadcraft-link" && info.linkUrl) sendDownload(info.linkUrl, tab);
+  else if (info.menuItemId === "downloadcraft-media" && info.srcUrl) sendDownload(info.srcUrl, tab);
+  else if (info.menuItemId === "downloadcraft-page" && tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "downloadcraft-grab-all" });
 });
-// Intercept browser downloads and redirect to idmcraft
+// Intercept browser downloads and redirect to downloadcraft
 chrome.downloads.onCreated.addListener(async (item) => {
   if (!item.url || item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
   // ponytail: chrome.downloads in MV3 requires user gesture in some builds; context menu + panel are primary paths.
@@ -119,7 +119,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ type: "candidates", candidates: list });
     return false;
   }
-  if (msg && msg.type === "idmcraft-download") { sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer }).then(sendResponse, (e) => sendResponse({ type: "error", error: String((e && e.message) || e) })); return true; }
-  if (msg && msg.type === "idmcraft-video-panel") { sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer }).then(sendResponse, (e) => sendResponse({ type: "error", error: String((e && e.message) || e) })); return true; }
+  if (msg && msg.type === "downloadcraft-download") { sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer }).then(sendResponse, (e) => sendResponse({ type: "error", error: String((e && e.message) || e) })); return true; }
+  if (msg && msg.type === "downloadcraft-video-panel") { sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer }).then(sendResponse, (e) => sendResponse({ type: "error", error: String((e && e.message) || e) })); return true; }
 });
-chrome.action.onClicked.addListener((tab) => { if (tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "idmcraft-scan" }); });
+chrome.action.onClicked.addListener((tab) => { if (tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "downloadcraft-scan" }); });

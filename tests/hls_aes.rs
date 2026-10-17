@@ -1,6 +1,6 @@
-use idmcraft_lib::engine::{build_client, Controls};
-use idmcraft_lib::model::*;
-use idmcraft_lib::stream::download_hls;
+use downloadcraft_lib::engine::{build_client, Controls};
+use downloadcraft_lib::model::*;
+use downloadcraft_lib::stream::download_hls;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -45,7 +45,7 @@ fn serve(routes: Vec<(String, Vec<u8>, String)>) -> String {
 }
 
 fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("idmcraft-hlsaes-{name}-{}", std::process::id()));
+    let d = std::env::temp_dir().join(format!("downloadcraft-hlsaes-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -65,8 +65,8 @@ async fn hls_aes128_sequence_iv_decrypts() {
     let plain2 = b"second segment, different length!!".to_vec();
     // No IV attribute: IV = media_sequence (5) + segment index.
     let seq = 5u64;
-    let enc1 = encrypt(&key, &idmcraft_lib::hls::iv_for_sequence(seq), &plain1);
-    let enc2 = encrypt(&key, &idmcraft_lib::hls::iv_for_sequence(seq + 1), &plain2);
+    let enc1 = encrypt(&key, &downloadcraft_lib::hls::iv_for_sequence(seq), &plain1);
+    let enc2 = encrypt(&key, &downloadcraft_lib::hls::iv_for_sequence(seq + 1), &plain2);
     let media = format!("#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:{seq}\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:4,\nseg1.ts\n#EXTINF:4,\nseg2.ts\n#EXT-X-ENDLIST\n");
     let base = serve(vec![
         ("/media.m3u8".into(), media.into_bytes(), "application/vnd.apple.mpegurl".into()),

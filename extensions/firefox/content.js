@@ -1,4 +1,4 @@
-// idmcraft content script: video panel + link detection. Observed IDM behavior reimplemented clean-room.
+// downloadcraft content script: video panel + link detection. Observed IDM behavior reimplemented clean-room.
 (function () {
   const seen = new Set();
   const api = typeof browser !== "undefined" ? browser : chrome;
@@ -22,24 +22,24 @@
     return q ? `${q} — ${url.split("/").pop()}` : url.split("/").pop();
   }
   function ensurePanel() {
-    let panel = document.getElementById("idmcraft-panel");
+    let panel = document.getElementById("downloadcraft-panel");
     if (panel) return panel;
     panel = document.createElement("div");
-    panel.id = "idmcraft-panel";
+    panel.id = "downloadcraft-panel";
     panel.style.cssText = "position:absolute;z-index:2147483647;background:#111;color:#fff;font:12px sans-serif;border-radius:6px;padding:6px;box-shadow:0 2px 10px rgba(0,0,0,.5);max-width:420px;";
-    panel.innerHTML = '<div style="font-weight:700;margin-bottom:4px;">Download with idmcraft</div><div class="idmcraft-items"></div>';
+    panel.innerHTML = '<div style="font-weight:700;margin-bottom:4px;">Download with downloadcraft</div><div class="downloadcraft-items"></div>';
     document.documentElement.appendChild(panel);
     return panel;
   }
   function showPanel(anchor, items) {
     const panel = ensurePanel();
-    const box = panel.querySelector(".idmcraft-items");
+    const box = panel.querySelector(".downloadcraft-items");
     box.innerHTML = "";
     items.forEach((it) => {
       const b = document.createElement("button");
       b.textContent = it.label;
       b.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;";
-      b.addEventListener("click", () => { api.runtime.sendMessage({ type: "idmcraft-video-panel", url: it.url, filename: it.filename || filenameFromUrl(it.url), mime: it.mime || it.type || "" }); panel.remove(); });
+      b.addEventListener("click", () => { api.runtime.sendMessage({ type: "downloadcraft-video-panel", url: it.url, filename: it.filename || filenameFromUrl(it.url), mime: it.mime || it.type || "" }); panel.remove(); });
       box.appendChild(b);
     });
     const r = anchor.getBoundingClientRect();
@@ -56,7 +56,7 @@
     const uniq = [...new Set(urls)].filter(u => u && !u.startsWith("blob:"));
     if (!uniq.length) return;
     const btn = document.createElement("button");
-    btn.textContent = "Download with idmcraft";
+    btn.textContent = "Download with downloadcraft";
     btn.style.cssText = "position:absolute;z-index:2147483646;background:#1e3a5f;color:#fff;border:0;border-radius:4px;padding:4px 8px;cursor:pointer;font:12px sans-serif;";
     btn.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); showPanel(btn, uniq.map(u => ({ url: u, label: labelFor(video, u) }))); });
     const parent = video.parentElement || document.body;
@@ -77,7 +77,7 @@
   mo.observe(document.documentElement, { childList: true, subtree: true });
   manifestUrls = scan();
   api.runtime.onMessage.addListener((msg) => {
-    if (msg.type === "idmcraft-scan") {
+    if (msg.type === "downloadcraft-scan") {
       const base = [...document.querySelectorAll("video, audio")].flatMap(v => [v.currentSrc, v.src].filter(Boolean)).concat(manifestUrls);
       fetchCandidates((candidates) => {
         const byUrl = new Map();
@@ -90,10 +90,10 @@
         }
       });
     }
-    if (msg.type === "idmcraft-grab-all") {
+    if (msg.type === "downloadcraft-grab-all") {
       document.querySelectorAll("a[href]").forEach(a => {
         const u = a.href;
-        if (/\.(zip|rar|7z|gz|pdf|exe|msi|mp4|mp3|mkv|iso|tar)(\?|#|$)/i.test(u)) api.runtime.sendMessage({ type: "idmcraft-download", url: u });
+        if (/\.(zip|rar|7z|gz|pdf|exe|msi|mp4|mp3|mkv|iso|tar)(\?|#|$)/i.test(u)) api.runtime.sendMessage({ type: "downloadcraft-download", url: u });
       });
     }
   });

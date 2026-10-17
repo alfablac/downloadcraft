@@ -56,8 +56,8 @@ jobs:
           cargo build --release --target x86_64-apple-darwin
           cargo build --release --target aarch64-apple-darwin
           mkdir -p target/universal
-          lipo -create -output target/universal/idmcraft target/x86_64-apple-darwin/release/idmcraft target/aarch64-apple-darwin/release/idmcraft
-          lipo -create -output target/universal/idmcraft-host target/x86_64-apple-darwin/release/idmcraft-host target/aarch64-apple-darwin/release/idmcraft-host
+          lipo -create -output target/universal/downloadcraft target/x86_64-apple-darwin/release/downloadcraft target/aarch64-apple-darwin/release/downloadcraft
+          lipo -create -output target/universal/downloadcraft-host target/x86_64-apple-darwin/release/downloadcraft-host target/aarch64-apple-darwin/release/downloadcraft-host
           mkdir -p target/release && cp target/universal/* target/release/
       - name: Build release
         if: runner.os != 'macOS'
@@ -67,13 +67,13 @@ jobs:
         shell: bash
         run: |
           mkdir -p target/release
-          cp target/${{ matrix.target }}/release/idmcraft* target/release/ 2>/dev/null || true
+          cp target/${{ matrix.target }}/release/downloadcraft* target/release/ 2>/dev/null || true
           ls target/release/
       - name: Smoke test
         shell: bash
         run: |
-          BIN=target/release/idmcraft
-          if [ "$RUNNER_OS" = "Windows" ]; then BIN=target/release/idmcraft.exe; fi
+          BIN=target/release/downloadcraft
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN=target/release/downloadcraft.exe; fi
           "$BIN" --smoke-test
       - name: Package Windows
         if: runner.os == 'Windows'
@@ -93,7 +93,7 @@ jobs:
           cat SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: idmcraft-${{ runner.os }}-${{ matrix.target }}
+          name: downloadcraft-${{ runner.os }}-${{ matrix.target }}
           path: dist/*
 
   release:

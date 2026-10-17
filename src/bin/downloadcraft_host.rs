@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 fn inbox_dir() -> PathBuf {
     // Must match main app config_dir without depending on it (host is standalone small binary).
-    let base = directories::ProjectDirs::from("", "", "idmcraft").map(|d| d.config_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".idmcraft"));
+    let base = directories::ProjectDirs::from("", "", "downloadcraft").map(|d| d.config_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".downloadcraft"));
     base.join("inbox")
 }
 

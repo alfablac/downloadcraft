@@ -201,7 +201,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let st = Arc::new(FakeState { cmds: Mutex::new(Vec::new()), rest: Mutex::new(0) });
         tokio::spawn(fake_ftp(listener, payload.clone(), st.clone()));
-        let dir = std::env::temp_dir().join(format!("idmcraft-ftp-{}-{prefill}-{user}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("downloadcraft-ftp-{}-{prefill}-{user}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
         if prefill > 0 { std::fs::write(dir.join("file.bin.part"), &payload[..prefill]).unwrap(); }
         let task = DownloadTask { id: "f1".into(), url: format!("ftp://127.0.0.1:{port}/dir/file.bin"), filename: "file.bin".into(), dest_dir: dir.clone(), username: user.into(), password: pass.into(), ..Default::default() };

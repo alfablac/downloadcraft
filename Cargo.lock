@@ -901,6 +901,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
+name = "downloadcraft"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "arboard",
+ "cbc",
+ "directories",
+ "eframe",
+ "egui",
+ "futures-util",
+ "reqwest",
+ "rfd",
+ "roxmltree",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tray-icon",
+ "url",
+ "winreg",
+]
+
+[[package]]
 name = "dpi"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1954,29 +1977,6 @@ dependencies = [
  "zerofrom",
  "zerotrie",
  "zerovec",
-]
-
-[[package]]
-name = "idmcraft"
-version = "0.1.0"
-dependencies = [
- "aes",
- "arboard",
- "cbc",
- "directories",
- "eframe",
- "egui",
- "futures-util",
- "reqwest",
- "rfd",
- "roxmltree",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tray-icon",
- "url",
- "winreg",
 ]
 
 [[package]]

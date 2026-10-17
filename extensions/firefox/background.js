@@ -1,5 +1,5 @@
-// idmcraft Firefox background. Native host: com.idmcraft.host
-const HOST = "com.idmcraft.host";
+// downloadcraft Firefox background. Native host: com.downloadcraft.host
+const HOST = "com.downloadcraft.host";
 // Native messaging: single in-flight queue (see Chromium background.js).
 let nativePort = null;
 let nativeNextId = 1;
@@ -80,14 +80,14 @@ async function sendDownload(url, tab, extra = {}) {
 }
 function filenameFromUrl(u) { try { const p = new URL(u).pathname; const last = p.split("/").pop(); return last ? decodeURIComponent(last) : ""; } catch (e) { return ""; } }
 browser.runtime.onInstalled.addListener(() => {
-  browser.contextMenus.create({ id: "idmcraft-link", title: "Download with idmcraft", contexts: ["link"] });
-  browser.contextMenus.create({ id: "idmcraft-media", title: "Download media with idmcraft", contexts: ["video", "audio", "image"] });
-  browser.contextMenus.create({ id: "idmcraft-page", title: "Download all links with idmcraft", contexts: ["page"] });
+  browser.contextMenus.create({ id: "downloadcraft-link", title: "Download with downloadcraft", contexts: ["link"] });
+  browser.contextMenus.create({ id: "downloadcraft-media", title: "Download media with downloadcraft", contexts: ["video", "audio", "image"] });
+  browser.contextMenus.create({ id: "downloadcraft-page", title: "Download all links with downloadcraft", contexts: ["page"] });
 });
 browser.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (info.menuItemId === "idmcraft-link" && info.linkUrl) sendDownload(info.linkUrl, tab);
-  else if (info.menuItemId === "idmcraft-media" && info.srcUrl) sendDownload(info.srcUrl, tab);
-  else if (info.menuItemId === "idmcraft-page" && tab && tab.id) browser.tabs.sendMessage(tab.id, { type: "idmcraft-grab-all" });
+  if (info.menuItemId === "downloadcraft-link" && info.linkUrl) sendDownload(info.linkUrl, tab);
+  else if (info.menuItemId === "downloadcraft-media" && info.srcUrl) sendDownload(info.srcUrl, tab);
+  else if (info.menuItemId === "downloadcraft-page" && tab && tab.id) browser.tabs.sendMessage(tab.id, { type: "downloadcraft-grab-all" });
 });
 browser.downloads.onCreated.addListener(async (item) => {
   if (!item.url || item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
@@ -105,6 +105,6 @@ browser.runtime.onMessage.addListener((msg, sender) => {
     const list = [...candidates.values()].filter((c) => tabId == null || c.tabId === tabId || c.tabId === -1);
     return Promise.resolve({ type: "candidates", candidates: list });
   }
-  if (msg && (msg.type === "idmcraft-download" || msg.type === "idmcraft-video-panel")) return sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer });
+  if (msg && (msg.type === "downloadcraft-download" || msg.type === "downloadcraft-video-panel")) return sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer });
 });
-browser.browserAction.onClicked.addListener((tab) => { if (tab && tab.id) browser.tabs.sendMessage(tab.id, { type: "idmcraft-scan" }); });
+browser.browserAction.onClicked.addListener((tab) => { if (tab && tab.id) browser.tabs.sendMessage(tab.id, { type: "downloadcraft-scan" }); });

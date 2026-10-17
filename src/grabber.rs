@@ -295,6 +295,22 @@ pub fn mirror_rel_path(_root: &Url, u: &Url) -> String {
     p.split('/').map(crate::model::sanitize_filename).collect::<Vec<_>>().join("/")
 }
 
+
+/// Relative path from page file `from_rel` (e.g. `host/a/index.html`) to target
+/// `to_rel` (e.g. `host/pic.png`) -> `../pic.png`. Pure string math, `/` separators.
+pub fn relative_link(from_rel: &str, to_rel: &str) -> String {
+    let from_dir: Vec<&str> = from_rel.split('/').collect();
+    let from_dir = &from_dir[..from_dir.len().saturating_sub(1)];
+    let to: Vec<&str> = to_rel.split('/').collect();
+    let mut common = 0;
+    while common < from_dir.len() && common < to.len().saturating_sub(1) && from_dir[common] == to[common] { common += 1; }
+    let mut out = String::new();
+    for _ in common..from_dir.len() { out.push_str("../"); }
+    out.push_str(&to[common..].join("/"));
+    if out.is_empty() { out = to.last().copied().unwrap_or("").to_string(); }
+    out
+}
+
 /// Mirror: crawl then download pages+files preserving structure, rewrite absolute URLs to relative local paths.
 pub async fn mirror_site(client: &reqwest::Client, project: &GrabberProject, out_dir: &std::path::Path) -> Result<Vec<String>, String> {
     let crawler = Crawler { project: project.clone() };
@@ -321,12 +337,9 @@ pub async fn mirror_site(client: &reqwest::Client, project: &GrabberProject, out
         let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
         if ct.contains("html") {
             let html = String::from_utf8_lossy(&bytes).into_owned();
-            // mapping keys are absolute urls; rewrite to paths relative to mirror root, then browser resolves from page location if we also write root-relative handling via <base> injection.
-            let mut out = html.clone();
-            for (url, r) in &mapping { out = out.replace(url, &format!("/{r}")); }
-            // ponytail: root-absolute /path links work when served/opened from mirror root via file:// only if mirrored at filesystem root; inject base pointing to mirror root file URL.
-            let base_url = format!("file://{}/", out_dir.display().to_string().replace('\\', "/"));
-            out = out.replace("<head>", &format!("<head><base href=\"{base_url}\">"));
+            // Per-page mapping: values relative to this page, so file:// browsing works at any depth.
+            let page_map: HashMap<String, String> = mapping.iter().map(|(u, r)| (u.clone(), relative_link(&rel, r))).collect();
+            let out = rewrite_links(&html, &parsed, &page_map, out_dir, &rel);
             std::fs::write(&dest, out).map_err(|e| e.to_string())?;
         } else {
             std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
@@ -341,6 +354,7 @@ pub fn links_with_doc_base(html: &str, page_url: &Url) -> (Vec<Url>, Vec<Url>) {
 
 pub fn rewrite_links(html: &str, page_url: &Url, mapping: &HashMap<String, String>, mirror_root: &std::path::Path, page_rel: &str) -> String {
     // Source <base href> must not survive: mirrored output carries its own base; relative hrefs were resolved against source base for mapping.
+    let doc_base = document_base(html, page_url);
     let lower0 = html.to_ascii_lowercase();
     let html_owned;
     let html = if let Some(i) = lower0.find("<base") { let mut s = html.to_string(); if let Some(j) = s[i..].find('>') { s.replace_range(i..=i + j, ""); } html_owned = s; &html_owned } else { html };
@@ -368,7 +382,7 @@ pub fn rewrite_links(html: &str, page_url: &Url, mapping: &HashMap<String, Strin
             None
         } else {
             // Browser resolves href/src against <base href> if present, else page URL.
-            document_base(html, page_url).join(val).ok().and_then(|resolved| {
+            doc_base.join(val).ok().and_then(|resolved| {
                 mapping.get(&resolved.to_string()).or_else(|| mapping.get(&canonicalize(&resolved))).cloned()
             })
         };
@@ -445,6 +459,21 @@ mod tests {
         map.insert("https://example.com/a/b/page.html".to_string(), "a/b/page.html".to_string());
         let out = rewrite_links(r#"<a href="../b/page.html">r</a><a href="/a/b/page.html">abs</a><a href="https://example.com/a/b/page.html">full</a>"#, &page, &map, std::path::Path::new("/tmp"), "a/c/index.html");
         assert_eq!(out.matches("a/b/page.html").count(), 3, "{out}");
+    }
+    #[test] fn relative_link_depths() {
+        assert_eq!(relative_link("example.com/index.html", "example.com/pic.png"), "pic.png");
+        assert_eq!(relative_link("example.com/a/index.html", "example.com/pic.png"), "../pic.png");
+        assert_eq!(relative_link("example.com/a/b/index.html", "example.com/a/c/p.html"), "../c/p.html");
+        assert_eq!(relative_link("example.com/a/index.html", "example.com/a/sub/p.html"), "sub/p.html");
+    }
+    #[test] fn rewrite_resolves_against_document_base() {
+        // <base href> shifts relative resolution; mapping keyed by resolved absolute URL.
+        let page = Url::parse("https://ex.com/dir/p.html").unwrap();
+        let mut map = HashMap::new();
+        map.insert("https://cdn.ex.com/static/a.png".to_string(), "../a.png".to_string());
+        let out = rewrite_links(r#"<head><base href="https://cdn.ex.com/static/"></head><img src="a.png">"#, &page, &map, std::path::Path::new("/tmp"), "dir/p.html");
+        assert!(out.contains(r#"src="../a.png""#), "{out}");
+        assert!(!out.to_ascii_lowercase().contains("<base"), "{out}");
     }
     #[test] fn canon_dedupe() { assert_eq!(canonicalize(&Url::parse("https://EXAMPLE.com/a#frag").unwrap()), canonicalize(&Url::parse("https://example.com/a").unwrap())); }
 }

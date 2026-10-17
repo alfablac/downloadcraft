@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 pub fn build_client(proxy: &str) -> reqwest::Client {
-    let mut b = reqwest::Client::builder().user_agent("idmcraft/0.1").connect_timeout(std::time::Duration::from_secs(15)).read_timeout(std::time::Duration::from_secs(60));
+    let mut b = reqwest::Client::builder().user_agent("downloadcraft/0.1").connect_timeout(std::time::Duration::from_secs(15)).read_timeout(std::time::Duration::from_secs(60));
     if !proxy.trim().is_empty() { if let Ok(p) = reqwest::Proxy::all(proxy.trim()) { b = b.proxy(p); } }
     b.build().unwrap_or_default()
 }
@@ -79,6 +79,20 @@ async fn throttle(ctrl: &Controls, bytes: u64) {
     }
 }
 
+
+/// Next stream chunk, but wake every 200ms to honour cancel/pause while socket idle.
+/// Without this, cancel only lands when next chunk arrives (stalled server = never).
+async fn next_chunk<S>(stream: &mut S, ctrl: &Controls) -> Result<Option<S::Item>, String>
+where S: futures_util::Stream + Unpin {
+    loop {
+        wait_not_paused(ctrl).await?;
+        match tokio::time::timeout(std::time::Duration::from_millis(200), stream.next()).await {
+            Ok(v) => return Ok(v),
+            Err(_) => { if ctrl.cancelled.load(Ordering::Relaxed) { return Err("cancelled".into()); } }
+        }
+    }
+}
+
 async fn wait_not_paused(ctrl: &Controls) -> Result<(), String> {
     while ctrl.paused.load(Ordering::Relaxed) {
         if ctrl.cancelled.load(Ordering::Relaxed) { return Err("cancelled".into()); }
@@ -138,7 +152,7 @@ fn save_state(part_dir: &Path, url: &str, etag: &Option<String>, total: u64, seg
     let _ = std::fs::write(state_path_for(part_dir), j.to_string());
 }
 
-/// Segmented HTTP download with resume. Segment files: part{i} in dest_dir/.idmcraft-{id}/
+/// Segmented HTTP download with resume. Segment files: part{i} in dest_dir/.downloadcraft-{id}/
 pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl: Arc<Controls>) -> Result<DownloadTask, String> {
     // Mirror failover (IDM Url0..UrlN): first URL whose probe succeeds wins; task.url rewritten to it.
     let mut urls = vec![task.url.clone()]; urls.extend(task.mirrors.iter().cloned());
@@ -152,7 +166,7 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
     task.total = probe.total;
     std::fs::create_dir_all(&task.dest_dir).map_err(|e| e.to_string())?;
     let dest = task.dest_dir.join(&task.filename);
-    let part_dir = task.dest_dir.join(format!(".idmcraft-{}", task.id));
+    let part_dir = task.dest_dir.join(format!(".downloadcraft-{}", task.id));
     // Server ignored Range: plain streaming download with throttle.
     if !probe.accept_ranges || probe.total.is_none() {
         let resp = client.get(&task.url).headers(headers_for(&task)).send().await.map_err(|e| e.to_string())?;
@@ -304,7 +318,6 @@ async fn run_segment(i: usize, segs: &Arc<tokio::sync::Mutex<Vec<SegmentState>>>
             Ok(written) => {
                 let keep = { let s = segs.lock().await; let sg = &s[i]; (sg.end + 1).saturating_sub(start + done).min(written) };
                 { let mut s = segs.lock().await; s[i].done = (s[i].done + keep).min(s[i].end + 1 - s[i].start); }
-                ctrl.downloaded.fetch_add(keep, Ordering::Relaxed);
                 let snapshot = { let s = segs.lock().await; s.iter().map(|x| SegmentState { start: x.start, end: x.end, done: x.done }).collect::<Vec<_>>() };
                 let et_opt = if etag.is_empty() { None } else { Some(etag.to_string()) }; save_state(part_dir, &task.url, &et_opt, total, &snapshot);
                 if keep < written { continue; }
@@ -328,14 +341,23 @@ async fn download_range(client: &reqwest::Client, task: &DownloadTask, start: u6
     file.set_len(prior).await.map_err(|e| e.to_string())?;
     file.seek(std::io::SeekFrom::Start(prior)).await.map_err(|e| e.to_string())?;
     let mut stream = resp.bytes_stream(); let mut n: u64 = 0;
-    while let Some(chunk) = stream.next().await {
-        wait_not_paused(ctrl).await?;
-        let chunk = chunk.map_err(|e| e.to_string())?;
-        throttle(ctrl, chunk.len() as u64).await;
-        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-        n += chunk.len() as u64;
+    let mut err: Option<String> = None;
+    loop {
+        let chunk = match next_chunk(&mut stream, ctrl).await { Ok(Some(c)) => c, Ok(None) => break, Err(e) => { err = Some(e); break; } };
+        match chunk {
+            Ok(chunk) => {
+                throttle(ctrl, chunk.len() as u64).await;
+                match file.write_all(&chunk).await {
+                    Ok(()) => { n += chunk.len() as u64; ctrl.downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed); }
+                    Err(e) => { err = Some(e.to_string()); break; }
+                }
+            }
+            Err(e) => { err = Some(e.to_string()); break; }
+        }
     }
-    file.flush().await.map_err(|e| e.to_string())?;
+    if err.is_none() { if let Err(e) = file.flush().await { err = Some(e.to_string()); } }
+    // Live-counted bytes roll back on failure: retry truncates part to `prior` and recounts.
+    if let Some(e) = err { ctrl.downloaded.fetch_sub(n, Ordering::Relaxed); return Err(e); }
     let expected = end - start + 1;
     if n != expected { return Err(format!("short range: got {n} expected {expected}")); }
     Ok(n)
@@ -358,7 +380,7 @@ pub async fn download_media(client: reqwest::Client, task: DownloadTask, ctrl: A
     // tracks: (kind, [(init, segment_url)...]) — one segment list per track, init repeated per entry ignored except first
     std::fs::create_dir_all(&task.dest_dir).map_err(|e| e.to_string())?;
     let mut task = task;
-    let work = task.dest_dir.join(format!(".idmcraft-media-{}", task.id));
+    let work = task.dest_dir.join(format!(".downloadcraft-media-{}", task.id));
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let mut track_files: Vec<PathBuf> = Vec::new();
     // Segment sizes unknown upfront: progress in bytes, task.total stays None.
@@ -374,9 +396,18 @@ pub async fn download_media(client: reqwest::Client, task: DownloadTask, ctrl: A
                 // manifest snapshot stored below allows re-run; segment files cached per index.
                 let cache = work.join(format!("{kind}-{}.seg", track_files.len() * 100000 + done_bytes as usize));
                 let _ = cache;
-                if let Some(init) = init { if seen_init.as_deref() != Some(init.as_str()) { seen_init = Some(init.clone()); done_bytes += fetch_into_inner(&client, &task, init, &mut file, &ctrl).await?; } }
-                done_bytes += fetch_into_inner(&client, &task, seg_url, &mut file, &ctrl).await?;
-                ctrl.downloaded.store(done_bytes, Ordering::Relaxed);
+                let seg_result = async {
+                    if let Some(init) = init { if seen_init.as_deref() != Some(init.as_str()) { seen_init = Some(init.clone()); done_bytes += fetch_into_inner(&client, &task, init, &mut file, &ctrl).await?; } }
+                    done_bytes += fetch_into_inner(&client, &task, seg_url, &mut file, &ctrl).await?;
+                    Ok::<(), String>(())
+                }.await;
+                if let Err(e) = seg_result {
+                    if ctrl.cancelled.load(Ordering::Relaxed) || e == "cancelled" {
+                        task.status = TaskStatus::Paused; task.downloaded = ctrl.downloaded.load(Ordering::Relaxed);
+                        return Ok(task);
+                    }
+                    return Err(e);
+                }
                 task.downloaded = done_bytes; task.total = None;
             }
             file.flush().await.map_err(|e| e.to_string())?;
@@ -432,7 +463,14 @@ async fn fetch_once_counted_impl(client: &reqwest::Client, task: &DownloadTask, 
     if !resp.status().is_success() { return Err(format!("HTTP {} for {url}", resp.status())); }
     let mut stream = resp.bytes_stream();
     let mut n = 0u64;
-    while let Some(chunk) = stream.next().await { let chunk = chunk.map_err(|e| e.to_string())?; throttle(ctrl, chunk.len() as u64).await; file.write_all(&chunk).await.map_err(|e| e.to_string())?; n += chunk.len() as u64; }
+    loop {
+        let Some(chunk) = (match next_chunk(&mut stream, ctrl).await { Ok(v) => v, Err(e) => { ctrl.downloaded.fetch_sub(n, Ordering::Relaxed); return Err(e); } }) else { break };
+        let chunk = match chunk { Ok(c) => c, Err(e) => { ctrl.downloaded.fetch_sub(n, Ordering::Relaxed); return Err(e.to_string()); } };
+        throttle(ctrl, chunk.len() as u64).await;
+        if let Err(e) = file.write_all(&chunk).await { ctrl.downloaded.fetch_sub(n, Ordering::Relaxed); return Err(e.to_string()); }
+        n += chunk.len() as u64;
+        ctrl.downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+    }
     Ok(n)
 }
 

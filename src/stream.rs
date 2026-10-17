@@ -71,6 +71,7 @@ pub async fn download_dash(client: reqwest::Client, mut task: DownloadTask, ctrl
                 break;
             }
         }
+        if ctrl.cancelled.load(std::sync::atomic::Ordering::Relaxed) { let mut t = task; t.status = TaskStatus::Paused; return Ok(t); }
         if track_is_empty(&seen) { return Err("live MPD produced no segments".into()); }
         return engine::download_media(client, task, ctrl, seen).await;
     }
@@ -178,6 +179,7 @@ async fn download_hls_media(client: reqwest::Client, task: DownloadTask, ctrl: A
             for (i, s) in m2.segments.iter().enumerate() { if !seen.contains(s) { seen.push(s.clone()); seen_keys.push(m2.key_infos.get(i).cloned().unwrap_or(None)); seen_ranges.push(m2.byte_ranges.get(i).copied().flatten()); } }
             if m2.end_list { media = m2; break; }
         }
+        if ctrl.cancelled.load(std::sync::atomic::Ordering::Relaxed) { let mut t = task.clone(); t.status = TaskStatus::Paused; return Ok(t); }
         if !media.end_list { media.segments = seen; media.key_infos = seen_keys; media.byte_ranges = seen_ranges; }
     }
     // Encrypted playlists: any non-AES-128 method refused; AES-128 handled below.
@@ -195,15 +197,17 @@ async fn download_hls_media(client: reqwest::Client, task: DownloadTask, ctrl: A
     // (plain path streams raw bytes via download_media; decrypt needs whole segment).
     let has_ranges = media.byte_ranges.iter().any(|r| r.is_some()) || media.map_byte_range.is_some();
     if has_ranges || encrypted {
-        let work = task.dest_dir.join(format!(".idmcraft-hls-{}", task.id));
+        let work = task.dest_dir.join(format!(".downloadcraft-hls-{}", task.id));
         std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
         let mut parts: Vec<std::path::PathBuf> = Vec::new();
         if let Some(init) = &media.init_uri { let p = work.join("init.bin"); engine::fetch_bytes(&client, &task, init, media.map_byte_range, &p).await?; parts.push(p); }
         // Key cache by URI: keys may rotate mid-playlist.
         let mut key_cache: std::collections::HashMap<String, [u8; 16]> = std::collections::HashMap::new();
         for (i, seg) in media.segments.iter().enumerate() {
+            if ctrl.cancelled.load(std::sync::atomic::Ordering::Relaxed) { let mut t = task.clone(); t.status = TaskStatus::Paused; return Ok(t); }
             let p = work.join(format!("{i}.seg"));
-            engine::fetch_bytes(&client, &task, seg, media.byte_ranges.get(i).copied().flatten(), &p).await?;
+            let n = engine::fetch_bytes_counted(&client, &task, seg, media.byte_ranges.get(i).copied().flatten(), &p).await?;
+            ctrl.downloaded.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
             if let Some(Some(ki)) = media.key_infos.get(i) {
                 let key_uri = ki.uri.as_deref().unwrap();
                 let key = match key_cache.get(key_uri) { Some(k) => *k, None => { let k = fetch_key(&client, &task, key_uri).await?; key_cache.insert(key_uri.to_string(), k); k } };
@@ -215,14 +219,16 @@ async fn download_hls_media(client: reqwest::Client, task: DownloadTask, ctrl: A
             parts.push(p);
         }
         let dest = task.dest_dir.join(&task.filename);
+        let mut total_bytes: u64 = 0;
         {
             let mut out = tokio::fs::File::create(&dest).await.map_err(|e| e.to_string())?;
             use tokio::io::AsyncWriteExt;
-            for p in &parts { let b = tokio::fs::read(p).await.map_err(|e| e.to_string())?; out.write_all(&b).await.map_err(|e| e.to_string())?; }
+            for p in &parts { let b = tokio::fs::read(p).await.map_err(|e| e.to_string())?; total_bytes += b.len() as u64; out.write_all(&b).await.map_err(|e| e.to_string())?; }
             out.flush().await.map_err(|e| e.to_string())?;
         }
         let _ = tokio::fs::remove_dir_all(&work).await;
-        let mut t = task; t.status = TaskStatus::Complete; t.downloaded = media.segments.len() as u64; t.total = Some(media.segments.len() as u64);
+        let mut t = task; t.status = TaskStatus::Complete; t.downloaded = total_bytes; t.total = Some(total_bytes);
+        ctrl.downloaded.store(total_bytes, std::sync::atomic::Ordering::Relaxed);
         return Ok(t);
     }
     let segs: Vec<(Option<String>, String)> = media.segments.iter().map(|u| (media.init_uri.clone(), u.clone())).collect();

@@ -53,7 +53,7 @@ fn bin_path(name: &str) -> PathBuf {
 
 #[test]
 fn smoke_test_passes() {
-    let bin = bin_path("idmcraft");
+    let bin = bin_path("downloadcraft");
     assert!(bin.exists(), "build first: {}", bin.display());
     let out = std::process::Command::new(&bin).arg("--smoke-test").output().unwrap();
     assert!(out.status.success(), "stdout={} stderr={}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));

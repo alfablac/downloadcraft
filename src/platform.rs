@@ -2,18 +2,38 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const HOST_NAME: &str = "com.idmcraft.host";
-pub const PROTOCOL: &str = "idmcraft";
-pub const FIREFOX_EXT_ID: &str = "idmcraft@idmcraft.local";
+pub const HOST_NAME: &str = "com.downloadcraft.host";
+pub const PROTOCOL: &str = "downloadcraft";
+pub const FIREFOX_EXT_ID: &str = "downloadcraft@downloadcraft.local";
 pub const CHROME_EXT_ID: &str = "ajkokpbgjajmkenllekaokjbglbcingk";
 
-pub fn config_dir() -> PathBuf { directories::ProjectDirs::from("", "", "idmcraft").map(|d| d.config_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".idmcraft")) }
-pub fn data_dir() -> PathBuf { directories::ProjectDirs::from("", "", "idmcraft").map(|d| d.data_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".idmcraft")) }
-pub fn cache_dir() -> PathBuf { directories::ProjectDirs::from("", "", "idmcraft").map(|d| d.cache_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".idmcraft-cache")) }
+pub fn config_dir() -> PathBuf { directories::ProjectDirs::from("", "", "downloadcraft").map(|d| d.config_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".downloadcraft")) }
+pub fn data_dir() -> PathBuf { directories::ProjectDirs::from("", "", "downloadcraft").map(|d| d.data_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".downloadcraft")) }
+pub fn cache_dir() -> PathBuf { directories::ProjectDirs::from("", "", "downloadcraft").map(|d| d.cache_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".downloadcraft-cache")) }
 pub fn default_download_dir() -> PathBuf { directories::UserDirs::new().and_then(|u| u.download_dir().map(|p| p.to_path_buf())).unwrap_or_else(|| std::env::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("Downloads")) }
 pub fn state_path() -> PathBuf { config_dir().join("state.json") }
 pub fn inbox_dir() -> PathBuf { config_dir().join("inbox") }
 pub fn ensure_dirs() -> std::io::Result<()> { for d in [config_dir(), data_dir(), cache_dir(), inbox_dir()] { std::fs::create_dir_all(d)?; } Ok(()) }
+
+/// One-time copy of legacy idmcraft config (state.json + inbox) into downloadcraft dir.
+/// Runs only when new state absent and legacy state exists; never overwrites new data.
+pub fn migrate_legacy() {
+    let legacy = directories::ProjectDirs::from("", "", "idmcraft").map(|d| d.config_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".idmcraft"));
+    migrate_legacy_from(&legacy, &config_dir());
+}
+pub fn migrate_legacy_from(legacy: &Path, new_dir: &Path) {
+    if new_dir.join("state.json").exists() || !legacy.join("state.json").exists() { return; }
+    let _ = std::fs::create_dir_all(new_dir);
+    let _ = std::fs::copy(legacy.join("state.json"), new_dir.join("state.json"));
+    let old_inbox = legacy.join("inbox");
+    if old_inbox.is_dir() {
+        let new_inbox = new_dir.join("inbox");
+        let _ = std::fs::create_dir_all(&new_inbox);
+        if let Ok(rd) = std::fs::read_dir(&old_inbox) {
+            for e in rd.flatten() { let _ = std::fs::copy(e.path(), new_inbox.join(e.file_name())); }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Browser { Chrome, Edge, Brave, Chromium, Vivaldi, Firefox }
@@ -26,7 +46,7 @@ pub fn native_host_manifest_paths(home: &Path) -> Vec<(Browser, PathBuf)> {
     #[cfg(target_os = "windows")]
     {
         // Windows uses registry pointing at manifest in install dir; path fn returns manifest file location convention.
-        let base = home.join("AppData").join("Local").join("idmcraft");
+        let base = home.join("AppData").join("Local").join("downloadcraft");
         for b in all_browsers() { v.push((b, base.join(if b == Browser::Firefox { "host-firefox.json" } else { "host.json" }))); }
     }
     #[cfg(target_os = "macos")]
@@ -56,9 +76,9 @@ pub fn native_host_manifest_paths(home: &Path) -> Vec<(Browser, PathBuf)> {
 
 pub fn host_manifest_json(host_exe: &Path, firefox: bool) -> String {
     if firefox {
-        format!("{{\n  \"name\": \"{HOST_NAME}\",\n  \"description\": \"idmcraft native host\",\n  \"type\": \"stdio\",\n  \"allowed_extensions\": [\"{FIREFOX_EXT_ID}\"],\n  \"path\": \"{}\"\n}}\n", host_exe.display().to_string().replace('\\', "\\\\"))
+        format!("{{\n  \"name\": \"{HOST_NAME}\",\n  \"description\": \"downloadcraft native host\",\n  \"type\": \"stdio\",\n  \"allowed_extensions\": [\"{FIREFOX_EXT_ID}\"],\n  \"path\": \"{}\"\n}}\n", host_exe.display().to_string().replace('\\', "\\\\"))
     } else {
-        format!("{{\n  \"name\": \"{HOST_NAME}\",\n  \"description\": \"idmcraft native host\",\n  \"type\": \"stdio\",\n  \"allowed_origins\": [\"chrome-extension://{CHROME_EXT_ID}/\"],\n  \"path\": \"{}\"\n}}\n", host_exe.display().to_string().replace('\\', "\\\\"))
+        format!("{{\n  \"name\": \"{HOST_NAME}\",\n  \"description\": \"downloadcraft native host\",\n  \"type\": \"stdio\",\n  \"allowed_origins\": [\"chrome-extension://{CHROME_EXT_ID}/\"],\n  \"path\": \"{}\"\n}}\n", host_exe.display().to_string().replace('\\', "\\\\"))
     }
 }
 
@@ -114,7 +134,7 @@ fn register_windows_protocol() -> std::io::Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let exe = std::env::current_exe()?;
     let (proto, _) = hkcu.create_subkey(format!("Software\\Classes\\{PROTOCOL}"))?;
-    proto.set_value("", &"URL:idmcraft Protocol")?;
+    proto.set_value("", &"URL:downloadcraft Protocol")?;
     proto.set_value("URL Protocol", &"")?;
     let (cmd, _) = proto.create_subkey("shell\\open\\command")?;
     cmd.set_value("", &format!("\"{}\" \"%1\"", exe.display()).as_str())?;
@@ -132,9 +152,9 @@ fn unregister_windows_native_host() {
 
 // ---------- autostart ----------
 pub fn autostart_path_for(home: &Path) -> PathBuf {
-    #[cfg(target_os = "macos")] { home.join("Library/LaunchAgents/com.idmcraft.plist") }
-    #[cfg(target_os = "linux")] { home.join(".config/autostart/idmcraft.desktop") }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))] { home.join("idmcraft-autostart") }
+    #[cfg(target_os = "macos")] { home.join("Library/LaunchAgents/com.downloadcraft.plist") }
+    #[cfg(target_os = "linux")] { home.join(".config/autostart/downloadcraft.desktop") }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))] { home.join("downloadcraft-autostart") }
 }
 
 pub fn set_autostart(enabled: bool) -> std::io::Result<()> {
@@ -144,7 +164,7 @@ pub fn set_autostart(enabled: bool) -> std::io::Result<()> {
         use winreg::{enums::HKEY_CURRENT_USER, RegKey};
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let (k, _) = hkcu.create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")?;
-        if enabled { k.set_value("idmcraft", &format!("\"{}\" --autostart", exe.display()).as_str())?; } else { let _ = k.delete_value("idmcraft"); }
+        if enabled { k.set_value("downloadcraft", &format!("\"{}\" --autostart", exe.display()).as_str())?; } else { let _ = k.delete_value("downloadcraft"); }
     }
     #[cfg(target_os = "macos")]
     {
@@ -152,7 +172,7 @@ pub fn set_autostart(enabled: bool) -> std::io::Result<()> {
         let path = autostart_path_for(&home);
         if enabled {
             if let Some(p) = path.parent() { std::fs::create_dir_all(p)?; }
-            std::fs::write(&path, format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>com.idmcraft</string><key>ProgramArguments</key><array><string>{}</string><string>--autostart</string></array><key>RunAtLoad</key><true/></dict></plist>\n", exe.display()))?;
+            std::fs::write(&path, format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>com.downloadcraft</string><key>ProgramArguments</key><array><string>{}</string><string>--autostart</string></array><key>RunAtLoad</key><true/></dict></plist>\n", exe.display()))?;
         } else { let _ = std::fs::remove_file(path); }
     }
     #[cfg(target_os = "linux")]
@@ -161,7 +181,7 @@ pub fn set_autostart(enabled: bool) -> std::io::Result<()> {
         let path = autostart_path_for(&home);
         if enabled {
             if let Some(p) = path.parent() { std::fs::create_dir_all(p)?; }
-            std::fs::write(&path, format!("[Desktop Entry]\nType=Application\nName=idmcraft\nExec=\"{}\" --autostart\nX-GNOME-Autostart-enabled=true\nNoDisplay=false\n", exe.display()))?;
+            std::fs::write(&path, format!("[Desktop Entry]\nType=Application\nName=downloadcraft\nExec=\"{}\" --autostart\nX-GNOME-Autostart-enabled=true\nNoDisplay=false\n", exe.display()))?;
         } else { let _ = std::fs::remove_file(path); }
     }
     Ok(())
@@ -172,7 +192,7 @@ pub fn autostart_enabled() -> bool {
     {
         use winreg::{enums::HKEY_CURRENT_USER, RegKey};
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        return hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run").and_then(|k| k.get_value::<String, _>("idmcraft")).is_ok();
+        return hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run").and_then(|k| k.get_value::<String, _>("downloadcraft")).is_ok();
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -189,12 +209,12 @@ pub fn register_protocol() -> std::io::Result<()> {
         let dir = home.join(".local/share/applications");
         std::fs::create_dir_all(&dir)?;
         let exe = std::env::current_exe()?;
-        std::fs::write(dir.join("idmcraft.desktop"), format!("[Desktop Entry]\nType=Application\nName=idmcraft\nExec=\"{}\" %u\nMimeType=x-scheme-handler/{PROTOCOL};\nNoDisplay=true\n", exe.display()))?;
-        let _ = Command::new("xdg-mime").args(["default", "idmcraft.desktop", &format!("x-scheme-handler/{PROTOCOL}")]).status();
+        std::fs::write(dir.join("downloadcraft.desktop"), format!("[Desktop Entry]\nType=Application\nName=downloadcraft\nExec=\"{}\" %u\nMimeType=x-scheme-handler/{PROTOCOL};\nNoDisplay=true\n", exe.display()))?;
+        let _ = Command::new("xdg-mime").args(["default", "downloadcraft.desktop", &format!("x-scheme-handler/{PROTOCOL}")]).status();
     }
     #[cfg(target_os = "windows")]
     { register_windows_protocol()?; }
-    // macOS: URL scheme declared in app bundle Info.plist (see packaging/idmcraft.app Info.plist template in docs).
+    // macOS: URL scheme declared in app bundle Info.plist (see packaging/downloadcraft.app Info.plist template in docs).
     Ok(())
 }
 
@@ -229,6 +249,22 @@ mod tests {
         let paths = native_host_manifest_paths(Path::new("/mockhome"));
         assert_eq!(paths.len(), 6);
         for (_, p) in &paths { let s = p.to_string_lossy().replace('\\', "/"); assert!(s.contains("/mockhome/") || s.contains("mockhome"), "{s}"); assert!(s.contains(HOST_NAME) || s.contains("host"), "{s}"); }
+    }
+    #[test] fn migrate_legacy_copies_only_when_new_empty() {
+        let base = std::env::temp_dir().join(format!("downloadcraft-mig-{}", std::process::id()));
+        let legacy = base.join("old"); let newd = base.join("new");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(legacy.join("inbox")).unwrap();
+        std::fs::write(legacy.join("state.json"), "{}").unwrap();
+        std::fs::write(legacy.join("inbox").join("a.txt"), "url=x").unwrap();
+        migrate_legacy_from(&legacy, &newd);
+        assert!(newd.join("state.json").exists());
+        assert!(newd.join("inbox").join("a.txt").exists());
+        // second run must not overwrite new state
+        std::fs::write(newd.join("state.json"), "{\"v\":2}").unwrap();
+        migrate_legacy_from(&legacy, &newd);
+        assert_eq!(std::fs::read_to_string(newd.join("state.json")).unwrap(), "{\"v\":2}");
+        let _ = std::fs::remove_dir_all(&base);
     }
     #[test] fn autostart_path_mock() { let p = autostart_path_for(Path::new("/h")); assert!(!p.to_string_lossy().is_empty()); }
     #[test] fn power_cmd_nonempty() { let (p, _) = power_command(PowerAction::Shutdown); assert!(!p.is_empty()); }

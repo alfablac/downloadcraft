@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Clone, Copy, PartialEq)]
 enum Tab { Downloads, Queues, Scheduler, Grabber, Options }
 
-pub struct IdmApp {
+pub struct DownloadApp {
     rt: Arc<Mutex<Runtime>>,
     tokio_rt: Arc<tokio::runtime::Runtime>,
     tab: Tab,
@@ -55,17 +55,21 @@ pub struct IdmApp {
     rate_map: std::collections::HashMap<String, Vec<(std::time::Instant, u64)>>,
     /// Live segment/part summary per task, from part dir contents.
     seg_info: std::collections::HashMap<String, String>,
+    /// Spawned download tasks; Remove aborts handle so background work really stops.
+    handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+    /// Tray Quit / Tasks Quit set this so close-to-tray intercept lets window close.
+    allow_close: bool,
 }
 
 /// Live tray state: keep icon+menu alive; poll MenuEvent receiver each tick for Show/Add/Quit.
 struct TrayState { _nav: Option<TrayNav> }
 struct TrayNav { _tray: tray_icon::TrayIcon, _menu: tray_icon::menu::Menu, show_id: tray_icon::menu::MenuId, add_id: tray_icon::menu::MenuId, quit_id: tray_icon::menu::MenuId }
 
-impl IdmApp {
+impl DownloadApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, rt: Arc<Mutex<Runtime>>, hidden: bool) -> Self {
         let tokio_rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio rt"));
         let tray = Self::make_tray();
-        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_scope: 0, grab_exts: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new() }
+        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_scope: 0, grab_exts: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new(), handles: std::collections::HashMap::new(), allow_close: false }
     }
 
     fn make_tray() -> Option<TrayNav> {
@@ -74,12 +78,12 @@ impl IdmApp {
         for i in 0..256 { rgba[i * 4] = 30; rgba[i * 4 + 1] = 58; rgba[i * 4 + 2] = 95; rgba[i * 4 + 3] = 255; }
         let icon = tray_icon::Icon::from_rgba(rgba, 16, 16).ok()?;
         let menu = tray_icon::menu::Menu::new();
-        let show = tray_icon::menu::MenuItem::new("Show idmcraft", true, None);
+        let show = tray_icon::menu::MenuItem::new("Show downloadcraft", true, None);
         let add = tray_icon::menu::MenuItem::new("Add URL...", true, None);
         let quit = tray_icon::menu::MenuItem::new("Quit", true, None);
         let (show_id, add_id, quit_id) = (show.id().clone(), add.id().clone(), quit.id().clone());
         let _ = menu.append_items(&[&show, &add, &quit]);
-        let tray = tray_icon::TrayIconBuilder::new().with_icon(icon).with_menu(Box::new(menu.clone())).with_tooltip("idmcraft").build().ok()?;
+        let tray = tray_icon::TrayIconBuilder::new().with_icon(icon).with_menu(Box::new(menu.clone())).with_tooltip("downloadcraft").build().ok()?;
         Some(TrayNav { _tray: tray, _menu: menu, show_id, add_id, quit_id })
     }
 
@@ -95,7 +99,8 @@ impl IdmApp {
         self.rt.lock().unwrap().controls.insert(id.to_string(), ctrl.clone());
         let rt = self.rt.clone(); let tid = id.to_string();
         let client = engine::build_client(&settings.proxy_url);
-        self.tokio_rt.spawn(async move {
+        let ctrl2 = ctrl.clone();
+        let handle = self.tokio_rt.spawn(async move {
             let result = crate::stream::download_url(client, task, ctrl).await;
             let mut g = rt.lock().unwrap();
             g.controls.remove(&tid);
@@ -122,6 +127,13 @@ impl IdmApp {
                     }
                 }
                 Err(e) => {
+                    if ctrl2.cancelled.load(Ordering::Relaxed) || e == "cancelled" {
+                        // User Stop/Remove: stay Paused (parts kept), no retry, no resurrect if row deleted.
+                        if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == tid) { t.status = TaskStatus::Paused; t.downloaded = ctrl2.downloaded.load(Ordering::Relaxed); }
+                        g.log(format!("Stopped {tid}"));
+                        g.save();
+                        return;
+                    }
                     // retry per queue policy: attempts persisted on task, next_retry_at gates poll requeue
                     let (retry, interval) = {
                         let t = g.state.tasks.iter().find(|t| t.id == tid);
@@ -140,6 +152,7 @@ impl IdmApp {
             }
             g.save();
         });
+        self.handles.insert(id.to_string(), handle);
     }
 
     /// Sample per-task rates from Controls counters (called every tick). Drives
@@ -154,7 +167,7 @@ impl IdmApp {
         }
         self.rate_map.retain(|id, _| { let g = self.rt.lock().unwrap(); g.controls.contains_key(id) || g.state.tasks.iter().any(|t| &t.id == id && matches!(t.status, TaskStatus::Downloading | TaskStatus::Paused)) });
         // Segment/part summary for downloading tasks: count part files in work dir.
-        let tasks: Vec<(String, std::path::PathBuf, u64)> = { let g = self.rt.lock().unwrap(); g.state.tasks.iter().filter(|t| t.status == TaskStatus::Downloading).map(|t| (t.id.clone(), t.dest_dir.join(format!(".idmcraft-{}", t.id)), t.total.unwrap_or(0))).collect() };
+        let tasks: Vec<(String, std::path::PathBuf, u64)> = { let g = self.rt.lock().unwrap(); g.state.tasks.iter().filter(|t| t.status == TaskStatus::Downloading).map(|t| (t.id.clone(), t.dest_dir.join(format!(".downloadcraft-{}", t.id)), t.total.unwrap_or(0))).collect() };
         for (id, dir, _total) in tasks {
             if let Ok(rd) = std::fs::read_dir(&dir) {
                 let parts: Vec<(String, u64)> = rd.flatten().filter_map(|e| { let p = e.path(); let sz = e.metadata().map(|m| m.len()).unwrap_or(0); p.file_name().and_then(|f| f.to_str()).map(|f| (f.to_string(), sz)) }).filter(|(f, _)| f.starts_with("part")).collect();
@@ -178,6 +191,7 @@ impl IdmApp {
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
+        self.handles.retain(|_, h| !h.is_finished());
         // Tray menu events (cheap, event-driven): Show / Add URL / Quit
         let tray_act = self.tray.as_ref().and_then(|t| t._nav.as_ref()).map(|nav| {
             let mut act = "";
@@ -189,7 +203,7 @@ impl IdmApp {
         match tray_act {
             "show" => { ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true)); ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false)); ctx.send_viewport_cmd(egui::ViewportCommand::Focus); }
             "add" => { ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true)); ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false)); ctx.send_viewport_cmd(egui::ViewportCommand::Focus); self.tab = Tab::Downloads; self.show_add = true; }
-            "quit" => { self.rt.lock().unwrap().save(); ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+            "quit" => { self.allow_close = true; self.rt.lock().unwrap().save(); ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
             _ => {}
         }
         crate::drain_inbox(&self.rt);
@@ -293,17 +307,34 @@ fn run_completion(g: &Runtime, queue_id: &str, task_id: &str) {
     }
 }
 
-impl eframe::App for IdmApp {
+impl eframe::App for DownloadApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.rt.lock().unwrap().save();
+        // Release single-instance lock only if it still holds our pid.
+        let lock = crate::platform::config_dir().join("instance.lock");
+        if let Ok(txt) = std::fs::read_to_string(&lock) {
+            if txt.trim() == std::process::id().to_string() { let _ = std::fs::remove_file(&lock); }
+        }
+    }
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         theme::apply(ctx);
         self.poll(ctx);
+        // Close-to-tray: window X hides to tray (setting existed but was never wired).
+        if !self.allow_close && ctx.input(|i| i.viewport().close_requested()) {
+            let to_tray = { let g = self.rt.lock().unwrap(); g.state.settings.close_to_tray } && self.tray.as_ref().and_then(|t| t._nav.as_ref()).is_some();
+            if to_tray {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                return;
+            }
+        }
         if self.hidden { return; }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title("idmcraft — Download Manager".into()));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title("downloadcraft — Download Manager".into()));
 
         // ── Top bar: brand + menus (IDM: Tasks/File/Downloads/View/Help) ──
         egui::TopBottomPanel::top("topbar").frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::symmetric(8.0, 4.0))).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("idmcraft").color(theme::TEXT).strong().size(17.0));
+                ui.label(egui::RichText::new("downloadcraft").color(theme::TEXT).strong().size(17.0));
                 theme::chip(ui, "v0.1.0", theme::TEAL_500);
                 ui.add_space(14.0);
                 egui::menu::bar(ui, |ui| {
@@ -340,7 +371,7 @@ impl eframe::App for IdmApp {
                         if ui.button("Options").clicked() { self.tab = Tab::Options; ui.close_menu(); }
                     });
                     ui.menu_button("Help", |ui| {
-                        if ui.button("About idmcraft").clicked() { self.show_about = true; ui.close_menu(); }
+                        if ui.button("About downloadcraft").clicked() { self.show_about = true; ui.close_menu(); }
                     });
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -359,12 +390,8 @@ impl eframe::App for IdmApp {
                 for (tab, label, ic) in [(Tab::Downloads, "Downloads", Icon::Download), (Tab::Queues, "Queues", Icon::Queue), (Tab::Scheduler, "Scheduler", Icon::Clock), (Tab::Grabber, "Site Grabber", Icon::Globe), (Tab::Options, "Options", Icon::Settings)] {
                     let on = self.tab == tab;
                     let col = if on { egui::Color32::WHITE } else { theme::TEXT_MUTED };
-                    ui.horizontal(|ui| {
-                        let (irect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
-                        icon(ui.painter(), &ic, irect, col);
-                        let b = egui::Button::new(egui::RichText::new(label).color(col)).fill(if on { theme::PRIMARY } else { egui::Color32::TRANSPARENT }).min_size(egui::vec2(162.0, 26.0));
-                        if ui.add(b).clicked() { self.tab = tab; }
-                    });
+                    if icon_btn(ui, ic, label, on, 172.0).clicked() { self.tab = tab; }
+                    let _ = col;
                 }
                 ui.add_space(14.0);
                 ui.separator();
@@ -374,12 +401,8 @@ impl eframe::App for IdmApp {
                 for (c, ic) in cats {
                     let on = self.category == *c;
                     let col = if on { theme::TEAL_500 } else { theme::TEXT_MUTED };
-                    ui.horizontal(|ui| {
-                        let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                        icon(ui.painter(), ic, irect, col);
-                        let b = egui::Button::new(egui::RichText::new(*c).color(col)).fill(egui::Color32::TRANSPARENT).min_size(egui::vec2(164.0, 24.0));
-                        if ui.add(b).clicked() { self.category = c.to_string(); self.tab = Tab::Downloads; }
-                    });
+                    if icon_btn(ui, *ic, c, on, 172.0).clicked() { self.category = c.to_string(); self.tab = Tab::Downloads; }
+                    let _ = col;
                 }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.label(egui::RichText::new("ffmpeg: PATH/beside exe only").color(theme::TEXT_FAINT).small());
@@ -424,8 +447,8 @@ impl eframe::App for IdmApp {
         });
 
         if self.show_about {
-            egui::Window::new("About idmcraft").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-                ui.label("idmcraft 0.1.0 — clean-room cross-platform download manager.");
+            egui::Window::new("About downloadcraft").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                ui.label("downloadcraft 0.1.0 — clean-room cross-platform download manager.");
                 ui.label("Rust + egui. Segmented downloads, DASH/HLS, queues, scheduler, Site Grabber.");
                 ui.label("No proprietary code, binaries, icons, or activation logic.");
                 if ui.button("Close").clicked() { self.show_about = false; }
@@ -476,37 +499,69 @@ fn cat_icon(filename: &str) -> Icon {
 }
 
 // free helpers used by menus
-fn stop_task(app: &mut IdmApp, id: &str) { let mut g = app.rt.lock().unwrap(); if let Some(c) = g.controls.get(id) { c.paused.store(true, Ordering::Relaxed); }
-    if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) { t.status = TaskStatus::Paused; } g.save(); }
-fn remove_task(app: &mut IdmApp, id: &str) { let mut g = app.rt.lock().unwrap(); g.state.tasks.retain(|t| t.id != id); g.controls.remove(id); app.selected = None; g.save(); }
-fn resume_all(app: &mut IdmApp) { let ids: Vec<String> = { let g = app.rt.lock().unwrap(); g.state.tasks.iter().filter(|t| matches!(t.status, TaskStatus::Paused | TaskStatus::Error | TaskStatus::Queued)).map(|t| t.id.clone()).collect() }; for id in ids { app.start_task(&id); } }
-fn stop_all(app: &mut IdmApp) { let ids: Vec<String> = { let g = app.rt.lock().unwrap(); g.state.tasks.iter().filter(|t| t.status == TaskStatus::Downloading).map(|t| t.id.clone()).collect() }; for id in ids { stop_task(app, &id); } }
-fn delete_completed(app: &mut IdmApp) { let mut g = app.rt.lock().unwrap(); g.state.tasks.retain(|t| t.status != TaskStatus::Complete); g.save(); }
-fn toggle_limiter(app: &mut IdmApp) { let mut g = app.rt.lock().unwrap(); g.state.settings.speed_limit_kbps = if g.state.settings.speed_limit_kbps == 0 { 512 } else { 0 }; let lim = g.state.settings.speed_limit_kbps; for c in g.controls.values() { c.limit_kbps.store(lim, Ordering::Relaxed); } g.save(); }
-fn export_json(app: &mut IdmApp) { let g = app.rt.lock().unwrap(); let txt = serde_json::to_string_pretty(&g.state.tasks.iter().map(|t| serde_json::json!({"url":t.url,"filename":t.filename,"queue":t.queue_id})).collect::<Vec<_>>()).unwrap_or_default(); let path = g.state.settings.download_dir.join("idmcraft-export.json"); let _ = std::fs::write(path, txt); }
-fn add_batch_clipboard(app: &mut IdmApp) {
+fn stop_task(app: &mut DownloadApp, id: &str) {
+    // Stop terminates transfer (connection drops, parts kept for resume). Pause-wait held worker + socket forever.
+    let mut g = app.rt.lock().unwrap();
+    if let Some(c) = g.controls.get(id) { c.cancelled.store(true, Ordering::Relaxed); c.paused.store(false, Ordering::Relaxed); }
+    if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) { t.status = TaskStatus::Paused; }
+    g.save();
+}
+fn remove_task(app: &mut DownloadApp, id: &str) {
+    if let Some(h) = app.handles.remove(id) { h.abort(); }
+    let mut g = app.rt.lock().unwrap();
+    if let Some(c) = g.controls.get(id) { c.cancelled.store(true, Ordering::Relaxed); c.paused.store(false, Ordering::Relaxed); }
+    g.state.tasks.retain(|t| t.id != id);
+    g.controls.remove(id);
+    app.selected = None;
+    if app.show_progress_for.as_deref() == Some(id) { app.show_progress_for = None; }
+    g.save();
+}
+fn resume_all(app: &mut DownloadApp) { let ids: Vec<String> = { let g = app.rt.lock().unwrap(); g.state.tasks.iter().filter(|t| matches!(t.status, TaskStatus::Paused | TaskStatus::Error | TaskStatus::Queued)).map(|t| t.id.clone()).collect() }; for id in ids { app.start_task(&id); } }
+fn stop_all(app: &mut DownloadApp) { let ids: Vec<String> = { let g = app.rt.lock().unwrap(); g.state.tasks.iter().filter(|t| t.status == TaskStatus::Downloading).map(|t| t.id.clone()).collect() }; for id in ids { stop_task(app, &id); } }
+fn delete_completed(app: &mut DownloadApp) { let mut g = app.rt.lock().unwrap(); g.state.tasks.retain(|t| t.status != TaskStatus::Complete); g.save(); }
+fn toggle_limiter(app: &mut DownloadApp) { let mut g = app.rt.lock().unwrap(); g.state.settings.speed_limit_kbps = if g.state.settings.speed_limit_kbps == 0 { 512 } else { 0 }; let lim = g.state.settings.speed_limit_kbps; for c in g.controls.values() { c.limit_kbps.store(lim, Ordering::Relaxed); } g.save(); }
+fn export_json(app: &mut DownloadApp) { let g = app.rt.lock().unwrap(); let txt = serde_json::to_string_pretty(&g.state.tasks.iter().map(|t| serde_json::json!({"url":t.url,"filename":t.filename,"queue":t.queue_id})).collect::<Vec<_>>()).unwrap_or_default(); let path = g.state.settings.download_dir.join("downloadcraft-export.json"); let _ = std::fs::write(path, txt); }
+fn add_batch_clipboard(app: &mut DownloadApp) {
     if let Ok(mut cb) = arboard::Clipboard::new() { if let Ok(txt) = cb.get_text() { for line in txt.lines() { let u = line.trim(); if u.starts_with("http://") || u.starts_with("https://") { add_url_task(app, u); } } } }
 }
-fn add_url_task(app: &mut IdmApp, url: &str) {
+fn add_url_task(app: &mut DownloadApp, url: &str) {
     let id = { let mut g = app.rt.lock().unwrap(); g.add_url(url, "main", "", "") };
     app.start_task(&id);
 }
 fn fmt_rate(bps: f32) -> String { if bps <= 0.0 { "0 B/s".into() } else if bps < 1024.0 { format!("{bps:.0} B/s") } else if bps < 1024.0 * 1024.0 { format!("{:.1} KB/s", bps / 1024.0) } else { format!("{:.2} MB/s", bps / 1048576.0) } }
 fn eta(secs: f64) -> String { if !secs.is_finite() || secs < 0.0 { "—".into() } else if secs < 60.0 { format!("{secs:.0}s") } else if secs < 3600.0 { format!("{:.0}m {:.0}s", secs / 60.0, secs % 60.0) } else { format!("{:.0}h {:.0}m", secs / 3600.0, (secs % 3600.0) / 60.0) } }
 
-impl IdmApp {
+
+/// IDM-style toolbar button: icon glyph + label in one bordered, clickable cell.
+/// (egui Button takes text only; separate icon widgets left icon outside hit area and label looked like plain text.)
+fn icon_btn(ui: &mut egui::Ui, ic: Icon, label: &str, primary: bool, min_w: f32) -> egui::Response {
+    let fill = if primary { theme::STEEL_DIM } else { theme::SURFACE_RAISED };
+    let resp = egui::Frame::none().fill(fill).stroke(egui::Stroke::new(1.0f32, theme::BORDER_STRONG)).inner_margin(egui::Margin::symmetric(7.0, 4.0)).show(ui, |ui| {
+        ui.set_min_width(min_w);
+        ui.horizontal(|ui| {
+            let (irect, _) = ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
+            icon(ui.painter(), &ic, irect, theme::TEXT);
+            ui.label(egui::RichText::new(label).color(theme::TEXT));
+        });
+    }).response;
+    let resp = resp.interact(egui::Sense::click());
+    if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+    resp
+}
+
+impl DownloadApp {
     fn ui_downloads(&mut self, ui: &mut egui::Ui) {
         // Header + actions (IDM toolbar: Add URL, Resume, Stop, Stop All, Delete, Options…)
         ui.horizontal(|ui| {
             ui.heading("Downloads");
             theme::chip(ui, &self.category.clone(), theme::TEXT_MUTED);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::primary_btn(ui, "+ Add URL").clicked() { self.show_add = true; }
-                if theme::ghost_btn(ui, "Resume").clicked() { if let Some(id) = self.selected.clone() { self.start_task(&id); } }
-                if theme::ghost_btn(ui, "Stop").clicked() { if let Some(id) = self.selected.clone() { stop_task(self, &id); } }
-                if theme::ghost_btn(ui, "Stop all").clicked() { stop_all(self); }
-                if theme::ghost_btn(ui, "Delete").clicked() { if let Some(id) = self.selected.clone() { remove_task(self, &id); } }
-                if theme::ghost_btn(ui, "Delete completed").clicked() { delete_completed(self); }
+                if icon_btn(ui, Icon::Plus, "Add URL", true, 86.0).clicked() { self.show_add = true; }
+                if icon_btn(ui, Icon::Play, "Resume", false, 78.0).clicked() { if let Some(id) = self.selected.clone() { self.start_task(&id); } }
+                if icon_btn(ui, Icon::Pause, "Stop", false, 62.0).clicked() { if let Some(id) = self.selected.clone() { stop_task(self, &id); } }
+                if icon_btn(ui, Icon::Pause, "Stop all", false, 74.0).clicked() { stop_all(self); }
+                if icon_btn(ui, Icon::Delete, "Delete", false, 70.0).clicked() { if let Some(id) = self.selected.clone() { remove_task(self, &id); } }
+                if icon_btn(ui, Icon::Check, "Delete completed", false, 128.0).clicked() { delete_completed(self); }
             });
         });
         ui.add_space(6.0);
@@ -594,9 +649,9 @@ impl IdmApp {
                         });
                         ui.horizontal(|ui| {
                             if t.status == TaskStatus::Downloading {
-                                if ui.small_button("Stop").clicked() { to_stop = Some(t.id.clone()); }
-                            } else if t.status != TaskStatus::Complete && ui.small_button("Start").clicked() { to_start = Some(t.id.clone()); }
-                            if ui.small_button("Progress").clicked() { to_progress = Some(t.id.clone()); }
+                                if icon_btn(ui, Icon::Pause, "Stop", false, 56.0).clicked() { to_stop = Some(t.id.clone()); }
+                            } else if t.status != TaskStatus::Complete && icon_btn(ui, Icon::Play, "Start", false, 58.0).clicked() { to_start = Some(t.id.clone()); }
+                            if icon_btn(ui, Icon::Info, "Progress", false, 82.0).clicked() { to_progress = Some(t.id.clone()); }
                         });
                         ui.end_row();
                     });
@@ -946,13 +1001,13 @@ impl IdmApp {
                         ui.separator();
                         if theme::ghost_btn(ui, "Repair browser integration (register native hosts + protocol)").clicked() { match platform::register_native_hosts(&crate::sibling_host_path()) { Ok(p) => g.log(format!("Registered {} host manifests", p.len())), Err(e) => g.log(format!("Register failed: {e}")) } let _ = platform::register_protocol(); }
                         if theme::ghost_btn(ui, "Remove browser integration + autostart").clicked() { let _ = platform::unregister_native_hosts(); let _ = platform::set_autostart(false); g.state.settings.autostart = false; }
-                        ui.label(egui::RichText::new(format!("Chromium extension ID (pinned): {}", idmcraft_lib::platform::CHROME_EXT_ID)).color(theme::TEXT_FAINT).small().monospace());
-                        ui.label(egui::RichText::new("Load unpacked: extensions/chromium (MV3) · extensions/firefox (MV2). Native host: idmcraft-host.").color(theme::TEXT_FAINT).small());
+                        ui.label(egui::RichText::new(format!("Chromium extension ID (pinned): {}", downloadcraft_lib::platform::CHROME_EXT_ID)).color(theme::TEXT_FAINT).small().monospace());
+                        ui.label(egui::RichText::new("Load unpacked: extensions/chromium (MV3) · extensions/firefox (MV2). Native host: downloadcraft-host.").color(theme::TEXT_FAINT).small());
                     }
                     _ => {
                         ui.label(egui::RichText::new("About").strong());
                         ui.separator();
-                        ui.label("idmcraft 0.1.0 — clean-room cross-platform download manager.");
+                        ui.label("downloadcraft 0.1.0 — clean-room cross-platform download manager.");
                         ui.label("Rust + egui. No proprietary IDM code, binaries, icons, or licensing logic.");
                         ui.label(egui::RichText::new("Sounds / Dial-Up / VPN tabs from IDM not cloned: desktop notifications use OS defaults; dial-up/VPN obsolete on target OSes.").color(theme::TEXT_FAINT).small());
                     }

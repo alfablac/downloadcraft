@@ -1,5 +1,5 @@
 [package]
-name = "idmcraft"
+name = "downloadcraft"
 version = "0.1.0"
 edition = "2021"
 description = "Clean-room cross-platform download manager (IDM feature clone)"
@@ -27,16 +27,16 @@ tray-icon = "0.19"
 winreg = "0.52"
 
 [lib]
-name = "idmcraft_lib"
+name = "downloadcraft_lib"
 path = "src/lib.rs"
 
 [[bin]]
-name = "idmcraft"
+name = "downloadcraft"
 path = "src/main.rs"
 
 [[bin]]
-name = "idmcraft-host"
-path = "src/bin/idmcraft_host.rs"
+name = "downloadcraft-host"
+path = "src/bin/downloadcraft_host.rs"
 
 [profile.release]
 lto = "thin"

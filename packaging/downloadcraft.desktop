@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=idmcraft
+Name=downloadcraft
 Comment=Cross-platform download manager
-Exec=idmcraft %u
-Icon=idmcraft
+Exec=downloadcraft %u
+Icon=downloadcraft
 Categories=Network;FileTransfer;
-MimeType=x-scheme-handler/idmcraft;
+MimeType=x-scheme-handler/downloadcraft;
 Terminal=false
