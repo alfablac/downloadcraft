@@ -18,6 +18,16 @@ Runs on Windows 10/11 x86_64, macOS 13 or later (Intel and Apple Silicon), and L
 
 Multi-track downloads are muxed with ffmpeg when ffmpeg is on PATH or beside the exe. Single-track downloads do not need it. The app never downloads ffmpeg at runtime.
 
+## Screenshots
+
+| Downloads | Options |
+|---|---|
+| ![Downloads](docs/screenshots/downloads.png) | ![Options](docs/screenshots/options.png) |
+
+| Site Grabber | Downloads at a narrow window size |
+|---|---|
+| ![Site Grabber](docs/screenshots/site-grabber.png) | ![Downloads at a narrow window size](docs/screenshots/downloads-narrow.png) |
+
 ## Build
 
 ```bash
@@ -37,7 +47,7 @@ macOS: open the `.dmg` and drag `downloadcraft.app` to Applications. Builds are 
 
 Linux: make the AppImage executable and run it, unpack the tarball, or install the package with `sudo apt install ./downloadcraft_*_amd64.deb`. The .deb registers the desktop entry and protocol handler. Tray on GNOME needs AppIndicator support. Uninstall with `sudo apt remove downloadcraft` and remove `~/.config/autostart/downloadcraft.desktop`, or turn autostart off in Options first.
 
-Older installs under the previous name still work. On first launch, downloadcraft copies `state.json` and any pending inbox messages from the old idmcraft config directory if the new one has no state yet. It does not overwrite existing downloadcraft state.
+Older installs still work. On first launch, downloadcraft copies `state.json` and any pending inbox messages from the previous config directory if the new one has no state yet. It does not overwrite existing downloadcraft state.
 
 ## Browser integration
 
@@ -45,9 +55,15 @@ The desktop app registers the native messaging host and protocol every time it s
 
 Chromium: load `extensions/chromium` as an unpacked extension.
 
-Firefox: a ready XPI is at `extensions/downloadcraft-firefox.xpi`. Remove the old idmcraft add-on first; it asks for the old native host name, which no longer exists. Start downloadcraft once so it registers the current host, then install the XPI from about:addons, gear menu, Install Add-on From File. Firefox release builds refuse unsigned add-ons permanently; use Firefox Developer Edition or Nightly, or set `xpinstall.signatures.required` to false in about:config on builds that allow it. For a temporary install, load `extensions/firefox` from about:debugging, This Firefox, Load Temporary Add-on. Rebuild the XPI with `scripts/package-firefox.ps1`.
+Firefox: a ready XPI is at `extensions/downloadcraft-firefox.xpi`. Remove the previous add-on first; it asks for a native host name that no longer exists. Start downloadcraft once so it registers the current host, then install the XPI from about:addons, gear menu, Install Add-on From File. Firefox release builds refuse unsigned add-ons permanently; use Firefox Developer Edition or Nightly, or set `xpinstall.signatures.required` to false in about:config on builds that allow it. For a temporary install, load `extensions/firefox` from about:debugging, This Firefox, Load Temporary Add-on. Rebuild the XPI with `scripts/package-firefox.ps1`.
 
 Native host name: `com.downloadcraft.host`.
+
+## Interface
+
+The main window groups related actions and labels each group. Download actions stay with the selected download. Queue actions stay with all downloads. Narrow windows scroll the download table instead of squeezing its columns together.
+
+Options save as soon as a setting changes. Site Grabber fields use the full panel width for the start URL and extensions list.
 
 ## Docs
 

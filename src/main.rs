@@ -160,7 +160,7 @@ fn run_gui(initial_urls: Vec<String>, hidden: bool) {
     // drain inbox
     drain_inbox(&rt);
     let rt_clone = rt.clone();
-    let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_inner_size([980.0, 640.0]).with_title("downloadcraft").with_visible(!hidden), ..Default::default() };
+    let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 720.0]).with_min_inner_size([760.0, 520.0]).with_title("downloadcraft").with_visible(!hidden), ..Default::default() };
     let _ = eframe::run_native("downloadcraft", options, Box::new(move |cc| Ok(Box::new(app::DownloadApp::new(cc, rt_clone, hidden)))));
 }
 
