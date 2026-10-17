@@ -9,7 +9,7 @@ pub struct GrabberProject {
     #[serde(default = "def_pages")] pub max_pages: usize,
     #[serde(default)] pub max_files: usize,
     #[serde(default)] pub max_total_bytes: u64,
-    /// 0=same host,1=same domain (registrable approx: last 2 labels),2=external allowed
+    /// 0=same host,1=same registrable domain (see `registrable_domain`),2=external allowed
     #[serde(default)] pub scope: u8,
     #[serde(default)] pub extensions: Vec<String>,
     #[serde(default)] pub mime_allow: Vec<String>,
@@ -23,8 +23,16 @@ pub struct GrabberProject {
 }
 fn def_depth() -> usize { 2 } fn def_pages() -> usize { 200 } fn def_true() -> bool { true }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct FoundFile { pub url: String, pub size: Option<u64>, pub mime: String, pub page_url: String, pub selected: bool }
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct FoundFile {
+    pub url: String,
+    pub size: Option<u64>,
+    pub mime: String,
+    /// Referrer: page on which this file was found (empty if unknown).
+    #[serde(default)]
+    pub page_url: String,
+    pub selected: bool,
+}
 
 pub fn canonicalize(u: &Url) -> String {
     let mut c = u.clone(); c.set_fragment(None);
@@ -33,7 +41,25 @@ pub fn canonicalize(u: &Url) -> String {
 }
 
 fn host_of(u: &Url) -> String { u.host_str().unwrap_or("").to_ascii_lowercase() }
-fn domain_of(u: &Url) -> String { let h = host_of(u); let parts: Vec<&str> = h.split('.').collect(); if parts.len() >= 2 { parts[parts.len() - 2..].join(".") } else { h } }
+/// Common two-label public suffixes (ponytail: tiny heuristic list, not full PSL;
+/// upgrade path: `publicsuffix` crate if coverage matters).
+const MULTI_LABEL_SUFFIXES: &[&str] = &[
+    "ac.uk", "co.uk", "gov.uk", "org.uk", "com.au", "net.au", "org.au", "co.nz", "com.br",
+    "com.cn", "com.tw", "com.hk", "co.jp", "ne.jp", "or.jp", "co.kr", "com.mx", "com.ar",
+    "co.in", "com.sg",
+];
+
+/// Registrable domain: last 2 labels, or last 3 under a known multi-label suffix
+/// (`example.co.uk`, not `co.uk`).
+pub fn registrable_domain(host: &str) -> String {
+    let labels: Vec<&str> = host.trim_end_matches('.').split('.').filter(|s| !s.is_empty()).collect();
+    if labels.len() <= 2 { return labels.join("."); }
+    let last_two = labels[labels.len() - 2..].join(".").to_lowercase();
+    let take = if MULTI_LABEL_SUFFIXES.contains(&last_two.as_str()) { 3 } else { 2 };
+    labels[labels.len() - take..].join(".")
+}
+
+fn domain_of(u: &Url) -> String { registrable_domain(&host_of(u)) }
 
 pub fn in_scope(start: &Url, cand: &Url, scope: u8) -> bool {
     match scope { 0 => host_of(start) == host_of(cand), 1 => domain_of(start) == domain_of(cand), _ => true }
@@ -68,18 +94,58 @@ pub fn extract_links(html: &str, base: &Url) -> (Vec<Url>, Vec<Url>) {
     (pages, files)
 }
 
-/// Minimal robots.txt check: Disallow prefixes for *.
-pub fn robots_allows(robots_txt: &str, path: &str) -> bool {
-    let mut in_star = false;
-    for line in robots_txt.lines() {
-        let l = line.trim();
-        if l.to_ascii_lowercase().starts_with("user-agent:") { in_star = l[11..].trim() == "*"; }
-        else if in_star && l.to_ascii_lowercase().starts_with("disallow:") {
-            let p = l[9..].trim();
-            if !p.is_empty() && path.starts_with(p) { return false; }
+/// Exact wildcard match: `*` matches any sequence (incl. empty), all else literal.
+fn robots_wildcard(pat: &str, text: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let mut dp = vec![vec![false; t.len() + 1]; p.len() + 1];
+    dp[0][0] = true;
+    for i in 1..=p.len() { if p[i - 1] == '*' { dp[i][0] = dp[i - 1][0]; } }
+    for i in 1..=p.len() {
+        for j in 1..=t.len() {
+            dp[i][j] = match p[i - 1] {
+                '*' => dp[i - 1][j] || dp[i][j - 1],
+                c => c == t[j - 1] && dp[i - 1][j - 1],
+            };
         }
     }
-    true
+    dp[p.len()][t.len()]
+}
+
+fn robots_pattern_matches(pat: &str, path: &str) -> bool {
+    // `$` at end anchors to end of path; otherwise pattern is a prefix pattern.
+    if let Some(anchored) = pat.strip_suffix('$') {
+        robots_wildcard(anchored, path)
+    } else {
+        robots_wildcard(&format!("{pat}*"), path)
+    }
+}
+
+/// Robots.txt check for `User-agent: *` group only. `Allow`/`Disallow` both
+/// supported; longest matching pattern wins, `Allow` wins ties. Patterns may
+/// contain `*` wildcards and a trailing `$` end anchor.
+pub fn robots_allows(robots_txt: &str, path: &str) -> bool {
+    let mut in_star = false;
+    let mut best: Option<(usize, bool)> = None; // (pattern len, allowed)
+    for line in robots_txt.lines() {
+        let l = line.trim();
+        let lower = l.to_ascii_lowercase();
+        if lower.starts_with("user-agent:") {
+            in_star = l[11..].trim() == "*";
+        } else if in_star && (lower.starts_with("disallow:") || lower.starts_with("allow:")) {
+            let is_allow = lower.starts_with("allow:");
+            let p = l[if is_allow { 6 } else { 9 }..].trim();
+            if p.is_empty() { continue; }
+            if robots_pattern_matches(p, path) {
+                let better = match best {
+                    None => true,
+                    Some((len, allowed)) => p.len() > len || (p.len() == len && is_allow && !allowed),
+                };
+                if better { best = Some((p.len(), is_allow)); }
+            }
+        }
+    }
+    best.map(|(_, allowed)| allowed).unwrap_or(true)
 }
 
 pub struct Crawler { pub project: GrabberProject }
@@ -130,10 +196,12 @@ impl Crawler {
                         visited.insert(canon); queue.push_back((cand, depth + 1));
                     }
                 } else {
+                    if !in_scope(&start, &cand, self.project.scope) { continue; }
                     if seen_files.contains(&canon) { continue; }
                     // HEAD for size/mime where possible (GET fallback in tests uses HEAD support)
                     let (size, mime) = head_info(client, &cand).await;
-                    if self.project.min_size > 0 { if let Some(s) = size { if s < self.project.min_size { continue; } } }
+                    // Unknown size cannot satisfy a positive minimum: skip.
+                    if self.project.min_size > 0 { match size { Some(s) if s >= self.project.min_size => {}, _ => continue } }
                     if self.project.max_size > 0 { if let Some(s) = size { if s > self.project.max_size { continue; } } }
                     if !self.project.mime_allow.is_empty() && !mime.is_empty() && !self.project.mime_allow.iter().any(|m| mime.contains(m)) { continue; }
                     if self.project.max_files > 0 && files.len() >= self.project.max_files { continue; }
@@ -195,6 +263,19 @@ pub fn mirror_rel_path(_root: &Url, u: &Url) -> String {
     let mut p = format!("{host}{}", u.path());
     if p.ends_with('/') { p.push_str("index.html"); }
     else if !p.contains('.') { p.push_str("/index.html"); }
+    // Query variants of same path collide on disk: tag filename with short query hash.
+    if let Some(q) = u.query().filter(|q| !q.is_empty()) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        q.hash(&mut h);
+        let hex = format!("{:016x}", h.finish());
+        let seg_start = p.rfind('/').map(|i| i + 1).unwrap_or(0);
+        if let Some(d) = p[seg_start..].rfind('.') {
+            p.insert_str(seg_start + d, &format!("-{}", &hex[..8]));
+        } else {
+            p.push_str(&format!("-{}", &hex[..8]));
+        }
+    }
     // sanitize per segment
     p.split('/').map(crate::model::sanitize_filename).collect::<Vec<_>>().join("/")
 }
@@ -241,11 +322,48 @@ pub async fn mirror_site(client: &reqwest::Client, project: &GrabberProject, out
 }
 
 pub fn rewrite_links(html: &str, page_url: &Url, mapping: &HashMap<String, String>, mirror_root: &std::path::Path, page_rel: &str) -> String {
-    let mut out = html.to_string();
+    let _ = (mirror_root, page_rel);
+    // Resolve href/src values (relative, root-relative, absolute) against the
+    // page URL first, then swap in the mapped mirror path.
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    'scan: while !rest.is_empty() {
+        let mut hit: Option<(usize, usize, char)> = None; // (value start, prefix len, quote)
+        for attr in ["href", "src"] {
+            for quote in ['"', '\''] {
+                let needle = format!("{attr}={quote}");
+                if let Some(idx) = rest.find(&needle) {
+                    let start = idx + needle.len();
+                    if hit.is_none_or(|(s, _, _)| start < s) { hit = Some((start, needle.len(), quote)); }
+                }
+            }
+        }
+        let Some((vstart, _, quote)) = hit else { break 'scan };
+        let Some(vend) = rest[vstart..].find(quote).map(|i| i + vstart) else { break 'scan };
+        let val = &rest[vstart..vend];
+        let skip = val.is_empty() || val.starts_with(['#', '?']) || ["javascript:", "mailto:", "data:", "tel:"].iter().any(|s| val.to_ascii_lowercase().starts_with(s));
+        let replacement = if skip {
+            None
+        } else {
+            page_url.join(val).ok().and_then(|resolved| {
+                mapping.get(&resolved.to_string()).or_else(|| mapping.get(&canonicalize(&resolved))).cloned()
+            })
+        };
+        match replacement {
+            Some(rel) => {
+                out.push_str(&rest[..vstart]);
+                out.push_str(&rel);
+                rest = &rest[vend..];
+            }
+            None => {
+                out.push_str(&rest[..vend]);
+                rest = &rest[vend..];
+            }
+        }
+    }
+    out.push_str(rest);
+    // Absolute URLs outside attributes (plain text, meta content, etc.).
     for (url, rel) in mapping {
-        // compute relative from page dir to target
-        let page_dir = page_rel.rsplit('/').next_back().unwrap_or("");
-        let _ = page_url; let _ = mirror_root; let _ = page_dir;
         out = out.replace(url, rel);
     }
     out
@@ -264,5 +382,36 @@ mod tests {
         assert!(in_scope(&base, &Url::parse("https://sub.example.com/").unwrap(), 1));
     }
     #[test] fn robots() { assert!(!robots_allows("User-agent: *\nDisallow: /private/", "/private/x")); assert!(robots_allows("User-agent: *\nDisallow: /private/", "/public")); }
+    #[test] fn robots_allow_and_wildcards() {
+        let txt = "User-agent: *\nDisallow: /private/\nAllow: /private/public.html\nDisallow: /*.pdf$\nDisallow: /tmp/*\n";
+        assert!(robots_allows(txt, "/private/public.html")); // longest match wins
+        assert!(!robots_allows(txt, "/private/other"));
+        assert!(!robots_allows(txt, "/a/b.pdf")); // * + $ anchor
+        assert!(robots_allows(txt, "/a/b.pdfx")); // $ prevents suffix match
+        assert!(!robots_allows(txt, "/tmp/a/b"));
+        assert!(robots_allows("User-agent: bot\nDisallow: /\n", "/anything")); // only * group applies
+        assert_eq!(registrable_domain("www.example.co.uk"), "example.co.uk");
+        assert_eq!(registrable_domain("a.b.example.com"), "example.com");
+        assert_eq!(registrable_domain("sub.shop.com.au"), "shop.com.au");
+        let base = Url::parse("https://example.co.uk/").unwrap();
+        assert!(in_scope(&base, &Url::parse("https://cdn.example.co.uk/").unwrap(), 1));
+        assert!(!in_scope(&base, &Url::parse("https://other.co.uk/").unwrap(), 1));
+        assert!(FoundFile::default().page_url.is_empty());
+    }
+    #[test] fn mirror_query_and_relative_rewrite() {
+        let root = Url::parse("https://example.com/").unwrap();
+        let plain = mirror_rel_path(&root, &Url::parse("https://example.com/a/page.html").unwrap());
+        let q1 = mirror_rel_path(&root, &Url::parse("https://example.com/a/page.html?x=1").unwrap());
+        let q2 = mirror_rel_path(&root, &Url::parse("https://example.com/a/page.html?x=2").unwrap());
+        assert_eq!(plain, "example.com/a/page.html");
+        assert_ne!(q1, plain); assert_ne!(q1, q2);
+        assert!(q1.starts_with("example.com/a/page-") && q1.ends_with(".html"), "{q1}");
+        assert_eq!(q1, mirror_rel_path(&root, &Url::parse("https://example.com/a/page.html?x=1").unwrap())); // deterministic
+        let page = Url::parse("https://example.com/a/c/index.html").unwrap();
+        let mut map = HashMap::new();
+        map.insert("https://example.com/a/b/page.html".to_string(), "a/b/page.html".to_string());
+        let out = rewrite_links(r#"<a href="../b/page.html">r</a><a href="/a/b/page.html">abs</a><a href="https://example.com/a/b/page.html">full</a>"#, &page, &map, std::path::Path::new("/tmp"), "a/c/index.html");
+        assert_eq!(out.matches("a/b/page.html").count(), 3, "{out}");
+    }
     #[test] fn canon_dedupe() { assert_eq!(canonicalize(&Url::parse("https://EXAMPLE.com/a#frag").unwrap()), canonicalize(&Url::parse("https://example.com/a").unwrap())); }
 }
