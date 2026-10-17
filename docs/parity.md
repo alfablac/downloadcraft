@@ -39,10 +39,10 @@
 | Queues scheduler start/stop, recurrence, missed policy flag, next-run | Done | scheduler unit + GUI |
 | Per-queue completion actions incl. power (opt-in flag field) | Done | `run_completion`, power cmd construction unit |
 | Site Grabber: depth/scope/filters/dedupe/robots/delay/export/project save-load | Done | grabber e2e + GUI |
-| Mirror mode | Partial | `mirror_rel_path`/`rewrite_links` helpers + unit; full mirror crawl download not wired in GUI |
-| Tray, close-to-tray, start-minimized, single hidden autostart (`--autostart`) | Partial | tray-icon created; autostart per-OS done; single-instance mutex not implemented (second launch opens second window) — documented limit |
+| Mirror mode | Done | mirror crawl+download wired in GUI; relative links resolved against document `<base href>`; source base stripped, own base injected |
+| Tray, close-to-tray, start-minimized, single hidden autostart (`--autostart`) | Done | tray-icon created + menu Show/Add/Quit wired into egui loop; autostart per-OS; single-instance pid lockfile (stale = dead pid check, forwards URL args via inbox) |
 | Protocol `idmcraft://` | Done | platform register + arg parsing |
 | `--smoke-test` | Done | main + CI step |
 | Installers Win/macOS/Linux | Done (CI artifacts) | workflow + packaging scripts; NSIS/dmg/AppImage when tools present, zip/tar/deb fallbacks always |
 
-Known limits: Safari extension (needs Xcode signing) — not attempted, does not block. GNOME tray needs AppIndicator extension on some distros. Unsigned macOS builds need right-click → Open. Mirror GUI wiring and single-instance are the two documented partials.
+Known limits: Safari extension (needs Xcode signing) — not attempted, does not block. GNOME tray needs AppIndicator extension on some distros. Unsigned macOS builds need right-click → Open. NSIS/AppImage only when respective tools exist in CI runner image (best-effort steps); IDM live-DASH panel behavior unverified without live fixture (standards-based polling implemented).
