@@ -1,6 +1,21 @@
 // idmcraft content script: video panel + link detection. Observed IDM behavior reimplemented clean-room.
 (function () {
   const seen = new Set();
+  const api = typeof browser !== "undefined" ? browser : chrome;
+  function filenameFromUrl(u) {
+    try { const p = new URL(u).pathname; const last = p.split("/").pop(); return last ? decodeURIComponent(last) : u; } catch (e) { return u.split("/").pop() || u; }
+  }
+  function candidateLabel(c) {
+    return `${filenameFromUrl(c.url)} (${c.type})`;
+  }
+  function fetchCandidates(cb) {
+    let done = false;
+    const finish = (list) => { if (!done) { done = true; cb(list || []); } };
+    try {
+      const maybe = api.runtime.sendMessage({ type: "getCandidates" }, (r) => finish(r && r.candidates));
+      if (maybe && maybe.then) maybe.then((r) => finish(r && r.candidates), () => finish([]));
+    } catch (e) { finish([]); }
+  }
   function labelFor(el, url) {
     // Quality labels: use data attributes / nearby text if present.
     const q = el.getAttribute && (el.getAttribute("data-quality") || el.getAttribute("label") || el.getAttribute("title"));
@@ -24,7 +39,7 @@
       const b = document.createElement("button");
       b.textContent = it.label;
       b.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;";
-      b.addEventListener("click", () => { chrome.runtime.sendMessage({ type: "idmcraft-video-panel", url: it.url }); panel.remove(); });
+      b.addEventListener("click", () => { api.runtime.sendMessage({ type: "idmcraft-video-panel", url: it.url, filename: it.filename || filenameFromUrl(it.url), mime: it.mime || it.type || "" }); panel.remove(); });
       box.appendChild(b);
     });
     const r = anchor.getBoundingClientRect();
@@ -61,20 +76,24 @@
   const mo = new MutationObserver(() => { manifestUrls = scan() || manifestUrls; });
   mo.observe(document.documentElement, { childList: true, subtree: true });
   manifestUrls = scan();
-  chrome.runtime.onMessage.addListener((msg) => {
+  api.runtime.onMessage.addListener((msg) => {
     if (msg.type === "idmcraft-scan") {
-      const items = [...document.querySelectorAll("video, audio")].flatMap(v => [v.currentSrc, v.src].filter(Boolean)).concat(manifestUrls);
-      const uniq = [...new Set(items)].filter(u => !u.startsWith("blob:"));
-      if (uniq.length) {
-        const anchor = document.querySelector("video, audio") || document.body;
-        // Use a temporary anchor at top-left if no media element.
-        showPanel(anchor, uniq.map(u => ({ url: u, label: u.split("/").pop() })));
-      }
+      const base = [...document.querySelectorAll("video, audio")].flatMap(v => [v.currentSrc, v.src].filter(Boolean)).concat(manifestUrls);
+      fetchCandidates((candidates) => {
+        const byUrl = new Map();
+        [...new Set(base)].filter(u => u && !u.startsWith("blob:")).forEach(u => byUrl.set(u, { url: u, label: u.split("/").pop(), filename: filenameFromUrl(u) }));
+        candidates.forEach((c) => { if (c && c.url && !c.url.startsWith("blob:")) byUrl.set(c.url, { url: c.url, label: candidateLabel(c), filename: filenameFromUrl(c.url), type: c.type, mime: c.type }); });
+        const uniq = [...byUrl.values()];
+        if (uniq.length) {
+          const anchor = document.querySelector("video, audio") || document.body;
+          showPanel(anchor, uniq);
+        }
+      });
     }
     if (msg.type === "idmcraft-grab-all") {
       document.querySelectorAll("a[href]").forEach(a => {
         const u = a.href;
-        if (/\.(zip|rar|7z|gz|pdf|exe|msi|mp4|mp3|mkv|iso|tar)(\?|#|$)/i.test(u)) chrome.runtime.sendMessage({ type: "idmcraft-download", url: u });
+        if (/\.(zip|rar|7z|gz|pdf|exe|msi|mp4|mp3|mkv|iso|tar)(\?|#|$)/i.test(u)) api.runtime.sendMessage({ type: "idmcraft-download", url: u });
       });
     }
   });

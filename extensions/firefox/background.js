@@ -48,6 +48,25 @@ function pumpNative() {
     );
   }
 }
+// --- Media sniffing (observing webRequest only; no blocking) ---
+const CANDIDATE_TTL_MS = 5 * 60 * 1000;
+const CANDIDATE_MAX = 50;
+const candidates = new Map(); // url -> {url, type, tabId, time}
+const SNIFF_TYPES = new Set(["application/dash+xml", "application/x-mpegurl", "application/vnd.apple.mpegurl"]);
+function pruneCandidates(now = Date.now()) {
+  for (const [url, c] of candidates) if (now - c.time > CANDIDATE_TTL_MS) candidates.delete(url);
+  while (candidates.size > CANDIDATE_MAX) candidates.delete(candidates.keys().next().value);
+}
+if (browser.webRequest && browser.webRequest.onHeadersReceived) {
+  browser.webRequest.onHeadersReceived.addListener((details) => {
+    const header = (details.responseHeaders || []).find((h) => h.name.toLowerCase() === "content-type");
+    if (!header || !header.value) return;
+    const type = header.value.split(";")[0].trim().toLowerCase();
+    if (!SNIFF_TYPES.has(type) && !type.startsWith("video/")) return;
+    candidates.set(details.url, { url: details.url, type, tabId: details.tabId, time: Date.now() });
+    pruneCandidates();
+  }, { urls: ["<all_urls>"], types: ["main_frame", "sub_frame", "media", "object", "xmlhttprequest", "other"] }, ["responseHeaders"]);
+}
 function basename(name) {
   return name ? String(name).split(/[\\/]/).pop() || "" : "";
 }
@@ -80,6 +99,12 @@ browser.downloads.onCreated.addListener(async (item) => {
   } catch (e) {}
 });
 browser.runtime.onMessage.addListener((msg, sender) => {
+  if (msg && msg.type === "getCandidates") {
+    pruneCandidates();
+    const tabId = sender.tab && sender.tab.id;
+    const list = [...candidates.values()].filter((c) => tabId == null || c.tabId === tabId || c.tabId === -1);
+    return Promise.resolve({ type: "candidates", candidates: list });
+  }
   if (msg && (msg.type === "idmcraft-download" || msg.type === "idmcraft-video-panel")) return sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer });
 });
 browser.browserAction.onClicked.addListener((tab) => { if (tab && tab.id) browser.tabs.sendMessage(tab.id, { type: "idmcraft-scan" }); });

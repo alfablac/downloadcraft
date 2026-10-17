@@ -4,12 +4,33 @@ use crate::model::*;
 use crate::mpd::*;
 use std::sync::Arc;
 
-/// Resolve URL to download task(s): dispatch on .mpd/.m3u8/extension or content fetch for manifests.
+enum Manifest { Dash, Hls, File }
+
+/// Probe Content-Type only (headers, body dropped). On any error/non-success -> File.
+/// ponytail: header-only probe misses manifests served as octet-stream/text; body-peek + reuse would need passing fetched text into download_dash/download_hls — add when such servers matter.
+async fn probe_manifest(client: &reqwest::Client, task: &DownloadTask) -> Manifest {
+    let mut req = client.get(&task.url);
+    if !task.referrer.is_empty() { req = req.header("Referer", &task.referrer); }
+    if !task.cookies.is_empty() { req = req.header("Cookie", &task.cookies); }
+    for (k, v) in &task.headers { req = req.header(k.as_str(), v.as_str()); }
+    let Ok(resp) = req.send().await else { return Manifest::File };
+    if !resp.status().is_success() { return Manifest::File; }
+    let ct = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
+    let ct = ct.split(';').next().unwrap_or("").trim();
+    if ct.contains("dash+xml") { Manifest::Dash } else if ct.contains("mpegurl") { Manifest::Hls } else { Manifest::File }
+}
+
+/// Resolve URL to download task(s): URL .mpd/.m3u8 hint first, else probe Content-Type, else plain HTTP.
 pub async fn download_url(client: reqwest::Client, task: DownloadTask, ctrl: Arc<engine::Controls>) -> Result<DownloadTask, String> {
     let lower = task.url.to_ascii_lowercase();
+    if lower.starts_with("ftp://") { return crate::ftp::download_ftp(task, ctrl).await; }
     if lower.contains(".mpd") { return download_dash(client, task, ctrl, false).await; }
     if lower.contains(".m3u8") { return download_hls(client, task, ctrl).await; }
-    engine::download_http(client, task, ctrl).await
+    match probe_manifest(&client, &task).await {
+        Manifest::Dash => download_dash(client, task, ctrl, false).await,
+        Manifest::Hls => download_hls(client, task, ctrl).await,
+        Manifest::File => engine::download_http(client, task, ctrl).await,
+    }
 }
 
 async fn fetch_text(client: &reqwest::Client, task: &DownloadTask, url: &str) -> Result<String, String> {
