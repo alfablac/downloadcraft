@@ -1,4 +1,6 @@
 mod app;
+#[allow(dead_code)]
+mod icons;
 mod theme;
 use idmcraft_lib::{engine, grabber, model, platform, queue, scheduler, stream};
 use model::*;
