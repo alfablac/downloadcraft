@@ -227,7 +227,7 @@ impl eframe::App for IdmApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title("idmcraft — Download Manager".into()));
 
         // ── Top bar: brand + menus (IDM: Tasks/File/Downloads/View/Help) ──
-        egui::TopBottomPanel::top("topbar").frame(egui::Frame::none().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(12.0, 6.0))).show(ctx, |ui| {
+        egui::TopBottomPanel::top("topbar").frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::symmetric(8.0, 4.0))).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("idmcraft").color(theme::TEXT).strong().size(17.0));
                 theme::chip(ui, "v0.1.0", theme::TEAL_500);
@@ -279,7 +279,7 @@ impl eframe::App for IdmApp {
 
         // ── Left rail: navigation + categories (IDM category tree, modern rail) ──
         egui::SidePanel::left("rail").resizable(false).exact_width(208.0)
-            .frame(egui::Frame::none().fill(theme::SURFACE).inner_margin(egui::Margin::same(10.0))).show(ctx, |ui| {
+            .frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::same(6.0))).show(ctx, |ui| {
                 ui.label(egui::RichText::new("WORKSPACE").color(theme::TEXT_FAINT).small().strong());
                 ui.add_space(4.0);
                 for (tab, label) in [(Tab::Downloads, "Downloads"), (Tab::Queues, "Queues"), (Tab::Scheduler, "Scheduler"), (Tab::Grabber, "Site Grabber"), (Tab::Options, "Options")] {
@@ -304,7 +304,7 @@ impl eframe::App for IdmApp {
             });
 
         // ── Bottom status bar ──
-        egui::TopBottomPanel::bottom("statusbar").frame(egui::Frame::none().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(12.0, 4.0))).show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("statusbar").frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::symmetric(8.0, 3.0))).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let (total, done, active) = { let g = self.rt.lock().unwrap(); (g.state.tasks.len(), g.state.tasks.iter().filter(|t| t.status == TaskStatus::Complete).count(), g.state.tasks.iter().filter(|t| t.status == TaskStatus::Downloading).count()) };
                 ui.label(egui::RichText::new(format!("{total} downloads · {done} finished · {active} active")).color(theme::TEXT_MUTED).small());
@@ -329,7 +329,7 @@ impl eframe::App for IdmApp {
             });
         });
 
-        egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG).inner_margin(egui::Margin::same(14.0))).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG).inner_margin(egui::Margin::same(8.0))).show(ctx, |ui| {
             match self.tab {
                 Tab::Downloads => self.ui_downloads(ui),
                 Tab::Queues => self.ui_queues(ui, false),
@@ -439,7 +439,7 @@ impl IdmApp {
         if !self.sort_asc { tasks.reverse(); }
 
         // Table header (IDM columns)
-        egui::Frame::none().fill(theme::SURFACE).rounding(egui::Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(10.0, 6.0)).show(ui, |ui| {
+        egui::Frame::none().fill(theme::SURFACE_RAISED).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::symmetric(8.0, 4.0)).show(ui, |ui| {
             egui::Grid::new("dl-head").num_columns(8).spacing([10.0, 4.0]).min_col_width(60.0).show(ui, |ui| {
                 for (i, h) in ["File Name", "Q", "Size", "Status", "Time left", "Transfer rate", "Progress", ""].iter().enumerate() {
                     if ui.add(egui::Button::new(egui::RichText::new(*h).color(theme::TEXT_MUTED).small().strong()).fill(egui::Color32::TRANSPARENT)).clicked() {
@@ -452,7 +452,7 @@ impl IdmApp {
         ui.add_space(4.0);
 
         if tasks.is_empty() {
-            egui::Frame::none().fill(theme::SURFACE).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(24.0)).show(ui, |ui| {
+            egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::same(24.0)).show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.label(egui::RichText::new("No downloads here").color(theme::TEXT).size(16.0).strong());
                     ui.label(egui::RichText::new("Add a URL, paste from clipboard (Tasks → Add batch), or send from browser extension.").color(theme::TEXT_MUTED));
@@ -469,8 +469,8 @@ impl IdmApp {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for t in &tasks {
                 let sel = self.selected.as_deref() == Some(t.id.as_str());
-                let fill = if sel { theme::SURFACE_RAISED } else { theme::SURFACE };
-                let resp = egui::Frame::none().fill(fill).rounding(egui::Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(10.0, 7.0)).show(ui, |ui| {
+                let fill = if sel { theme::STEEL_DIM } else { theme::SURFACE };
+                let resp = egui::Frame::none().fill(fill).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::symmetric(8.0, 4.0)).show(ui, |ui| {
                     egui::Grid::new(format!("dl-{}", t.id)).num_columns(8).spacing([10.0, 4.0]).min_col_width(60.0).show(ui, |ui| {
                         ui.label(egui::RichText::new(&t.filename).color(theme::TEXT).strong());
                         ui.label(egui::RichText::new(if t.queue_id.is_empty() { "main" } else { &t.queue_id }).color(theme::TEXT_MUTED).small());

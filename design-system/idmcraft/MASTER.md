@@ -10,6 +10,13 @@
 **Generated:** 2026-10-16 23:04:24
 **Category:** Productivity Tool
 
+> **OVERRIDE (2026-10-16, user direction):** Desktop-app feel, not web.
+> Graphite neutral grays (no blue-black tint), ZERO corner radius everywhere,
+> hard 1px borders for window/panel separation, flat bordered buttons,
+> dense native-tool layout. Palette below is superseded by `src/theme.rs`
+> tokens (G_950..G_100 graphite ramp + desaturated steel accent).
+> No pills, no rounded cards, no shadows-as-hierarchy.
+
 ---
 
 ## Global Rules
