@@ -33,6 +33,21 @@ Clone Configuration UI restructured to property-sheet sections mirroring this ma
 
 Source machine: Windows, `C:\Program Files (x86)\Internet Download Manager`. No proprietary code/binaries copied. Extension `manifest.json` files read from `.crx`/`.xpi` containers; behavior inferred from manifests, file layout, registry keys, `DwnlData` segment layout, and public UI surface. No decompilation of IDMan.exe logic beyond file/registry observation.
 
+## RE round 5 — live fixtures (2026-10-17, loopback only)
+
+Method: local fixtures under `%TEMP%\opencode\idm-fixtures\` (`server.py` ThreadingHTTPServer, Range-capable, request log `log.txt`; `drive.py` pywinauto win32). IDMan 6.43.15.3 driven via documented CLI `IDMan.exe /d <url>` (same backend as Add URL) + Start Download button in Download File Info; each fixture ~20 s observation; Downloads/DwnlData/registry probed names+counts only, values redacted/not read. Baseline control `file.bin` (3 MB): multiple Range GETs, saved `Downloads\file.bin` 3145728 B, "Download complete 3,00 MB" dialog — drive method valid.
+
+| Fixture | Observation | Inference | Unknown |
+|---|---|---|---|
+| `dash/vod.mpd` (static, control) via `/d` | 1 GET `/dash/vod.mpd`, 0 segment GETs; saved `Downloads\vod.mpd` 546 B as plain file; Download complete dialog | Manual add does NOT parse MPD; treats manifest as ordinary file | Panel/browser-capture path |
+| `dash/live.mpd` (dynamic, `minimumUpdatePeriod=PT2S`) via `/d` | 1 GET in 20 s (total live GET count incl. curl smoke = 2), 0 segment GETs, no repeat poll; saved 576 B plain file | Manual add does NOT poll dynamic MPD, does NOT assemble segments. Clone poll+assemble model not contradicted via this entry path, but not confirmed either | Whether browser download-panel path (`mpdtoidm://` internal message, round 2) polls/assembles live, selects live-edge, or refuses |
+| `mpdtoidm://…` / `hlstoidm://…` as CLI arg; schemes in registry | Main window opened only; 0 GETs; schemes absent from HKCU/HKCR Classes (names checked) | Schemes = internal extension→native-host messages, not OS protocol handlers; not reachable via CLI | Exact native-host payload format (not probed; would need browser+extension session) |
+| `hls/aes/playlist.m3u8` (`EXT-X-KEY METHOD=AES-128`, local key) via `/d` | 1 GET playlist only; 0 GET key/segments; saved 180 B plain file | Manual add does NOT parse HLS, KEY never fetched/decrypted via this path | Panel path (`hlstoidm://`) AES-128 handling |
+| `hls/sample/playlist.m3u8` (`METHOD=SAMPLE-AES`) via `/d` | 1 GET playlist only; 0 GET fake key/segments; saved 184 B plain file; no error dialog | Manual add does NOT evaluate EXT-X-KEY at all via this path | Panel path SAMPLE-AES refusal/acceptance |
+| Registry + post-run state | `HKCU\Software\DownloadManager` 74 value names, none MPD/HLS/DASH-specific (only `PanelExceptionServers` matched); fixture tasks appeared in main list as plain filenames (`live.mpd`, `vod.mpd`, `playlist.m3u8`) and were deleted after | No persisted MPD/HLS config evidence | — |
+
+Parity recommendation (A) live/dynamic DASH: **keep clone behavior** (poll `minimumUpdatePeriod`, dedupe, assemble) — IDM manual-add treats MPD as plain file, panel path Unverified; do not claim IDM parity. (B) HLS EXT-X-KEY: **keep clone behavior** (decrypt AES-128, refuse SAMPLE-AES → `Protected`) — same reasoning; IDM AES/SAMPLE-AES handling Unverified, not observed. Anything panel-path = **Unverified — do not guess IDM internals.**
+
 ## Install inventory (observed)
 
 | Item | Evidence |
