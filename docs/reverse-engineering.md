@@ -48,6 +48,19 @@ Method: local fixtures under `%TEMP%\opencode\idm-fixtures\` (`server.py` Thread
 
 Parity recommendation (A) live/dynamic DASH: **keep clone behavior** (poll `minimumUpdatePeriod`, dedupe, assemble) — IDM manual-add treats MPD as plain file, panel path Unverified; do not claim IDM parity. (B) HLS EXT-X-KEY: **keep clone behavior** (decrypt AES-128, refuse SAMPLE-AES → `Protected`) — same reasoning; IDM AES/SAMPLE-AES handling Unverified, not observed. Anything panel-path = **Unverified — do not guess IDM internals.**
 
+## RE round 7 - IDM video panel mechanics (2026-10-17, REA agent)
+
+Tags: [REA Evidence ...] = REA analyze_javascript_application records; [strings] = plain shell string scans (not REA Evidence). IDMan.exe 6.43.15.3 sha256 661e78ea..., native not decompiled (no Ghidra/Hopper).
+
+- Content detection [REA ev_1ea020b0]: content script on *://*/* all_frames document_start enumerates video,audio,object,embed; MutationObserver (attributes style + parent childList), ResizeObserver, IntersectionObserver(0.2); 200ms debounce re-report; size gate width<15 or height<10 rejected; anchor/poster pairing retries 10x500ms.
+- Page-context sniffing [REA ev_1ea020b0]: document.js injected into page wraps fetch + XMLHttpRequest.open, tags matches (.pfm-/.pxr- ids), posts to content script; also parses inline <script> player configs. This is how blob/MSE players (no src) still surface URLs.
+- Network sniffing [REA ev_1ea020b0]: webRequest onBeforeRequest/onBeforeSendHeaders/onHeadersReceived/onResponseStarted; classifier scores extension/Content-Type (M3U8|F4M|MPD stream, F4F fragments, M4S DASH segment); status 200/206/304; verdicts consulted with native host per request.
+- Site modes [REA ev_1ea020b0]: modes A=1..5 largely pushed from IDMan at runtime (init opcode 11), not hardcoded; shipped defaults: Facebook selectors, Vimeo id regex, YouTube inline-script extraction; hostname site classifier fed by native table (site 1 = youtube). Unknown hosts -> site 0 generic.
+- Flow [REA ev_1ea020b0]: content port ops [21] page, [41] media register, [23] update, [24] panel meta; background -> native type 23 element, type 9 rect (native draws/moves panel), type 14 link download. Transport: WebSocket ws://127.0.0.1:1001 fallback connectNative com.tonec.idm, custom framed records. Clone keeps own JSON native messaging (wire format internal to IDM, not cloned).
+- Native [strings]: scheme cluster yta*/mpda*/mpd*/hls*/dhs*toidm:// plus googlevideo/videoplayback; CM3UParser + CMp4DashReader classes (no CMDP parser string - bounded negative); DwnlPanel registry Software\DownloadManager\DwnlPanel minsize/defminsizeset, "Do not show Download this video button if media file size is below ... kilobytes" (native-side gate); protected-stream refusal string. No ffmpeg string.
+- Reddit [strings]: zero hits reddit/v.redd.it/redd.it (ROT13 erqqvg too) in all 4 extension containers + IDMan.exe ASCII/UTF-16. v.redd.it rides generic paths only; runtime-pushed native site rule cannot be excluded but nothing Reddit-specific ships statically.
+- Clone actions round 7: button no longer gated on direct URLs (blob/MSE), discreet 30px draggable glyph, click resolves sniffed streams (empty -> guidance note); sniffers accept video/*, audio/*, .mpd/.m3u8 path regardless Content-Type; Firefox webRequest adds media type. Page-context fetch/XHR wrapping (document.js equivalent) NOT cloned - follow-up gap if background sniffing alone misses a player.
+
 ## RE round 6 — REA on shipped extension containers + IDMan.exe (2026-10-17)
 
 Tool: `rea-agents@6.5.0` CLI (MCP registration for opencode `aligned` per `doctor`, skill v42; REA MCP tools absent from this session — client restart required; CLI fallback used, per skill). Attempt 1: default npx cache corrupt (`ERR_MODULE_NOT_FOUND AbortablePromise-*.js`). Attempt 2: fresh `npm_config_cache` → success.

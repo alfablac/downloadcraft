@@ -103,6 +103,15 @@
   function showForVideo(video) {
     const direct = directUrls(video);
     fetchCandidates((candidates) => {
+      if (!direct.length && !candidates.length && !manifestUrls.length) {
+        const panel = ensurePanel();
+        const box = panel.querySelector(".downloadcraft-items");
+        box.innerHTML = '<div style="color:#bbb;padding:4px 2px;">No stream captured yet. Press play on the video, then click again.</div>';
+        const r = video.getBoundingClientRect();
+        panel.style.left = (window.scrollX + Math.max(8, r.left)) + "px";
+        panel.style.top = (window.scrollY + r.bottom + 4) + "px";
+        return;
+      }
       const byUrl = new Map();
       direct.forEach((u) => byUrl.set(u, { url: u, label: labelFor(video, u), filename: filenameFromUrl(u) }));
       manifestUrls.forEach((u) => { if (!byUrl.has(u)) byUrl.set(u, { url: u, label: filenameFromUrl(u), filename: filenameFromUrl(u) }); });
@@ -110,18 +119,69 @@
       showPanel(video, [...byUrl.values()]);
     });
   }
+  const btnFor = new WeakMap();
+  function positionBtn(video) {
+    const btn = btnFor.get(video);
+    if (!btn) return;
+    const r = video.getBoundingClientRect();
+    if (r.width < 120 || r.height < 68) { btn.style.display = "none"; return; }
+    btn.style.display = "";
+    if (btn.dataset.dragged) return;
+    btn.style.left = (window.scrollX + r.right - btn.offsetWidth - 8) + "px";
+    btn.style.top = (window.scrollY + r.top + 8) + "px";
+  }
+  function attachBtn(video) {
+    let btn = btnFor.get(video);
+    if (btn) { positionBtn(video); return btn; }
+    btn = document.createElement("button");
+    btn.title = "Download with downloadcraft (drag to move)";
+    btn.setAttribute("aria-label", "Download with downloadcraft");
+    btn.setAttribute("data-downloadcraft-btn", "1");
+    btn.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:7px auto;pointer-events:none"><path d="M12 3v11"/><path d="m7 10 5 5 5-5"/><path d="M4 20h16"/></svg>';
+    btn.style.cssText = "position:absolute;z-index:2147483646;width:30px;height:30px;border-radius:50%;background:rgba(17,17,17,.62);color:#fff;border:1px solid rgba(255,255,255,.28);padding:0;cursor:grab;font:14px/30px sans-serif;text-align:center;opacity:.55;display:none;touch-action:none;user-select:none;-webkit-user-select:none;";
+    btn.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); if (btn.dataset.suppressClick) { delete btn.dataset.suppressClick; return; } showForVideo(video); });
+
+    // Draggable: press-move >4px drags (persisted offset per video via dataset),
+    // plain click still downloads. Grab cursor affords drag.
+    let drag = null;
+    btn.addEventListener("pointerdown", (e) => {
+      drag = { x: e.clientX, y: e.clientY, moved: false };
+      btn.setPointerCapture && btn.setPointerCapture(e.pointerId);
+      btn.style.cursor = "grabbing";
+    });
+    btn.addEventListener("pointermove", (e) => {
+      if (!drag) return;
+      const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+      if (Math.abs(dx) + Math.abs(dy) > 4) drag.moved = true;
+      if (drag.moved) {
+        btn.style.left = (parseFloat(btn.style.left || "0") + dx) + "px";
+        btn.style.top = (parseFloat(btn.style.top || "0") + dy) + "px";
+        drag.x = e.clientX; drag.y = e.clientY;
+        btn.dataset.dragged = "1";
+      }
+    });
+    btn.addEventListener("pointerup", (e) => {
+      const wasDrag = drag && drag.moved;
+      drag = null;
+      btn.style.cursor = "grab"; if (wasDrag) { btn.dataset.suppressClick = "1"; setTimeout(() => delete btn.dataset.suppressClick, 50); }
+      if (wasDrag) { e.preventDefault(); e.stopPropagation(); }
+    });
+    btn.addEventListener("mouseenter", () => { btn.style.opacity = "1"; });
+    btn.addEventListener("mouseleave", () => { btn.style.opacity = ".55"; });
+
+    btnFor.set(video, btn);
+    (document.body || document.documentElement).appendChild(btn);
+    positionBtn(video);
+    return btn;
+  }
   function scanVideo(video) {
-    if (wired.has(video)) return; wired.add(video);
-    const btn = document.createElement("button");
-    btn.textContent = "Download with downloadcraft";
-    btn.style.cssText = "position:absolute;z-index:2147483646;background:#161616;color:#eee;border:1px solid #555;padding:4px 8px;cursor:pointer;font:12px sans-serif;";
-    btn.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); showForVideo(video); });
-    const parent = video.parentElement || document.body;
-    if (getComputedStyle(parent).position === "static") parent.style.position = "relative";
-    parent.appendChild(btn);
-    // MSE/blob: player: no direct URL; still useful once requests are sniffed.
-    const tryAuto = () => { if (!directUrls(video).length) return; };
-    video.addEventListener("loadedmetadata", tryAuto, { once: true });
+    if (wired.has(video)) { attachBtn(video); return; }
+    wired.add(video);
+    // Blob/MSE players (Reddit etc): button must exist before any direct URL
+    // is knowable; streams resolve from sniffed requests at click time.
+    const show = () => attachBtn(video);
+    if (video.getBoundingClientRect().width >= 120) attachBtn(video);
+    ["loadedmetadata", "canplay", "playing", "loadeddata"].forEach((ev) => video.addEventListener(ev, show));
   }
   let manifestUrls = [];
   function scanManifests() {
@@ -132,7 +192,8 @@
   function scan() { document.querySelectorAll("video, audio").forEach(scanVideo); scanManifests(); }
   // Debounced: full-page rescan on every DOM mutation is too expensive.
   let pending = null;
-  const mo = new MutationObserver(() => { if (pending) return; pending = setTimeout(() => { pending = null; scan(); }, 400); });
+  const mo = new MutationObserver(() => { if (pending) return; pending = setTimeout(() => { pending = null; scan(); document.querySelectorAll("video, audio").forEach(positionBtn); }, 400); });
+  window.addEventListener("resize", () => document.querySelectorAll("video, audio").forEach(positionBtn), { passive: true });
   mo.observe(document.documentElement, { childList: true, subtree: true });
   scan();
   api.runtime.onMessage.addListener((msg) => {

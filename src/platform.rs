@@ -25,22 +25,21 @@ pub fn spawn_show_watcher() {
             fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
             fn ShowWindow(hwnd: Hwnd, cmd: i32) -> Bool;
             fn SetForegroundWindow(hwnd: Hwnd) -> Bool;
+            fn PostMessageW(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> Bool;
         }
         extern "system" fn show(hwnd: *mut core::ffi::c_void, _: isize) -> i32 {
             unsafe {
                 let mut pid = 0;
                 GetWindowThreadProcessId(hwnd, &mut pid);
-                if pid == std::process::id() { ShowWindow(hwnd, 9); SetForegroundWindow(hwnd); }
+                if pid == std::process::id() { ShowWindow(hwnd, 9); SetForegroundWindow(hwnd); PostMessageW(hwnd, 0x8001, 0, 0); }
             }
             1
         }
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
             let req = config_dir().join("show.request");
-            if req.exists() {
-                let _ = std::fs::remove_file(req);
-                unsafe { EnumWindows(show, 0); }
-            }
+            // Do not delete: app poll must consume it to clear hidden state.
+            if req.exists() { unsafe { EnumWindows(show, 0); } }
         }
     });
 }

@@ -49,9 +49,9 @@ pub const R_CTRL: f32 = 6.0;
 pub const R_CHIP: f32 = 4.0;
 pub const R_PANEL: f32 = 8.0;
 /// Uniform clickable-control height (buttons, TextEdit, ComboBox, DragValue).
-pub const BTN_H: f32 = 26.0;
+pub const BTN_H: f32 = 23.0;
 /// Sidebar nav row height (IDM-compact density).
-pub const ROW_H_NAV: f32 = 22.0;
+pub const ROW_H_NAV: f32 = 20.0;
 /// STEEL as text (links, status, accents): STEEL fill color is 3.0-3.5:1 as text (fail); this is 6.1-7.3:1.
 pub const STEEL_TEXT: Color32 = Color32::from_rgb(0x7F, 0xB3, 0xAA);
 
@@ -60,7 +60,30 @@ pub fn status_color(s: crate::model::TaskStatus) -> Color32 {
     match s { Complete => OK, Downloading => STEEL, Error => ERR, Protected => WARN, Paused => WARN, Queued => TEXT_FAINT }
 }
 
+/// Table header text: 11px semibold. Named body size, so call sites drop `.small()`.
+pub fn table_header_text(s: &str) -> egui::RichText {
+    egui::RichText::new(s).color(TEXT_MUTED).size(10.0).strong()
+}
+
 pub fn apply(ctx: &egui::Context) {
+    // Inter (variable, bundled) first for Proportional; Monospace fallback last.
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "Inter".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/InterVariable.ttf")),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "Inter".to_owned());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .push("Inter".to_owned());
+    ctx.set_fonts(fonts);
+
     let r_ctrl = egui::Rounding::same(R_CTRL);
     let r_panel = egui::Rounding::same(R_PANEL);
     let mut v = egui::Visuals::dark();
@@ -100,9 +123,9 @@ pub fn apply(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     // Download-manager UI: labels are never text-selection targets (was I-beam cursor + stolen row clicks).
     style.interaction.selectable_labels = false;
-    style.spacing.item_spacing = egui::vec2(6.0, 4.0);
-    style.spacing.button_padding = egui::vec2(8.0, 4.0);
-    style.spacing.interact_size = egui::vec2(36.0, BTN_H);
+    style.spacing.item_spacing = egui::vec2(6.0, 3.0);
+    style.spacing.button_padding = egui::vec2(8.0, 3.0);
+    style.spacing.interact_size = egui::vec2(32.0, BTN_H);
     style.spacing.window_margin = egui::Margin::same(12.0);
     style.spacing.menu_margin = egui::Margin::same(6.0);
     style.spacing.slider_width = 160.0;
@@ -112,11 +135,11 @@ pub fn apply(ctx: &egui::Context) {
     style.visuals.slider_trailing_fill = true;
     style.animation_time = 0.15;
     style.text_styles = [
-        (TextStyle::Heading, FontId::proportional(15.0)),
-        (TextStyle::Body, FontId::proportional(12.5)),
-        (TextStyle::Button, FontId::proportional(12.0)),
-        (TextStyle::Small, FontId::proportional(11.0)),
-        (TextStyle::Monospace, FontId::monospace(12.0)),
+        (TextStyle::Heading, FontId::proportional(12.0)),
+        (TextStyle::Body, FontId::proportional(10.0)),
+        (TextStyle::Button, FontId::proportional(10.0)),
+        (TextStyle::Small, FontId::proportional(9.5)),
+        (TextStyle::Monospace, FontId::monospace(10.0)),
     ].into();
     ctx.set_style(style);
 }

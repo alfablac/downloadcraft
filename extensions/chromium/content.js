@@ -1,34 +1,50 @@
-// downloadcraft content script: video panel + link detection. Observed IDM behavior reimplemented clean-room.
+// downloadcraft content script (Chromium MV3): video button + panel.
+// IDM-observed behavior, clean-room: button appears on first playable/sized
+// frame (readyState>=2 or a poster), anchored top-right of the media frame,
+// even when src is blob:/MSE (Reddit, YouTube...). Stream URLs come from the
+// background webRequest sniffer; clicking the button (and only then) queries
+// candidates and downloads the picked stream DIRECTLY (no second list that
+// can dead-end empty -> "button does nothing").
 (function () {
-  const seen = new Set();
   const api = typeof browser !== "undefined" ? browser : chrome;
+  const wired = new WeakSet();
+  const btnFor = new WeakMap();
+
   function filenameFromUrl(u) {
-    try { const p = new URL(u).pathname; const last = p.split("/").pop(); return last ? decodeURIComponent(last) : u; } catch (e) { return u.split("/").pop() || u; }
+    try { const p = new URL(u).pathname; const last = p.split("/").pop(); return last ? decodeURIComponent(last) : u; } catch (e) { return (u || "").split("/").pop() || u; }
   }
-  function candidateLabel(c) {
-    return `${filenameFromUrl(c.url)} (${c.type})`;
-  }
+  function candidateLabel(c) { return `${filenameFromUrl(c.url)} (${c.type || "media"})`; }
   function fetchCandidates(cb) {
     let done = false;
     const finish = (list) => { if (!done) { done = true; cb(list || []); } };
     try {
-      // Chrome MV3: callback form. Firefox-style promise also handled.
       const maybe = api.runtime.sendMessage({ type: "getCandidates" }, (r) => finish(r && r.candidates));
       if (maybe && maybe.then) maybe.then((r) => finish(r && r.candidates), () => finish([]));
     } catch (e) { finish([]); }
+    setTimeout(() => finish([]), 900);
   }
   function labelFor(el, url) {
-    // Quality labels: use data attributes / nearby text if present.
     const q = el.getAttribute && (el.getAttribute("data-quality") || el.getAttribute("label") || el.getAttribute("title"));
-    return q ? `${q} — ${url.split("/").pop()}` : url.split("/").pop();
+    return q ? `${q} - ${url.split("/").pop()}` : url.split("/").pop();
   }
+
+  // ---------- direct download (button -> pick -> native host) ----------
+  function sendStream(it) {
+    try {
+      const p = api.runtime.sendMessage({ type: "downloadcraft-video-panel", url: it.url, filename: it.filename || filenameFromUrl(it.url), mime: it.mime || it.type || "" });
+      if (p && p.catch) p.catch(() => {});
+    } catch (e) {}
+  }
+
+  // ---------- panel (stream picker + ask-first confirm) ----------
   function ensurePanel() {
     let panel = document.getElementById("downloadcraft-panel");
     if (panel) return panel;
     panel = document.createElement("div");
     panel.id = "downloadcraft-panel";
-    panel.style.cssText = "position:absolute;z-index:2147483647;background:#111;color:#fff;font:12px sans-serif;border-radius:6px;padding:6px;box-shadow:0 2px 10px rgba(0,0,0,.5);max-width:420px;";
-    panel.innerHTML = '<div style="font-weight:700;margin-bottom:4px;">Download with downloadcraft</div><div class="downloadcraft-items"></div>';
+    panel.style.cssText = "position:absolute;z-index:2147483647;background:#111;color:#fff;font:12px sans-serif;border-radius:6px;padding:6px;box-shadow:0 2px 10px rgba(0,0,0,.5);max-width:420px;min-width:260px;";
+    panel.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;"><b>Download with downloadcraft</b><button class="dc-close" style="cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #555;padding:0 6px;">×</button></div><div class="downloadcraft-items"></div>';
+    panel.querySelector(".dc-close").addEventListener("click", () => panel.remove());
     document.documentElement.appendChild(panel);
     return panel;
   }
@@ -53,76 +69,160 @@
     ok.textContent = "Download with downloadcraft";
     ok.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;";
     ok.addEventListener("click", () => reply(true));
-    const native = document.createElement("button");
-    native.textContent = "Browser download";
-    native.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;";
-    native.addEventListener("click", () => reply(false));
+    const nat = document.createElement("button");
+    nat.textContent = "Browser download";
+    nat.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;";
+    nat.addEventListener("click", () => reply(false));
     close.addEventListener("click", () => reply(false));
-    box.appendChild(close); box.appendChild(name); box.appendChild(urlEl); box.appendChild(ok); box.appendChild(native);
+    box.appendChild(close); box.appendChild(name); box.appendChild(urlEl); box.appendChild(ok); box.appendChild(nat);
   }
-  function showPanel(anchor, items) {
-    const panel = ensurePanel();
-    const box = panel.querySelector(".downloadcraft-items");
-    box.innerHTML = "";
-    items.forEach((it) => {
-      const b = document.createElement("button");
-      b.textContent = it.label;
-      b.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;";
-      b.addEventListener("click", () => { api.runtime.sendMessage({ type: "downloadcraft-video-panel", url: it.url, filename: it.filename || filenameFromUrl(it.url), mime: it.mime || it.type || "" }); panel.remove(); });
-      box.appendChild(b);
-    });
-    const r = anchor.getBoundingClientRect();
-    panel.style.left = (window.scrollX + r.left) + "px";
-    panel.style.top = (window.scrollY + r.bottom + 4) + "px";
-  }
-  function scanVideo(video) {
-    if (seen.has(video)) return; seen.add(video);
+
+  function directUrls(video) {
     const urls = [];
     if (video.currentSrc) urls.push(video.currentSrc);
     if (video.src) urls.push(video.src);
-    video.querySelectorAll("source").forEach(s => { if (s.src) urls.push(s.src); });
-    // DASH/HLS often set via MSE; page source scan below catches .mpd/.m3u8 strings.
-    const uniq = [...new Set(urls)].filter(u => u && !u.startsWith("blob:"));
-    if (!uniq.length) return;
-    const btn = document.createElement("button");
-    btn.textContent = "Download with downloadcraft";
-    btn.style.cssText = "position:absolute;z-index:2147483646;background:#1e3a5f;color:#fff;border:0;border-radius:4px;padding:4px 8px;cursor:pointer;font:12px sans-serif;";
-    btn.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); showPanel(btn, uniq.map(u => ({ url: u, label: labelFor(video, u) }))); });
-    const parent = video.parentElement || document.body;
-    if (getComputedStyle(parent).position === "static") parent.style.position = "relative";
-    parent.appendChild(btn);
+    video.querySelectorAll("source").forEach((s) => { if (s.src) urls.push(s.src); });
+    return [...new Set(urls)].filter((u) => u && !u.startsWith("blob:") && !u.startsWith("data:"));
   }
-  function scan() {
-    document.querySelectorAll("video, audio").forEach(scanVideo);
-    // Page-source scan for manifest URLs (IDM video panel does equivalent network/page sniffing observation).
-    const html = document.documentElement.innerHTML;
-    const re = /https?:\/\/[^\s"'<>]+\.(?:mpd|m3u8)(?:\?[^\s"'<>]*)?/gi;
-    const found = [...new Set(html.match(re) || [])];
-    // Expose via panel on first video-less page only through extension action scan message.
-    return found;
+
+  function pickStream(video) {
+    const direct = directUrls(video);
+    fetchCandidates((candidates) => {
+      const mans = [], medias = [];
+      candidates.forEach((c) => { if (c && c.url) (/mpd|m3u8|dash|mpegurl/i.test(c.type || c.url) ? mans : medias).push(c); });
+      const all = [...direct.map((u) => ({ url: u })), ...mans, ...medias];
+      const seenU = new Set();
+      const items = [];
+      all.forEach((c) => { if (!seenU.has(c.url)) { seenU.add(c.url); items.push(c); } });
+      if (!items.length) {
+        // Nothing sniffed yet: stream may exist but player has not fetched
+        // past the manifest gate. Tell user instead of silent dead click.
+        showPanel(video, [], "No stream captured yet. Press play on the video, then click again.");
+        return;
+      }
+      if (items.length === 1) { sendStream({ url: items[0].url, filename: filenameFromUrl(items[0].url), type: items[0].type, mime: items[0].type }); return; }
+      showPanel(video, items.map((c) => ({ url: c.url, label: c.label || candidateLabel(c), filename: filenameFromUrl(c.url), type: c.type })));
+    });
+  }
+
+  function showPanel(anchor, items, note) {
+    const panel = ensurePanel();
+    const box = panel.querySelector(".downloadcraft-items");
+    box.innerHTML = "";
+    if (note) {
+      const d = document.createElement("div");
+      d.textContent = note;
+      d.style.cssText = "color:#bbb;padding:4px 2px;word-break:break-word;";
+      box.appendChild(d);
+    }
+    items.forEach((it) => {
+      const b = document.createElement("button");
+      b.textContent = it.label;
+      b.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #555;padding:4px 6px;";
+      b.addEventListener("click", () => { sendStream(it); panel.remove(); });
+      box.appendChild(b);
+    });
+    const r = anchor.getBoundingClientRect();
+    panel.style.left = (window.scrollX + Math.max(8, r.left)) + "px";
+    panel.style.top = (window.scrollY + r.bottom + 4) + "px";
+  }
+
+  // ---------- button lifecycle ----------
+  function positionBtn(video) {
+    const btn = btnFor.get(video);
+    if (!btn) return;
+    const r = video.getBoundingClientRect();
+    if (r.width < 40 || r.height < 30) { btn.style.display = "none"; return; }
+    btn.style.display = "";
+    if (btn.dataset.dragged) return;
+    btn.style.left = (window.scrollX + r.right - btn.offsetWidth - 8) + "px";
+    btn.style.top = (window.scrollY + r.top + 8) + "px";
+  }
+  function attachBtn(video) {
+    let btn = btnFor.get(video);
+    if (btn) { positionBtn(video); return btn; }
+    btn = document.createElement("button");
+    btn.title = "Download with downloadcraft (drag to move)";
+    btn.setAttribute("aria-label", "Download with downloadcraft");
+    btn.setAttribute("data-downloadcraft-btn", "1");
+    btn.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:7px auto;pointer-events:none"><path d="M12 3v11"/><path d="m7 10 5 5 5-5"/><path d="M4 20h16"/></svg>';
+    btn.style.cssText = "position:absolute;z-index:2147483646;width:30px;height:30px;border-radius:50%;background:rgba(17,17,17,.62);color:#fff;border:1px solid rgba(255,255,255,.28);padding:0;cursor:grab;font:14px/30px sans-serif;text-align:center;opacity:.55;display:none;touch-action:none;user-select:none;-webkit-user-select:none;";
+    btn.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); if (btn.dataset.suppressClick) { delete btn.dataset.suppressClick; return; } pickStream(video); });
+
+    // Draggable: press-move >4px drags (persisted offset per video via dataset),
+    // plain click still downloads. Grab cursor affords drag.
+    let drag = null;
+    btn.addEventListener("pointerdown", (e) => {
+      drag = { x: e.clientX, y: e.clientY, moved: false };
+      btn.setPointerCapture && btn.setPointerCapture(e.pointerId);
+      btn.style.cursor = "grabbing";
+    });
+    btn.addEventListener("pointermove", (e) => {
+      if (!drag) return;
+      const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+      if (Math.abs(dx) + Math.abs(dy) > 4) drag.moved = true;
+      if (drag.moved) {
+        btn.style.left = (parseFloat(btn.style.left || "0") + dx) + "px";
+        btn.style.top = (parseFloat(btn.style.top || "0") + dy) + "px";
+        drag.x = e.clientX; drag.y = e.clientY;
+        btn.dataset.dragged = "1";
+      }
+    });
+    btn.addEventListener("pointerup", (e) => {
+      const wasDrag = drag && drag.moved;
+      drag = null;
+      btn.style.cursor = "grab"; if (wasDrag) { btn.dataset.suppressClick = "1"; setTimeout(() => delete btn.dataset.suppressClick, 50); }
+      if (wasDrag) { e.preventDefault(); e.stopPropagation(); }
+    });
+    btn.addEventListener("mouseenter", () => { btn.style.opacity = "1"; });
+    btn.addEventListener("mouseleave", () => { btn.style.opacity = ".55"; });
+
+    btnFor.set(video, btn);
+    (document.body || document.documentElement).appendChild(btn);
+    positionBtn(video);
+    return btn;
+  }
+  function scanVideo(video) {
+    if (wired.has(video)) { attachBtn(video); return; }
+    wired.add(video);
+    const show = () => { if (isBigEnough(video)) attachBtn(video); };
+    if (isBigEnough(video)) attachBtn(video);
+    ["loadedmetadata", "canplay", "playing", "loadeddata"].forEach((ev) => video.addEventListener(ev, show));
+  }
+  function isBigEnough(video) {
+    const r = video.getBoundingClientRect();
+    return r.width >= 120 && r.height >= 68;
   }
   let manifestUrls = [];
-  const mo = new MutationObserver(() => { manifestUrls = scan() || manifestUrls; });
-  mo.observe(document.documentElement, { childList: true, subtree: true });
-  manifestUrls = scan();
+  function scanManifests() {
+    const html = document.documentElement.innerHTML;
+    const re = /https?:\/\/[^\s"'<>]+\.(?:mpd|m3u8)(?:\?[^\s"'<>]*)?/gi;
+    manifestUrls = [...new Set(html.match(re) || [])];
+  }
+  function scan() { document.querySelectorAll("video, audio").forEach(scanVideo); scanManifests(); }
+  let pending = null;
+  const mo = new MutationObserver(() => {
+    if (pending) return;
+    pending = setTimeout(() => {
+      pending = null; scan();
+      document.querySelectorAll("video, audio").forEach(positionBtn);
+    }, 400);
+  });
+  mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "style", "class"] });
+  window.addEventListener("resize", () => document.querySelectorAll("video, audio").forEach(positionBtn), { passive: true });
+  scan();
+
   api.runtime.onMessage.addListener((msg) => {
+    if (!msg) return;
     if (msg.type === "downloadcraft-confirm") { showConfirm(msg); return; }
+    if (msg.type === "downloadcraft-navigate") { scan(); return; }
     if (msg.type === "downloadcraft-scan") {
-      const base = [...document.querySelectorAll("video, audio")].flatMap(v => [v.currentSrc, v.src].filter(Boolean)).concat(manifestUrls);
-      fetchCandidates((candidates) => {
-        const byUrl = new Map();
-        [...new Set(base)].filter(u => u && !u.startsWith("blob:")).forEach(u => byUrl.set(u, { url: u, label: u.split("/").pop(), filename: filenameFromUrl(u) }));
-        candidates.forEach((c) => { if (c && c.url && !c.url.startsWith("blob:")) byUrl.set(c.url, { url: c.url, label: candidateLabel(c), filename: filenameFromUrl(c.url), type: c.type, mime: c.type }); });
-        const uniq = [...byUrl.values()];
-        if (uniq.length) {
-          const anchor = document.querySelector("video, audio") || document.body;
-          // Use a temporary anchor at top-left if no media element.
-          showPanel(anchor, uniq);
-        }
-      });
+      const anchor = document.querySelector("video, audio");
+      if (anchor) { attachBtn(anchor); pickStream(anchor); }
+      return;
     }
     if (msg.type === "downloadcraft-grab-all") {
-      document.querySelectorAll("a[href]").forEach(a => {
+      document.querySelectorAll("a[href]").forEach((a) => {
         const u = a.href;
         if (/\.(zip|rar|7z|gz|pdf|exe|msi|mp4|mp3|mkv|iso|tar)(\?|#|$)/i.test(u)) api.runtime.sendMessage({ type: "downloadcraft-download", url: u });
       });

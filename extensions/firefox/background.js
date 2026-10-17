@@ -97,7 +97,7 @@ async function promptCapture(capture) {
 // --- Capture tables (IDM: Extensions registry list + MIME->ext map subset) ---
 const FILE_EXTS = new Set("3gp 7z aac ace avi bin bz2 cab dmg deb doc docx epub exe flac gz iso jar mkv mov mp3 mp4 mpeg mpg msi ogg pdf ppt pptx psd rar rpm tar tgz wav webm wma wmv xls xlsx xz zip".split(" "));
 const PANEL_EXTS = new Set("aac avi f4v flv m4a m4v mkv mov mp3 mp4 mpeg mpg ogg ogv rm ts wav webm wma wmv 3gp".split(" "));
-const STREAM_TYPES = new Set(["application/dash+xml", "application/x-mpegurl", "application/vnd.apple.mpegurl", "application/x-mpegurl"]);
+const STREAM_TYPES = new Set(["application/dash+xml", "application/x-mpegurl", "application/vnd.apple.mpegurl", "application/x-mpegurl", "video/vnd.mpeg.dash.mpd", "video/mpegurl", "video/x-mpegurl", "application/mpegurl"]);
 const CANDIDATE_TTL_MS = 5 * 60 * 1000;
 const CANDIDATE_MAX = 80;
 const candidates = new Map(); // url -> {url, type, tabId, time}
@@ -156,7 +156,7 @@ if (browser.webRequest && browser.webRequest.onHeadersReceived) {
       if (!shown) { const tab = details.tabId >= 0 ? await browser.tabs.get(details.tabId).catch(() => null) : null; await safeSend(d.url, tab, { filename: d.filename, mime: d.mime, referrer: ref }); }
       return { cancel: true };
     } catch (e) { return {}; } // native failed: let browser download proceed
-  }, { urls: ["<all_urls>"], types: ["main_frame", "sub_frame", "other"] }, ["blocking", "responseHeaders"]);
+  }, { urls: ["<all_urls>"], types: ["main_frame", "sub_frame", "media", "xmlhttprequest", "other"] }, ["blocking", "responseHeaders"]);
 }
 async function sendDownload(url, tab, extra = {}) {
   let cookies = "";

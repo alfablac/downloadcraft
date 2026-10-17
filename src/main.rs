@@ -17,6 +17,10 @@ pub struct Runtime {
     pub messages: Vec<String>,
     pub clip_last: String,
     pub tray_visible: bool,
+    /// Browser captures awaiting IDM-style confirm dialog. In-memory only:
+    /// inbox files are already deleted when a capture lands here, so an
+    /// unconfirmed capture does not survive restart (accepted trade-off).
+    pub pending_captures: Vec<DownloadTask>,
 }
 
 impl Runtime {
@@ -27,7 +31,7 @@ impl Runtime {
         if state.queues.is_empty() { state.queues.push(Queue::default()); }
         // reset Downloading -> Paused on restart (resume available)
         for t in &mut state.tasks { if t.status == TaskStatus::Downloading { t.status = TaskStatus::Paused; } }
-        Self { state, controls: HashMap::new(), messages: vec!["Ready".into()], clip_last: String::new(), tray_visible: false }
+        Self { state, controls: HashMap::new(), messages: vec!["Ready".into()], clip_last: String::new(), tray_visible: false, pending_captures: Vec::new() }
     }
     pub fn save(&self) { save_state(&self.state); }
     pub fn log(&mut self, m: impl Into<String>) { self.messages.push(m.into()); if self.messages.len() > 200 { self.messages.drain(..50); } }
@@ -160,8 +164,8 @@ fn run_gui(initial_urls: Vec<String>, hidden: bool) {
         let clean = u.strip_prefix("downloadcraft://add?url=").map(url_decode).unwrap_or_else(|| u.clone());
         rt.lock().unwrap().add_url(&clean, "main", "", "");
     }
-    // drain inbox
-    drain_inbox(&rt);
+    // drain inbox into pending captures (confirm dialog shows on first frame)
+    rt.lock().unwrap().pending_captures = take_inbox_tasks(&rt);
     let rt_clone = rt.clone();
     let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 720.0]).with_min_inner_size([760.0, 520.0]).with_title(format!("downloadcraft v{}", env!("CARGO_PKG_VERSION"))).with_visible(!hidden), ..Default::default() };
     let _ = eframe::run_native("downloadcraft", options, Box::new(move |cc| Ok(Box::new(app::DownloadApp::new(cc, rt_clone, hidden)))));
@@ -184,8 +188,14 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-pub fn drain_inbox(rt: &Arc<Mutex<Runtime>>) {
+/// Drain inbox files into pending captures (IDM "Download File Info").
+/// Same parsing (parse_kv_file) and grab/add prefix handling as the old silent
+/// path; returned tasks are finalized (id/filename/queue/dest_dir/order/
+/// category) but NOT pushed to state.tasks — app confirms them first.
+/// Inbox files are deleted here, so unconfirmed captures are lost on restart.
+pub fn take_inbox_tasks(rt: &Arc<Mutex<Runtime>>) -> Vec<DownloadTask> {
     let dir = platform::inbox_dir();
+    let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
             let p = e.path();
@@ -197,12 +207,19 @@ pub fn drain_inbox(rt: &Arc<Mutex<Runtime>>) {
                 if t.filename.is_empty() { t.filename = filename_from_url(&t.url); }
                 if t.queue_id.is_empty() { t.queue_id = "main".into(); }
                 if t.dest_dir.as_os_str().is_empty() { t.dest_dir = g.state.settings.download_dir.clone(); }
-                t.order = g.state.tasks.len() as i64 + 1;
+                t.order = g.state.tasks.len() as i64 + 1 + out.len() as i64;
                 t.category = category_for(&t.filename).into();
                 g.log(format!("Inbox: {}", t.url));
-                g.state.tasks.push(t); g.save();
+                drop(g);
+                out.push(t);
             }
             let _ = std::fs::remove_file(p);
         }
     }
+    out
+}
+
+pub fn drain_inbox(rt: &Arc<Mutex<Runtime>>) {
+    let caps = take_inbox_tasks(rt);
+    if !caps.is_empty() { rt.lock().unwrap().pending_captures.extend(caps); }
 }

@@ -127,6 +127,13 @@ pub struct DownloadApp {
     handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
     /// Tray Quit / Tasks Quit set this so close-to-tray intercept lets window close.
     allow_close: bool,
+    /// User-dragged column widths for downloads/grabber tables (memory-only; not persisted).
+    dl_widths: Option<Vec<f32>>,
+    grab_widths: Option<Vec<f32>>,
+    /// IDM-style pre-download capture dialog state: task being confirmed +
+    /// editable filename buffer (None = no capture dialog open).
+    capture_task: Option<DownloadTask>,
+    capture_name: String,
 }
 
 /// Live tray state: keep icon+menu alive; poll MenuEvent receiver each tick for Show/Add/Quit.
@@ -149,7 +156,7 @@ impl DownloadApp {
             tray_icon::menu::MenuEvent::set_event_handler(Some(move |ev: tray_icon::menu::MenuEvent| {
                 let Some((show_id, add_id, quit_id)) = ids.clone() else { return; };
                 if ev.id == quit_id {
-                    rt_ev.lock().unwrap().save();
+                    if let Ok(g) = rt_ev.try_lock() { g.save(); }
                     let lock = crate::platform::config_dir().join("instance.lock");
                     if let Ok(txt) = std::fs::read_to_string(&lock) { if txt.trim() == std::process::id().to_string() { let _ = std::fs::remove_file(&lock); } }
                     std::process::exit(0);
@@ -159,7 +166,7 @@ impl DownloadApp {
                 }
             }));
         }
-        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_ext_depth: 0, grab_scope: 0, grab_exts: String::new(), grab_parent_dirs: false, grab_only_paths: String::new(), grab_exclude_paths: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), grab_status: "Enter a start URL, then Explore.".into(), grab_busy: false, grab_auto_explore: false, last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, options_notice: "Changes save automatically.".into(), show_add: false, show_progress_for: None, selected: None, selected_schedule: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new(), rate_smooth: std::collections::HashMap::new(), handles: std::collections::HashMap::new(), allow_close: false }
+        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_ext_depth: 0, grab_scope: 0, grab_exts: String::new(), grab_parent_dirs: false, grab_only_paths: String::new(), grab_exclude_paths: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), grab_status: "Enter a start URL, then Explore.".into(), grab_busy: false, grab_auto_explore: false, last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, options_notice: "Changes save automatically.".into(), show_add: false, show_progress_for: None, selected: None, selected_schedule: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new(), rate_smooth: std::collections::HashMap::new(), handles: std::collections::HashMap::new(), allow_close: false, dl_widths: None, grab_widths: None, capture_task: None, capture_name: String::new() }
     }
 
     fn make_tray() -> Option<TrayNav> {
@@ -343,6 +350,16 @@ impl DownloadApp {
         // Extension "Grab site": prefill Grabber and auto-explore.
         { let grabf = crate::platform::config_dir().join("pending-grab.txt"); if let Ok(u) = std::fs::read_to_string(&grabf) { let _ = std::fs::remove_file(&grabf); let u = u.trim().to_string(); if !u.is_empty() { self.grab_url = u; self.tab = Tab::Grabber; self.grab_auto_explore = true; } } }
         crate::drain_inbox(&self.rt);
+        // Browser capture arrived: reveal window so user sees confirm dialog.
+        // Downloaded already-running pages fire no task.start guard — captures
+        // sit in rt.pending_captures until confirmed, so no auto-start here.
+        let has_capture = self.capture_task.is_some() || !self.rt.lock().unwrap().pending_captures.is_empty();
+        if has_capture && (self.hidden || ctx.input(|i| i.viewport().minimized.unwrap_or(false))) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.hidden = false;
+        }
         if self.grab_busy {
             GRAB_SLOT.with(|s| {
                 if let Some(slot) = &*s.borrow() {
@@ -504,8 +521,16 @@ impl eframe::App for DownloadApp {
             let to_tray = { let g = self.rt.lock().unwrap(); g.state.settings.close_to_tray } && self.tray.as_ref().and_then(|t| t._nav.as_ref()).is_some();
             if to_tray {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 self.hidden = true;
+                // One-shot trim on hide: pages go to standby (Private unchanged, fault back on use).
+                #[cfg(windows)]
+                unsafe {
+                    #[link(name = "psapi")]
+                    extern "system" { fn EmptyWorkingSet(h: isize) -> i32; fn GetCurrentProcess() -> isize; }
+                    EmptyWorkingSet(GetCurrentProcess());
+                }
                 return;
             }
         }
@@ -561,8 +586,8 @@ impl eframe::App for DownloadApp {
         });
 
         // ── Left rail: navigation + categories (IDM category tree, modern rail) ──
-        egui::SidePanel::left("rail").resizable(false).show_separator_line(false).exact_width(176.0)
-            .frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::same(6.0))).show(ctx, |ui| {
+        egui::SidePanel::left("rail").resizable(false).show_separator_line(true).exact_width(176.0)
+            .frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::NONE).inner_margin(egui::Margin::same(6.0))).show(ctx, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 2.0;
                 ui.label(egui::RichText::new("WORKSPACE").color(theme::TEXT_FAINT).small().strong());
@@ -641,6 +666,7 @@ impl eframe::App for DownloadApp {
         }
         if self.show_add { self.ui_add_dialog(ctx); }
         if let Some(id) = self.show_progress_for.clone() { self.ui_progress_dialog(ctx, &id); }
+        self.ui_capture_dialog(ctx);
         if let Some(name) = self.completed_notice.clone() {
             egui::Window::new("Download complete").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
                 ui.label(format!("{name} finished."));
@@ -787,12 +813,70 @@ fn icon_btn_enabled(ui: &mut egui::Ui, ic: Icon, label: &str, primary: bool, min
 /// independently, so header and row columns never lined up). Name column takes remainder.
 /// Fixed widths follow live IDM ListSettings (File Name|Q 30|Size 75|Status 65|
 /// Time left 73|Transfer rate 82); Progress/Actions are DownloadCraft extras.
-fn dl_cols(avail: f32, compact: bool) -> Vec<f32> {
+const COL_GAP: f32 = 10.0; // header/rows use item_spacing.x = 10; leading cell at row_origin_x
+const COL_MIN: f32 = 36.0;
+const NAME_MIN: f32 = 120.0;
+
+fn clamp_min(w: f32, idx: usize) -> f32 { if idx == 0 { w.max(NAME_MIN) } else { w.max(COL_MIN) } }
+
+fn dl_cols(avail: f32, compact: bool, stored: Option<&[f32]>) -> Vec<f32> {
     let fixed: &[f32] = if compact { &[75.0, 76.0, 132.0, 48.0] } else { &[30.0, 75.0, 76.0, 73.0, 82.0, 132.0, 48.0] };
-    let gaps = 10.0 * fixed.len() as f32; // rows/header use item_spacing.x = 10
-    let mut v = vec![(avail - fixed.iter().sum::<f32>() - gaps).max(120.0)];
+    if let Some(s) = stored.filter(|s| s.len() == fixed.len() + 1) {
+        // User widths: clamp each; Name = remainder only when total fits avail, else keep user width (h-scroll handles overflow).
+        let mut v: Vec<f32> = s.iter().enumerate().map(|(i, w)| clamp_min(*w, i)).collect();
+        let total: f32 = v.iter().sum::<f32>() + COL_GAP * fixed.len() as f32;
+        if total <= avail { v[0] = (avail - v[1..].iter().sum::<f32>() - COL_GAP * fixed.len() as f32).max(NAME_MIN); }
+        return v;
+    }
+    let gaps = COL_GAP * fixed.len() as f32;
+    let mut v = vec![(avail - fixed.iter().sum::<f32>() - gaps).max(NAME_MIN)];
     v.extend_from_slice(fixed);
     v
+}
+
+/// Cumulative x of each column boundary (relative to first cell left edge).
+fn col_bounds(cols: &[f32]) -> Vec<f32> {
+    let mut xs = Vec::with_capacity(cols.len().saturating_sub(1));
+    let mut x = 0.0;
+    for w in &cols[..cols.len().saturating_sub(1)] { x += w + COL_GAP; xs.push(x - COL_GAP / 2.0); }
+    xs
+}
+
+/// Draggable 6px separators over header row. Drag pairs i/i+1 (delta added to i, subtracted from i+1, clamped).
+fn col_resize_handles(ui: &mut egui::Ui, header: egui::Rect, cols: &mut [f32]) -> bool {
+    let mut changed = false;
+    for (i, bx) in col_bounds(cols).into_iter().enumerate() {
+        let x = header.min.x + bx;
+        let rect = egui::Rect::from_min_size(egui::pos2(x - 4.0, header.min.y), egui::vec2(8.0, header.height()));
+        let resp = ui.interact(rect, ui.id().with(("col_resize", i)), egui::Sense::click_and_drag());
+        let active = resp.dragged() || resp.hovered();
+        if resp.hovered() || resp.dragged() { ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal); }
+        ui.painter().line_segment([egui::pos2(x, header.min.y + 3.0), egui::pos2(x, header.max.y - 3.0)], egui::Stroke::new(if active { 2.0f32 } else { 1.0 }, if active { theme::STEEL } else { theme::BORDER_STRONG }));
+        if resp.dragged() {
+            let d = resp.drag_delta().x;
+            if d != 0.0 {
+                let (a, b) = (cols[i], cols[i + 1]);
+                let na = clamp_min(a + d, i);
+                let nb = clamp_min(b - (na - a), i + 1);
+                cols[i] = na; cols[i + 1] = nb;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Sheet row fill: selected STEEL_DIM only; else zebra. Bottom 1px separator, no cell boxes.
+fn sheet_row(ui: &mut egui::Ui, rect: egui::Rect, sel: bool, idx: usize, last: bool) {
+    let _ = idx; let fill = if sel { theme::STEEL_DIM } else { theme::BG };
+    ui.painter().rect_filled(rect, 0.0, fill);
+    if !last { ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0f32, theme::BORDER)); }
+}
+
+/// Flat table header: SURFACE_RAISED fill, no rounding/outline, bottom border line.
+fn sheet_header(ui: &mut egui::Ui, rect: egui::Rect) {
+    ui.painter().rect_filled(rect, 0.0, theme::SURFACE_RAISED);
+    ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0f32, theme::BORDER));
 }
 
 /// IDM list pitch is 17px (Tahoma 8pt, 16px icon, 1px separator). egui 11px
@@ -894,18 +978,26 @@ impl DownloadApp {
         let mut to_stop: Option<String> = None;
         let mut to_remove: Option<String> = None;
         let mut to_progress: Option<String> = None;
+        let mut to_open: Option<std::path::PathBuf> = None;
         let compact_table = ui.available_width() < 760.0;
-        let cols = dl_cols(ui.available_width() - 18.0, compact_table);
-        // IDM columns on wide windows; compact set on narrow windows (no squeezed overlap).
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        egui::Frame::none().fill(theme::SURFACE_RAISED).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).rounding(theme::R_CTRL).inner_margin(egui::Margin::symmetric(8.0, 0.0)).show(ui, |ui| {
+        // Outer vertical scroll wraps inner horizontal scroll (wide user widths scroll sideways, header+rows together).
+        egui::ScrollArea::vertical().id_salt("dl_outer").auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::horizontal().id_salt("dl_h").auto_shrink([false, false]).show(ui, |ui| {
+        let avail = ui.available_width().max(200.0);
+        let mut cols = dl_cols(avail, compact_table, self.dl_widths.as_deref());
+        // Header: flat sheet row + resize handles (handles overlay, after cells so drag wins over sort click at boundary).
+        let (hdr_rect, _) = ui.allocate_exact_size(egui::vec2(cols.iter().sum::<f32>() + COL_GAP * (cols.len() - 1) as f32, ROW_H + 2.0), egui::Sense::hover());
+        sheet_header(ui, hdr_rect);
+        {
+            let mut c = ui.new_child(egui::UiBuilder::new().max_rect(hdr_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+            let ui = &mut c;
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.spacing_mut().item_spacing.x = COL_GAP;
                 for (i, (h, sc)) in if compact_table { vec![("File Name", Some(0u8)), ("Size", Some(2u8)), ("Status", Some(3u8)), ("Progress", None), ("", None)] } else { vec![("File Name", Some(0u8)), ("Q", Some(1u8)), ("Size", Some(2u8)), ("Status", Some(3u8)), ("Time left", None), ("Transfer rate", None), ("Progress", None), ("", None)] }.iter().enumerate() {
                     let arrow = if Some(self.sort_col) == *sc { if self.sort_asc { " ▲" } else { " ▼" } } else { "" };
                     let clicked = match sc {
-                        Some(_) => cell(ui, cols[i], |ui| ui.add(egui::Label::new(egui::RichText::new(format!("{h}{arrow}")).color(theme::TEXT_MUTED).small().strong()).truncate().selectable(false).sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()),
-                        None => { cell(ui, cols[i], |ui| ui.add(egui::Label::new(egui::RichText::new(*h).color(theme::TEXT_MUTED).small().strong()).truncate().selectable(false))); false }
+                        Some(_) => cell(ui, cols[i], |ui| ui.add(egui::Label::new(theme::table_header_text(&format!("{h}{arrow}"))).truncate().selectable(false).sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()),
+                        None => { cell(ui, cols[i], |ui| ui.add(egui::Label::new(theme::table_header_text(h)).truncate().selectable(false))); false }
                     };
                     if clicked {
                         let sc = sc.unwrap();
@@ -913,32 +1005,34 @@ impl DownloadApp {
                     }
                 }
             });
-        });
-        ui.add_space(2.0);
+        }
+        if col_resize_handles(ui, hdr_rect, &mut cols) { self.dl_widths = Some(cols.clone()); }
 
         if tasks.is_empty() {
-            egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::same(24.0)).show(ui, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("No downloads here").color(theme::TEXT).size(16.0).strong());
-                    ui.label(egui::RichText::new("Add a URL, paste from clipboard (Tasks → Add batch), or send from browser extension.").color(theme::TEXT_MUTED));
-                    if theme::primary_btn(ui, "+ Add URL").clicked() { self.show_add = true; }
-                });
+            ui.vertical_centered(|ui| {
+                ui.add_space(24.0);
+                ui.label(egui::RichText::new("No downloads here").color(theme::TEXT).size(16.0).strong());
+                ui.label(egui::RichText::new("Add a URL, paste from clipboard (Tasks → Add batch), or send from browser extension.").color(theme::TEXT_MUTED));
+                if theme::primary_btn(ui, "+ Add URL").clicked() { self.show_add = true; }
+                ui.add_space(24.0);
             });
             return;
         }
 
         {
-            for t in &tasks {
+            let n_tasks = tasks.len();
+            for (row_idx, t) in tasks.iter().enumerate() {
+              let t = t.clone();
               ui.push_id(t.id.as_str(), |ui| {
                 let sel = self.selected.as_deref() == Some(t.id.as_str());
-                let fill = if sel { theme::STEEL_DIM } else { theme::SURFACE };
-                let (row_rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H + 4.0), egui::Sense::click());
-                ui.painter().rect(row_rect, egui::Rounding::same(theme::R_CTRL), fill, egui::Stroke::new(1.0f32, if sel { theme::STEEL } else { theme::BORDER }));
-                let mut c = ui.new_child(egui::UiBuilder::new().max_rect(row_rect.shrink2(egui::vec2(8.0, 0.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                let row_w = cols.iter().sum::<f32>() + COL_GAP * (cols.len() - 1) as f32;
+                let (row_rect, resp) = ui.allocate_exact_size(egui::vec2(row_w, ROW_H + 2.0), egui::Sense::click());
+                sheet_row(ui, row_rect, sel, row_idx, row_idx + 1 == n_tasks);
+                let mut c = ui.new_child(egui::UiBuilder::new().max_rect(row_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
                 {
                     let ui = &mut c;
 
-                    ui.horizontal(|ui| { ui.spacing_mut().item_spacing.x = 10.0; let mut ci = 0usize; let mut nw = || { ci += 1; cols[ci - 1] };
+                    ui.horizontal(|ui| { ui.spacing_mut().item_spacing.x = COL_GAP; let mut ci = 0usize; let mut nw = || { ci += 1; cols[ci - 1] };
                         let task_rate = self.task_rate(&t.id);
                         cell(ui, nw(), |ui| { let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover()); icon(ui.painter(), &cat_icon(&t.filename), irect, theme::TEXT_MUTED); ui.add(egui::Label::new(egui::RichText::new(&t.filename).color(theme::TEXT).small()).truncate().selectable(false)).on_hover_text(if t.error.is_empty() { t.filename.clone() } else { format!("{}\nError: {}", t.filename, t.error) }); });
                         if !compact_table { let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(if t.queue_id.is_empty() { "main" } else { &t.queue_id }).color(theme::TEXT_MUTED).small()).truncate().selectable(false))); }
@@ -952,7 +1046,7 @@ impl DownloadApp {
                             let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(if t.status == TaskStatus::Downloading { fmt_rate(task_rate as f32) } else { "—".into() }).color(theme::TEXT_MUTED).small()).truncate().selectable(false)));
                         }
                         let seg_view = self.seg_info.get(&t.id);
-                        let frac_opt = display_fraction(t, seg_view);
+                        let frac_opt = display_fraction(&t, seg_view);
                         let frac = frac_opt.unwrap_or(0.0);
                         let hover = format!("{}{}", if frac_opt.is_some() { format!("{:.1}% · ", frac * 100.0) } else { String::new() }, if t.total.is_some() { format!("{} of {}", fmt_bytes(t.downloaded), t.total.map(fmt_bytes).unwrap_or_else(|| "?".into())) } else if let Some(v) = seg_view.filter(|v| v.manifest) { format!("{} | {}", fmt_bytes(t.downloaded), v.label()) } else { format!("{} of ?", fmt_bytes(t.downloaded)) });
                         let w = nw(); cell(ui, w, |ui| {
@@ -971,7 +1065,11 @@ impl DownloadApp {
                 }
 
                 if resp.clicked() { self.selected = Some(t.id.clone()); }
-                if resp.double_clicked() { to_progress = Some(t.id.clone()); }
+                if resp.double_clicked() {
+                    // Complete + file on disk: open it. Else (incl. complete-but-missing): progress dialog.
+                    let path = t.dest_dir.join(&t.filename);
+                    if t.status == TaskStatus::Complete && path.exists() { to_open = Some(path); } else { to_progress = Some(t.id.clone()); }
+                }
                 resp.context_menu(|ui| {
                     if ui.add_enabled(matches!(t.status, TaskStatus::Paused | TaskStatus::Error | TaskStatus::Queued), egui::Button::new("Start / Resume")).clicked() { to_start = Some(t.id.clone()); ui.close_menu(); }
                     if ui.add_enabled(t.status == TaskStatus::Downloading, egui::Button::new("Stop")).clicked() { to_stop = Some(t.id.clone()); ui.close_menu(); }
@@ -981,15 +1079,96 @@ impl DownloadApp {
                     ui.separator();
                     if ui.button("Remove").clicked() { to_remove = Some(t.id.clone()); ui.close_menu(); }
                 });
-                ui.add_space(4.0);
               });
             }
         }
         });
+        });
         if let Some(id) = to_start { self.start_task(&id); }
         if let Some(id) = to_stop { stop_task(self, &id); }
         if let Some(id) = to_remove { remove_task(self, &id); }
+        if let Some(p) = to_open { let _ = crate::platform::open_path(&p); }
         if let Some(id) = to_progress { self.show_progress_for = Some(id); }
+    }
+
+    /// IDM-style "Download File Info" confirm window for browser captures.
+    /// One at a time; confirming/dropping pops next from rt.pending_captures.
+    fn ui_capture_dialog(&mut self, ctx: &egui::Context) {
+        // Pull next pending capture into editor state.
+        if self.capture_task.is_none() {
+            let next = { let mut g = self.rt.lock().unwrap(); if g.pending_captures.is_empty() { None } else { Some(g.pending_captures.remove(0)) } };
+            match next { Some(t) => { self.capture_name = t.filename.clone(); self.capture_task = Some(t); } None => return }
+        }
+        let task = self.capture_task.clone().unwrap();
+        let queues: Vec<(String, String)> = { let g = self.rt.lock().unwrap(); g.state.queues.iter().map(|q| (q.id.clone(), q.name.clone())).collect() };
+        let mut open = true;
+        let mut action: Option<&'static str> = None; // "start" | "later" | "cancel"
+        egui::Window::new("Download file").open(&mut open).resizable(false).collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).default_width(460.0)
+            .frame(egui::Frame::window(&ctx.style()).fill(theme::SURFACE).inner_margin(egui::Margin::same(14.0)))
+            .show(ctx, |ui| {
+                ui.set_min_width(432.0);
+                ui.label(egui::RichText::new("URL").color(theme::TEXT_MUTED).small().strong());
+                // Task clone edited locally; writes back into capture_task below.
+                let mut t = task.clone();
+                ui.add(egui::Label::new(egui::RichText::new(&t.url).color(theme::STEEL_TEXT).small()).wrap());
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Save as").color(theme::TEXT_MUTED).small().strong());
+                ui.add(egui::TextEdit::singleline(&mut self.capture_name).desired_width(f32::INFINITY));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Folder").color(theme::TEXT_MUTED).small().strong());
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(t.dest_dir.display().to_string()).color(theme::TEXT).small()).truncate());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::ghost_btn(ui, "Browse…").clicked() { if let Some(p) = rfd::FileDialog::new().pick_folder() { t.dest_dir = p; } }
+                    });
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("Category").color(theme::TEXT_MUTED).small().strong());
+                        egui::ComboBox::from_id_salt("cap-cat").selected_text(t.category.clone()).width(200.0).show_ui(ui, |ui| {
+                            for c in ["General", "Compressed", "Documents", "Programs", "Video", "Audio"] { ui.selectable_value(&mut t.category, c.to_string(), c); }
+                        });
+                    });
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("Queue").color(theme::TEXT_MUTED).small().strong());
+                        let cur = queues.iter().find(|(id, _)| *id == t.queue_id).map(|(_, n)| n.clone()).unwrap_or_else(|| t.queue_id.clone());
+                        egui::ComboBox::from_id_salt("cap-queue").selected_text(cur).width(200.0).show_ui(ui, |ui| {
+                            for (id, name) in &queues { if ui.selectable_label(t.queue_id == *id, name).clicked() { t.queue_id = id.clone(); } }
+                        });
+                    });
+                });
+                if !t.referrer.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(format!("Referrer: {}", t.referrer)).color(theme::TEXT_FAINT).small());
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::primary_btn(ui, "Start download").clicked() { action = Some("start"); }
+                        if theme::ghost_btn(ui, "Download later").clicked() { action = Some("later"); }
+                        if theme::ghost_btn(ui, "Cancel").clicked() { action = Some("cancel"); }
+                    });
+                });
+                self.capture_task = Some(t);
+            });
+        if !open { action = Some("cancel"); }
+        let Some(act) = action else { return };
+        let mut t = self.capture_task.take().unwrap();
+        let name_input = std::mem::take(&mut self.capture_name);
+        match act {
+            "start" | "later" => {
+                // Basename sanitized on confirm ("" -> "download.bin" via sanitizer).
+                t.filename = crate::model::sanitize_filename(&name_input);
+                t.status = if act == "start" { TaskStatus::Queued } else { TaskStatus::Paused };
+                let start_id = (act == "start").then(|| t.id.clone());
+                { let mut g = self.rt.lock().unwrap(); if t.queue_id.is_empty() || !g.state.queues.iter().any(|q| q.id == t.queue_id) { t.queue_id = "main".into(); } g.state.tasks.push(t); g.save(); }
+                // start_task locks rt itself — call outside lock scope.
+                if let Some(id) = start_id { self.start_task(&id); }
+            }
+            _ => { /* Cancel: drop task entirely. */ }
+        }
     }
 
     fn ui_add_dialog(&mut self, ctx: &egui::Context) {
@@ -1368,22 +1547,55 @@ impl DownloadApp {
             ui.separator();
             // Captured links get remaining page height (was capped 320px).
             let list_h = ui.available_height().max(160.0);
-            egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
-                if self.grab_files.is_empty() { ui.label(egui::RichText::new(if self.grab_busy { "Working..." } else { "No files found yet." }).color(theme::TEXT_FAINT).small()); }
-                egui::Grid::new("grab-files").num_columns(4).striped(false).spacing([10.0, 3.0]).show(ui, |ui| {
-                    ui.label(egui::RichText::new("").strong());
-                    ui.label(egui::RichText::new("URL").color(theme::TEXT_MUTED).small().strong());
-                    ui.label(egui::RichText::new("Size").color(theme::TEXT_MUTED).small().strong());
-                    ui.label(egui::RichText::new("Type").color(theme::TEXT_MUTED).small().strong());
-                    ui.end_row();
-                    for f in &mut self.grab_files {
-                        ui.checkbox(&mut f.selected, "");
-                        ui.add(egui::Label::new(egui::RichText::new(&f.url).color(theme::TEXT)).truncate()).on_hover_text(format!("{}\nfrom: {}", f.url, f.page_url));
-                        ui.label(egui::RichText::new(f.size.map(fmt_bytes).unwrap_or_else(|| "—".into())).color(theme::TEXT_MUTED).small());
-                        ui.label(egui::RichText::new(&f.mime).color(theme::TEXT_FAINT).small());
-                        ui.end_row();
+            if self.grab_files.is_empty() { ui.label(egui::RichText::new(if self.grab_busy { "Working..." } else { "No files found yet." }).color(theme::TEXT_FAINT).small()); }
+            // Sheet-style grabber table: checkbox 28 | URL remainder | Size 76 | Type 90. Double-click row toggles.
+            egui::ScrollArea::vertical().id_salt("grab_v").max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
+            egui::ScrollArea::horizontal().id_salt("grab_h").auto_shrink([false, false]).show(ui, |ui| {
+                let avail = ui.available_width().max(200.0);
+                // Grab cols are [check, URL, Size, Type]; stored vec uses URL at idx 0 for helpers (clamped NAME_MIN).
+                let grab_defaults = [28.0f32, 76.0, 90.0];
+                let mut gcols: Vec<f32> = match self.grab_widths.as_deref().filter(|s| s.len() == 4) {
+                    Some(s) => { let mut v: Vec<f32> = s.iter().enumerate().map(|(i, w)| if i == 0 { w.max(NAME_MIN) } else { w.max(COL_MIN) }).collect(); let total: f32 = v.iter().sum::<f32>() + grab_defaults[0] + COL_GAP * 3.0; if total <= avail { v[0] = (avail - v[1..].iter().sum::<f32>() - grab_defaults[0] - COL_GAP * 3.0).max(NAME_MIN); } v }
+                    None => vec![(avail - grab_defaults.iter().sum::<f32>() - COL_GAP * 3.0).max(NAME_MIN), grab_defaults[1], grab_defaults[2]],
+                };
+                // Display widths in cell order: [check, URL, Size, Type].
+                let disp = [grab_defaults[0], gcols[0], gcols[1], gcols[2]];
+                let row_w = disp.iter().sum::<f32>() + COL_GAP * 3.0;
+                let (hdr_rect, _) = ui.allocate_exact_size(egui::vec2(row_w, ROW_H + 2.0), egui::Sense::hover());
+                sheet_header(ui, hdr_rect);
+                {
+                    let mut c = ui.new_child(egui::UiBuilder::new().max_rect(hdr_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                    let ui = &mut c;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = COL_GAP;
+                        cell(ui, disp[0], |ui| ui.label(theme::table_header_text("")));
+                        cell(ui, disp[1], |ui| ui.add(egui::Label::new(theme::table_header_text("URL")).truncate().selectable(false)));
+                        cell(ui, disp[2], |ui| ui.add(egui::Label::new(theme::table_header_text("Size")).truncate().selectable(false)));
+                        cell(ui, disp[3], |ui| ui.add(egui::Label::new(theme::table_header_text("Type")).truncate().selectable(false)));
+                    });
+                }
+                // Resize handles operate on gcols [URL, Size, Type]; check col fixed.
+                let hdr_shifted = egui::Rect::from_min_size(egui::pos2(hdr_rect.min.x + grab_defaults[0] + COL_GAP, hdr_rect.min.y), egui::vec2(hdr_rect.width() - grab_defaults[0] - COL_GAP, hdr_rect.height()));
+                if col_resize_handles(ui, hdr_shifted, &mut gcols) { self.grab_widths = Some(gcols.clone()); }
+                let disp = [grab_defaults[0], gcols[0], gcols[1], gcols[2]];
+                let n = self.grab_files.len();
+                for (idx, f) in self.grab_files.iter_mut().enumerate() {
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(row_w, ROW_H + 2.0), egui::Sense::click());
+                    sheet_row(ui, rect, false, idx, idx + 1 == n);
+                    let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                    {
+                        let ui = &mut c;
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = COL_GAP;
+                            cell(ui, disp[0], |ui| { let mut sel = f.selected; ui.checkbox(&mut sel, ""); if sel != f.selected { f.selected = sel; } });
+                            cell(ui, disp[1], |ui| ui.add(egui::Label::new(egui::RichText::new(&f.url).color(theme::TEXT)).truncate().selectable(false)).on_hover_text(format!("{}\nfrom: {}", f.url, f.page_url)));
+                            cell(ui, disp[2], |ui| ui.add(egui::Label::new(egui::RichText::new(f.size.map(fmt_bytes).unwrap_or_else(|| "—".into())).color(theme::TEXT_MUTED).small()).truncate().selectable(false)));
+                            cell(ui, disp[3], |ui| ui.add(egui::Label::new(egui::RichText::new(&f.mime).color(theme::TEXT_FAINT).small()).truncate().selectable(false)));
+                        });
                     }
-                });
+                    if resp.double_clicked() { f.selected = !f.selected; }
+                }
+            });
             });
         });
         ui.add_space(6.0);
