@@ -60,6 +60,19 @@ pub fn plan_segments(total: u64, wanted: u32) -> Vec<(u64, u64)> {
     v
 }
 
+pub const MIN_SPLIT: u64 = 256 * 1024;
+/// New end for victim when stealing its tail: split remaining (from committed
+/// `done`) in half. None when either half would be < MIN_SPLIT.
+/// ponytail: keyed on committed done, not in-flight progress; in-flight bytes
+/// past split point are discarded by victim (see run_segment) and re-downloaded
+/// by thief. Upgrade: track per-segment in-flight offset if waste matters.
+fn split_point(start: u64, end: u64, done: u64) -> Option<u64> {
+    let cur = start.checked_add(done)?;
+    if cur > end { return None; }
+    let remaining = end - cur + 1;
+    if remaining < 2 * MIN_SPLIT { None } else { Some(cur + remaining / 2 - 1) }
+}
+
 pub struct Probe { pub total: Option<u64>, pub accept_ranges: bool, pub etag: Option<String>, pub last_modified: Option<String>, pub final_url: String }
 
 pub async fn probe(client: &reqwest::Client, task: &DownloadTask) -> Result<Probe, String> {
@@ -130,14 +143,20 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
                 let etag_ok = v.get("etag").and_then(|e| e.as_str()).map(|s| s.to_string()) == probe.etag || probe.etag.is_none();
                 if v.get("url").and_then(|u| u.as_str()) == Some(task.url.as_str()) && v.get("total").and_then(|t| t.as_u64()) == Some(total) && etag_ok {
                     if let Some(arr) = v.get("segments").and_then(|s| s.as_array()) {
+                        let mut loaded: Vec<SegmentState> = Vec::new();
                         for s in arr {
                             let (start, end, done) = (s["start"].as_u64().unwrap_or(0), s["end"].as_u64().unwrap_or(0), s["done"].as_u64().unwrap_or(0));
-                            // verify part file size matches done
-                            let pf = part_dir.join(format!("part{}", segs.len()));
+                            // verify part file size matches done (index = position in saved array)
+                            let pf = part_dir.join(format!("part{}", loaded.len()));
                             let actual = std::fs::metadata(&pf).map(|m| m.len()).unwrap_or(0);
-                            let done = done.min(actual);
-                            segs.push(SegmentState { start, end, done }); resumed += done;
+                            loaded.push(SegmentState { start, end, done: done.min(actual) });
                         }
+                        // Split tails appended out of order: intervals must tile [0,total) exactly, else discard corrupt state.
+                        let mut sorted: Vec<&SegmentState> = loaded.iter().collect();
+                        sorted.sort_by_key(|s| s.start);
+                        let mut expect = 0u64; let mut ok = total > 0;
+                        for s in &sorted { if s.start != expect || s.end < s.start || s.done > s.end - s.start + 1 { ok = false; break; } expect = s.end + 1; }
+                        if ok && expect == total { resumed = loaded.iter().map(|s| s.done).sum(); segs = loaded; }
                     }
                 }
             }
@@ -148,47 +167,38 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
         segs = plan_segments(total, wanted).into_iter().map(|(start, end)| SegmentState { start, end, done: 0 }).collect();
     }
     ctrl.downloaded.store(resumed, Ordering::Relaxed); task.downloaded = resumed;
-    // Download missing parts in parallel
+    // Work-stealing pool: fixed worker count (= initial segment count). Idle
+    // worker splits largest remaining in-flight segment, steals its tail.
     let etag: Arc<str> = probe.etag.clone().unwrap_or_default().into();
     let segs = Arc::new(tokio::sync::Mutex::new(segs));
+    let active = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::<usize>::new()));
     let mut handles = Vec::new();
     let count = segs.lock().await.len();
-    for i in 0..count {
-        let (client, task_c, ctrl, segs, part_dir, etag) = (client.clone(), task.clone(), ctrl.clone(), segs.clone(), part_dir.clone(), etag.clone());
+    for _ in 0..count.max(1) {
+        let (client, task_c, ctrl, segs, active, part_dir, etag) = (client.clone(), task.clone(), ctrl.clone(), segs.clone(), active.clone(), part_dir.clone(), etag.clone());
         handles.push(tokio::spawn(async move {
-            let mut attempt = 0;
             loop {
-                let (start, end, done) = { let s = segs.lock().await; let sg = &s[i]; (sg.start, sg.end, sg.done) };
-                if done > end - start { return Ok::<(), String>(()); }
-                let range_start = start + done;
-                if range_start > end { return Ok(()); }
-                match download_range(&client, &task_c, range_start, end, &part_dir.join(format!("part{i}")), &ctrl, done).await {
-                    Ok(written) => {
-                        { let mut s = segs.lock().await; s[i].done += written; }
-                        ctrl.downloaded.fetch_add(written, Ordering::Relaxed);
-                        let snapshot = { let s = segs.lock().await; s.iter().map(|x| SegmentState { start: x.start, end: x.end, done: x.done }).collect::<Vec<_>>() };
-                        let et_opt = if etag.is_empty() { None } else { Some(etag.to_string()) }; save_state(&part_dir, &task_c.url, &et_opt, total, &snapshot);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        if ctrl.cancelled.load(Ordering::Relaxed) { return Err(e); }
-                        attempt += 1;
-                        if attempt > 5 { return Err(e); }
-                        tokio::time::sleep(std::time::Duration::from_millis(500 * (1 << attempt.min(4)))).await;
-                    }
-                }
+                let Some(i) = claim_or_split(&segs, &active, &part_dir, &task_c.url, &etag, total).await else { return Ok::<(), String>(()) };
+                let r = run_segment(i, &segs, &client, &task_c, &part_dir, &etag, total, &ctrl).await;
+                active.lock().await.remove(&i);
+                if ctrl.cancelled.load(Ordering::Relaxed) { return Err("cancelled".to_string()); }
+                r?;
             }
         }));
     }
     for h in handles { h.await.map_err(|e| e.to_string())??; }
     if ctrl.cancelled.load(Ordering::Relaxed) { task.status = TaskStatus::Paused; task.downloaded = ctrl.downloaded.load(Ordering::Relaxed); return Ok(task); }
-    // Assemble
+    // Assemble in byte order: split tails appended (index != byte order).
+    let order: Vec<usize> = { let s = segs.lock().await; let mut v: Vec<usize> = (0..s.len()).collect(); v.sort_by_key(|&i| s[i].start); v };
     let tmp = task.dest_dir.join(format!(".assemble-{}", task.filename));
     {
         let mut out = tokio::fs::File::create(&tmp).await.map_err(|e| e.to_string())?;
-        for i in 0..count {
-            let mut f = tokio::fs::File::open(part_dir.join(format!("part{i}"))).await.map_err(|e| e.to_string())?;
-            tokio::io::copy(&mut f, &mut out).await.map_err(|e| e.to_string())?;
+        for i in order {
+            let meta_len = tokio::fs::metadata(part_dir.join(format!("part{i}"))).await.map(|m| m.len()).unwrap_or(0);
+            // Part may hold discarded in-flight bytes past a split point; copy only full segment length clamped to file size.
+            let want = { let s = segs.lock().await; let sg = &s[i]; (sg.end - sg.start + 1).min(meta_len) };
+            let f = tokio::fs::File::open(part_dir.join(format!("part{i}"))).await.map_err(|e| e.to_string())?;
+            tokio::io::copy(&mut f.take(want), &mut out).await.map_err(|e| e.to_string())?;
         }
         out.flush().await.map_err(|e| e.to_string())?;
     }
@@ -199,6 +209,70 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
     finish_check(&dest, &task).await?;
     task.status = TaskStatus::Complete; task.downloaded = total;
     Ok(task)
+}
+
+/// Claim work: prefer unclaimed unfinished segment; else split largest
+/// remaining active segment (tail half >= MIN_SPLIT) and claim new tail.
+/// None when all segments done.
+async fn claim_or_split(segs: &Arc<tokio::sync::Mutex<Vec<SegmentState>>>, active: &Arc<tokio::sync::Mutex<std::collections::HashSet<usize>>>, part_dir: &Path, url: &str, etag: &Arc<str>, total: u64) -> Option<usize> {
+    let mut s = segs.lock().await;
+    let mut act = active.lock().await;
+    let remaining = |sg: &SegmentState| (sg.end + 1).saturating_sub(sg.start + sg.done);
+    for (i, sg) in s.iter().enumerate() {
+        if remaining(sg) > 0 && !act.contains(&i) { act.insert(i); return Some(i); }
+    }
+    let mut victim: Option<(usize, u64)> = None;
+    for (i, sg) in s.iter().enumerate() {
+        if act.contains(&i) {
+            if let Some(np) = split_point(sg.start, sg.end, sg.done) {
+                let tail = sg.end - np;
+                if victim.is_none_or(|(_, b)| tail > b) { victim = Some((i, tail)); }
+            }
+        }
+    }
+    let (vi, _) = victim?;
+    let old_end = s[vi].end;
+    let np = split_point(s[vi].start, old_end, s[vi].done)?;
+    s[vi].end = np;
+    let new_idx = s.len();
+    s.push(SegmentState { start: np + 1, end: old_end, done: 0 });
+    act.insert(new_idx);
+    let snapshot: Vec<SegmentState> = s.iter().map(|x| SegmentState { start: x.start, end: x.end, done: x.done }).collect();
+    drop(act); drop(s);
+    let et_opt = if etag.is_empty() { None } else { Some(etag.to_string()) };
+    save_state(part_dir, url, &et_opt, total, &snapshot);
+    Some(new_idx)
+}
+
+/// Download one claimed segment index until its (possibly shrunk) end.
+/// On split-shrink: only bytes up to current end counted/committed; tail
+/// bytes in part file discarded at assemble, re-downloaded by thief.
+#[allow(clippy::too_many_arguments)]
+async fn run_segment(i: usize, segs: &Arc<tokio::sync::Mutex<Vec<SegmentState>>>, client: &reqwest::Client, task: &DownloadTask, part_dir: &Path, etag: &Arc<str>, total: u64, ctrl: &Arc<Controls>) -> Result<(), String> {
+    let mut attempt = 0;
+    loop {
+        let (start, end, done) = { let s = segs.lock().await; let sg = &s[i]; (sg.start, sg.end, sg.done) };
+        if done > end - start { return Ok(()); }
+        let range_start = start + done;
+        if range_start > end { return Ok(()); }
+        match download_range(client, task, range_start, end, part_dir.join(format!("part{i}")).as_path(), ctrl, done).await {
+            Ok(written) => {
+                let keep = { let s = segs.lock().await; let sg = &s[i]; (sg.end + 1).saturating_sub(start + done).min(written) };
+                { let mut s = segs.lock().await; s[i].done = (s[i].done + keep).min(s[i].end + 1 - s[i].start); }
+                ctrl.downloaded.fetch_add(keep, Ordering::Relaxed);
+                let snapshot = { let s = segs.lock().await; s.iter().map(|x| SegmentState { start: x.start, end: x.end, done: x.done }).collect::<Vec<_>>() };
+                let et_opt = if etag.is_empty() { None } else { Some(etag.to_string()) }; save_state(part_dir, &task.url, &et_opt, total, &snapshot);
+                if keep < written { continue; }
+                return Ok(());
+            }
+            Err(e) => {
+                if ctrl.cancelled.load(Ordering::Relaxed) { return Err(e); }
+                attempt += 1;
+                if attempt > 5 { return Err(e); }
+                tokio::time::sleep(std::time::Duration::from_millis(500 * (1 << attempt.min(4)))).await;
+            }
+        }
+    }
 }
 
 async fn download_range(client: &reqwest::Client, task: &DownloadTask, start: u64, end: u64, dest: &Path, ctrl: &Controls, prior: u64) -> Result<u64, String> {
@@ -346,4 +420,26 @@ pub async fn mux_tracks(tracks: &[PathBuf], dest: &Path) -> Result<(), String> {
         }
     }
     Err(last_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn plan_segments_unchanged() {
+        assert_eq!(plan_segments(0, 8), vec![]);
+        assert_eq!(plan_segments(10, 3), vec![(0, 2), (3, 5), (6, 9)]);
+        assert_eq!(plan_segments(5, 8).len(), 5);
+    }
+    #[test]
+    fn split_point_halves_remaining() {
+        let kb = 1024u64;
+        assert_eq!(split_point(0, 1024 * kb - 1, 0), Some(512 * kb - 1));
+        assert_eq!(split_point(0, 512 * kb - 2, 0), None, "remaining < 512KB never splits");
+        assert_eq!(split_point(0, 600 * kb - 1, 200 * kb), None, "done counts toward remaining");
+        assert_eq!(split_point(100, 100 + 1024 * kb - 1, 512 * kb), Some(100 + 768 * kb - 1));
+        assert_eq!(split_point(0, 10, 20), None);
+        // both halves >= MIN_SPLIT at exact threshold
+        assert_eq!(split_point(0, 2 * MIN_SPLIT - 1, 0), Some(MIN_SPLIT - 1));
+    }
 }
