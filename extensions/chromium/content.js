@@ -32,6 +32,34 @@
     document.documentElement.appendChild(panel);
     return panel;
   }
+  function showConfirm(msg) {
+    const panel = ensurePanel();
+    panel.style.left = Math.max(8, window.scrollX + Math.round((window.innerWidth - 420) / 2)) + "px";
+    panel.style.top = (window.scrollY + 16) + "px";
+    const box = panel.querySelector(".downloadcraft-items");
+    box.innerHTML = "";
+    const close = document.createElement("button");
+    close.textContent = "✕";
+    close.title = "Browser download";
+    close.style.cssText = "float:right;cursor:pointer;";
+    const name = document.createElement("div");
+    name.textContent = msg.filename || filenameFromUrl(msg.url || "");
+    name.style.cssText = "font-weight:700;word-break:break-all;margin-right:24px;";
+    const urlEl = document.createElement("div");
+    urlEl.textContent = msg.url || "";
+    urlEl.style.cssText = "color:#bbb;word-break:break-all;margin:4px 0;";
+    const reply = (accept) => { panel.remove(); try { api.runtime.sendMessage({ type: "downloadcraft-confirm-result", id: msg.id, accept }); } catch (e) {} };
+    const ok = document.createElement("button");
+    ok.textContent = "Download with downloadcraft";
+    ok.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;";
+    ok.addEventListener("click", () => reply(true));
+    const native = document.createElement("button");
+    native.textContent = "Browser download";
+    native.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;";
+    native.addEventListener("click", () => reply(false));
+    close.addEventListener("click", () => reply(false));
+    box.appendChild(close); box.appendChild(name); box.appendChild(urlEl); box.appendChild(ok); box.appendChild(native);
+  }
   function showPanel(anchor, items) {
     const panel = ensurePanel();
     const box = panel.querySelector(".downloadcraft-items");
@@ -78,6 +106,7 @@
   mo.observe(document.documentElement, { childList: true, subtree: true });
   manifestUrls = scan();
   api.runtime.onMessage.addListener((msg) => {
+    if (msg.type === "downloadcraft-confirm") { showConfirm(msg); return; }
     if (msg.type === "downloadcraft-scan") {
       const base = [...document.querySelectorAll("video, audio")].flatMap(v => [v.currentSrc, v.src].filter(Boolean)).concat(manifestUrls);
       fetchCandidates((candidates) => {

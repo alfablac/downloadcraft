@@ -100,18 +100,57 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   else if (info.menuItemId === "downloadcraft-media" && info.srcUrl) sendDownload(info.srcUrl, tab);
   else if (info.menuItemId === "downloadcraft-page" && tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "downloadcraft-grab-all" });
 });
-// Intercept browser downloads and redirect to downloadcraft
+// Ask-first intercept: stash pending, confirm in originating tab, then
+// send to downloadcraft or resume browser-native download.
+const pending = new Map(); // download id -> {id, url, filename, mime, referrer}
+const bypass = new Map(); // url -> timestamp, one-shot for resumed native downloads
+const BYPASS_TTL_MS = 30 * 1000;
+function takeBypass(url) {
+  const t = bypass.get(url);
+  if (t == null) return false;
+  bypass.delete(url);
+  return Date.now() - t < BYPASS_TTL_MS;
+}
+// Intercept browser downloads and ask before redirecting to downloadcraft
 chrome.downloads.onCreated.addListener(async (item) => {
   if (!item.url || item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
+  const url = item.finalUrl || item.url;
+  if (takeBypass(url) || takeBypass(item.url)) return;
   // ponytail: chrome.downloads in MV3 requires user gesture in some builds; context menu + panel are primary paths.
   try {
-    const stored = await chrome.storage.local.get(["intercept"]);
+    const stored = await chrome.storage.local.get(["intercept", "askBeforeDownload"]);
     if (stored.intercept === false) return;
     await chrome.downloads.cancel(item.id).catch(() => {});
-    await sendDownload(item.finalUrl || item.url, null, { referrer: item.referrer || "", filename: basename(item.filename), mime: item.mime || "" });
+    const entry = { id: item.id, url, filename: basename(item.filename), mime: item.mime || "", referrer: item.referrer || "" };
+    const extra = { referrer: entry.referrer, filename: entry.filename, mime: entry.mime };
+    if (stored.askBeforeDownload === false) { await sendDownload(entry.url, null, extra); return; }
+    pending.set(item.id, entry);
+    let tabId = typeof item.tabId === "number" && item.tabId >= 0 ? item.tabId : null;
+    if (tabId == null) {
+      try { const tabs = await chrome.tabs.query({ active: true, currentWindow: true }); tabId = tabs && tabs[0] ? tabs[0].id : null; } catch (e) {}
+    }
+    let delivered = false;
+    if (tabId != null) {
+      try { await chrome.tabs.sendMessage(tabId, { type: "downloadcraft-confirm", id: entry.id, url: entry.url, filename: entry.filename, mime: entry.mime }); delivered = true; } catch (e) {}
+    }
+    if (!delivered) { pending.delete(item.id); await sendDownload(entry.url, null, extra); }
   } catch (e) {}
 });
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg && msg.type === "downloadcraft-confirm-result") {
+    const entry = pending.get(msg.id);
+    if (entry) {
+      pending.delete(msg.id);
+      if (msg.accept) {
+        sendDownload(entry.url, null, { referrer: entry.referrer, filename: entry.filename, mime: entry.mime }).catch(() => {});
+      } else {
+        // Resume browser-native. Bypass keyed by URL so onCreated skips re-intercept.
+        bypass.set(entry.url, Date.now());
+        try { const p = chrome.downloads.download({ url: entry.url, filename: entry.filename || undefined }); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+      }
+    }
+    return;
+  }
   if (msg && msg.type === "getCandidates") {
     pruneCandidates();
     const tabId = sender.tab && sender.tab.id;

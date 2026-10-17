@@ -28,13 +28,49 @@
     panel.id = "downloadcraft-panel";
     panel.style.cssText = "position:absolute;z-index:2147483647;background:#161616;color:#eee;font:12px sans-serif;border:1px solid #555;padding:6px;box-shadow:0 2px 10px rgba(0,0,0,.5);max-width:480px;min-width:260px;";
     panel.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;"><b>Download with downloadcraft</b><button class="dc-close" style="cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #555;padding:0 6px;">×</button></div><div class="downloadcraft-items"></div>';
-    panel.querySelector(".dc-close").addEventListener("click", () => panel.remove());
+    panel.querySelector(".dc-close").addEventListener("click", () => { if (panel.dataset.confirmId) { api.runtime.sendMessage({ type: "downloadcraft-confirm-result", id: Number(panel.dataset.confirmId), action: "browser" }); } panel.remove(); });
     document.documentElement.appendChild(panel);
     return panel;
+  }
+  function fmtSize(n) { if (!n) return ""; if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB"; if (n >= 1024) return (n / 1024).toFixed(1) + " KB"; return n + " B"; }
+  function ensureConfirm(msg) {
+    let panel = ensurePanel();
+    panel.id = "downloadcraft-panel";
+    panel.dataset.confirmId = String(msg.id);
+    const box = panel.querySelector(".downloadcraft-items");
+    box.innerHTML = "";
+    const close = panel.querySelector(".dc-close");
+    const finish = (action) => { clearTimeout(timer); if (panel.dataset.confirmId) delete panel.dataset.confirmId; api.runtime.sendMessage({ type: "downloadcraft-confirm-result", id: msg.id, action }); panel.remove(); };
+    const name = document.createElement("div");
+    name.textContent = msg.filename || filenameFromUrl(msg.url);
+    name.style.cssText = "font-weight:bold;word-break:break-all;margin:2px 0 4px;";
+    const meta = document.createElement("div");
+    meta.textContent = [fmtSize(msg.size), msg.mime].filter(Boolean).join("  ");
+    meta.style.cssText = "color:#bbb;word-break:break-all;";
+    const link = document.createElement("div");
+    link.textContent = msg.url.length > 120 ? msg.url.slice(0, 117) + "..." : msg.url;
+    link.style.cssText = "color:#8ab4f8;word-break:break-all;margin:2px 0 6px;";
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;gap:6px;";
+    const mk = (text, action, primary) => {
+      const b = document.createElement("button");
+      b.textContent = text;
+      b.style.cssText = "flex:1;text-align:center;margin:2px 0;padding:6px;cursor:pointer;border:1px solid #555;color:#eee;background:" + (primary ? "#1d65d8" : "#2a2a2a") + ";";
+      b.addEventListener("click", () => finish(action));
+      return b;
+    };
+    row.appendChild(mk("Download with downloadcraft", "downloadcraft", true));
+    row.appendChild(mk("Browser download", "browser", false));
+    box.appendChild(name); box.appendChild(meta); box.appendChild(link); box.appendChild(row);
+    // No answer (panel orphaned?) -> default browser download: file not lost.
+    const timer = setTimeout(() => finish("browser"), 120000);
+    panel.style.left = (window.scrollX + Math.max(8, (window.innerWidth - 480) / 2)) + "px";
+    panel.style.top = (window.scrollY + 16) + "px";
   }
   function showPanel(anchor, items) {
     if (!items.length) return;
     const panel = ensurePanel();
+    if (panel.dataset.confirmId) { api.runtime.sendMessage({ type: "downloadcraft-confirm-result", id: Number(panel.dataset.confirmId), action: "browser" }); delete panel.dataset.confirmId; }
     const box = panel.querySelector(".downloadcraft-items");
     box.innerHTML = "";
     items.forEach((it) => {
@@ -106,6 +142,7 @@
       const anchor = mediaAnchor();
       if (panel && anchor) showForVideo(anchor);
     }
+    if (msg.type === "downloadcraft-confirm" && self === top) ensureConfirm(msg);
     if (msg.type === "downloadcraft-scan") {
       const anchor = mediaAnchor() || document.body;
       fetchCandidates((candidates) => {

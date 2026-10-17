@@ -58,6 +58,42 @@ async function safeSend(url, tab, extra = {}) {
   try { return await sendDownload(url, tab, extra); }
   catch (e) { notify("downloadcraft: download not sent", "Native host unreachable. Start downloadcraft desktop app once, then retry. (" + (e && e.message || e) + ")"); throw e; }
 }
+// --- Ask-first capture: stash, prompt tab, act on answer. Fallback: safeSend. ---
+const pendingCaptures = new Map(); // id -> {id,url,filename,mime,size,referrer,tabId,time}
+let pendingNextId = 1;
+// ponytail: URL-only bypass for 60s; a same-URL re-click inside window goes
+// to browser. Ceiling: cannot key by download id, id unknown at webRequest time.
+const bypassUrls = new Map(); // url -> time
+function markBypass(url) {
+  const now = Date.now();
+  bypassUrls.set(url, now);
+  for (const [u, t] of bypassUrls) if (now - t > 60000) bypassUrls.delete(u);
+}
+function isBypassed(url) {
+  const t = bypassUrls.get(url);
+  if (!t) return false;
+  if (Date.now() - t > 60000) { bypassUrls.delete(url); return false; }
+  return true;
+}
+async function browserDownload(p) {
+  markBypass(p.url);
+  const opts = { url: p.url };
+  if (p.filename) opts.filename = basename(p.filename);
+  try { await browser.downloads.download(opts); }
+  catch (e) { if (!opts.filename) throw e; markBypass(p.url); await browser.downloads.download({ url: p.url }); }
+}
+// Returns true when panel shown (or same URL already awaiting an answer).
+async function promptCapture(capture) {
+  if (!(capture.tabId >= 0) || !capture.url) return false;
+  const now = Date.now();
+  for (const p of pendingCaptures.values()) if (p.url === capture.url && now - p.time < 60000) return true;
+  const id = pendingNextId++;
+  pendingCaptures.set(id, { ...capture, id, time: now });
+  try {
+    await browser.tabs.sendMessage(capture.tabId, { type: "downloadcraft-confirm", id, url: capture.url, filename: capture.filename || "", mime: capture.mime || "", size: capture.size || 0 }, { frameId: 0 });
+    return true;
+  } catch (e) { pendingCaptures.delete(id); return false; }
+}
 // --- Capture tables (IDM: Extensions registry list + MIME->ext map subset) ---
 const FILE_EXTS = new Set("3gp 7z aac ace avi bin bz2 cab dmg deb doc docx epub exe flac gz iso jar mkv mov mp3 mp4 mpeg mpg msi ogg pdf ppt pptx psd rar rpm tar tgz wav webm wma wmv xls xlsx xz zip".split(" "));
 const PANEL_EXTS = new Set("aac avi f4v flv m4a m4v mkv mov mp3 mp4 mpeg mpg ogg ogv rm ts wav webm wma wmv 3gp".split(" "));
@@ -80,6 +116,7 @@ function filenameFromUrl(u) { try { const p = new URL(u).pathname; const last = 
 function basename(name) { return name ? String(name).split(/[\\/]/).pop() || "" : ""; }
 // IDM takeover rules: status ok, attachment, binary/media type, or known file extension.
 function captureDecision(details) {
+  if (isBypassed(details.url)) return null;
   if (![200, 206].includes(details.statusCode)) return null;
   if (/^Seg\d|^ts\d/i.test(filenameFromUrl(details.url))) return null; // stream segments: panel lists manifest, not fragments
   const type = headerOf(details.responseHeaders, "content-type").split(";")[0].trim().toLowerCase();
@@ -98,6 +135,7 @@ function captureDecision(details) {
   return null;
 }
 const interceptOn = async () => { try { const s = await browser.storage.local.get(["intercept"]); return s.intercept !== false; } catch (e) { return true; } };
+const askFirstOn = async () => { try { const s = await browser.storage.local.get(["askBeforeDownload"]); return s.askBeforeDownload !== false; } catch (e) { return true; } };
 if (browser.webRequest && browser.webRequest.onHeadersReceived) {
   browser.webRequest.onHeadersReceived.addListener(async (details) => {
     const d = captureDecision(details);
@@ -110,9 +148,12 @@ if (browser.webRequest && browser.webRequest.onHeadersReceived) {
     }
     // File takeover: only main/sub frame navigations + explicit other downloads.
     if (!(await interceptOn())) return {};
+    // Ask-first: cancel browser download, prompt tab, act on answer.
     try {
-      const tab = details.tabId >= 0 ? await browser.tabs.get(details.tabId).catch(() => null) : null;
-      await safeSend(d.url, tab, { filename: d.filename, mime: d.mime, referrer: details.originUrl || details.documentUrl || "" });
+      const ref = details.originUrl || details.documentUrl || "";
+      const cap = { url: d.url, filename: d.filename, mime: d.mime, size: parseInt(headerOf(details.responseHeaders, "content-length"), 10) || 0, referrer: ref, tabId: details.tabId };
+      const shown = (await askFirstOn()) && await promptCapture(cap);
+      if (!shown) { const tab = details.tabId >= 0 ? await browser.tabs.get(details.tabId).catch(() => null) : null; await safeSend(d.url, tab, { filename: d.filename, mime: d.mime, referrer: ref }); }
       return { cancel: true };
     } catch (e) { return {}; } // native failed: let browser download proceed
   }, { urls: ["<all_urls>"], types: ["main_frame", "sub_frame", "other"] }, ["blocking", "responseHeaders"]);
@@ -143,14 +184,33 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
   else if (info.menuItemId === "downloadcraft-grab" && tab && tab.url) safeSend("downloadcraft://grab?url=" + encodeURIComponent(tab.url), tab, { referrer: tab.url }).catch(() => {});
 });
 browser.downloads.onCreated.addListener(async (item) => {
-  if (!item.url || item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
+  if (!item.url || isBypassed(item.url) || item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
   try {
     if (!(await interceptOn())) return;
     await browser.downloads.cancel(item.id).catch(() => {});
-    await safeSend(item.finalUrl || item.url, null, { referrer: item.referrer || "", filename: basename(item.filename), mime: item.mime || "" });
+    // Ask-first; downloads API carries no tabId, so prompt stays fallback-only here.
+    const url = item.finalUrl || item.url;
+    const cap = { url, filename: basename(item.filename), mime: item.mime || "", size: item.fileSize > 0 ? item.fileSize : 0, referrer: item.referrer || "", tabId: -1 };
+    if (!((await askFirstOn()) && await promptCapture(cap))) await safeSend(url, null, { referrer: cap.referrer, filename: cap.filename, mime: cap.mime });
   } catch (e) {}
 });
 browser.runtime.onMessage.addListener((msg, sender) => {
+  if (msg && msg.type === "downloadcraft-confirm-result") {
+    const p = pendingCaptures.get(msg.id);
+    if (p) {
+      pendingCaptures.delete(msg.id);
+      (async () => {
+        if (msg.action === "downloadcraft") {
+          const tab = p.tabId >= 0 ? await browser.tabs.get(p.tabId).catch(() => null) : null;
+          try { await safeSend(p.url, tab, { filename: p.filename, mime: p.mime, referrer: p.referrer }); }
+          catch (e) { try { await browserDownload(p); } catch (e2) {} } // host died: file must not vanish
+        } else if (msg.action === "browser") {
+          try { await browserDownload(p); } catch (e) { notify("downloadcraft: browser download failed", (e && e.message) || String(e)); }
+        }
+      })();
+    }
+    return Promise.resolve({ ok: true });
+  }
   if (msg && msg.type === "getCandidates") {
     pruneCandidates();
     const tabId = sender.tab && sender.tab.id;
@@ -159,4 +219,6 @@ browser.runtime.onMessage.addListener((msg, sender) => {
   }
   if (msg && (msg.type === "downloadcraft-download" || msg.type === "downloadcraft-video-panel")) return safeSend(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer });
 });
+// Ask-first leftovers: tab closed mid-prompt must not lose file (no candidates map here).
+if (browser.tabs && browser.tabs.onRemoved) browser.tabs.onRemoved.addListener((tid) => { for (const [pid, p] of [...pendingCaptures]) if (p.tabId === tid) { pendingCaptures.delete(pid); browserDownload(p).catch(() => {}); } });
 browser.browserAction.onClicked.addListener((tab) => { if (tab && tab.id) browser.tabs.sendMessage(tab.id, { type: "downloadcraft-scan" }); });
