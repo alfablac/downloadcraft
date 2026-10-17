@@ -23,6 +23,9 @@
 | Mirrors (Url0..UrlN) + per-URL Basic auth | Done | task `mirrors`/`username`/`password`, engine probe failover |
 | FTP (PASV, REST resume) | Done | `src/ftp.rs` + fake-server tests |
 | Scheduler quota (no more than X MB every Y hours) | Done | schedule `quota_*`, `quota_exhausted` gate |
+| Scheduler IDM dialog layout (named list New/Delete, Turn-on master, HH:MM AM/PM, Once date, Repeat N days, weekdays, Stop at, files-at-once, completion/power confirm) | Done | IDM two-pane page; `Schedule.name/repeat_days`, `Settings.scheduler_enabled`, repeat logic in `scheduler.rs`; hang-up modem N/A |
+| Row interaction (aligned fixed-height rows, working Start/Stop, pointer cursor) | Done | allocate-first `icon_btn_enabled`, 46px `cell`, labels `selectable(false)`; engine cancel e2e |
+| Version onscreen (title, top-bar chip, About, `--version`) | Done | `env!("CARGO_PKG_VERSION")` single source |
 | Browser manifest sniffing (webRequest) → download panel candidates | Done | Chromium + Firefox candidates map, panel merge |
 | Content-Type manifest dispatch (no extension in URL) | Done | `stream::probe_manifest` |
 | Release v0.1.0 published (matrix + release job green, SHA256SUMS verified) | Done | GitHub Release v0.1.0 assets; NSIS/AppImage best-effort in CI |
