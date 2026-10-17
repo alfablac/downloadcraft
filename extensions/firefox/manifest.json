@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "downloadcraft Integration Module",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "Send downloads to downloadcraft desktop app",
   "browser_specific_settings": { "gecko": { "id": "downloadcraft@downloadcraft.local", "strict_min_version": "109.0" } },
   "background": { "scripts": ["background.js"], "persistent": true },
