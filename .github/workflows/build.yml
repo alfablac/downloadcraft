@@ -1,0 +1,92 @@
+name: build
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: universal-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'x86_64-apple-darwin,aarch64-apple-darwin' || matrix.target }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ffmpeg (test fixtures + mux verification)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y ffmpeg; fi
+          if [ "$RUNNER_OS" = "macOS" ]; then brew install ffmpeg || true; fi
+          if [ "$RUNNER_OS" = "Windows" ]; then choco install ffmpeg -y || winget install --id Gyan.FFmpeg -e --accept-source-agreements --accept-package-agreements || true; fi
+          ffmpeg -version | head -1 || true
+      - name: Linux GUI deps (egui glow/x11/wayland + tray)
+        if: runner.os == 'Linux'
+        # egui needs X11/Wayland + GL libs; rfd needs gtk3; tray-icon needs libappindicator
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libx11-dev libwayland-dev libgl1-mesa-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: Test
+        run: cargo test --all-targets
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build release (macOS universal)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          mkdir -p target/universal
+          lipo -create -output target/universal/idmcraft target/x86_64-apple-darwin/release/idmcraft target/aarch64-apple-darwin/release/idmcraft
+          lipo -create -output target/universal/idmcraft-host target/x86_64-apple-darwin/release/idmcraft-host target/aarch64-apple-darwin/release/idmcraft-host
+          mkdir -p target/release && cp target/universal/* target/release/
+      - name: Build release
+        if: runner.os != 'macOS'
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Normalize release dir (non-macOS)
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          mkdir -p target/release
+          cp target/${{ matrix.target }}/release/idmcraft* target/release/ 2>/dev/null || true
+          ls target/release/
+      - name: Smoke test
+        shell: bash
+        run: |
+          BIN=target/release/idmcraft
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN=target/release/idmcraft.exe; fi
+          "$BIN" --smoke-test
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 0.1.0
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        run: bash scripts/package-macos.sh 0.1.0
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: bash scripts/package-linux.sh 0.1.0
+      - name: Checksums
+        shell: bash
+        run: |
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then sha256sum * > SHA256SUMS.txt; else shasum -a 256 * > SHA256SUMS.txt; fi
+          cat SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: idmcraft-${{ runner.os }}-${{ matrix.target }}
+          path: dist/*
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
