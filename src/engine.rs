@@ -38,8 +38,12 @@ fn headers_for(task: &DownloadTask) -> reqwest::header::HeaderMap {
     h
 }
 
-pub struct Controls { pub paused: AtomicBool, pub cancelled: AtomicBool, pub downloaded: AtomicU64, pub limit_kbps: AtomicU64, pub rate: std::sync::Mutex<(std::time::Instant, u64, Option<std::time::Instant>, u64, f64)> }
-impl Controls { pub fn new(limit: u64) -> Self { Self { paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), downloaded: AtomicU64::new(0), limit_kbps: AtomicU64::new(limit), rate: std::sync::Mutex::new((std::time::Instant::now(), 0, None, 0, 0.0)) } } }
+pub struct Controls { pub paused: AtomicBool, pub cancelled: AtomicBool, pub downloaded: AtomicU64, pub limit_kbps: AtomicU64, pub rate: std::sync::Mutex<(std::time::Instant, u64, Option<std::time::Instant>, u64, f64)>,
+    /// Total bytes when known (0 = unknown). GUI needs this live; task.total only lands at finish.
+    pub total: AtomicU64,
+    /// Segmented: per-part (done, expected) bytes. Manifests: single (done_segments, total_segments).
+    pub parts: std::sync::Mutex<Vec<(u64, u64)>> }
+impl Controls { pub fn new(limit: u64) -> Self { Self { paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), downloaded: AtomicU64::new(0), limit_kbps: AtomicU64::new(limit), rate: std::sync::Mutex::new((std::time::Instant::now(), 0, None, 0, 0.0)), total: AtomicU64::new(0), parts: std::sync::Mutex::new(Vec::new()) } } }
 
 fn compute_rate(prev_bytes: u64, cur_bytes: u64, dt_secs: f64) -> f64 {
     if dt_secs <= 0.0 || cur_bytes <= prev_bytes { 0.0 } else { (cur_bytes - prev_bytes) as f64 / dt_secs }
@@ -172,6 +176,7 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
         let resp = client.get(&task.url).headers(headers_for(&task)).send().await.map_err(|e| e.to_string())?;
         if !resp.status().is_success() { return Err(format!("HTTP {}", resp.status())); }
         task.total = resp.content_length().or(task.total);
+        if let Some(t) = task.total { ctrl.total.store(t, Ordering::Relaxed); }
         let tmp = task.dest_dir.join(format!(".partial-{}", task.filename));
         let mut file = tokio::fs::File::create(&tmp).await.map_err(|e| e.to_string())?;
         let mut stream = resp.bytes_stream(); let mut n: u64 = 0;
@@ -226,6 +231,8 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
         segs = plan_segments(total, wanted).into_iter().map(|(start, end)| SegmentState { start, end, done: 0 }).collect();
     }
     ctrl.downloaded.store(resumed, Ordering::Relaxed); task.downloaded = resumed;
+    ctrl.total.store(total, Ordering::Relaxed);
+    { let mut pg = ctrl.parts.lock().unwrap(); *pg = segs.iter().map(|x| (x.done, x.end + 1 - x.start)).collect(); }
     // Work-stealing pool: fixed worker count (= initial segment count). Idle
     // worker splits largest remaining in-flight segment, steals its tail.
     let etag: Arc<str> = probe.etag.clone().unwrap_or_default().into();
@@ -319,6 +326,7 @@ async fn run_segment(i: usize, segs: &Arc<tokio::sync::Mutex<Vec<SegmentState>>>
                 let keep = { let s = segs.lock().await; let sg = &s[i]; (sg.end + 1).saturating_sub(start + done).min(written) };
                 { let mut s = segs.lock().await; s[i].done = (s[i].done + keep).min(s[i].end + 1 - s[i].start); }
                 let snapshot = { let s = segs.lock().await; s.iter().map(|x| SegmentState { start: x.start, end: x.end, done: x.done }).collect::<Vec<_>>() };
+                    { let mut pg = ctrl.parts.lock().unwrap(); *pg = snapshot.iter().map(|x| (x.done, x.end + 1 - x.start)).collect(); }
                 let et_opt = if etag.is_empty() { None } else { Some(etag.to_string()) }; save_state(part_dir, &task.url, &et_opt, total, &snapshot);
                 if keep < written { continue; }
                 return Ok(());
@@ -385,6 +393,7 @@ pub async fn download_media(client: reqwest::Client, task: DownloadTask, ctrl: A
     let mut track_files: Vec<PathBuf> = Vec::new();
     // Segment sizes unknown upfront: progress in bytes, task.total stays None.
     let mut done_bytes: u64 = 0; task.total = None; task.downloaded = 0; ctrl.downloaded.store(0, Ordering::Relaxed);
+    { let total_segs: u64 = tracks.iter().map(|(_, sg)| sg.len() as u64).sum(); *ctrl.parts.lock().unwrap() = vec![(0, total_segs)]; }
     for (kind, segs) in &tracks {
         let out = work.join(format!("track-{kind}.bin"));
         {
@@ -401,6 +410,7 @@ pub async fn download_media(client: reqwest::Client, task: DownloadTask, ctrl: A
                     done_bytes += fetch_into_inner(&client, &task, seg_url, &mut file, &ctrl).await?;
                     Ok::<(), String>(())
                 }.await;
+                if seg_result.is_ok() { let mut pg = ctrl.parts.lock().unwrap(); if let Some(first) = pg.first_mut() { first.0 += 1; } }
                 if let Err(e) = seg_result {
                     if ctrl.cancelled.load(Ordering::Relaxed) || e == "cancelled" {
                         task.status = TaskStatus::Paused; task.downloaded = ctrl.downloaded.load(Ordering::Relaxed);

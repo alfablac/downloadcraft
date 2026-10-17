@@ -177,3 +177,20 @@ async fn progress_live_then_cancel_stops() {
     assert!(!dir.join("v.mp4").exists() || done.status != TaskStatus::Complete);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn http_progress_publishes_total_and_parts() {
+    let body: Vec<u8> = (0..80_000u32).map(|i| (i % 251) as u8).collect();
+    let base = serve(vec![("/f.bin".into(), body.clone(), "application/octet-stream".into())], false);
+    let dir = tmpdir("progpub");
+    let task = DownloadTask { id: "pp1".into(), url: format!("{base}/f.bin"), filename: "f.bin".into(), dest_dir: dir.clone(), segments: 4, ..Default::default() };
+    let ctrl = Arc::new(Controls::new(0));
+    let done = download_url(build_client(""), task, ctrl.clone()).await.unwrap();
+    assert_eq!(done.status, TaskStatus::Complete);
+    assert_eq!(ctrl.total.load(std::sync::atomic::Ordering::Relaxed), body.len() as u64, "GUI progress needs live total from Controls");
+    let parts = ctrl.parts.lock().unwrap().clone();
+    assert_eq!(parts.len(), 4, "parts snapshot: {parts:?}");
+    for (d, e) in &parts { assert_eq!(d, e, "finished part must be full: {parts:?}"); }
+    assert_eq!(parts.iter().map(|(_, e)| *e).sum::<u64>(), body.len() as u64);
+    let _ = std::fs::remove_dir_all(&dir);
+}

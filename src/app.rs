@@ -14,6 +14,43 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Clone, Copy, PartialEq)]
 enum Tab { Downloads, Queues, Scheduler, Grabber, Options }
 
+/// Live per-part progress snapshot for one task.
+/// Segmented HTTP: one entry per part, (done_bytes, expected_bytes).
+/// Manifest downloads: single entry (done_segments, total_segments).
+#[derive(Clone, Default)]
+pub struct SegView { pub parts: Vec<(u64, u64)>, pub manifest: bool }
+impl SegView {
+    fn label(&self) -> String {
+        if self.manifest {
+            let (d, t) = self.parts.first().copied().unwrap_or((0, 0));
+            format!("{d} / {t} segments")
+        } else {
+            let done = self.parts.iter().filter(|(d, e)| e > &0 && d >= e).count();
+            format!("{done} / {} parts done", self.parts.len())
+        }
+    }
+}
+
+/// Draw per-part strip: each cell width proportional to expected size, fill = done fraction.
+fn parts_strip(ui: &mut egui::Ui, view: &SegView, width: f32) {
+    if view.parts.is_empty() { return; }
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 10.0), egui::Sense::hover());
+    let total_exp: u64 = view.parts.iter().map(|(_, e)| *e).sum::<u64>().max(1);
+    let painter = ui.painter();
+    let mut x = rect.left();
+    for (done, exp) in &view.parts {
+        let w = rect.width() * (*exp as f32 / total_exp as f32);
+        let cell = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2((w - 1.0).max(1.0), rect.height()));
+        painter.rect_filled(cell, 0.0, theme::G_700);
+        let frac = if *exp > 0 { (*done as f32 / *exp as f32).clamp(0.0, 1.0) } else { 0.0 };
+        if frac > 0.0 {
+            let fill = egui::Rect::from_min_size(cell.min, egui::vec2(cell.width() * frac, cell.height()));
+            painter.rect_filled(fill, 0.0, theme::PRIMARY);
+        }
+        x += w;
+    }
+}
+
 pub struct DownloadApp {
     rt: Arc<Mutex<Runtime>>,
     tokio_rt: Arc<tokio::runtime::Runtime>,
@@ -53,8 +90,10 @@ pub struct DownloadApp {
     last_dl_total: u64,
     /// Per-task rate samples (drives Transfer rate column + ETA per row).
     rate_map: std::collections::HashMap<String, Vec<(std::time::Instant, u64)>>,
-    /// Live segment/part summary per task, from part dir contents.
-    seg_info: std::collections::HashMap<String, String>,
+    /// Live segment/part snapshot per task (Controls.parts, fallback part-dir scan).
+    seg_info: std::collections::HashMap<String, SegView>,
+    /// Smoothed displayed rate per task (bytes/s), EMA over 5s window rate.
+    rate_smooth: std::collections::HashMap<String, f64>,
     /// Spawned download tasks; Remove aborts handle so background work really stops.
     handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
     /// Tray Quit / Tasks Quit set this so close-to-tray intercept lets window close.
@@ -69,7 +108,7 @@ impl DownloadApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, rt: Arc<Mutex<Runtime>>, hidden: bool) -> Self {
         let tokio_rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio rt"));
         let tray = Self::make_tray();
-        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_scope: 0, grab_exts: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new(), handles: std::collections::HashMap::new(), allow_close: false }
+        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_scope: 0, grab_exts: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new(), rate_smooth: std::collections::HashMap::new(), handles: std::collections::HashMap::new(), allow_close: false }
     }
 
     fn make_tray() -> Option<TrayNav> {
@@ -159,35 +198,58 @@ impl DownloadApp {
     /// Transfer rate + ETA columns; before this, every row shared the global rate.
     fn sample_rates(&mut self) {
         let now = std::time::Instant::now();
-        let snap: Vec<(String, u64)> = { let g = self.rt.lock().unwrap(); g.controls.iter().map(|(k, c)| (k.clone(), c.downloaded.load(std::sync::atomic::Ordering::Relaxed))).collect() };
-        for (id, n) in snap {
-            let v = self.rate_map.entry(id).or_default();
-            if v.last().map(|(_, b)| *b != n).unwrap_or(true) { v.push((now, n)); }
-            if v.len() > 24 { v.drain(..v.len() - 24); }
+        // Snapshot controls: (id, downloaded, total, parts)
+        type Snap = (String, u64, u64, Vec<(u64, u64)>);
+        let snap: Vec<Snap> = { let g = self.rt.lock().unwrap(); g.controls.iter().map(|(k, c)| (k.clone(), c.downloaded.load(Ordering::Relaxed), c.total.load(Ordering::Relaxed), c.parts.lock().unwrap().clone())).collect() };
+        for (id, n, _total, parts) in &snap {
+            let v = self.rate_map.entry(id.clone()).or_default();
+            v.push((now, *n));
+            v.retain(|(t, _)| now.duration_since(*t).as_secs_f64() <= 6.0);
+            if !parts.is_empty() {
+                // Single (done,total) entry with small total = manifest segment counter.
+                let manifest = parts.len() == 1;
+                self.seg_info.insert(id.clone(), SegView { parts: parts.clone(), manifest });
+            }
         }
         self.rate_map.retain(|id, _| { let g = self.rt.lock().unwrap(); g.controls.contains_key(id) || g.state.tasks.iter().any(|t| &t.id == id && matches!(t.status, TaskStatus::Downloading | TaskStatus::Paused)) });
-        // Segment/part summary for downloading tasks: count part files in work dir.
+        self.seg_info.retain(|id, _| { let g = self.rt.lock().unwrap(); g.controls.contains_key(id) || g.state.tasks.iter().any(|t| &t.id == id && matches!(t.status, TaskStatus::Downloading | TaskStatus::Paused)) });
+        // Fallback for tasks without controls yet (probe/queue): part files on disk vs known total.
         let tasks: Vec<(String, std::path::PathBuf, u64)> = { let g = self.rt.lock().unwrap(); g.state.tasks.iter().filter(|t| t.status == TaskStatus::Downloading).map(|t| (t.id.clone(), t.dest_dir.join(format!(".downloadcraft-{}", t.id)), t.total.unwrap_or(0))).collect() };
-        for (id, dir, _total) in tasks {
+        for (id, dir, total) in tasks {
+            if self.seg_info.contains_key(&id) { continue; }
+            if total == 0 { continue; }
             if let Ok(rd) = std::fs::read_dir(&dir) {
-                let parts: Vec<(String, u64)> = rd.flatten().filter_map(|e| { let p = e.path(); let sz = e.metadata().map(|m| m.len()).unwrap_or(0); p.file_name().and_then(|f| f.to_str()).map(|f| (f.to_string(), sz)) }).filter(|(f, _)| f.starts_with("part")).collect();
-                if !parts.is_empty() {
-                    let done_bytes: u64 = parts.iter().map(|(_, s)| *s).sum();
-                    let _ = done_bytes;
-                    let txt = format!("{} parts", parts.len());
-                    self.seg_info.insert(id, txt);
+                let mut sizes: Vec<u64> = rd.flatten().filter_map(|e| { let p = e.path(); if p.file_name().and_then(|f| f.to_str()).map(|f| f.starts_with("part")).unwrap_or(false) { e.metadata().map(|m| m.len()).ok() } else { None } }).collect();
+                if !sizes.is_empty() {
+                    sizes.sort_unstable();
+                    let n = sizes.len() as u64;
+                    // Even split approximation until engine publishes exact ranges.
+                    let parts: Vec<(u64, u64)> = sizes.iter().enumerate().map(|(i, sz)| { let exp = if i as u64 == n - 1 { total - total / n * (n - 1) } else { total / n }; (*sz, exp) }).collect();
+                    self.seg_info.insert(id, SegView { parts, manifest: false });
                 }
             }
         }
     }
 
-    fn task_rate(&self, id: &str) -> f64 {
-        let Some(v) = self.rate_map.get(id) else { return 0.0; };
-        if v.len() < 2 { return 0.0; }
-        let (t0, b0) = v[0]; let (t1, b1) = v[v.len() - 1];
-        let dt = t1.duration_since(t0).as_secs_f64();
-        if dt <= 0.05 { return 0.0; }
-        b1.saturating_sub(b0) as f64 / dt
+    fn task_rate(&self, id: &str) -> f64 { self.rate_smooth.get(id).copied().unwrap_or(0.0) }
+
+    /// Once per poll: 6s window rate -> EMA. Done here, not in draw code, so
+    /// repaint frequency cannot change smoothing.
+    fn update_smooth_rates(&mut self) {
+        let ids: Vec<String> = self.rate_map.keys().cloned().collect();
+        for id in ids {
+            let raw = {
+                let Some(v) = self.rate_map.get(&id) else { continue; };
+                if v.len() < 2 { 0.0 } else {
+                    let (t0, b0) = v[0]; let (t1, b1) = v[v.len() - 1];
+                    let dt = t1.duration_since(t0).as_secs_f64();
+                    if dt < 0.8 { continue; } else { b1.saturating_sub(b0) as f64 / dt }
+                }
+            };
+            let e = self.rate_smooth.entry(id).or_insert(raw);
+            *e = if raw > 0.0 { *e * 0.65 + raw * 0.35 } else { *e * 0.8 };
+            if *e < 1.0 { *e = 0.0; }
+        }
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
@@ -208,11 +270,14 @@ impl DownloadApp {
         }
         crate::drain_inbox(&self.rt);
         self.sample_rates();
+        self.update_smooth_rates();
         // progress sync
         {
             let mut g = self.rt.lock().unwrap();
             let ctrls: Vec<(String, u64)> = g.controls.iter().map(|(k, c)| (k.clone(), c.downloaded.load(std::sync::atomic::Ordering::Relaxed))).collect();
             for (id, n) in ctrls { if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) { t.downloaded = n; } }
+            let totals: Vec<(String, u64)> = g.controls.iter().map(|(k, c)| (k.clone(), c.total.load(Ordering::Relaxed))).collect();
+            for (id, tot) in totals { if tot > 0 { if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) { t.total = Some(tot); } } }
             if self.completed_notice.is_none() {
                 let done_name = g.state.tasks.iter().find(|t| t.status == TaskStatus::Complete).map(|t| t.filename.clone());
                 if let Some(n) = done_name { if self.last_notified.as_deref() != Some(n.as_str()) { self.completed_notice = Some(n.clone()); self.last_notified = Some(n); } }
@@ -643,9 +708,15 @@ impl DownloadApp {
                         ui.label(egui::RichText::new(if t.status == TaskStatus::Downloading { fmt_rate(task_rate as f32) } else { "—".into() }).color(theme::TEXT_MUTED).small());
                         let frac = match t.total { Some(total) if total > 0 => (t.downloaded as f32 / total as f32).clamp(0.0, 1.0), _ => 0.0 };
                         ui.vertical(|ui| {
-                            ui.add(egui::ProgressBar::new(frac).desired_width(150.0).fill(theme::PRIMARY).text(format!("{:.1}%", frac * 100.0)));
+                            if t.total.is_some() {
+                                ui.add(egui::ProgressBar::new(frac).desired_width(150.0).fill(theme::PRIMARY).text(format!("{:.1}%", frac * 100.0)));
+                            } else if t.status == TaskStatus::Downloading {
+                                ui.add(egui::ProgressBar::new(0.0).desired_width(150.0).fill(theme::PRIMARY).animate(true).text("receiving".to_string()));
+                            } else {
+                                ui.add(egui::ProgressBar::new(frac).desired_width(150.0).fill(theme::PRIMARY).text(format!("{:.1}%", frac * 100.0)));
+                            }
                             ui.label(egui::RichText::new(format!("{} of {}", fmt_bytes(t.downloaded), t.total.map(fmt_bytes).unwrap_or_else(|| "?".into()))).color(theme::TEXT_FAINT).small());
-                            if t.status == TaskStatus::Downloading { if let Some(si) = self.seg_info.get(&t.id) { ui.label(egui::RichText::new(si.clone()).color(theme::TEXT_FAINT).small()); } }
+                            if t.status == TaskStatus::Downloading { if let Some(si) = self.seg_info.get(&t.id).cloned() { parts_strip(ui, &si, 150.0); ui.label(egui::RichText::new(si.label()).color(theme::TEXT_FAINT).small()); } }
                         });
                         ui.horizontal(|ui| {
                             if t.status == TaskStatus::Downloading {
@@ -738,12 +809,34 @@ impl DownloadApp {
                 ui.label(egui::RichText::new("Status").color(theme::TEXT_MUTED)); ui.label(format!("{:?}", t.status)); ui.end_row();
                 ui.label(egui::RichText::new("Transfer rate").color(theme::TEXT_MUTED)); ui.label(if t.status == TaskStatus::Downloading { fmt_rate(task_rate as f32) } else { "—".into() }); ui.end_row();
                 ui.label(egui::RichText::new("Time left").color(theme::TEXT_MUTED)); ui.label(eta_txt); ui.end_row();
-                ui.label(egui::RichText::new("Segments").color(theme::TEXT_MUTED)); ui.label(self.seg_info.get(&t.id).cloned().unwrap_or_else(|| format!("{} connections", t.segments))); ui.end_row();
+                ui.label(egui::RichText::new("Segments").color(theme::TEXT_MUTED)); ui.label(self.seg_info.get(&t.id).map(|v| v.label()).unwrap_or_else(|| format!("{} connections", t.segments))); ui.end_row();
                 ui.label(egui::RichText::new("Downloaded").color(theme::TEXT_MUTED)); ui.label(format!("{} / {}", fmt_bytes(t.downloaded), t.total.map(fmt_bytes).unwrap_or_else(|| "—".into()))); ui.end_row();
                 ui.label(egui::RichText::new("Save to").color(theme::TEXT_MUTED)); ui.label(t.dest_dir.display().to_string()); ui.end_row();
                 ui.label(egui::RichText::new("Queue").color(theme::TEXT_MUTED)); ui.label(if t.queue_id.is_empty() { "main".into() } else { t.queue_id.clone() }); ui.end_row();
                 if !t.error.is_empty() { ui.label(egui::RichText::new("Error").color(theme::RED_600)); ui.label(egui::RichText::new(&t.error).color(theme::RED_600)); ui.end_row(); }
             });
+            if let Some(view) = self.seg_info.get(&t.id).cloned() {
+                if !view.parts.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("Parts").color(theme::TEXT_MUTED).small().strong());
+                    parts_strip(ui, &view, 400.0);
+                    if view.manifest {
+                        let (d, tot) = view.parts.first().copied().unwrap_or((0, 0));
+                        ui.label(egui::RichText::new(format!("{d} of {tot} segments downloaded")).color(theme::TEXT_FAINT).small());
+                    } else {
+                        egui::Grid::new("prog-parts").num_columns(3).spacing([12.0, 2.0]).show(ui, |ui| {
+                            for (i, (done, exp)) in view.parts.iter().enumerate().take(32) {
+                                let pct = if *exp > 0 { *done as f32 / *exp as f32 * 100.0 } else { 0.0 };
+                                ui.label(egui::RichText::new(format!("Part {}", i + 1)).color(theme::TEXT_FAINT).small());
+                                ui.label(egui::RichText::new(format!("{:.0}%", pct)).color(theme::TEXT).small());
+                                ui.label(egui::RichText::new(format!("{} / {}", fmt_bytes(*done), fmt_bytes(*exp))).color(theme::TEXT_FAINT).small());
+                                ui.end_row();
+                            }
+                        });
+                        if view.parts.len() > 32 { ui.label(egui::RichText::new(format!("... and {} more parts", view.parts.len() - 32)).color(theme::TEXT_FAINT).small()); }
+                    }
+                }
+            }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if t.status == TaskStatus::Downloading { if theme::ghost_btn(ui, "Pause").clicked() { toggle_pause = true; } }
