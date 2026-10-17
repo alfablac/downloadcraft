@@ -153,7 +153,7 @@ if (browser.webRequest && browser.webRequest.onHeadersReceived) {
       const ref = details.originUrl || details.documentUrl || "";
       const cap = { url: d.url, filename: d.filename, mime: d.mime, size: parseInt(headerOf(details.responseHeaders, "content-length"), 10) || 0, referrer: ref, tabId: details.tabId };
       const shown = (await askFirstOn()) && await promptCapture(cap);
-      if (!shown) { const tab = details.tabId >= 0 ? await browser.tabs.get(details.tabId).catch(() => null) : null; await safeSend(d.url, tab, { filename: d.filename, mime: d.mime, referrer: ref }); }
+      if (!shown) { const tab = details.tabId >= 0 ? await browser.tabs.get(details.tabId).catch(() => null) : null; await safeSend(d.url, tab, { filename: d.filename, mime: d.mime, referrer: ref, size: cap.size, captured: true }); }
       return { cancel: true };
     } catch (e) { return {}; } // native failed: let browser download proceed
   }, { urls: ["<all_urls>"], types: ["main_frame", "sub_frame", "media", "xmlhttprequest", "other"] }, ["blocking", "responseHeaders"]);
@@ -164,6 +164,11 @@ async function sendDownload(url, tab, extra = {}) {
   const referrer = extra.referrer != null ? extra.referrer : (tab ? tab.url : "");
   const msg = { type: "download", url, referrer, referer: referrer, cookies, filename: extra.filename ? basename(extra.filename) : filenameFromUrl(url) };
   if (extra.mime) msg.mime = extra.mime;
+  // Captured (intercepted) downloads pass host-side capture filter (extension
+  // allowlist + min size from capture-filter.json). Explicit sends (context
+  // menu, video panel, link grab) omit `captured` and always go: user intent.
+  if (extra.captured) msg.captured = true;
+  if (extra.size > 0) msg.size = extra.size;
   return nativeSend(msg);
 }
 // Menus: create on startup too (event-page restarts lose onInstalled-only menus).
@@ -191,7 +196,7 @@ browser.downloads.onCreated.addListener(async (item) => {
     // Ask-first; downloads API carries no tabId, so prompt stays fallback-only here.
     const url = item.finalUrl || item.url;
     const cap = { url, filename: basename(item.filename), mime: item.mime || "", size: item.fileSize > 0 ? item.fileSize : 0, referrer: item.referrer || "", tabId: -1 };
-    if (!((await askFirstOn()) && await promptCapture(cap))) await safeSend(url, null, { referrer: cap.referrer, filename: cap.filename, mime: cap.mime });
+    if (!((await askFirstOn()) && await promptCapture(cap))) await safeSend(url, null, { referrer: cap.referrer, filename: cap.filename, mime: cap.mime, size: cap.size, captured: true });
   } catch (e) {}
 });
 browser.runtime.onMessage.addListener((msg, sender) => {
@@ -202,7 +207,7 @@ browser.runtime.onMessage.addListener((msg, sender) => {
       (async () => {
         if (msg.action === "downloadcraft") {
           const tab = p.tabId >= 0 ? await browser.tabs.get(p.tabId).catch(() => null) : null;
-          try { await safeSend(p.url, tab, { filename: p.filename, mime: p.mime, referrer: p.referrer }); }
+          try { await safeSend(p.url, tab, { filename: p.filename, mime: p.mime, referrer: p.referrer, size: p.size, captured: true }); }
           catch (e) { try { await browserDownload(p); } catch (e2) {} } // host died: file must not vanish
         } else if (msg.action === "browser") {
           try { await browserDownload(p); } catch (e) { notify("downloadcraft: browser download failed", (e && e.message) || String(e)); }

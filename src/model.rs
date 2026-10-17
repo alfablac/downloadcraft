@@ -116,12 +116,18 @@ pub struct Settings {
     #[serde(default)] pub proxy_url: String,
     /// Master "Turn on scheduler" (IDM Scheduler dialog). Default on.
     #[serde(default = "def_true")] pub scheduler_enabled: bool,
+    /// Browser-capture extension allowlist, raw comma-separated list e.g. "mp4,zip,pdf".
+    /// Empty = capture all known types (filter in host via capture-filter.json).
+    #[serde(default)] pub capture_exts: String,
+    /// Browser-capture minimum size in MB. 0 = no minimum. Files with unknown
+    /// size (missing Content-Length) still captured: cannot prove small.
+    #[serde(default)] pub capture_min_mb: u64,
 }
 fn def_conn() -> u32 { 8 }
 fn def_global() -> usize { 3 }
 impl Default for Settings {
     fn default() -> Self {
-        Self { download_dir: crate::platform::default_download_dir(), max_connections: 8, global_max_concurrent: 3, speed_limit_kbps: 0, autostart: false, start_minimized: false, close_to_tray: true, clipboard_monitor: false, proxy_url: String::new(), scheduler_enabled: true }
+        Self { download_dir: crate::platform::default_download_dir(), max_connections: 8, global_max_concurrent: 3, speed_limit_kbps: 0, autostart: false, start_minimized: false, close_to_tray: true, clipboard_monitor: false, proxy_url: String::new(), scheduler_enabled: true, capture_exts: String::new(), capture_min_mb: 0 }
     }
 }
 

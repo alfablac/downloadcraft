@@ -134,6 +134,8 @@ pub struct DownloadApp {
     /// editable filename buffer (None = no capture dialog open).
     capture_task: Option<DownloadTask>,
     capture_name: String,
+    /// True only for first frame after capture dialog opens: focus filename field.
+    capture_just_opened: bool,
 }
 
 /// Live tray state: keep icon+menu alive; poll MenuEvent receiver each tick for Show/Add/Quit.
@@ -166,7 +168,7 @@ impl DownloadApp {
                 }
             }));
         }
-        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_ext_depth: 0, grab_scope: 0, grab_exts: String::new(), grab_parent_dirs: false, grab_only_paths: String::new(), grab_exclude_paths: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), grab_status: "Enter a start URL, then Explore.".into(), grab_busy: false, grab_auto_explore: false, last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, options_notice: "Changes save automatically.".into(), show_add: false, show_progress_for: None, selected: None, selected_schedule: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new(), rate_smooth: std::collections::HashMap::new(), handles: std::collections::HashMap::new(), allow_close: false, dl_widths: None, grab_widths: None, capture_task: None, capture_name: String::new() }
+        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_ext_depth: 0, grab_scope: 0, grab_exts: String::new(), grab_parent_dirs: false, grab_only_paths: String::new(), grab_exclude_paths: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), grab_status: "Enter a start URL, then Explore.".into(), grab_busy: false, grab_auto_explore: false, last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, options_notice: "Changes save automatically.".into(), show_add: false, show_progress_for: None, selected: None, selected_schedule: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new(), rate_smooth: std::collections::HashMap::new(), handles: std::collections::HashMap::new(), allow_close: false, dl_widths: None, grab_widths: None, capture_task: None, capture_name: String::new(), capture_just_opened: false }
     }
 
     fn make_tray() -> Option<TrayNav> {
@@ -537,7 +539,7 @@ impl eframe::App for DownloadApp {
         if self.hidden { return; }
 
         // ── Top bar: brand + menus (IDM: Tasks/File/Downloads/View/Help) ──
-        egui::TopBottomPanel::top("topbar").frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::symmetric(8.0, 4.0))).show(ctx, |ui| {
+        egui::TopBottomPanel::top("topbar").frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::NONE).inner_margin(egui::Margin::symmetric(8.0, 4.0))).show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 egui::menu::bar(ui, |ui| {
                     ui.menu_button("Tasks", |ui| {
@@ -587,7 +589,7 @@ impl eframe::App for DownloadApp {
 
         // ── Left rail: navigation + categories (IDM category tree, modern rail) ──
         egui::SidePanel::left("rail").resizable(false).show_separator_line(true).exact_width(176.0)
-            .frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::NONE).inner_margin(egui::Margin::same(6.0))).show(ctx, |ui| {
+            .frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::NONE).inner_margin(egui::Margin { left: 6.0, right: 8.0, top: 6.0, bottom: 6.0 })).show(ctx, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 2.0;
                 ui.label(egui::RichText::new("WORKSPACE").color(theme::TEXT_FAINT).small().strong());
@@ -610,7 +612,7 @@ impl eframe::App for DownloadApp {
             });
 
         // ── Bottom status bar ──
-        egui::TopBottomPanel::bottom("statusbar").frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::symmetric(8.0, 3.0))).show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("statusbar").frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::NONE).inner_margin(egui::Margin::symmetric(8.0, 3.0))).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let (total, done, active) = { let g = self.rt.lock().unwrap(); (g.state.tasks.len(), g.state.tasks.iter().filter(|t| t.status == TaskStatus::Complete).count(), g.state.tasks.iter().filter(|t| t.status == TaskStatus::Downloading).count()) };
                 ui.label(egui::RichText::new(format!("{total} downloads · {done} finished · {active} active")).color(theme::TEXT_MUTED).small());
@@ -637,8 +639,8 @@ impl eframe::App for DownloadApp {
             });
         });
 
-        // Left margin 0: any BG gap beside rail reads as a stray vertical bar.
-        egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG).inner_margin(egui::Margin { left: 0.0, right: 8.0, top: 8.0, bottom: 8.0 })).show(ctx, |ui| {
+        // Left margin 10: breathing gap between rail separator line and central content.
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG).inner_margin(egui::Margin { left: 10.0, right: 8.0, top: 8.0, bottom: 8.0 })).show(ctx, |ui| {
             match self.tab {
                 Tab::Downloads => self.ui_downloads(ui),
                 // Grabber manages own scroll: results list fills remaining height.
@@ -767,7 +769,7 @@ fn nav_row(ui: &mut egui::Ui, ic: Icon, label: &str, selected: bool) -> egui::Re
     let fg = if selected { egui::Color32::WHITE } else if resp.hovered() { theme::TEXT } else { theme::TEXT_MUTED };
     let icon_rect = egui::Rect::from_min_size(rect.left_top() + egui::vec2(6.0, 3.0), egui::vec2(16.0, 16.0));
     icon(painter, &ic, icon_rect, fg);
-    let font = egui::FontId::proportional(12.5);
+    let font = egui::FontId::proportional(13.5);
     let avail = (rect.right() - (icon_rect.right() + 6.0) - 6.0).max(0.0);
     // single row, ellipsis-truncated to avail width; never overflow rail
     let mut job = egui::text::LayoutJob::single_section(label.to_owned(), egui::TextFormat { font_id: font, color: fg, ..Default::default() });
@@ -1011,7 +1013,7 @@ impl DownloadApp {
         if tasks.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(24.0);
-                ui.label(egui::RichText::new("No downloads here").color(theme::TEXT).size(16.0).strong());
+                ui.label(egui::RichText::new("No downloads here").color(theme::TEXT).size(17.0).strong());
                 ui.label(egui::RichText::new("Add a URL, paste from clipboard (Tasks → Add batch), or send from browser extension.").color(theme::TEXT_MUTED));
                 if theme::primary_btn(ui, "+ Add URL").clicked() { self.show_add = true; }
                 ui.add_space(24.0);
@@ -1097,7 +1099,7 @@ impl DownloadApp {
         // Pull next pending capture into editor state.
         if self.capture_task.is_none() {
             let next = { let mut g = self.rt.lock().unwrap(); if g.pending_captures.is_empty() { None } else { Some(g.pending_captures.remove(0)) } };
-            match next { Some(t) => { self.capture_name = t.filename.clone(); self.capture_task = Some(t); } None => return }
+            match next { Some(t) => { self.capture_name = t.filename.clone(); self.capture_task = Some(t); self.capture_just_opened = true; ctx.send_viewport_cmd(egui::ViewportCommand::Focus); } None => return }
         }
         let task = self.capture_task.clone().unwrap();
         let queues: Vec<(String, String)> = { let g = self.rt.lock().unwrap(); g.state.queues.iter().map(|q| (q.id.clone(), q.name.clone())).collect() };
@@ -1114,7 +1116,8 @@ impl DownloadApp {
                 ui.add(egui::Label::new(egui::RichText::new(&t.url).color(theme::STEEL_TEXT).small()).wrap());
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("Save as").color(theme::TEXT_MUTED).small().strong());
-                ui.add(egui::TextEdit::singleline(&mut self.capture_name).desired_width(f32::INFINITY));
+                let name_resp = ui.add(egui::TextEdit::singleline(&mut self.capture_name).id(egui::Id::new("capture-name")).desired_width(f32::INFINITY));
+                if self.capture_just_opened { name_resp.request_focus(); ctx.memory_mut(|m| m.request_focus(egui::Id::new("capture-name"))); self.capture_just_opened = false; }
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("Folder").color(theme::TEXT_MUTED).small().strong());
                 ui.horizontal(|ui| {
@@ -1219,7 +1222,7 @@ impl DownloadApp {
         let mut close = false; let mut toggle_pause = false;
         egui::Window::new("Download progress").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
             ui.set_min_width(420.0);
-            ui.label(egui::RichText::new(&t.filename).strong().size(15.0));
+            ui.label(egui::RichText::new(&t.filename).strong().size(16.0));
             ui.label(egui::RichText::new(&t.url).color(theme::TEXT_FAINT).small());
             ui.add_space(8.0);
             let frac_opt = display_fraction(&t, self.seg_info.get(&t.id));
@@ -1701,6 +1704,14 @@ impl DownloadApp {
                     });
                     ui.label(egui::RichText::new(format!("Chromium extension ID: {}", downloadcraft_lib::platform::CHROME_EXT_ID)).color(theme::TEXT_FAINT).small().monospace());
                     ui.label(egui::RichText::new("Load extensions/chromium in Chromium browsers or extensions/firefox in Firefox. Native host: downloadcraft-host.").color(theme::TEXT_FAINT).small());
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("Browser capture filter").strong());
+                    ui.separator();
+                    egui::Grid::new("opts_capture_filter").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                        ui.label("Allowed extensions"); ui.add(egui::TextEdit::singleline(&mut settings.capture_exts).hint_text("mp4,zip,pdf,mp3").desired_width(ui.available_width())); ui.end_row();
+                        ui.label("Minimum size MB"); ui.add(egui::DragValue::new(&mut settings.capture_min_mb).range(0..=100_000)); ui.end_row();
+                    });
+                    ui.label(egui::RichText::new("Empty extensions = all types. Size filter only skips files with known size below limit; unknown size still captured. Explicit browser sends (context menu, video panel) bypass filter.").color(theme::TEXT_FAINT).small());
                 }
                 _ => {
                     ui.label(egui::RichText::new("About").strong());
@@ -1733,6 +1744,10 @@ impl DownloadApp {
         if serde_json::to_string(&settings).unwrap_or_default() != before {
             if settings.autostart != before_autostart { let _ = platform::set_autostart(settings.autostart); }
             let speed_limit = settings.speed_limit_kbps;
+            // Native host reads capture-filter.json on each captured download;
+            // desktop owns settings, browser storage never synced.
+            let exts: Vec<String> = settings.capture_exts.split(',').map(|s| s.trim().trim_start_matches('.').to_lowercase()).filter(|s| !s.is_empty()).collect();
+            let _ = std::fs::write(crate::platform::config_dir().join("capture-filter.json"), serde_json::json!({"exts": exts, "minBytes": settings.capture_min_mb.saturating_mul(1024 * 1024)}).to_string());
             let limits: Vec<_> = {
                 let mut g = self.rt.lock().unwrap();
                 g.state.settings = settings;

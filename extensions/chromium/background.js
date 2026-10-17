@@ -93,6 +93,11 @@ async function sendDownload(url, tab, extra = {}) {
   const referrer = extra.referrer != null ? extra.referrer : (tab ? tab.url : "");
   const msg = { type: "download", url, referrer, referer: referrer, cookies, filename: extra.filename ? basename(extra.filename) : filenameFromUrl(url) };
   if (extra.mime) msg.mime = extra.mime;
+  // Captured (intercepted) downloads pass host-side capture filter (extension
+  // allowlist + min size from capture-filter.json). Explicit sends (context
+  // menu, video panel, link grab) omit `captured` and always go: user intent.
+  if (extra.captured) msg.captured = true;
+  if (extra.size > 0) msg.size = extra.size;
   return nativeSend(msg);
 }
 function filenameFromUrl(u) {
@@ -130,8 +135,8 @@ chrome.downloads.onCreated.addListener(async (item) => {
     const stored = await chrome.storage.local.get(["intercept", "askBeforeDownload"]);
     if (stored.intercept === false) return;
     await chrome.downloads.cancel(item.id).catch(() => {});
-    const entry = { id: item.id, url, filename: basename(item.filename), mime: item.mime || "", referrer: item.referrer || "" };
-    const extra = { referrer: entry.referrer, filename: entry.filename, mime: entry.mime };
+    const entry = { id: item.id, url, filename: basename(item.filename), mime: item.mime || "", referrer: item.referrer || "", size: item.fileSize > 0 ? item.fileSize : 0 };
+    const extra = { referrer: entry.referrer, filename: entry.filename, mime: entry.mime, size: entry.size, captured: true };
     if (stored.askBeforeDownload === false) { await sendDownload(entry.url, null, extra); return; }
     pending.set(item.id, entry);
     let tabId = typeof item.tabId === "number" && item.tabId >= 0 ? item.tabId : null;
@@ -151,7 +156,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (entry) {
       pending.delete(msg.id);
       if (msg.accept) {
-        sendDownload(entry.url, null, { referrer: entry.referrer, filename: entry.filename, mime: entry.mime }).catch(() => {});
+        sendDownload(entry.url, null, { referrer: entry.referrer, filename: entry.filename, mime: entry.mime, size: entry.size, captured: true }).catch(() => {});
       } else {
         // Resume browser-native. Bypass keyed by URL so onCreated skips re-intercept.
         bypass.set(entry.url, Date.now());

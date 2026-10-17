@@ -62,7 +62,7 @@ pub fn status_color(s: crate::model::TaskStatus) -> Color32 {
 
 /// Table header text: 11px semibold. Named body size, so call sites drop `.small()`.
 pub fn table_header_text(s: &str) -> egui::RichText {
-    egui::RichText::new(s).color(TEXT_MUTED).size(10.0).strong()
+    egui::RichText::new(s).color(TEXT_MUTED).size(11.0).strong()
 }
 
 pub fn apply(ctx: &egui::Context) {
@@ -135,11 +135,11 @@ pub fn apply(ctx: &egui::Context) {
     style.visuals.slider_trailing_fill = true;
     style.animation_time = 0.15;
     style.text_styles = [
-        (TextStyle::Heading, FontId::proportional(12.0)),
-        (TextStyle::Body, FontId::proportional(10.0)),
-        (TextStyle::Button, FontId::proportional(10.0)),
-        (TextStyle::Small, FontId::proportional(9.5)),
-        (TextStyle::Monospace, FontId::monospace(10.0)),
+        (TextStyle::Heading, FontId::proportional(13.0)),
+        (TextStyle::Body, FontId::proportional(11.0)),
+        (TextStyle::Button, FontId::proportional(11.0)),
+        (TextStyle::Small, FontId::proportional(10.5)),
+        (TextStyle::Monospace, FontId::monospace(11.0)),
     ].into();
     ctx.set_style(style);
 }
