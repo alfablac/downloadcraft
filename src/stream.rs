@@ -71,7 +71,13 @@ fn append_reps(parsed: &Mpd, tracks: &mut engine::MediaTracks, task: &DownloadTa
         let reps = &set.representations;
         if reps.is_empty() { continue; }
         let chosen = if let Some(w) = &want_rep { reps.iter().find(|r| &r.id == w).unwrap_or(&reps[0]) } else { reps.iter().max_by_key(|r| r.bandwidth).unwrap_or(&reps[0]) };
-        let segs: Vec<(Option<String>, String)> = chosen.segment_urls.iter().map(|u| (chosen.init_url.clone(), u.clone())).collect();
+        // SegmentBase: single file holds init+index+media. Emit (None, file) — engine
+        // fetching init_url too would download whole file twice (mpd.rs keeps init_url=None there).
+        let segs: Vec<(Option<String>, String)> = if chosen.segment_base {
+            chosen.segment_urls.iter().map(|u| (None, u.clone())).collect()
+        } else {
+            chosen.segment_urls.iter().map(|u| (chosen.init_url.clone(), u.clone())).collect()
+        };
         if let Some(existing) = tracks.iter_mut().find(|(k, _)| k == kind) {
             for s in segs { if !existing.1.contains(&s) { existing.1.push(s); } }
         } else { tracks.push((kind.to_string(), segs)); }
@@ -89,27 +95,33 @@ pub async fn download_hls(client: reqwest::Client, mut task: DownloadTask, ctrl:
         let idx: usize = task.headers.get("x-variant-index").and_then(|v| v.parse().ok()).unwrap_or_else(|| master.variants.iter().enumerate().max_by_key(|(_, v)| v.bandwidth).map(|(i, _)| i).unwrap_or(0));
         let variant = &master.variants[idx.min(master.variants.len() - 1)];
         let mut t2 = task.clone(); t2.url = variant.uri.clone();
-        // also fetch audio rendition if present
-        let audio_uri = master.renditions.iter().find(|r| r.kind == "AUDIO" && (variant.audio_group.is_empty() || r.group_id == variant.audio_group) && (r.default || variant.audio_group.is_empty())).and_then(|r| r.uri.clone());
-        let video_task = download_hls_media(client.clone(), t2.clone(), ctrl.clone()).await;
-        if let Some(au) = audio_uri {
-            let mut at = task.clone(); at.url = au;
-            // download audio track separately then mux
-            let mut audio_task_result = download_hls_media(client.clone(), at, ctrl.clone()).await;
-            // rename outputs to temp names and mux
-            match (video_task, audio_task_result.as_mut()) {
-                (Ok(vt), Ok(at2)) => {
-                    let vfile = vt.dest_dir.join(&vt.filename);
-                    let afile = at2.dest_dir.join(&at2.filename);
-                    // download_hls_media writes directly to dest filename (same). Need distinct handling: if same filename, audio overwrote? They share filename so avoid mux path when same.
-                    let _ = (vfile, afile);
-                    return Ok(vt);
-                }
-                (Ok(vt), Err(_)) => return Ok(vt),
-                (Err(e), _) => return Err(e),
-            }
+        // AUDIO rendition in same group; DEFAULT=YES preferred.
+        let audio_uri = master.renditions.iter().find(|r| r.kind == "AUDIO" && r.default && !variant.audio_group.is_empty() && r.group_id == variant.audio_group).and_then(|r| r.uri.clone())
+            .or_else(|| master.renditions.iter().find(|r| r.kind == "AUDIO" && (variant.audio_group.is_empty() || r.group_id == variant.audio_group)).and_then(|r| r.uri.clone()));
+        let video_task = download_hls_media(client.clone(), t2.clone(), ctrl.clone()).await?;
+        let Some(au) = audio_uri.filter(|u| u != &variant.uri) else { return Ok(video_task); };
+        // Video failed/protected: keep its status, skip audio.
+        if video_task.status != TaskStatus::Complete { return Ok(video_task); }
+        // Audio to hidden temp file, then mux into final dest. Mirror DASH: mux fail -> Error, keep video.
+        let mut at = task.clone(); at.url = au.clone(); at.filename = format!(".{}-audio", task.filename);
+        match download_hls_media(client.clone(), at, ctrl.clone()).await {
+            Err(e) => { let mut out = video_task; out.status = TaskStatus::Error; out.error = format!("audio download failed: {e}"); return Ok(out); }
+            Ok(at2) if at2.status != TaskStatus::Complete => { let mut out = video_task; out.status = TaskStatus::Error; out.error = format!("audio download failed: {}", at2.error); return Ok(out); }
+            Ok(_) => {}
         }
-        return video_task;
+        let audio_file = task.dest_dir.join(format!(".{}-audio", task.filename));
+        let video_file = task.dest_dir.join(&task.filename);
+        // ffmpeg cannot mux in-place (input == output) and picks muxer by extension:
+        // temp name must keep real extension or it cannot choose output format.
+        let mux_out = task.dest_dir.join(format!(".mux-{}", task.filename));
+        let result = engine::mux_tracks(&[video_file.clone(), audio_file.clone()], &mux_out).await
+            .and_then(|()| std::fs::rename(&mux_out, &video_file).map_err(|e| e.to_string()));
+        let _ = std::fs::remove_file(&mux_out);
+        let _ = std::fs::remove_file(&audio_file);
+        match result {
+            Ok(()) => return Ok(video_task),
+            Err(e) => { let mut out = video_task; out.status = TaskStatus::Error; out.error = format!("audio mux failed: {e}"); return Ok(out); }
+        }
     }
     download_hls_media(client, task, ctrl).await
 }
@@ -118,7 +130,7 @@ async fn download_hls_media(client: reqwest::Client, task: DownloadTask, ctrl: A
     let base = url::Url::parse(&task.url).map_err(|e| e.to_string())?;
     let text = fetch_text(&client, &task, &task.url).await?;
     if hls::has_key(&text) { let mut t = task.clone(); t.status = TaskStatus::Protected; t.error = "Encrypted HLS (EXT-X-KEY) is not supported".into(); return Ok(t); }
-    let media = hls::parse_media(&text, &base);
+    let media = hls::resolve_implicit_ranges(hls::parse_media(&text, &base));
     if media.segments.is_empty() { return Err("HLS media playlist has no segments".into()); }
     // Live HLS: if no ENDLIST, poll until ENDLIST appears or cancelled
     let mut media = media;
@@ -128,9 +140,9 @@ async fn download_hls_media(client: reqwest::Client, task: DownloadTask, ctrl: A
             if ctrl.cancelled.load(std::sync::atomic::Ordering::Relaxed) { break; }
             tokio::time::sleep(std::time::Duration::from_secs_f64(media.target_duration.max(1.0) / 2.0)).await;
             let t2 = fetch_text(&client, &task, &task.url).await?;
-            let m2 = hls::parse_media(&t2, &base);
+            let m2 = hls::resolve_implicit_ranges(hls::parse_media(&t2, &base));
             for s in &m2.segments { if !seen.contains(s) { seen.push(s.clone()); } }
-            if m2.end_list { break; }
+            if m2.end_list { media.byte_ranges = m2.byte_ranges; break; }
         }
         media.segments = seen;
     }

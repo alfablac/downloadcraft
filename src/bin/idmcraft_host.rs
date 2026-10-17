@@ -7,6 +7,12 @@ fn inbox_dir() -> PathBuf {
     base.join("inbox")
 }
 
+/// Basename only: strip `/` and `\` components, reject empty / "." / "..".
+fn sanitize_filename(name: &str) -> Option<String> {
+    let base = name.rsplit(['/', '\\']).next().filter(|s| !s.is_empty() && *s != "." && *s != "..")?;
+    Some(base.to_string())
+}
+
 fn handle(msg: &serde_json::Value) -> serde_json::Value {
     let ty = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match ty {
@@ -19,7 +25,12 @@ fn handle(msg: &serde_json::Value) -> serde_json::Value {
             let name = format!("msg-{}.txt", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
             let mut body = format!("url={url}\n");
             for k in ["filename", "referrer", "cookies", "referer", "cookie", "queue"] {
-                if let Some(v) = msg.get(k).and_then(|v| v.as_str()) { body.push_str(&format!("{k}={v}\n")); }
+                if let Some(v) = msg.get(k).and_then(|v| v.as_str()) {
+                    if k == "filename" {
+                        // Drop traversal: write basename only; drop if basename invalid/empty.
+                        if let Some(b) = sanitize_filename(v) { body.push_str(&format!("filename={b}\n")); }
+                    } else { body.push_str(&format!("{k}={v}\n")); }
+                }
             }
             // headers object flattened as header lines are ignored by parser except known keys; store referrer/cookies above
             match std::fs::write(dir.join(name), body) {

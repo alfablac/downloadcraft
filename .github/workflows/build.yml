@@ -85,8 +85,13 @@ jobs:
         with:
           name: idmcraft-${{ runner.os }}-${{ matrix.target }}
           path: dist/*
-      - name: Release
+      - name: Release (collect assets via gh)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # softprops/action-gh-release failed on this repo (Release step error all OS).
+          # Use gh upload to the release created for the tag; create it if missing.
+          gh release view "${{ github.ref_name }}" >/dev/null 2>&1 || gh release create "${{ github.ref_name }}" --title "${{ github.ref_name }}" --generate-notes
+          gh release upload "${{ github.ref_name }}" dist/* --clobber

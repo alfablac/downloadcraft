@@ -32,6 +32,9 @@ pub struct DownloadTask {
     #[serde(default)] pub error: String,
     #[serde(default)] pub category: String,
     #[serde(default)] pub speed_limit_kbps: u64,
+    #[serde(default)] pub attempts: u32,
+    #[serde(default)] pub next_retry_at: u64,
+    #[serde(default)] pub created_at: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

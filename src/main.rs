@@ -1,4 +1,5 @@
 mod app;
+mod theme;
 use idmcraft_lib::{engine, grabber, model, platform, queue, scheduler, stream};
 use model::*;
 use std::collections::HashMap;
@@ -48,7 +49,8 @@ fn parse_kv_file(path: &std::path::Path) -> Option<DownloadTask> {
         if let Some((k, v)) = line.split_once('=') {
             match k.trim() {
                 "url" => t.url = v.trim().to_string(),
-                "filename" => t.filename = v.trim().to_string(),
+                // Reject traversal: basename only; empty/invalid left empty for URL fallback at inbox site.
+                "filename" => { let raw = v.trim(); let base = raw.rsplit(['/', '\\']).next().unwrap_or(""); if !raw.is_empty() && !base.is_empty() && base != "." && base != ".." { t.filename = model::sanitize_filename(base); } }
                 "referrer" | "referer" => t.referrer = v.trim().to_string(),
                 "cookies" | "cookie" => t.cookies = v.trim().to_string(),
                 "queue" => t.queue_id = v.trim().to_string(),

@@ -12,6 +12,13 @@ pub struct Representation {
     pub init_url: Option<String>,
     pub segment_urls: Vec<String>,
     pub index_range: Option<String>,
+    /// SegmentBase only: `Initialization@range` ("start-end") — init bytes of the single file.
+    pub init_range: Option<String>,
+    /// SegmentBase only: `SegmentBase@indexRange` ("start-end") — sidx bytes of the single file.
+    pub media_range: Option<String>,
+    /// True when this rep came from SegmentBase. File already contains init+index+media,
+    /// so stream layer must emit one segment with no init — downloading once, not twice.
+    pub segment_base: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -179,9 +186,14 @@ pub fn parse_mpd(xml: &str, base_url: &Url) -> Result<Mpd, String> {
                     }
                     handled = true;
                 }
-                // SegmentBase
+                // SegmentBase: single file; Initialization@range=init bytes, SegmentBase@indexRange=sidx.
                 for sb in rep_node.children().chain(aset.children()).filter(|c| c.has_tag_name("SegmentBase")) {
-                    for c in sb.children() { if c.has_tag_name("Initialization") { if let Some(r) = c.attribute("range") { rep.index_range = Some(r.into()); rep.init_url = Some(base.to_string()); } } }
+                    rep.segment_base = true;
+                    if let Some(r) = sb.attribute("indexRange") { rep.index_range = Some(r.into()); rep.media_range = Some(r.into()); }
+                    for c in sb.children() { if c.has_tag_name("Initialization") { if let Some(r) = c.attribute("range") { rep.init_range = Some(r.into()); if rep.index_range.is_none() { rep.index_range = Some(r.into()); } } } }
+                    // Single URL = whole file. init_url stays None: engine would fetch whole file
+                    // again as init (bug). stream layer emits (None, file) — one download.
+                    rep.init_url = None;
                     if rep.segment_urls.is_empty() { rep.segment_urls.push(base.to_string()); }
                     handled = true;
                 }
@@ -230,7 +242,12 @@ mod tests {
         let xml = r#"<MPD type="static"><BaseURL>https://a.example.com/x/</BaseURL><Period><AdaptationSet mimeType="audio/mp4"><Representation id="a1" bandwidth="64000"><SegmentList><Initialization sourceURL="init.mp4"/><SegmentURL media="1.m4s"/><SegmentURL media="2.m4s"/></SegmentList></Representation></AdaptationSet><AdaptationSet mimeType="video/mp4"><Representation id="v1" bandwidth="100"><BaseURL>../y/</BaseURL><SegmentBase><Initialization range="0-100"/></SegmentBase></Representation></AdaptationSet></Period></MPD>"#;
         let m = parse_mpd(xml, &base()).unwrap();
         assert_eq!(m.sets[0].representations[0].segment_urls, vec!["https://a.example.com/x/1.m4s", "https://a.example.com/x/2.m4s"]);
-        assert_eq!(m.sets[1].representations[0].segment_urls, vec!["https://a.example.com/y/"]);
+        let sb = &m.sets[1].representations[0];
+        assert_eq!(sb.segment_urls, vec!["https://a.example.com/y/"]);
+        // SegmentBase: parsed ranges kept, no init URL — file downloaded once (see stream::append_reps).
+        assert!(sb.segment_base);
+        assert_eq!(sb.init_range.as_deref(), Some("0-100"));
+        assert_eq!(sb.init_url, None);
     }
     #[test] fn nested_baseurl() {
         let xml = r#"<MPD type="static" mediaPresentationDuration="PT10S"><BaseURL>https://cdn1.example.com/</BaseURL><Period><AdaptationSet mimeType="video/mp4"><BaseURL>vod/</BaseURL><SegmentTemplate media="$RepresentationID$/$Number$.m4s" duration="10" timescale="1"/><Representation id="hi" bandwidth="100"/></AdaptationSet></Period></MPD>"#;

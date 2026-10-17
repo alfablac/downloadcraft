@@ -75,6 +75,29 @@ pub fn parse_media(text: &str, base: &Url) -> MediaPlaylist {
     p
 }
 
+/// Fill implicit BYTERANGE offsets: omitted offset = end of previous range on same URL
+/// (HLS spec 4.3.2.2). Chains EXT-X-MAP range too. Without this, engine defaulted
+/// missing offset to 0 and re-fetched file head per segment.
+pub fn resolve_implicit_ranges(mut p: MediaPlaylist) -> MediaPlaylist {
+    use std::collections::HashMap;
+    let mut last_end: HashMap<String, u64> = HashMap::new();
+    if let (Some(uri), Some((len, off))) = (&p.init_uri, &mut p.map_byte_range) {
+        *off = off.or_else(|| last_end.get(uri.as_str()).copied());
+        if let Some(start) = *off { last_end.insert(uri.clone(), start + *len); }
+    }
+    for i in 0..p.segments.len() {
+        let url = p.segments[i].clone();
+        match &mut p.byte_ranges[i] {
+            Some((len, off)) => {
+                *off = off.or_else(|| last_end.get(url.as_str()).copied());
+                if let Some(start) = *off { last_end.insert(url, start + *len); }
+            }
+            None => { last_end.remove(url.as_str()); }
+        }
+    }
+    p
+}
+
 pub fn has_key(text: &str) -> bool { text.lines().any(|l| { let l = l.trim(); l.starts_with("#EXT-X-KEY:") && !l.contains("METHOD=NONE") }) }
 
 #[cfg(test)]
@@ -90,5 +113,13 @@ mod tests {
         let t = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:6,\nseg1.m4s\n#EXT-X-BYTERANGE:100@0\n#EXTINF:6,\nseg2.m4s\n#EXT-X-ENDLIST\n";
         let p = parse_media(t, &Url::parse("https://x.example.com/hls/720.m3u8").unwrap());
         assert_eq!(p.segments.len(), 2); assert!(p.init_uri.is_some()); assert!(p.end_list); assert_eq!(p.byte_ranges[1], Some((100, Some(0))));
+    }
+    #[test] fn implicit_byterange_offsets_chain_same_url() {
+        let t = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"init.mp4\",BYTERANGE=\"720@0\"\n#EXT-X-BYTERANGE:100@200\n#EXTINF:4,\nfile.mp4\n#EXT-X-BYTERANGE:50\n#EXTINF:4,\nfile.mp4\n#EXT-X-BYTERANGE:25\n#EXTINF:4,\nother.mp4\n#EXT-X-ENDLIST\n";
+        let p = resolve_implicit_ranges(parse_media(t, &base()));
+        assert_eq!(p.map_byte_range, Some((720, Some(0))));
+        assert_eq!(p.byte_ranges[0], Some((100, Some(200))));
+        assert_eq!(p.byte_ranges[1], Some((50, Some(300))));
+        assert_eq!(p.byte_ranges[2], Some((25, None)));
     }
 }

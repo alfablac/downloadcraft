@@ -26,6 +26,10 @@ Chrome MV3 (`IDMGCExt.crx`, v6.43.1): `background.service_worker=background.js`,
 
 Clone extension design (own code): host name `com.idmcraft.host`, inbox-file drop (`%config%/idmcraft/inbox/msg-*.txt` key=value: url/filename/referrer/cookies), message `{type:"download",url,referrer,cookies,filename}`, `{type:"ping"}→{type:"pong"}`. One codebase per engine family (Chromium MV3, Firefox MV2).
 
+**RE round 2 (2026-10-16):** IDM binary/runtime evidence deepened: extension JS opcode protocol (persistent native port, ping ticker, `x-idm-*` header injection mirroring IDMan, `idmreg:`/`idmdwnl:` schemes), LNG UI string tables (menus/columns/dialogs), PE imports (WinINet/WinSock in IDMan.exe; VMPrs = bundled dash parser), IDMan internal schemes (`mpdtoidm://`, `hlstoidm://`, `idmhlstomp4://`), UIA main-window dump (menus Tasks/File/Downloads/View/Help/Registration; category tree All/Compressed/Documents/Music/Programs/Video/Unfinished/Finished/Grabber projects/Queues; columns File Name/Q/Size/Status/Time left/Transfer rate/Last Try Date/Description/Date Added/Save To/Referer/Parent web page), DwnlData logs (8 parts typical per multi-part download). Clone GUI rebuilt to this surface with modern dark design system (design-system/idmcraft/MASTER.md). IDM live-DASH panel behavior remains unverified (3 documented attempts); clone keeps standards-based DASH.
+
+**Release infra note:** tag run `38992400781` failed at Release step on all OS (softprops/action-gh-release). Workflow now uploads via `gh release upload --clobber` (creates release if missing).
+
 ## DwnlData segment model (observed)
 
 Per-download folder `<sanitized-host+path>_<numeric id>` containing sequential part files with no extension (`<name>`, `<name>1`…), plus `log_<id>.log` with per-connection trace (DNS, TLS handshake, HTTP status, headers). Observed parts: up to 9+ parts, sizes independently grown. Clone: `.idmcraft-<id>/part{i}` + `state.json` (url/etag/total/segments) — same model, own format.

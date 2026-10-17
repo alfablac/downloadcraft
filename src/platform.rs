@@ -5,7 +5,7 @@ use std::process::Command;
 pub const HOST_NAME: &str = "com.idmcraft.host";
 pub const PROTOCOL: &str = "idmcraft";
 pub const FIREFOX_EXT_ID: &str = "idmcraft@idmcraft.local";
-pub const CHROME_EXT_ID_PLACEHOLDER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+pub const CHROME_EXT_ID: &str = "ajkokpbgjajmkenllekaokjbglbcingk";
 
 pub fn config_dir() -> PathBuf { directories::ProjectDirs::from("", "", "idmcraft").map(|d| d.config_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".idmcraft")) }
 pub fn data_dir() -> PathBuf { directories::ProjectDirs::from("", "", "idmcraft").map(|d| d.data_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".idmcraft")) }
@@ -58,7 +58,7 @@ pub fn host_manifest_json(host_exe: &Path, firefox: bool) -> String {
     if firefox {
         format!("{{\n  \"name\": \"{HOST_NAME}\",\n  \"description\": \"idmcraft native host\",\n  \"type\": \"stdio\",\n  \"allowed_extensions\": [\"{FIREFOX_EXT_ID}\"],\n  \"path\": \"{}\"\n}}\n", host_exe.display().to_string().replace('\\', "\\\\"))
     } else {
-        format!("{{\n  \"name\": \"{HOST_NAME}\",\n  \"description\": \"idmcraft native host\",\n  \"type\": \"stdio\",\n  \"allowed_origins\": [\"chrome-extension://{CHROME_EXT_ID_PLACEHOLDER}/\"],\n  \"path\": \"{}\"\n}}\n", host_exe.display().to_string().replace('\\', "\\\\"))
+        format!("{{\n  \"name\": \"{HOST_NAME}\",\n  \"description\": \"idmcraft native host\",\n  \"type\": \"stdio\",\n  \"allowed_origins\": [\"chrome-extension://{CHROME_EXT_ID}/\"],\n  \"path\": \"{}\"\n}}\n", host_exe.display().to_string().replace('\\', "\\\\"))
     }
 }
 
@@ -107,11 +107,18 @@ fn register_windows_native_host(chrome_manifest: &Path, moz_manifest: &Path) {
         if let Ok((k, _)) = hkcu.create_subkey(format!("{root}\\{HOST_NAME}")) { let _ = k.set_value("", &chrome_manifest.to_string_lossy().as_ref()); }
     }
     if let Ok((k, _)) = hkcu.create_subkey(format!("Software\\Mozilla\\NativeMessagingHosts\\{HOST_NAME}")) { let _ = k.set_value("", &moz_manifest.to_string_lossy().as_ref()); }
-    // Protocol + autostart handled elsewhere.
-    if let Ok((k, _)) = hkcu.create_subkey(format!("Software\\Classes\\{PROTOCOL}\\shell\\open\\command")) {
-        if let Ok(exe) = std::env::current_exe() { let _ = k.set_value("", &format!("\"{}\" \"%1\"", exe.display()).as_str()); }
-    }
-    if let Ok((k, _)) = hkcu.create_subkey(format!("Software\\Classes\\{PROTOCOL}")) { let _ = k.set_value("", &"URL:idmcraft Protocol"); let _ = k.set_value("URL Protocol", &""); }
+}
+#[cfg(target_os = "windows")]
+fn register_windows_protocol() -> std::io::Result<()> {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let exe = std::env::current_exe()?;
+    let (proto, _) = hkcu.create_subkey(format!("Software\\Classes\\{PROTOCOL}"))?;
+    proto.set_value("", &"URL:idmcraft Protocol")?;
+    proto.set_value("URL Protocol", &"")?;
+    let (cmd, _) = proto.create_subkey("shell\\open\\command")?;
+    cmd.set_value("", &format!("\"{}\" \"%1\"", exe.display()).as_str())?;
+    Ok(())
 }
 #[cfg(target_os = "windows")]
 fn unregister_windows_native_host() {
@@ -186,7 +193,7 @@ pub fn register_protocol() -> std::io::Result<()> {
         let _ = Command::new("xdg-mime").args(["default", "idmcraft.desktop", &format!("x-scheme-handler/{PROTOCOL}")]).status();
     }
     #[cfg(target_os = "windows")]
-    { let exe = std::env::current_exe()?; let _ = exe; register_windows_native_host(&state_path(), &state_path()); }
+    { register_windows_protocol()?; }
     // macOS: URL scheme declared in app bundle Info.plist (see packaging/idmcraft.app Info.plist template in docs).
     Ok(())
 }
@@ -225,5 +232,16 @@ mod tests {
     }
     #[test] fn autostart_path_mock() { let p = autostart_path_for(Path::new("/h")); assert!(!p.to_string_lossy().is_empty()); }
     #[test] fn power_cmd_nonempty() { let (p, _) = power_command(PowerAction::Shutdown); assert!(!p.is_empty()); }
-    #[test] fn manifest_json_content() { let j = host_manifest_json(Path::new("/tmp/host"), false); assert!(j.contains(HOST_NAME)); let jf = host_manifest_json(Path::new("/tmp/host"), true); assert!(jf.contains(FIREFOX_EXT_ID)); }
+    #[test] fn manifest_json_content() { let j = host_manifest_json(Path::new("/tmp/host"), false); assert!(j.contains(HOST_NAME)); assert!(j.contains(&format!("chrome-extension://{CHROME_EXT_ID}/"))); let jf = host_manifest_json(Path::new("/tmp/host"), true); assert!(jf.contains(FIREFOX_EXT_ID)); }
+    #[test] fn chrome_ext_id_matches_manifest_key() {
+        fn b64(s: &str) -> Vec<u8> { const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let vals: Vec<u32> = s.bytes().filter(|&b| b != b'=').map(|c| u32::try_from(T.iter().position(|&x| x == c).unwrap()).unwrap()).collect(); let full = vals.len() * 6 / 8; vals.chunks(4).flat_map(|c| { let n = c.iter().fold(0u32, |a, &v| a * 64 + v); [ (n >> 16) as u8, (n >> 8) as u8, n as u8 ] }).take(full).collect() }
+        let m = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/extensions/chromium/manifest.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+        let key = v["key"].as_str().expect("pinned key");
+        let der = b64(key);
+        use sha2::Digest;
+        let d = sha2::Sha256::digest(&der);
+        let id: String = d[..16].iter().flat_map(|b| [b >> 4, b & 15]).map(|n| (b'a' + n) as char).collect();
+        assert_eq!(id, CHROME_EXT_ID, "update CHROME_EXT_ID or manifest key");
+    }
 }

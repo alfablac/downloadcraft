@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 pub fn build_client(proxy: &str) -> reqwest::Client {
-    let mut b = reqwest::Client::builder().user_agent("idmcraft/0.1");
+    let mut b = reqwest::Client::builder().user_agent("idmcraft/0.1").connect_timeout(std::time::Duration::from_secs(15)).read_timeout(std::time::Duration::from_secs(60));
     if !proxy.trim().is_empty() { if let Ok(p) = reqwest::Proxy::all(proxy.trim()) { b = b.proxy(p); } }
     b.build().unwrap_or_default()
 }
@@ -20,15 +20,26 @@ fn headers_for(task: &DownloadTask) -> reqwest::header::HeaderMap {
     h
 }
 
-pub struct Controls { pub paused: AtomicBool, pub cancelled: AtomicBool, pub downloaded: AtomicU64, pub limit_kbps: AtomicU64 }
-impl Controls { pub fn new(limit: u64) -> Self { Self { paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), downloaded: AtomicU64::new(0), limit_kbps: AtomicU64::new(limit) } } }
+pub struct Controls { pub paused: AtomicBool, pub cancelled: AtomicBool, pub downloaded: AtomicU64, pub limit_kbps: AtomicU64, pub rate: std::sync::Mutex<(std::time::Instant, u64)> }
+impl Controls { pub fn new(limit: u64) -> Self { Self { paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), downloaded: AtomicU64::new(0), limit_kbps: AtomicU64::new(limit), rate: std::sync::Mutex::new((std::time::Instant::now(), 0)) } } }
 
 async fn throttle(ctrl: &Controls, bytes: u64) {
     let limit = ctrl.limit_kbps.load(Ordering::Relaxed);
     if limit == 0 { return; }
-    // ponytail: simple per-chunk sleep throttle; good enough for KB/s caps.
-    let secs = bytes as f64 / (limit as f64 * 1024.0);
-    if secs > 0.0 { tokio::time::sleep(std::time::Duration::from_secs_f64(secs.min(1.0))).await; }
+    // Global 1s window gate shared across workers.
+    loop {
+        let wait = {
+            let mut g = ctrl.rate.lock().unwrap();
+            if g.0.elapsed() >= std::time::Duration::from_secs(1) { *g = (std::time::Instant::now(), 0); }
+            let budget = limit.saturating_mul(1024);
+            if bytes > budget {
+                if g.1 == 0 { g.1 = bytes; return; }
+                std::time::Duration::from_secs(1).saturating_sub(g.0.elapsed())
+            } else if g.1 + bytes <= budget { g.1 += bytes; return; }
+            else { std::time::Duration::from_secs(1).saturating_sub(g.0.elapsed()) }
+        };
+        tokio::time::sleep(wait).await;
+    }
 }
 
 async fn wait_not_paused(ctrl: &Controls) -> Result<(), String> {
@@ -138,11 +149,12 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
     }
     ctrl.downloaded.store(resumed, Ordering::Relaxed); task.downloaded = resumed;
     // Download missing parts in parallel
+    let etag: Arc<str> = probe.etag.clone().unwrap_or_default().into();
     let segs = Arc::new(tokio::sync::Mutex::new(segs));
     let mut handles = Vec::new();
     let count = segs.lock().await.len();
     for i in 0..count {
-        let (client, task_c, ctrl, segs, part_dir) = (client.clone(), task.clone(), ctrl.clone(), segs.clone(), part_dir.clone());
+        let (client, task_c, ctrl, segs, part_dir, etag) = (client.clone(), task.clone(), ctrl.clone(), segs.clone(), part_dir.clone(), etag.clone());
         handles.push(tokio::spawn(async move {
             let mut attempt = 0;
             loop {
@@ -150,12 +162,12 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
                 if done > end - start { return Ok::<(), String>(()); }
                 let range_start = start + done;
                 if range_start > end { return Ok(()); }
-                match download_range(&client, &task_c, range_start, end, &part_dir.join(format!("part{i}")), &ctrl).await {
+                match download_range(&client, &task_c, range_start, end, &part_dir.join(format!("part{i}")), &ctrl, done).await {
                     Ok(written) => {
                         { let mut s = segs.lock().await; s[i].done += written; }
                         ctrl.downloaded.fetch_add(written, Ordering::Relaxed);
                         let snapshot = { let s = segs.lock().await; s.iter().map(|x| SegmentState { start: x.start, end: x.end, done: x.done }).collect::<Vec<_>>() };
-                        save_state(&part_dir, &task_c.url, &None, total, &snapshot);
+                        let et_opt = if etag.is_empty() { None } else { Some(etag.to_string()) }; save_state(&part_dir, &task_c.url, &et_opt, total, &snapshot);
                         return Ok(());
                     }
                     Err(e) => {
@@ -189,12 +201,13 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
     Ok(task)
 }
 
-async fn download_range(client: &reqwest::Client, task: &DownloadTask, start: u64, end: u64, dest: &Path, ctrl: &Controls) -> Result<u64, String> {
+async fn download_range(client: &reqwest::Client, task: &DownloadTask, start: u64, end: u64, dest: &Path, ctrl: &Controls, prior: u64) -> Result<u64, String> {
     let resp = client.get(&task.url).headers(headers_for(task)).header("Range", format!("bytes={start}-{end}")).send().await.map_err(|e| e.to_string())?;
     if resp.status().as_u16() != 206 { return Err(format!("expected 206 got {}", resp.status())); }
-    let append = dest.exists() && tokio::fs::metadata(dest).await.map(|m| m.len()).unwrap_or(0) > 0;
-    let mut file = if append { tokio::fs::OpenOptions::new().append(true).open(dest).await.map_err(|e| e.to_string())? } else { tokio::fs::File::create(dest).await.map_err(|e| e.to_string())? };
-    if append { file.seek(std::io::SeekFrom::End(0)).await.map_err(|e| e.to_string())?; }
+    // Truncate to caller-known done: drops bytes from interrupted attempt.
+    let mut file = tokio::fs::OpenOptions::new().create(true).write(true).truncate(false).open(dest).await.map_err(|e| e.to_string())?;
+    file.set_len(prior).await.map_err(|e| e.to_string())?;
+    file.seek(std::io::SeekFrom::Start(prior)).await.map_err(|e| e.to_string())?;
     let mut stream = resp.bytes_stream(); let mut n: u64 = 0;
     while let Some(chunk) = stream.next().await {
         wait_not_paused(ctrl).await?;
@@ -205,11 +218,7 @@ async fn download_range(client: &reqwest::Client, task: &DownloadTask, start: u6
     }
     file.flush().await.map_err(|e| e.to_string())?;
     let expected = end - start + 1;
-    // Caller tracks done by existing offset; written here is bytes in this session beyond prior file len handled in download_http via done logic:
-    // Our part file was opened append, offset already counted in done. So n must equal remaining.
-    let prior_len = if append { tokio::fs::metadata(dest).await.map(|m| m.len()).unwrap_or(0).saturating_sub(n) } else { 0 };
-    let _ = prior_len;
-    if n > expected { return Err("overlong range response".into()); }
+    if n != expected { return Err(format!("short range: got {n} expected {expected}")); }
     Ok(n)
 }
 
@@ -283,10 +292,17 @@ pub async fn download_media(client: reqwest::Client, task: DownloadTask, ctrl: A
 
 async fn fetch_into(client: &reqwest::Client, task: &DownloadTask, url: &str, file: &mut tokio::fs::File, ctrl: &Controls) -> Result<(), String> {
     let mut attempt = 0;
+    let pos = file.seek(std::io::SeekFrom::Current(0)).await.map_err(|e| e.to_string())?;
     loop {
         match fetch_once(client, task, url, file, ctrl).await {
             Ok(()) => return Ok(()),
-            Err(e) => { attempt += 1; if attempt > 4 { return Err(e); } tokio::time::sleep(std::time::Duration::from_millis(400 * attempt)).await; }
+            Err(e) => {
+                attempt += 1; if attempt > 4 { return Err(e); }
+                // Roll back partial bytes so retry does not duplicate.
+                file.set_len(pos).await.map_err(|x| x.to_string())?;
+                file.seek(std::io::SeekFrom::Start(pos)).await.map_err(|x| x.to_string())?;
+                tokio::time::sleep(std::time::Duration::from_millis(400 * attempt)).await;
+            }
         }
     }
 }

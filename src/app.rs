@@ -4,7 +4,9 @@ use crate::model::*;
 use crate::platform;
 use crate::queue::plan_starts;
 use crate::scheduler::{next_run_in, should_start, should_stop};
+use crate::theme;
 use crate::{Runtime, save_state};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,6 +35,16 @@ pub struct IdmApp {
     show_about: bool,
     search: String,
     minutes_today: (i64, u32),
+    category: String,
+    sort_col: u8,
+    sort_asc: bool,
+    show_add: bool,
+    show_progress_for: Option<String>,
+    selected: Option<String>,
+    completed_notice: Option<String>,
+    last_notified: Option<String>,
+    speed_hist: Vec<f32>,
+    last_dl_total: u64,
 }
 
 struct TrayState { _tray: Option<tray_icon::TrayIcon>, }
@@ -41,7 +53,7 @@ impl IdmApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, rt: Arc<Mutex<Runtime>>, hidden: bool) -> Self {
         let tokio_rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio rt"));
         let tray = Self::make_tray();
-        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_scope: 0, grab_exts: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), last_tick: std::time::Instant::now(), tray: Some(TrayState { _tray: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts() }
+        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_scope: 0, grab_exts: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), last_tick: std::time::Instant::now(), tray: Some(TrayState { _tray: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0 }
     }
 
     fn make_tray() -> Option<tray_icon::TrayIcon> {
@@ -80,24 +92,26 @@ impl IdmApp {
                     g.log(format!("Finished {fname}: {:?} {err}", status));
                     if status == TaskStatus::Complete {
                         let queue_id = g.state.tasks.iter().find(|t| t.id == tid).map(|t| t.queue_id.clone()).unwrap_or_default();
-                        run_completion(&g, &queue_id, &tid);
+                        // completion action only when queue drained (was: first task could exit/shutdown mid-queue)
+                        let drained = !g.state.tasks.iter().any(|t| t.queue_id == queue_id && matches!(t.status, TaskStatus::Queued | TaskStatus::Downloading));
+                        if drained { run_completion(&g, &queue_id, &tid); }
                     }
                 }
                 Err(e) => {
-                    // retry per queue policy
-                    let (retry, interval, attempts_left) = {
+                    // retry per queue policy: attempts persisted on task, next_retry_at gates poll requeue
+                    let (retry, interval) = {
                         let t = g.state.tasks.iter().find(|t| t.id == tid);
                         let q = t.and_then(|t| g.state.queues.iter().find(|q| q.id == t.queue_id));
-                        let retry = q.map(|q| q.retry_count).unwrap_or(0);
-                        let interval = q.map(|q| q.retry_interval_secs).unwrap_or(10);
-                        // ponytail: retry count tracked via error prefix attempts not persisted separately; use segments field? Use simple: retry if error not containing 'retry-exhausted'
-                        (retry, interval, !e.contains("retry-exhausted"))
+                        (q.map(|q| q.retry_count).unwrap_or(0), q.map(|q| q.retry_interval_secs).unwrap_or(10))
                     };
-                    if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == tid) { t.status = TaskStatus::Error; t.error = e.clone(); }
-                    g.log(format!("Error {tid}: {e} (queue retry={retry} interval={interval}s left={attempts_left})"));
-                    if retry > 0 && attempts_left {
-                        if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == tid) { t.status = TaskStatus::Queued; }
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                    let mut left = 0u32;
+                    if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == tid) {
+                        t.attempts += 1; t.error = e.clone();
+                        if t.attempts <= retry { t.status = TaskStatus::Queued; t.next_retry_at = now + interval; left = retry - t.attempts; }
+                        else { t.status = TaskStatus::Error; t.next_retry_at = 0; }
                     }
+                    g.log(format!("Error {tid}: {e} (queue retry left={left} interval={interval}s)"));
                 }
             }
             g.save();
@@ -111,6 +125,10 @@ impl IdmApp {
             let mut g = self.rt.lock().unwrap();
             let ctrls: Vec<(String, u64)> = g.controls.iter().map(|(k, c)| (k.clone(), c.downloaded.load(std::sync::atomic::Ordering::Relaxed))).collect();
             for (id, n) in ctrls { if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) { t.downloaded = n; } }
+            if self.completed_notice.is_none() {
+                let done_name = g.state.tasks.iter().find(|t| t.status == TaskStatus::Complete).map(|t| t.filename.clone());
+                if let Some(n) = done_name { if self.last_notified.as_deref() != Some(n.as_str()) { self.completed_notice = Some(n.clone()); self.last_notified = Some(n); } }
+            }
             // clipboard monitor
             if g.state.settings.clipboard_monitor {
                 if let Ok(mut cb) = arboard::Clipboard::new() {
@@ -126,21 +144,19 @@ impl IdmApp {
                 }
             }
         }
-        // queue auto-start
+        // queue auto-start (respect retry gate next_retry_at)
         {
-            let g = self.rt.lock().unwrap();
-            let auto = g.state.queues.iter().any(|q| q.auto_start);
-            if auto {
-                let active: Vec<(String, String)> = g.controls.keys().map(|id| (id.clone(), g.state.tasks.iter().find(|t| &t.id == id).map(|t| t.queue_id.clone()).unwrap_or_default())).collect();
-                let plan = plan_starts(&g.state.tasks, &g.state.queues, &active, g.state.settings.global_max_concurrent);
-                drop(g);
-                for id in plan {
-                    // only auto-start queues flagged
-                    let qid = self.rt.lock().unwrap().state.tasks.iter().find(|t| t.id == id).map(|t| t.queue_id.clone()).unwrap_or_default();
-                    let auto_q = self.rt.lock().unwrap().state.queues.iter().find(|q| q.id == qid).map(|q| q.auto_start).unwrap_or(false);
-                    if auto_q { self.start_task(&id); }
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let ready: Vec<String> = {
+                let g = self.rt.lock().unwrap();
+                if !g.state.queues.iter().any(|q| q.auto_start) { Vec::new() } else {
+                    let active: Vec<(String, String)> = g.controls.keys().map(|id| (id.clone(), g.state.tasks.iter().find(|t| &t.id == id).map(|t| t.queue_id.clone()).unwrap_or_default())).collect();
+                    plan_starts(&g.state.tasks, &g.state.queues, &active, g.state.settings.global_max_concurrent).into_iter()
+                        .filter(|id| { g.state.tasks.iter().find(|t| &t.id == id).map(|t| t.next_retry_at <= now && g.state.queues.iter().find(|q| q.id == t.queue_id).map(|q| q.auto_start).unwrap_or(false)).unwrap_or(false) })
+                        .collect()
                 }
-            }
+            };
+            for id in ready { self.start_task(&id); }
         }
         // scheduler tick (every poll, cheap)
         {
@@ -160,13 +176,23 @@ impl IdmApp {
                 if !to_start.is_empty() || !to_stop.is_empty() { g.save(); }
             }
             for qid in to_start {
-                let ids: Vec<String> = self.rt.lock().unwrap().state.tasks.iter().filter(|t| t.queue_id == qid && t.status == TaskStatus::Queued).map(|t| t.id.clone()).collect();
+                // route through planner so global/per-queue caps hold (was: direct start, caps bypassed)
+                let ids: Vec<String> = {
+                    let g = self.rt.lock().unwrap();
+                    let active: Vec<(String, String)> = g.controls.keys().map(|id| (id.clone(), g.state.tasks.iter().find(|t| &t.id == id).map(|t| t.queue_id.clone()).unwrap_or_default())).collect();
+                    plan_starts(&g.state.tasks, &g.state.queues, &active, g.state.settings.global_max_concurrent).into_iter().filter(|id| g.state.tasks.iter().find(|t| &t.id == id).map(|t| t.queue_id == qid).unwrap_or(false)).collect()
+                };
                 let limit = self.rt.lock().unwrap().state.schedules.iter().find(|s| s.queue_id == qid).map(|s| s.files_at_once).unwrap_or(ids.len());
                 for id in ids.into_iter().take(if limit == 0 { usize::MAX } else { limit }) { self.start_task(&id); }
             }
             for qid in to_stop {
                 let g = self.rt.lock().unwrap();
                 for (id, c) in &g.controls { if g.state.tasks.iter().find(|t| &t.id == id).map(|t| t.queue_id.clone()).as_deref() == Some(&qid) { c.paused.store(true, std::sync::atomic::Ordering::Relaxed); } }
+                // mark paused so slot frees + status visible (was: stayed Downloading)
+                let ids: Vec<String> = g.state.tasks.iter().filter(|t| t.queue_id == qid && t.status == TaskStatus::Downloading).map(|t| t.id.clone()).collect();
+                drop(g);
+                let mut g = self.rt.lock().unwrap();
+                for id in ids { if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) { t.status = TaskStatus::Paused; } }
             }
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
@@ -195,40 +221,115 @@ fn run_completion(g: &Runtime, queue_id: &str, task_id: &str) {
 
 impl eframe::App for IdmApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.hidden {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            // still poll inbox/scheduler while hidden
-            if self.last_tick.elapsed() > std::time::Duration::from_secs(2) { self.last_tick = std::time::Instant::now(); self.poll(ctx); }
-            // tray menu events handled by tray-icon polling via context repaint; check show via hidden flag externally not wired to menu clicks in egui loop
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
-            return;
-        }
-        if self.last_tick.elapsed() > std::time::Duration::from_millis(500) { self.last_tick = std::time::Instant::now(); self.poll(ctx); }
-        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
-                ui.menu_button("Tasks", |ui| {
-                    if ui.button("Add URL...").clicked() { self.tab = Tab::Downloads; }
-                    if ui.button("Add batch (one URL per line)...").clicked() { self.tab = Tab::Downloads; }
-                    if ui.button("Resume all").clicked() { let ids: Vec<String> = self.rt.lock().unwrap().state.tasks.iter().filter(|t| t.status == TaskStatus::Paused || t.status == TaskStatus::Error).map(|t| t.id.clone()).collect(); for id in ids { if let Some(t) = self.rt.lock().unwrap().state.tasks.iter_mut().find(|t| t.id == id) { t.status = TaskStatus::Queued; } } self.rt.lock().unwrap().save(); }
-                    if ui.button("Stop all").clicked() { let g = self.rt.lock().unwrap(); for c in g.controls.values() { c.paused.store(true, std::sync::atomic::Ordering::Relaxed); } }
-                    if ui.button("Quit").clicked() { std::process::exit(0); }
+        theme::apply(ctx);
+        self.poll(ctx);
+        if self.hidden { return; }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title("idmcraft — Download Manager".into()));
+
+        // ── Top bar: brand + menus (IDM: Tasks/File/Downloads/View/Help) ──
+        egui::TopBottomPanel::top("topbar").frame(egui::Frame::none().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(12.0, 6.0))).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("idmcraft").color(theme::TEXT).strong().size(17.0));
+                theme::chip(ui, "v0.1.0", theme::TEAL_500);
+                ui.add_space(14.0);
+                egui::menu::bar(ui, |ui| {
+                    ui.menu_button("Tasks", |ui| {
+                        if ui.button("Add new download…").clicked() { self.show_add = true; ui.close_menu(); }
+                        if ui.button("Add batch from clipboard").clicked() { add_batch_clipboard(self); ui.close_menu(); }
+                        if ui.button("Run Site Grabber").clicked() { self.tab = Tab::Grabber; ui.close_menu(); }
+                        ui.separator();
+                        if ui.button("Export queue (JSON)").clicked() { export_json(self); ui.close_menu(); }
+                        if ui.button("Quit").clicked() { std::process::exit(0); }
+                    });
+                    ui.menu_button("File", |ui| {
+                        let sel = self.selected.clone();
+                        if ui.button("Download now").clicked() { if let Some(id) = &sel { self.start_task(id); } ui.close_menu(); }
+                        if ui.button("Stop download").clicked() { if let Some(id) = &sel { stop_task(self, id); } ui.close_menu(); }
+                        if ui.button("Remove").clicked() { if let Some(id) = &sel { remove_task(self, id); } ui.close_menu(); }
+                        if ui.button("Redownload").clicked() { if let Some(id) = &sel { self.start_task(id); } ui.close_menu(); }
+                    });
+                    ui.menu_button("Downloads", |ui| {
+                        if ui.button("Resume all").clicked() { resume_all(self); ui.close_menu(); }
+                        if ui.button("Stop all").clicked() { stop_all(self); ui.close_menu(); }
+                        if ui.button("Delete all completed").clicked() { delete_completed(self); ui.close_menu(); }
+                        ui.separator();
+                        if ui.button("Scheduler…").clicked() { self.tab = Tab::Scheduler; ui.close_menu(); }
+                        if ui.button("Start queue").clicked() { self.tab = Tab::Queues; ui.close_menu(); }
+                        if ui.button("Speed limiter: toggle").clicked() { toggle_limiter(self); ui.close_menu(); }
+                        if ui.button("Options…").clicked() { self.tab = Tab::Options; ui.close_menu(); }
+                    });
+                    ui.menu_button("View", |ui| {
+                        if ui.button("Downloads").clicked() { self.tab = Tab::Downloads; ui.close_menu(); }
+                        if ui.button("Queues").clicked() { self.tab = Tab::Queues; ui.close_menu(); }
+                        if ui.button("Scheduler").clicked() { self.tab = Tab::Scheduler; ui.close_menu(); }
+                        if ui.button("Site Grabber").clicked() { self.tab = Tab::Grabber; ui.close_menu(); }
+                        if ui.button("Options").clicked() { self.tab = Tab::Options; ui.close_menu(); }
+                    });
+                    ui.menu_button("Help", |ui| {
+                        if ui.button("About idmcraft").clicked() { self.show_about = true; ui.close_menu(); }
+                    });
                 });
-                ui.menu_button("Downloads", |ui| { if ui.button("Options").clicked() { self.tab = Tab::Options; } });
-                ui.menu_button("View", |ui| {
-                    if ui.button("Queues & Scheduler").clicked() { self.tab = Tab::Queues; }
-                    if ui.button("Site Grabber").clicked() { self.tab = Tab::Grabber; }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let active = { let g = self.rt.lock().unwrap(); g.state.tasks.iter().filter(|t| t.status == TaskStatus::Downloading).count() };
+                    let speed = self.speed_hist.last().copied().unwrap_or(0.0);
+                    theme::chip(ui, &format!("{active} active · {}", fmt_rate(speed)), theme::TEXT_MUTED);
                 });
-                ui.menu_button("Help", |ui| { if ui.button("About").clicked() { self.show_about = true; } });
-                ui.separator();
-                for (label, tab) in [("Downloads", Tab::Downloads), ("Queues", Tab::Queues), ("Scheduler", Tab::Scheduler), ("Grabber", Tab::Grabber), ("Options", Tab::Options)] {
-                    if ui.selectable_label(self.tab == tab, label).clicked() { self.tab = tab; }
-                }
             });
         });
-        if self.show_about {
-            egui::Window::new("About idmcraft").show(ctx, |ui| { ui.label("idmcraft 0.1.0 — clean-room download manager. Not affiliated with Tonec/IDM."); if ui.button("Close").clicked() { self.show_about = false; } });
-        }
-        egui::CentralPanel::default().show(ctx, |ui| {
+
+        // ── Left rail: navigation + categories (IDM category tree, modern rail) ──
+        egui::SidePanel::left("rail").resizable(false).exact_width(208.0)
+            .frame(egui::Frame::none().fill(theme::SURFACE).inner_margin(egui::Margin::same(10.0))).show(ctx, |ui| {
+                ui.label(egui::RichText::new("WORKSPACE").color(theme::TEXT_FAINT).small().strong());
+                ui.add_space(4.0);
+                for (tab, label) in [(Tab::Downloads, "Downloads"), (Tab::Queues, "Queues"), (Tab::Scheduler, "Scheduler"), (Tab::Grabber, "Site Grabber"), (Tab::Options, "Options")] {
+                    let on = self.tab == tab;
+                    let b = egui::Button::new(egui::RichText::new(label).color(if on { egui::Color32::WHITE } else { theme::TEXT_MUTED })).fill(if on { theme::PRIMARY } else { egui::Color32::TRANSPARENT }).min_size(egui::vec2(188.0, 30.0));
+                    if ui.add(b).clicked() { self.tab = tab; }
+                }
+                ui.add_space(14.0);
+                ui.separator();
+                ui.label(egui::RichText::new("CATEGORIES").color(theme::TEXT_FAINT).small().strong());
+                ui.add_space(4.0);
+                let cats = ["All Downloads", "Compressed", "Documents", "Music", "Programs", "Video", "Audio", "General", "Unfinished", "Finished", "Grabber projects", "Queues"];
+                for c in cats {
+                    let on = self.category == c;
+                    let b = egui::Button::new(egui::RichText::new(c).color(if on { theme::TEAL_500 } else { theme::TEXT_MUTED })).fill(egui::Color32::TRANSPARENT).min_size(egui::vec2(188.0, 24.0));
+                    if ui.add(b).clicked() { self.category = c.to_string(); self.tab = Tab::Downloads; }
+                }
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    ui.label(egui::RichText::new("ffmpeg: PATH/beside exe only").color(theme::TEXT_FAINT).small());
+                    ui.label(egui::RichText::new("DRM content refused").color(theme::TEXT_FAINT).small());
+                });
+            });
+
+        // ── Bottom status bar ──
+        egui::TopBottomPanel::bottom("statusbar").frame(egui::Frame::none().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(12.0, 4.0))).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let (total, done, active) = { let g = self.rt.lock().unwrap(); (g.state.tasks.len(), g.state.tasks.iter().filter(|t| t.status == TaskStatus::Complete).count(), g.state.tasks.iter().filter(|t| t.status == TaskStatus::Downloading).count()) };
+                ui.label(egui::RichText::new(format!("{total} downloads · {done} finished · {active} active")).color(theme::TEXT_MUTED).small());
+                ui.separator();
+                // speed sparkline (last 40 ticks)
+                let (id, rect) = ui.allocate_space(egui::vec2(120.0, 18.0));
+                let painter = ui.painter();
+                let max = self.speed_hist.iter().cloned().fold(1.0f32, f32::max);
+                let n = self.speed_hist.len();
+                for i in 1..n {
+                    let x0 = rect.left() + (i - 1) as f32 / 39.0 * rect.width();
+                    let x1 = rect.left() + i as f32 / 39.0 * rect.width();
+                    let y0 = rect.bottom() - (self.speed_hist[i - 1] / max) * rect.height();
+                    let y1 = rect.bottom() - (self.speed_hist[i] / max) * rect.height();
+                    painter.line_segment([egui::pos2(x0, y0), egui::pos2(x1, y1)], egui::Stroke::new(1.5f32, theme::TEAL_500));
+                }
+                let _ = id;
+                ui.label(egui::RichText::new(fmt_rate(self.speed_hist.last().copied().unwrap_or(0.0))).color(theme::TEAL_500).small());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new("Ready").color(theme::TEXT_FAINT).small());
+                });
+            });
+        });
+
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG).inner_margin(egui::Margin::same(14.0))).show(ctx, |ui| {
             match self.tab {
                 Tab::Downloads => self.ui_downloads(ui),
                 Tab::Queues => self.ui_queues(ui, false),
@@ -237,81 +338,244 @@ impl eframe::App for IdmApp {
                 Tab::Options => self.ui_options(ui),
             }
         });
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            let g = self.rt.lock().unwrap();
-            ui.horizontal(|ui| { ui.label(g.messages.last().cloned().unwrap_or_default()); ui.separator(); ui.label(format!("{} tasks", g.state.tasks.len())); });
-        });
-        // close to tray
-        if ctx.input(|i| i.viewport().close_requested()) {
-            let close_to_tray = self.rt.lock().unwrap().state.settings.close_to_tray;
-            if close_to_tray { ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose); self.hidden = true; ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false)); }
+
+        if self.show_about {
+            egui::Window::new("About idmcraft").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                ui.label("idmcraft 0.1.0 — clean-room cross-platform download manager.");
+                ui.label("Rust + egui. Segmented downloads, DASH/HLS, queues, scheduler, Site Grabber.");
+                ui.label("No proprietary code, binaries, icons, or activation logic.");
+                if ui.button("Close").clicked() { self.show_about = false; }
+            });
         }
+        if self.show_add { self.ui_add_dialog(ctx); }
+        if let Some(id) = self.show_progress_for.clone() { self.ui_progress_dialog(ctx, &id); }
+        if let Some(name) = self.completed_notice.clone() {
+            egui::Window::new("Download complete").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                ui.label(format!("{name} finished."));
+                ui.horizontal(|ui| {
+                    if theme::primary_btn(ui, "Open file").clicked() {
+                        if let Some(t) = self.rt.lock().unwrap().state.tasks.iter().find(|t| t.filename == name) { let p = t.dest_dir.join(&t.filename); let _ = crate::platform::open_path(&p); }
+                        self.completed_notice = None;
+                    }
+                    if theme::ghost_btn(ui, "Close").clicked() { self.completed_notice = None; }
+                });
+            });
+        }
+        // speed history sample (1/tick)
+        let cur: u64 = { let g = self.rt.lock().unwrap(); g.state.tasks.iter().filter(|t| t.status == TaskStatus::Downloading).map(|t| t.downloaded).sum() };
+        let dt = self.last_tick.elapsed().as_secs_f32().max(0.05);
+        let rate = (cur.saturating_sub(self.last_dl_total)) as f32 / dt;
+        self.last_dl_total = cur;
+        if self.speed_hist.len() > 40 { self.speed_hist.remove(0); }
+        self.speed_hist.push(rate);
     }
 }
 
+// free helpers used by menus
+fn stop_task(app: &mut IdmApp, id: &str) { let mut g = app.rt.lock().unwrap(); if let Some(c) = g.controls.get(id) { c.paused.store(true, Ordering::Relaxed); }
+    if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) { t.status = TaskStatus::Paused; } g.save(); }
+fn remove_task(app: &mut IdmApp, id: &str) { let mut g = app.rt.lock().unwrap(); g.state.tasks.retain(|t| t.id != id); g.controls.remove(id); app.selected = None; g.save(); }
+fn resume_all(app: &mut IdmApp) { let ids: Vec<String> = { let g = app.rt.lock().unwrap(); g.state.tasks.iter().filter(|t| matches!(t.status, TaskStatus::Paused | TaskStatus::Error | TaskStatus::Queued)).map(|t| t.id.clone()).collect() }; for id in ids { app.start_task(&id); } }
+fn stop_all(app: &mut IdmApp) { let ids: Vec<String> = { let g = app.rt.lock().unwrap(); g.state.tasks.iter().filter(|t| t.status == TaskStatus::Downloading).map(|t| t.id.clone()).collect() }; for id in ids { stop_task(app, &id); } }
+fn delete_completed(app: &mut IdmApp) { let mut g = app.rt.lock().unwrap(); g.state.tasks.retain(|t| t.status != TaskStatus::Complete); g.save(); }
+fn toggle_limiter(app: &mut IdmApp) { let mut g = app.rt.lock().unwrap(); g.state.settings.speed_limit_kbps = if g.state.settings.speed_limit_kbps == 0 { 512 } else { 0 }; let lim = g.state.settings.speed_limit_kbps; for c in g.controls.values() { c.limit_kbps.store(lim, Ordering::Relaxed); } g.save(); }
+fn export_json(app: &mut IdmApp) { let g = app.rt.lock().unwrap(); let txt = serde_json::to_string_pretty(&g.state.tasks.iter().map(|t| serde_json::json!({"url":t.url,"filename":t.filename,"queue":t.queue_id})).collect::<Vec<_>>()).unwrap_or_default(); let path = g.state.settings.download_dir.join("idmcraft-export.json"); let _ = std::fs::write(path, txt); }
+fn add_batch_clipboard(app: &mut IdmApp) {
+    if let Ok(mut cb) = arboard::Clipboard::new() { if let Ok(txt) = cb.get_text() { for line in txt.lines() { let u = line.trim(); if u.starts_with("http://") || u.starts_with("https://") { add_url_task(app, u); } } } }
+}
+fn add_url_task(app: &mut IdmApp, url: &str) {
+    let id = { let mut g = app.rt.lock().unwrap(); g.add_url(url, "main", "", "") };
+    app.start_task(&id);
+}
+fn fmt_rate(bps: f32) -> String { if bps <= 0.0 { "0 B/s".into() } else if bps < 1024.0 { format!("{bps:.0} B/s") } else if bps < 1024.0 * 1024.0 { format!("{:.1} KB/s", bps / 1024.0) } else { format!("{:.2} MB/s", bps / 1048576.0) } }
+fn eta(secs: f64) -> String { if !secs.is_finite() || secs < 0.0 { "—".into() } else if secs < 60.0 { format!("{secs:.0}s") } else if secs < 3600.0 { format!("{:.0}m {:.0}s", secs / 60.0, secs % 60.0) } else { format!("{:.0}h {:.0}m", secs / 3600.0, (secs % 3600.0) / 60.0) } }
+
 impl IdmApp {
     fn ui_downloads(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Downloads");
+        // Header + actions (IDM toolbar: Add URL, Resume, Stop, Stop All, Delete, Options…)
         ui.horizontal(|ui| {
-            ui.label("URL:"); ui.text_edit_singleline(&mut self.add_url);
-            ui.label("Queue:"); ui.text_edit_singleline(&mut self.add_queue);
-            if ui.button("Add").clicked() && !self.add_url.trim().is_empty() {
-                for line in self.add_url.lines().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                    self.rt.lock().unwrap().add_url(line, &self.add_queue.clone(), &self.add_referrer.clone(), &self.add_cookies.clone());
-                }
-                self.add_url.clear();
-            }
-            if ui.button("Add + Start").clicked() && !self.add_url.trim().is_empty() {
-                let u = self.add_url.trim().to_string(); let id = self.rt.lock().unwrap().add_url(&u, &self.add_queue.clone(), &self.add_referrer.clone(), &self.add_cookies.clone());
-                self.start_task(&id); self.add_url.clear();
-            }
-            if ui.button("Paste").clicked() { if let Ok(mut cb) = arboard::Clipboard::new() { if let Ok(t) = cb.get_text() { self.add_url = t.trim().to_string(); } } }
-        });
-        ui.horizontal(|ui| { ui.label("Referrer:"); ui.text_edit_singleline(&mut self.add_referrer); ui.label("Cookies:"); ui.text_edit_singleline(&mut self.add_cookies); ui.label("Search:"); ui.text_edit_singleline(&mut self.search); });
-        ui.separator();
-        // toolbar
-        let mut to_start: Vec<String> = Vec::new(); let mut to_pause: Vec<String> = Vec::new(); let mut to_remove: Vec<String> = Vec::new(); let mut to_resume_ctrl: Vec<String> = Vec::new();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("tasks").striped(true).num_columns(8).show(ui, |ui| {
-                ui.strong("File"); ui.strong("Size"); ui.strong("Downloaded"); ui.strong("Status"); ui.strong("Queue"); ui.strong("Priority"); ui.strong("Speed"); ui.strong("Actions"); ui.end_row();
-                let tasks = self.rt.lock().unwrap().state.tasks.clone();
-                for t in &tasks {
-                    if !self.search.is_empty() && !t.filename.to_ascii_lowercase().contains(&self.search.to_ascii_lowercase()) && !t.url.to_ascii_lowercase().contains(&self.search.to_ascii_lowercase()) { continue; }
-                    ui.label(&t.filename);
-                    ui.label(t.total.map(fmt_bytes).unwrap_or_else(|| "?".into()));
-                    ui.label(fmt_bytes(t.downloaded));
-                    ui.label(format!("{:?}{}", t.status, if t.error.is_empty() { "".into() } else { format!(": {}", t.error) }));
-                    ui.label(&t.queue_id);
-                    ui.label(format!("{:?}", t.priority));
-                    ui.label(if t.total.unwrap_or(0) > 0 { format!("{:.0}%", t.downloaded as f64 * 100.0 / t.total.unwrap_or(1) as f64) } else { "".into() });
-                    ui.horizontal(|ui| {
-                        let is_active = self.rt.lock().unwrap().controls.contains_key(&t.id);
-                        if !is_active && t.status != TaskStatus::Complete && ui.button("Start").clicked() { to_start.push(t.id.clone()); }
-                        if is_active {
-                            if ui.button("Pause").clicked() { to_pause.push(t.id.clone()); }
-                            if ui.button("Resume").clicked() { to_resume_ctrl.push(t.id.clone()); }
-                        }
-                        if ui.button("Remove").clicked() { to_remove.push(t.id.clone()); }
-                        if ui.button("Open").clicked() { let _ = platform::open_path(&t.dest_dir.join(&t.filename)); }
-                        if ui.button("Folder").clicked() { let _ = platform::reveal_path(&t.dest_dir.join(&t.filename)); }
-                    });
-                    ui.end_row();
-                    if let Some(total) = t.total { if total > 0 { ui.add(egui::ProgressBar::new(t.downloaded as f32 / total as f32).show_percentage()); ui.end_row(); } }
-                }
+            ui.heading("Downloads");
+            theme::chip(ui, &self.category.clone(), theme::TEXT_MUTED);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if theme::primary_btn(ui, "+ Add URL").clicked() { self.show_add = true; }
+                if theme::ghost_btn(ui, "Resume").clicked() { if let Some(id) = self.selected.clone() { self.start_task(&id); } }
+                if theme::ghost_btn(ui, "Stop").clicked() { if let Some(id) = self.selected.clone() { stop_task(self, &id); } }
+                if theme::ghost_btn(ui, "Stop all").clicked() { stop_all(self); }
+                if theme::ghost_btn(ui, "Delete").clicked() { if let Some(id) = self.selected.clone() { remove_task(self, &id); } }
+                if theme::ghost_btn(ui, "Delete completed").clicked() { delete_completed(self); }
             });
         });
-        for id in to_start { self.start_task(&id); }
-        for id in to_pause {
-            let g = self.rt.lock().unwrap();
-            if let Some(c) = g.controls.get(&id) { c.paused.store(true, std::sync::atomic::Ordering::Relaxed); }
-            drop(g);
-            if let Some(t) = self.rt.lock().unwrap().state.tasks.iter_mut().find(|t| t.id == id) { t.status = TaskStatus::Paused; }
-            self.rt.lock().unwrap().save();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Filter").color(theme::TEXT_MUTED).small());
+            ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search filename or URL…").desired_width(280.0));
+            ui.label(egui::RichText::new("Click headers to sort · Double-click row: progress · Right-click: actions").color(theme::TEXT_FAINT).small());
+        });
+        ui.add_space(8.0);
+
+        // snapshot + filter + sort
+        let mut tasks: Vec<DownloadTask> = { let g = self.rt.lock().unwrap(); g.state.tasks.clone() };
+        let cat = self.category.clone();
+        tasks.retain(|t| {
+            let cat_ok = match cat.as_str() {
+                "All Downloads" => true,
+                "Unfinished" => t.status != TaskStatus::Complete,
+                "Finished" => t.status == TaskStatus::Complete,
+                "Grabber projects" => t.queue_id == "grabber",
+                "Queues" => true,
+                c => t.category == c || crate::model::category_for(&t.filename) == c,
+            };
+            let q = self.search.to_ascii_lowercase();
+            cat_ok && (q.is_empty() || t.filename.to_ascii_lowercase().contains(&q) || t.url.to_ascii_lowercase().contains(&q))
+        });
+        let rate_now = self.speed_hist.last().copied().unwrap_or(0.0) as f64;
+        match self.sort_col {
+            0 => tasks.sort_by_key(|a| a.filename.to_lowercase()),
+            1 => tasks.sort_by_key(|t| t.queue_id.clone()),
+            2 => tasks.sort_by_key(|t| t.total.unwrap_or(0)),
+            3 => tasks.sort_by_key(|t| format!("{:?}", t.status)),
+            _ => tasks.sort_by_key(|t| t.order),
         }
-        for id in to_resume_ctrl { let g = self.rt.lock().unwrap(); if let Some(c) = g.controls.get(&id) { c.paused.store(false, std::sync::atomic::Ordering::Relaxed); } else { drop(g); self.start_task(&id); } }
-        for id in to_remove { let mut g = self.rt.lock().unwrap(); if let Some(c) = g.controls.get(&id) { c.cancelled.store(true, std::sync::atomic::Ordering::Relaxed); } g.state.tasks.retain(|t| t.id != id); g.controls.remove(&id); g.save(); }
-        // drag-drop files/URLs via egui dropped files
-        // ponytail: URL drag-drop from browser uses text drop not exposed by egui files API; clipboard + inbox cover it.
+        if !self.sort_asc { tasks.reverse(); }
+
+        // Table header (IDM columns)
+        egui::Frame::none().fill(theme::SURFACE).rounding(egui::Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(10.0, 6.0)).show(ui, |ui| {
+            egui::Grid::new("dl-head").num_columns(8).spacing([10.0, 4.0]).min_col_width(60.0).show(ui, |ui| {
+                for (i, h) in ["File Name", "Q", "Size", "Status", "Time left", "Transfer rate", "Progress", ""].iter().enumerate() {
+                    if ui.add(egui::Button::new(egui::RichText::new(*h).color(theme::TEXT_MUTED).small().strong()).fill(egui::Color32::TRANSPARENT)).clicked() {
+                        if self.sort_col == i as u8 { self.sort_asc = !self.sort_asc; } else { self.sort_col = i as u8; self.sort_asc = true; }
+                    }
+                }
+                ui.end_row();
+            });
+        });
+        ui.add_space(4.0);
+
+        if tasks.is_empty() {
+            egui::Frame::none().fill(theme::SURFACE).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(24.0)).show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("No downloads here").color(theme::TEXT).size(16.0).strong());
+                    ui.label(egui::RichText::new("Add a URL, paste from clipboard (Tasks → Add batch), or send from browser extension.").color(theme::TEXT_MUTED));
+                    if theme::primary_btn(ui, "+ Add URL").clicked() { self.show_add = true; }
+                });
+            });
+            return;
+        }
+
+        let mut to_start: Option<String> = None;
+        let mut to_stop: Option<String> = None;
+        let mut to_remove: Option<String> = None;
+        let mut to_progress: Option<String> = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for t in &tasks {
+                let sel = self.selected.as_deref() == Some(t.id.as_str());
+                let fill = if sel { theme::SURFACE_RAISED } else { theme::SURFACE };
+                let resp = egui::Frame::none().fill(fill).rounding(egui::Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(10.0, 7.0)).show(ui, |ui| {
+                    egui::Grid::new(format!("dl-{}", t.id)).num_columns(8).spacing([10.0, 4.0]).min_col_width(60.0).show(ui, |ui| {
+                        ui.label(egui::RichText::new(&t.filename).color(theme::TEXT).strong());
+                        ui.label(egui::RichText::new(if t.queue_id.is_empty() { "main" } else { &t.queue_id }).color(theme::TEXT_MUTED).small());
+                        ui.label(egui::RichText::new(match t.total { Some(n) => fmt_bytes(n), None => "—".into() }).color(theme::TEXT_MUTED).small());
+                        let sc = theme::status_color(t.status);
+                        ui.label(egui::RichText::new(format!("{:?}", t.status)).color(sc).small().strong());
+                        // ETA
+                        let eta_txt = if t.status == TaskStatus::Downloading { if let Some(total) = t.total { if rate_now > 0.0 && total > t.downloaded { eta((total - t.downloaded) as f64 / rate_now) } else { "—".into() } } else { "—".into() } } else { "—".into() };
+                        ui.label(egui::RichText::new(eta_txt).color(theme::TEXT_MUTED).small());
+                        ui.label(egui::RichText::new(if t.status == TaskStatus::Downloading { fmt_rate(rate_now as f32) } else { "—".into() }).color(theme::TEXT_MUTED).small());
+                        let frac = match t.total { Some(total) if total > 0 => (t.downloaded as f32 / total as f32).clamp(0.0, 1.0), _ => 0.0 };
+                        ui.add(egui::ProgressBar::new(frac).desired_width(140.0).fill(theme::PRIMARY).text(format!("{:.0}%", frac * 100.0)));
+                        ui.horizontal(|ui| {
+                            if t.status == TaskStatus::Downloading {
+                                if ui.small_button("Stop").clicked() { to_stop = Some(t.id.clone()); }
+                            } else if t.status != TaskStatus::Complete && ui.small_button("Start").clicked() { to_start = Some(t.id.clone()); }
+                            if ui.small_button("Progress").clicked() { to_progress = Some(t.id.clone()); }
+                        });
+                        ui.end_row();
+                    });
+                    if !t.error.is_empty() { ui.label(egui::RichText::new(&t.error).color(theme::RED_600).small()); }
+                }).response;
+                let resp = resp.interact(egui::Sense::click());
+                if resp.clicked() { self.selected = Some(t.id.clone()); }
+                if resp.double_clicked() { to_progress = Some(t.id.clone()); }
+                resp.context_menu(|ui| {
+                    if ui.button("Start / Resume").clicked() { to_start = Some(t.id.clone()); ui.close_menu(); }
+                    if ui.button("Stop").clicked() { to_stop = Some(t.id.clone()); ui.close_menu(); }
+                    if ui.button("Progress…").clicked() { to_progress = Some(t.id.clone()); ui.close_menu(); }
+                    if ui.button("Open folder").clicked() { let _ = crate::platform::reveal_path(&t.dest_dir.join(&t.filename)); ui.close_menu(); }
+                    if ui.button("Copy URL").clicked() { ui.output_mut(|o| o.copied_text = t.url.clone()); ui.close_menu(); }
+                    ui.separator();
+                    if ui.button("Remove").clicked() { to_remove = Some(t.id.clone()); ui.close_menu(); }
+                });
+                ui.add_space(3.0);
+            }
+        });
+        if let Some(id) = to_start { self.start_task(&id); }
+        if let Some(id) = to_stop { stop_task(self, &id); }
+        if let Some(id) = to_remove { remove_task(self, &id); }
+        if let Some(id) = to_progress { self.show_progress_for = Some(id); }
+    }
+
+    fn ui_add_dialog(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Add download").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            ui.set_min_width(460.0);
+            ui.label(egui::RichText::new("URL").color(theme::TEXT_MUTED).small().strong());
+            ui.add(egui::TextEdit::singleline(&mut self.add_url).hint_text("https://example.com/file.zip or .mpd/.m3u8").desired_width(440.0));
+            ui.horizontal(|ui| {
+                if ui.button("Paste").clicked() { if let Ok(mut cb) = arboard::Clipboard::new() { if let Ok(t) = cb.get_text() { self.add_url = t.trim().to_string(); } } }
+                ui.label(egui::RichText::new("Supports segmented HTTP, DASH, HLS").color(theme::TEXT_FAINT).small());
+            });
+            ui.add_space(6.0);
+            egui::Grid::new("add-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Queue"); ui.add(egui::TextEdit::singleline(&mut self.add_queue).desired_width(200.0)); ui.end_row();
+                ui.label("Referrer"); ui.add(egui::TextEdit::singleline(&mut self.add_referrer).desired_width(300.0)); ui.end_row();
+                ui.label("Cookies"); ui.add(egui::TextEdit::singleline(&mut self.add_cookies).desired_width(300.0)); ui.end_row();
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if theme::primary_btn(ui, "Start download").clicked() {
+                    let url = self.add_url.trim().to_string();
+                    if !url.is_empty() {
+                        let (referrer, cookies, queue) = (self.add_referrer.clone(), self.add_cookies.clone(), if self.add_queue.is_empty() { "main".into() } else { self.add_queue.clone() });
+                        let id = { let mut g = self.rt.lock().unwrap(); let id = g.add_url(&url, &queue, &referrer, &cookies); let segs = g.state.settings.max_connections; if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) { t.segments = segs; } g.save(); id };
+                        self.start_task(&id);
+                        self.add_url.clear(); self.show_add = false;
+                    }
+                }
+                if theme::ghost_btn(ui, "Cancel").clicked() { self.show_add = false; }
+            });
+        });
+    }
+
+    fn ui_progress_dialog(&mut self, ctx: &egui::Context, id: &str) {
+        let task = { let g = self.rt.lock().unwrap(); g.state.tasks.iter().find(|t| t.id == id).cloned() };
+        let Some(t) = task else { self.show_progress_for = None; return; };
+        let mut close = false; let mut toggle_pause = false;
+        egui::Window::new("Download progress").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            ui.set_min_width(420.0);
+            ui.label(egui::RichText::new(&t.filename).strong().size(15.0));
+            ui.label(egui::RichText::new(&t.url).color(theme::TEXT_FAINT).small());
+            ui.add_space(8.0);
+            let frac = match t.total { Some(total) if total > 0 => (t.downloaded as f32 / total as f32).clamp(0.0, 1.0), _ => 0.0 };
+            ui.add(egui::ProgressBar::new(frac).desired_width(400.0).fill(theme::PRIMARY).text(format!("{:.1}%", frac * 100.0)));
+            ui.add_space(6.0);
+            egui::Grid::new("prog-grid").num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
+                ui.label(egui::RichText::new("Status").color(theme::TEXT_MUTED)); ui.label(format!("{:?}", t.status)); ui.end_row();
+                ui.label(egui::RichText::new("Downloaded").color(theme::TEXT_MUTED)); ui.label(format!("{} / {}", fmt_bytes(t.downloaded), t.total.map(fmt_bytes).unwrap_or_else(|| "—".into()))); ui.end_row();
+                ui.label(egui::RichText::new("Save to").color(theme::TEXT_MUTED)); ui.label(t.dest_dir.display().to_string()); ui.end_row();
+                ui.label(egui::RichText::new("Queue").color(theme::TEXT_MUTED)); ui.label(if t.queue_id.is_empty() { "main".into() } else { t.queue_id.clone() }); ui.end_row();
+                if !t.error.is_empty() { ui.label(egui::RichText::new("Error").color(theme::RED_600)); ui.label(egui::RichText::new(&t.error).color(theme::RED_600)); ui.end_row(); }
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if t.status == TaskStatus::Downloading { if theme::ghost_btn(ui, "Pause").clicked() { toggle_pause = true; } }
+                else if t.status != TaskStatus::Complete && theme::primary_btn(ui, "Resume").clicked() { toggle_pause = true; }
+                if theme::ghost_btn(ui, "Open folder").clicked() { let _ = crate::platform::reveal_path(&t.dest_dir.join(&t.filename)); }
+                if theme::ghost_btn(ui, "Close").clicked() { close = true; }
+            });
+        });
+        if toggle_pause {
+            if t.status == TaskStatus::Downloading { stop_task(self, id); } else { self.start_task(id); }
+        }
+        if close { self.show_progress_for = None; }
     }
 
     fn ui_queues(&mut self, ui: &mut egui::Ui, scheduler_only: bool) {
