@@ -36,6 +36,16 @@ jobs:
         if: runner.os == 'Linux'
         # egui needs X11/Wayland + GL libs; rfd needs gtk3; tray-icon needs libappindicator
         run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libx11-dev libwayland-dev libgl1-mesa-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev libxkbcommon-dev
+      - name: Windows NSIS (setup exe)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install nsis -y; Get-Command makensis -ErrorAction SilentlyContinue | Select-Object Source
+      - name: Linux appimagetool (AppImage)
+        if: runner.os == 'Linux'
+        run: |
+          curl -sL -o /tmp/appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x /tmp/appimagetool && sudo mv /tmp/appimagetool /usr/local/bin/appimagetool || true
+          appimagetool --version || true
       - name: Test
         run: cargo test --all-targets
       - name: Clippy
