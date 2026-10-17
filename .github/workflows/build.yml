@@ -79,6 +79,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/package-windows.ps1 0.2.0
+      - name: Package Firefox XPI
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package-firefox.ps1; Copy-Item extensions/downloadcraft-firefox.xpi dist/ -ErrorAction SilentlyContinue
       - name: Package macOS
         if: runner.os == 'macOS'
         run: bash scripts/package-macos.sh 0.2.0

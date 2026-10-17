@@ -227,9 +227,16 @@ pub fn normalize_start_url(raw: &str) -> Result<Url, String> {
 
 const CRAWL_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 
-pub struct Crawler { pub project: GrabberProject }
+pub struct Crawler { pub project: GrabberProject, pub progress: Option<std::sync::Arc<std::sync::Mutex<CrawlProgress>>> }
+
+/// Live crawl state, updated per page/file so GUI shows results as depth grows (IDM Grabber behavior).
+#[derive(Default, Clone)]
+pub struct CrawlProgress { pub pages_done: usize, pub pages_queued: usize, pub depth: usize, pub files: Vec<FoundFile>, pub current_url: String, pub error: Option<String> }
 
 impl Crawler {
+    fn publish(&self, pages: &[String], queue_len: usize, depth: usize, files: &[FoundFile], current: &str) {
+        if let Some(p) = &self.progress { let mut g = p.lock().unwrap(); g.pages_done = pages.len(); g.pages_queued = queue_len; g.depth = depth; g.files = files.to_vec(); g.current_url = current.to_string(); }
+    }
     pub async fn crawl(&self, client: &reqwest::Client) -> Result<(Vec<String>, Vec<FoundFile>), String> {
         let start = normalize_start_url(&self.project.start_url)?;
         let mut robots = String::new();
@@ -279,9 +286,11 @@ impl Crawler {
                 if let Some(z) = size { total_bytes += z; if self.project.max_total_bytes > 0 && total_bytes > self.project.max_total_bytes { continue; } }
                 seen_files.insert(canon.clone());
                 files.push(FoundFile { url: canon, size, mime: ct.clone(), page_url: referrer, selected: true });
+                self.publish(&pages, queue.len(), depth, &files, url.as_str());
                 continue;
             }
             pages.push(canonicalize(&url));
+            self.publish(&pages, queue.len(), depth, &files, url.as_str());
             if leaf { continue; }
             let html = resp.text().await.unwrap_or_default();
             // page text exclude/include via substring check on html if regex is plain word (regex compiled via simple contains fallback)
@@ -331,6 +340,7 @@ impl Crawler {
                     if self.project.max_files > 0 && files.len() >= self.project.max_files { continue; }
                     if let Some(z) = size { total_bytes += z; if self.project.max_total_bytes > 0 && total_bytes > self.project.max_total_bytes { continue; } }
                     files.push(FoundFile { url: canonicalize(&cand), size, mime, page_url: url.to_string(), selected: true });
+                    self.publish(&pages, queue.len(), depth, &files, url.as_str());
                 }
             }
         }
@@ -422,7 +432,7 @@ pub fn relative_link(from_rel: &str, to_rel: &str) -> String {
 
 /// Mirror: crawl then download pages+files preserving structure, rewrite absolute URLs to relative local paths.
 pub async fn mirror_site(client: &reqwest::Client, project: &GrabberProject, out_dir: &std::path::Path) -> Result<Vec<String>, String> {
-    let crawler = Crawler { project: project.clone() };
+    let crawler = Crawler { project: project.clone(), progress: None };
     let (pages, files) = crawler.crawl(client).await?;
     let start = normalize_start_url(&project.start_url)?;
     let mut mapping: HashMap<String, String> = HashMap::new();

@@ -69,7 +69,7 @@ fn parts_strip(ui: &mut egui::Ui, view: &SegView, width: f32) {
 }
 
 #[derive(Default)]
-struct GrabOutcome { done: bool, apply_files: bool, files: Vec<FoundFile>, message: String }
+struct GrabOutcome { done: bool, apply_files: bool, files: Vec<FoundFile>, message: String, progress: Option<Arc<Mutex<crate::grabber::CrawlProgress>>> }
 
 pub struct DownloadApp {
     rt: Arc<Mutex<Runtime>>,
@@ -96,6 +96,7 @@ pub struct DownloadApp {
     grab_project_json: String,
     grab_status: String,
     grab_busy: bool,
+    grab_auto_explore: bool,
     last_tick: std::time::Instant,
     #[allow(dead_code)]
     tray: Option<TrayState>,
@@ -135,7 +136,7 @@ impl DownloadApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, rt: Arc<Mutex<Runtime>>, hidden: bool) -> Self {
         let tokio_rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio rt"));
         let tray = Self::make_tray();
-        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_ext_depth: 0, grab_scope: 0, grab_exts: String::new(), grab_parent_dirs: false, grab_only_paths: String::new(), grab_exclude_paths: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), grab_status: "Enter a start URL, then Explore.".into(), grab_busy: false, last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, options_notice: "Changes save automatically.".into(), show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new(), rate_smooth: std::collections::HashMap::new(), handles: std::collections::HashMap::new(), allow_close: false }
+        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_ext_depth: 0, grab_scope: 0, grab_exts: String::new(), grab_parent_dirs: false, grab_only_paths: String::new(), grab_exclude_paths: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), grab_status: "Enter a start URL, then Explore.".into(), grab_busy: false, grab_auto_explore: false, last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, options_notice: "Changes save automatically.".into(), show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new(), rate_smooth: std::collections::HashMap::new(), handles: std::collections::HashMap::new(), allow_close: false }
     }
 
     fn make_tray() -> Option<TrayNav> {
@@ -309,10 +310,20 @@ impl DownloadApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
+        // Extension "Grab site": prefill Grabber and auto-explore.
+        { let grabf = crate::platform::config_dir().join("pending-grab.txt"); if let Ok(u) = std::fs::read_to_string(&grabf) { let _ = std::fs::remove_file(&grabf); let u = u.trim().to_string(); if !u.is_empty() { self.grab_url = u; self.tab = Tab::Grabber; self.grab_auto_explore = true; } } }
         crate::drain_inbox(&self.rt);
         if self.grab_busy {
             GRAB_SLOT.with(|s| {
                 if let Some(slot) = &*s.borrow() {
+                    // Live results while exploring (IDM Grabber behavior).
+                    { let o = slot.lock().unwrap(); if !o.done {
+                        if let Some(p) = &o.progress {
+                            let snap = p.lock().unwrap().clone();
+                            if snap.files.len() >= self.grab_files.len() { self.grab_files = snap.files; }
+                            if snap.pages_done > 0 || !snap.current_url.is_empty() { self.grab_status = format!("Exploring... depth {} · {} pages done · {} queued · {} files", snap.depth, snap.pages_done, snap.pages_queued, self.grab_files.len()); }
+                        }
+                    } }
                     let done = { let o = slot.lock().unwrap(); if o.done { Some((o.apply_files, o.files.clone(), o.message.clone())) } else { None } };
                     if let Some((apply, files, message)) = done {
                         if apply { self.grab_files = files; }
@@ -510,10 +521,8 @@ impl eframe::App for DownloadApp {
         });
 
         // ── Left rail: navigation + categories (IDM category tree, modern rail) ──
-        egui::SidePanel::left("rail").resizable(false).exact_width(208.0)
+        egui::SidePanel::left("rail").resizable(false).show_separator_line(false).exact_width(208.0)
             .frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::same(6.0))).show(ctx, |ui| {
-            // Panel allocation can exceed first-frame content width; fill it or a grey strip shows beside rail.
-            ui.painter().rect_filled(ui.max_rect(), 0.0, theme::SURFACE);
             ui.set_width(ui.available_width());
                 ui.label(egui::RichText::new("WORKSPACE").color(theme::TEXT_FAINT).small().strong());
                 ui.add_space(4.0);
@@ -566,17 +575,19 @@ impl eframe::App for DownloadApp {
             });
         });
 
-        egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG).inner_margin(egui::Margin::same(8.0))).show(ctx, |ui| {
+        // Left margin 0: any BG gap beside rail reads as a stray vertical bar.
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG).inner_margin(egui::Margin { left: 0.0, right: 8.0, top: 8.0, bottom: 8.0 })).show(ctx, |ui| {
             match self.tab {
                 Tab::Downloads => self.ui_downloads(ui),
-                Tab::Queues | Tab::Scheduler | Tab::Grabber | Tab::Options => {
+                // Grabber manages own scroll: results list fills remaining height.
+                Tab::Grabber => self.ui_grabber(ui),
+                Tab::Queues | Tab::Scheduler | Tab::Options => {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         match self.tab {
                             Tab::Queues => self.ui_queues(ui, false),
                             Tab::Scheduler => self.ui_queues(ui, true),
-                            Tab::Grabber => self.ui_grabber(ui),
                             Tab::Options => self.ui_options(ui),
-                            Tab::Downloads => {}
+                            _ => {}
                         }
                     });
                 }
@@ -691,8 +702,10 @@ fn icon_btn(ui: &mut egui::Ui, ic: Icon, label: &str, primary: bool, min_w: f32)
 fn icon_btn_enabled(ui: &mut egui::Ui, ic: Icon, label: &str, primary: bool, min_w: f32, enabled: bool) -> egui::Response {
     let fill = if !enabled { theme::SURFACE } else if primary { theme::STEEL_DIM } else { theme::SURFACE_RAISED };
     let fg = if enabled { theme::TEXT } else { theme::TEXT_FAINT };
+    // min_w = total framed width. Frame adds 14px horizontal margin; counting it
+    // twice overflowed the 208px rail by 10px and pushed CentralPanel right (grey bar).
     let resp = egui::Frame::none().fill(fill).stroke(egui::Stroke::new(1.0f32, theme::BORDER_STRONG)).inner_margin(egui::Margin::symmetric(7.0, 4.0)).show(ui, |ui| {
-        ui.set_min_width(min_w);
+        ui.set_min_width((min_w - 14.0).max(0.0));
         ui.horizontal(|ui| {
             let (irect, _) = ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
             icon(ui.painter(), &ic, irect, fg);
@@ -1086,7 +1099,9 @@ impl DownloadApp {
     }
 
     fn ui_grabber(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Site Grabber");
+        ui.add_space(8.0);
+        ui.horizontal(|ui| { ui.add_space(8.0); ui.heading("Site Grabber"); });
+        ui.add_space(4.0);
         ui.add_space(4.0);
         theme::panel().show(ui, |ui| {
             ui.label(egui::RichText::new("Start URL").color(theme::TEXT_MUTED).small().strong());
@@ -1127,14 +1142,16 @@ impl DownloadApp {
             });
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
-                if icon_btn_enabled(ui, Icon::Search, "Explore", true, 92.0, !self.grab_url.trim().is_empty()).clicked() {
+                if icon_btn_enabled(ui, Icon::Search, "Explore", true, 92.0, !self.grab_url.trim().is_empty()).clicked() || (self.grab_auto_explore && !self.grab_busy && !self.grab_url.trim().is_empty()) {
+                    self.grab_auto_explore = false;
                     let proj = self.grab_project(false);
                     self.grab_project_json = serde_json::to_string_pretty(&proj).unwrap_or_default();
                     self.grab_busy = true;
                     self.grab_status = "Exploring site...".into();
                     let rt = self.rt.clone(); let client = engine::build_client("");
-                    let crawler = Crawler { project: proj };
-                    let files_slot = Arc::new(Mutex::new(GrabOutcome::default()));
+                    let progress = Arc::new(Mutex::new(crate::grabber::CrawlProgress::default()));
+                    let crawler = Crawler { project: proj, progress: Some(progress.clone()) };
+                    let files_slot = Arc::new(Mutex::new(GrabOutcome { progress: Some(progress), ..Default::default() }));
                     let slot2 = files_slot.clone();
                     let rt2 = self.tokio_rt.clone();
                     std::thread::spawn(move || {
@@ -1184,18 +1201,24 @@ impl DownloadApp {
                 });
             });
             ui.separator();
-            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+            // Captured links get remaining page height (was capped 320px).
+            let list_h = ui.available_height().max(160.0);
+            egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
                 if self.grab_files.is_empty() { ui.label(egui::RichText::new(if self.grab_busy { "Working..." } else { "No files found yet." }).color(theme::TEXT_FAINT).small()); }
-                for f in &mut self.grab_files {
-                    ui.horizontal(|ui| {
+                egui::Grid::new("grab-files").num_columns(4).striped(false).spacing([10.0, 3.0]).show(ui, |ui| {
+                    ui.label(egui::RichText::new("").strong());
+                    ui.label(egui::RichText::new("URL").color(theme::TEXT_MUTED).small().strong());
+                    ui.label(egui::RichText::new("Size").color(theme::TEXT_MUTED).small().strong());
+                    ui.label(egui::RichText::new("Type").color(theme::TEXT_MUTED).small().strong());
+                    ui.end_row();
+                    for f in &mut self.grab_files {
                         ui.checkbox(&mut f.selected, "");
-                        ui.add(egui::Label::new(egui::RichText::new(&f.url).color(theme::TEXT)).truncate()).on_hover_text(&f.url);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(egui::RichText::new(&f.mime).color(theme::TEXT_FAINT).small());
-                            ui.label(egui::RichText::new(f.size.map(fmt_bytes).unwrap_or_default()).color(theme::TEXT_MUTED).small());
-                        });
-                    });
-                }
+                        ui.add(egui::Label::new(egui::RichText::new(&f.url).color(theme::TEXT)).truncate()).on_hover_text(format!("{}\nfrom: {}", f.url, f.page_url));
+                        ui.label(egui::RichText::new(f.size.map(fmt_bytes).unwrap_or_else(|| "—".into())).color(theme::TEXT_MUTED).small());
+                        ui.label(egui::RichText::new(&f.mime).color(theme::TEXT_FAINT).small());
+                        ui.end_row();
+                    }
+                });
             });
         });
         ui.add_space(6.0);

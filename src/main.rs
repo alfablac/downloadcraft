@@ -189,6 +189,7 @@ pub fn drain_inbox(rt: &Arc<Mutex<Runtime>>) {
         for e in rd.flatten() {
             let p = e.path();
             if let Some(mut t) = parse_kv_file(&p) {
+                if let Some(enc) = t.url.strip_prefix("downloadcraft://grab?url=") { let _ = std::fs::write(platform::config_dir().join("pending-grab.txt"), url_decode(enc)); let _ = std::fs::remove_file(&p); continue; }
                 if let Some(enc) = t.url.strip_prefix("downloadcraft://add?url=") { t.url = url_decode(enc); }
                 let mut g = rt.lock().unwrap();
                 if t.id.is_empty() { t.id = new_id(); }

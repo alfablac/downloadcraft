@@ -1,4 +1,7 @@
 // downloadcraft Firefox background. Native host: com.downloadcraft.host
+// IDM-parity capture (from shipped IDM Firefox ext evidence): blocking
+// webRequest.onHeadersReceived decides takeover by status, Content-Disposition,
+// Content-Type (MIME->ext map), URL extension; media requests feed video panel.
 const HOST = "com.downloadcraft.host";
 // Native messaging: single in-flight queue (see Chromium background.js).
 let nativePort = null;
@@ -48,27 +51,71 @@ function pumpNative() {
     );
   }
 }
-// --- Media sniffing (observing webRequest only; no blocking) ---
+function notify(title, message) {
+  try { browser.notifications.create({ type: "basic", title, message: String(message || "").slice(0, 240) }); } catch (e) {}
+}
+async function safeSend(url, tab, extra = {}) {
+  try { return await sendDownload(url, tab, extra); }
+  catch (e) { notify("downloadcraft: download not sent", "Native host unreachable. Start downloadcraft desktop app once, then retry. (" + (e && e.message || e) + ")"); throw e; }
+}
+// --- Capture tables (IDM: Extensions registry list + MIME->ext map subset) ---
+const FILE_EXTS = new Set("3gp 7z aac ace avi bin bz2 cab dmg deb doc docx epub exe flac gz iso jar mkv mov mp3 mp4 mpeg mpg msi ogg pdf ppt pptx psd rar rpm tar tgz wav webm wma wmv xls xlsx xz zip".split(" "));
+const PANEL_EXTS = new Set("aac avi f4v flv m4a m4v mkv mov mp3 mp4 mpeg mpg ogg ogv rm ts wav webm wma wmv 3gp".split(" "));
+const STREAM_TYPES = new Set(["application/dash+xml", "application/x-mpegurl", "application/vnd.apple.mpegurl", "application/x-mpegurl"]);
 const CANDIDATE_TTL_MS = 5 * 60 * 1000;
-const CANDIDATE_MAX = 50;
+const CANDIDATE_MAX = 80;
 const candidates = new Map(); // url -> {url, type, tabId, time}
-const SNIFF_TYPES = new Set(["application/dash+xml", "application/x-mpegurl", "application/vnd.apple.mpegurl"]);
 function pruneCandidates(now = Date.now()) {
   for (const [url, c] of candidates) if (now - c.time > CANDIDATE_TTL_MS) candidates.delete(url);
   while (candidates.size > CANDIDATE_MAX) candidates.delete(candidates.keys().next().value);
 }
-if (browser.webRequest && browser.webRequest.onHeadersReceived) {
-  browser.webRequest.onHeadersReceived.addListener((details) => {
-    const header = (details.responseHeaders || []).find((h) => h.name.toLowerCase() === "content-type");
-    if (!header || !header.value) return;
-    const type = header.value.split(";")[0].trim().toLowerCase();
-    if (!SNIFF_TYPES.has(type) && !type.startsWith("video/")) return;
-    candidates.set(details.url, { url: details.url, type, tabId: details.tabId, time: Date.now() });
-    pruneCandidates();
-  }, { urls: ["<all_urls>"], types: ["main_frame", "sub_frame", "media", "object", "xmlhttprequest", "other"] }, ["responseHeaders"]);
+function headerOf(headers, name) { const h = (headers || []).find((x) => x.name.toLowerCase() === name); return h ? h.value || "" : ""; }
+function extOfUrl(u) { try { const seg = new URL(u).pathname.split("/").pop() || ""; const i = seg.lastIndexOf("."); return i > 0 ? seg.slice(i + 1).toLowerCase() : ""; } catch (e) { return ""; } }
+function filenameFromDisp(disp, url) {
+  const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(disp || "");
+  if (m) { try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; } }
+  return filenameFromUrl(url);
 }
-function basename(name) {
-  return name ? String(name).split(/[\\/]/).pop() || "" : "";
+function filenameFromUrl(u) { try { const p = new URL(u).pathname; const last = p.split("/").pop(); return last ? decodeURIComponent(last) : ""; } catch (e) { return ""; } }
+function basename(name) { return name ? String(name).split(/[\\/]/).pop() || "" : ""; }
+// IDM takeover rules: status ok, attachment, binary/media type, or known file extension.
+function captureDecision(details) {
+  if (![200, 206].includes(details.statusCode)) return null;
+  if (/^Seg\d|^ts\d/i.test(filenameFromUrl(details.url))) return null; // stream segments: panel lists manifest, not fragments
+  const type = headerOf(details.responseHeaders, "content-type").split(";")[0].trim().toLowerCase();
+  const disp = headerOf(details.responseHeaders, "content-disposition").toLowerCase();
+  const ext = extOfUrl(details.url);
+  const fname = filenameFromDisp(disp, details.url);
+  const isStream = STREAM_TYPES.has(type) || ext === "m3u8" || ext === "mpd";
+  const isMedia = type.startsWith("video/") || type.startsWith("audio/") || PANEL_EXTS.has(ext);
+  if (isStream || isMedia) return { url: details.url, type: type || (ext === "mpd" ? "application/dash+xml" : "application/x-mpegurl"), tabId: details.tabId, kind: "panel" };
+  const isAttach = disp.startsWith("attachment");
+  const isBinary = type === "application/octet-stream" || type === "application/x-download" || type.startsWith("application/") && type !== "application/xhtml+xml";
+  if (isAttach || (isBinary && (FILE_EXTS.has(ext) || fname)) || FILE_EXTS.has(ext) && type !== "text/html") {
+    if (type === "text/html" && !isAttach) return null;
+    return { url: details.url, type, tabId: details.tabId, kind: "download", filename: fname, mime: type };
+  }
+  return null;
+}
+const interceptOn = async () => { try { const s = await browser.storage.local.get(["intercept"]); return s.intercept !== false; } catch (e) { return true; } };
+if (browser.webRequest && browser.webRequest.onHeadersReceived) {
+  browser.webRequest.onHeadersReceived.addListener(async (details) => {
+    const d = captureDecision(details);
+    if (!d) return {};
+    if (d.kind === "panel") {
+      candidates.set(d.url, { url: d.url, type: d.type, tabId: d.tabId, time: Date.now() });
+      pruneCandidates();
+      if (details.tabId >= 0) { try { browser.tabs.sendMessage(details.tabId, { type: "downloadcraft-candidates" }); } catch (e) {} }
+      return {};
+    }
+    // File takeover: only main/sub frame navigations + explicit other downloads.
+    if (!(await interceptOn())) return {};
+    try {
+      const tab = details.tabId >= 0 ? await browser.tabs.get(details.tabId).catch(() => null) : null;
+      await safeSend(d.url, tab, { filename: d.filename, mime: d.mime, referrer: details.originUrl || details.documentUrl || "" });
+      return { cancel: true };
+    } catch (e) { return {}; } // native failed: let browser download proceed
+  }, { urls: ["<all_urls>"], types: ["main_frame", "sub_frame", "other"] }, ["blocking", "responseHeaders"]);
 }
 async function sendDownload(url, tab, extra = {}) {
   let cookies = "";
@@ -78,24 +125,29 @@ async function sendDownload(url, tab, extra = {}) {
   if (extra.mime) msg.mime = extra.mime;
   return nativeSend(msg);
 }
-function filenameFromUrl(u) { try { const p = new URL(u).pathname; const last = p.split("/").pop(); return last ? decodeURIComponent(last) : ""; } catch (e) { return ""; } }
-browser.runtime.onInstalled.addListener(() => {
-  browser.contextMenus.create({ id: "downloadcraft-link", title: "Download with downloadcraft", contexts: ["link"] });
-  browser.contextMenus.create({ id: "downloadcraft-media", title: "Download media with downloadcraft", contexts: ["video", "audio", "image"] });
-  browser.contextMenus.create({ id: "downloadcraft-page", title: "Download all links with downloadcraft", contexts: ["page"] });
-});
+// Menus: create on startup too (event-page restarts lose onInstalled-only menus).
+function createMenus() {
+  try {
+    browser.contextMenus.create({ id: "downloadcraft-link", title: "Download with downloadcraft", contexts: ["link"] }, () => void browser.runtime.lastError);
+    browser.contextMenus.create({ id: "downloadcraft-media", title: "Download media with downloadcraft", contexts: ["video", "audio", "image"] }, () => void browser.runtime.lastError);
+    browser.contextMenus.create({ id: "downloadcraft-page", title: "Download all links with downloadcraft", contexts: ["page"] }, () => void browser.runtime.lastError);
+    browser.contextMenus.create({ id: "downloadcraft-grab", title: "Grab site with downloadcraft", contexts: ["page"] }, () => void browser.runtime.lastError);
+  } catch (e) {}
+}
+browser.runtime.onInstalled.addListener(createMenus);
+createMenus();
 browser.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (info.menuItemId === "downloadcraft-link" && info.linkUrl) sendDownload(info.linkUrl, tab);
-  else if (info.menuItemId === "downloadcraft-media" && info.srcUrl) sendDownload(info.srcUrl, tab);
+  if (info.menuItemId === "downloadcraft-link" && info.linkUrl) safeSend(info.linkUrl, tab).catch(() => {});
+  else if (info.menuItemId === "downloadcraft-media" && info.srcUrl) safeSend(info.srcUrl, tab).catch(() => {});
   else if (info.menuItemId === "downloadcraft-page" && tab && tab.id) browser.tabs.sendMessage(tab.id, { type: "downloadcraft-grab-all" });
+  else if (info.menuItemId === "downloadcraft-grab" && tab && tab.url) safeSend("downloadcraft://grab?url=" + encodeURIComponent(tab.url), tab, { referrer: tab.url }).catch(() => {});
 });
 browser.downloads.onCreated.addListener(async (item) => {
   if (!item.url || item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
   try {
-    const stored = await browser.storage.local.get(["intercept"]);
-    if (stored.intercept === false) return;
+    if (!(await interceptOn())) return;
     await browser.downloads.cancel(item.id).catch(() => {});
-    await sendDownload(item.finalUrl || item.url, null, { referrer: item.referrer || "", filename: basename(item.filename), mime: item.mime || "" });
+    await safeSend(item.finalUrl || item.url, null, { referrer: item.referrer || "", filename: basename(item.filename), mime: item.mime || "" });
   } catch (e) {}
 });
 browser.runtime.onMessage.addListener((msg, sender) => {
@@ -105,6 +157,6 @@ browser.runtime.onMessage.addListener((msg, sender) => {
     const list = [...candidates.values()].filter((c) => tabId == null || c.tabId === tabId || c.tabId === -1);
     return Promise.resolve({ type: "candidates", candidates: list });
   }
-  if (msg && (msg.type === "downloadcraft-download" || msg.type === "downloadcraft-video-panel")) return sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer });
+  if (msg && (msg.type === "downloadcraft-download" || msg.type === "downloadcraft-video-panel")) return safeSend(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer });
 });
 browser.browserAction.onClicked.addListener((tab) => { if (tab && tab.id) browser.tabs.sendMessage(tab.id, { type: "downloadcraft-scan" }); });

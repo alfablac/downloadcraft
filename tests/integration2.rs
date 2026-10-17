@@ -144,7 +144,7 @@ async fn grabber_fixture_site() {
         ("/robots.txt".into(), b"User-agent: *\nAllow: /\n".to_vec(), "text/plain".into()),
     ]);
     let proj = downloadcraft_lib::grabber::GrabberProject { start_url: format!("{base}/index.html"), depth: 2, scope: 0, max_pages: 50, ..Default::default() };
-    let crawler = downloadcraft_lib::grabber::Crawler { project: proj };
+    let crawler = downloadcraft_lib::grabber::Crawler { project: proj, progress: None };
     let (_pages, files) = crawler.crawl(&build_client("")).await.unwrap();
     let mut urls: Vec<String> = files.iter().map(|f| f.url.clone()).collect(); urls.sort();
     assert!(urls.iter().any(|u| u.ends_with("/files/doc.pdf")), "{urls:?}");
@@ -153,7 +153,7 @@ async fn grabber_fixture_site() {
     assert_eq!(urls.iter().filter(|u| u.ends_with("/files/doc.pdf")).count(), 1, "dedupe: {urls:?}");
     // extension filter
     let proj2 = downloadcraft_lib::grabber::GrabberProject { start_url: format!("{base}/index.html"), depth: 2, scope: 0, max_pages: 50, extensions: vec!["pdf".into()], ..Default::default() };
-    let (_p, files2) = downloadcraft_lib::grabber::Crawler { project: proj2 }.crawl(&build_client("")).await.unwrap();
+    let (_p, files2) = downloadcraft_lib::grabber::Crawler { project: proj2, progress: None }.crawl(&build_client("")).await.unwrap();
     assert!(files2.iter().all(|f| f.url.ends_with(".pdf")), "{files2:?}");
 }
 
@@ -177,7 +177,7 @@ async fn grabber_idm_parity_discovery() {
         ("/robots.txt".to_string(), b"User-agent: *\nAllow: /\n".to_vec(), "text/plain".to_string()),
     ]);
     let crawl = |proj: downloadcraft_lib::grabber::GrabberProject| async move {
-        downloadcraft_lib::grabber::Crawler { project: proj }.crawl(&build_client("")).await.unwrap()
+        downloadcraft_lib::grabber::Crawler { project: proj, progress: None }.crawl(&build_client("")).await.unwrap()
     };
     // Parent-dir guard + exclude path filter + script endpoint discovery.
     let proj = downloadcraft_lib::grabber::GrabberProject { start_url: format!("{base}/dir/index.html"), depth: 3, scope: 0, max_pages: 50, dont_explore_parent_dirs: true, exclude_paths: vec!["/ads/".into()], ..Default::default() };
@@ -201,6 +201,6 @@ async fn grabber_idm_parity_discovery() {
 async fn grabber_start_http_error_surfaces() {
     let base = serve(vec![("/index.html".into(), b"<html></html>".to_vec(), "text/html".into())]);
     let proj = downloadcraft_lib::grabber::GrabberProject { start_url: format!("{base}/missing"), depth: 1, scope: 0, max_pages: 10, ..Default::default() };
-    let err = downloadcraft_lib::grabber::Crawler { project: proj }.crawl(&build_client("")).await.unwrap_err();
+    let err = downloadcraft_lib::grabber::Crawler { project: proj, progress: None }.crawl(&build_client("")).await.unwrap_err();
     assert!(err.contains("404") || err.contains("start page"), "{err}");
 }
