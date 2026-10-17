@@ -855,6 +855,7 @@ impl DownloadApp {
 
         {
             for t in &tasks {
+              ui.push_id(t.id.as_str(), |ui| {
                 let sel = self.selected.as_deref() == Some(t.id.as_str());
                 let fill = if sel { theme::STEEL_DIM } else { theme::SURFACE };
                 let resp = egui::Frame::none().fill(fill).stroke(egui::Stroke::new(1.0f32, if sel { theme::STEEL } else { theme::BORDER })).rounding(theme::R_CTRL).inner_margin(egui::Margin::symmetric(10.0, 2.0)).show(ui, |ui| {
@@ -903,7 +904,8 @@ impl DownloadApp {
                     ui.separator();
                     if ui.button("Remove").clicked() { to_remove = Some(t.id.clone()); ui.close_menu(); }
                 });
-                ui.add_space(3.0);
+                ui.add_space(4.0);
+              });
             }
         }
         });
