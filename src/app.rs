@@ -38,6 +38,7 @@ pub struct IdmApp {
     category: String,
     sort_col: u8,
     sort_asc: bool,
+    options_tab: u8,
     show_add: bool,
     show_progress_for: Option<String>,
     selected: Option<String>,
@@ -53,7 +54,7 @@ impl IdmApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, rt: Arc<Mutex<Runtime>>, hidden: bool) -> Self {
         let tokio_rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio rt"));
         let tray = Self::make_tray();
-        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_scope: 0, grab_exts: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), last_tick: std::time::Instant::now(), tray: Some(TrayState { _tray: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0 }
+        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_scope: 0, grab_exts: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), last_tick: std::time::Instant::now(), tray: Some(TrayState { _tray: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0 }
     }
 
     fn make_tray() -> Option<tray_icon::TrayIcon> {
@@ -581,116 +582,248 @@ impl IdmApp {
     fn ui_queues(&mut self, ui: &mut egui::Ui, scheduler_only: bool) {
         if !scheduler_only {
             ui.heading("Queues");
-            ui.horizontal(|ui| { ui.text_edit_singleline(&mut self.new_queue_name); if ui.button("Add queue").clicked() && !self.new_queue_name.trim().is_empty() { let mut g = self.rt.lock().unwrap(); let id = crate::model::new_id(); g.state.queues.push(Queue { id, name: self.new_queue_name.clone(), max_concurrent: 1, auto_start: false, retry_count: 3, retry_interval_secs: 10, ..Default::default() }); g.save(); self.new_queue_name.clear(); } });
+            ui.add_space(4.0);
+            theme::panel().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("New queue:");
+                    ui.add(egui::TextEdit::singleline(&mut self.new_queue_name).desired_width(220.0));
+                    if theme::ghost_btn(ui, "Add queue").clicked() && !self.new_queue_name.trim().is_empty() { let mut g = self.rt.lock().unwrap(); let id = crate::model::new_id(); g.state.queues.push(Queue { id, name: self.new_queue_name.clone(), max_concurrent: 1, auto_start: false, retry_count: 3, retry_interval_secs: 10, ..Default::default() }); g.save(); self.new_queue_name.clear(); }
+                });
+            });
+            ui.add_space(6.0);
             let queues = self.rt.lock().unwrap().state.queues.clone();
             for q in queues {
-                ui.collapsing(format!("{} (max {})", q.name, q.max_concurrent), |ui| {
-                    ui.label(format!("id={} auto_start={} retry={}x/{}s complete={:?}", q.id, q.auto_start, q.retry_count, q.retry_interval_secs, q.on_complete));
-                    // task order controls
+                theme::panel().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(&q.name).strong());
+                        theme::chip(ui, &format!("max {}", q.max_concurrent), theme::TEXT_MUTED);
+                        if q.auto_start { theme::chip(ui, "auto-start", theme::TEAL_500); }
+                        theme::chip(ui, &format!("retry {}x/{}s", q.retry_count, q.retry_interval_secs), theme::TEXT_MUTED);
+                        theme::chip(ui, &format!("on complete: {:?}", q.on_complete), theme::TEXT_MUTED);
+                    });
+                    ui.separator();
                     let tasks: Vec<DownloadTask> = { let g = self.rt.lock().unwrap(); let mut v: Vec<_> = g.state.tasks.iter().filter(|t| t.queue_id == q.id).cloned().collect(); v.sort_by_key(|t| t.order); v };
+                    if tasks.is_empty() { ui.label(egui::RichText::new("No downloads in queue.").color(theme::TEXT_FAINT).small()); }
                     for t in &tasks {
                         ui.horizontal(|ui| {
-                            ui.label(format!("{} [{:?}] {:?}", t.order, t.priority, t.filename));
-                            if ui.button("Up").clicked() { let mut g = self.rt.lock().unwrap(); move_task(&mut g.state.tasks, &t.id, -1); g.save(); }
-                            if ui.button("Down").clicked() { let mut g = self.rt.lock().unwrap(); move_task(&mut g.state.tasks, &t.id, 1); g.save(); }
-                            for (label, pr) in [("High", Priority::High), ("Normal", Priority::Normal), ("Low", Priority::Low)] { if ui.button(label).clicked() { let mut g = self.rt.lock().unwrap(); if let Some(x) = g.state.tasks.iter_mut().find(|x| x.id == t.id) { x.priority = pr; } g.save(); } }
-                            if ui.button("Start").clicked() { self.start_task(&t.id.clone()); }
+                            ui.label(egui::RichText::new(format!("#{} [{:?}]", t.order, t.priority)).color(theme::TEXT_MUTED).small().monospace());
+                            ui.label(&t.filename);
+                            let sc = theme::status_color(t.status);
+                            ui.label(egui::RichText::new(format!("{:?}", t.status)).color(sc).small());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("Start").clicked() { self.start_task(&t.id.clone()); }
+                                if ui.small_button("Down").clicked() { let mut g = self.rt.lock().unwrap(); move_task(&mut g.state.tasks, &t.id, 1); g.save(); }
+                                if ui.small_button("Up").clicked() { let mut g = self.rt.lock().unwrap(); move_task(&mut g.state.tasks, &t.id, -1); g.save(); }
+                                for (label, pr) in [("Low", Priority::Low), ("Normal", Priority::Normal), ("High", Priority::High)] { if ui.small_button(label).clicked() { let mut g = self.rt.lock().unwrap(); if let Some(x) = g.state.tasks.iter_mut().find(|x| x.id == t.id) { x.priority = pr; } g.save(); } }
+                            });
                         });
                     }
+                    ui.separator();
                     ui.horizontal(|ui| {
-                        let mut maxc = q.max_concurrent; let mut auto = q.auto_start; let mut retry = q.retry_count;
-                        ui.add(egui::DragValue::new(&mut maxc).prefix("max: "));
-                        ui.checkbox(&mut auto, "auto-start");
-                        ui.add(egui::DragValue::new(&mut retry).prefix("retries: "));
-                        if maxc != q.max_concurrent || auto != q.auto_start || retry != q.retry_count { let mut g = self.rt.lock().unwrap(); if let Some(x) = g.state.queues.iter_mut().find(|x| x.id == q.id) { x.max_concurrent = maxc.max(1); x.auto_start = auto; x.retry_count = retry; } g.save(); }
+                        let mut maxc = q.max_concurrent; let mut auto = q.auto_start; let mut retry = q.retry_count; let mut interval = q.retry_interval_secs;
+                        ui.label("Max concurrent:"); ui.add(egui::DragValue::new(&mut maxc).range(1..=16));
+                        ui.checkbox(&mut auto, "Auto-start");
+                        ui.label("Retries:"); ui.add(egui::DragValue::new(&mut retry).range(0..=20));
+                        ui.label("every (s):"); ui.add(egui::DragValue::new(&mut interval).range(1..=3600));
+                        if maxc != q.max_concurrent || auto != q.auto_start || retry != q.retry_count || interval != q.retry_interval_secs { let mut g = self.rt.lock().unwrap(); if let Some(x) = g.state.queues.iter_mut().find(|x| x.id == q.id) { x.max_concurrent = maxc.max(1); x.auto_start = auto; x.retry_count = retry; x.retry_interval_secs = interval; } g.save(); }
                     });
                 });
+                ui.add_space(6.0);
             }
         } else {
             ui.heading("Scheduler");
-            if ui.button("Add schedule for main queue").clicked() { let mut g = self.rt.lock().unwrap(); g.state.schedules.push(Schedule { id: crate::model::new_id(), queue_id: "main".into(), enabled: true, recurrence: Recurrence::Daily, start_secs: 3600, stop_secs: Some(7200), files_at_once: 3, ..Default::default() }); g.save(); }
+            ui.add_space(4.0);
+            theme::panel().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if theme::primary_btn(ui, "+ Add schedule (main queue)").clicked() { let mut g = self.rt.lock().unwrap(); g.state.schedules.push(Schedule { id: crate::model::new_id(), queue_id: "main".into(), enabled: true, recurrence: Recurrence::Daily, start_secs: 3600, stop_secs: Some(7200), files_at_once: 3, ..Default::default() }); g.save(); }
+                    ui.label(egui::RichText::new("Start/stop windows per queue · files at once · optional speed limit").color(theme::TEXT_FAINT).small());
+                });
+            });
+            ui.add_space(6.0);
             let schedules = self.rt.lock().unwrap().state.schedules.clone();
             let (day, secs) = self.minutes_today;
+            if schedules.is_empty() { ui.label(egui::RichText::new("No schedules.").color(theme::TEXT_FAINT)); }
             for s in schedules {
-                ui.group(|ui| {
-                    ui.label(format!("queue={} {:?} start={}s stop={:?} enabled={} next={:?}", s.queue_id, s.recurrence, s.start_secs, s.stop_secs, s.enabled, next_run_in(&s, day, secs)));
+                theme::panel().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("Queue {}", s.queue_id)).strong());
+                        theme::chip(ui, &format!("{:?}", s.recurrence), theme::TEXT_MUTED);
+                        theme::chip(ui, &format!("start {:02}:{:02}", s.start_secs / 3600, (s.start_secs % 3600) / 60), theme::TEXT_MUTED);
+                        if let Some(st) = s.stop_secs { theme::chip(ui, &format!("stop {:02}:{:02}", st / 3600, (st % 3600) / 60), theme::TEXT_MUTED); }
+                        match next_run_in(&s, day, secs) { Some(n) => theme::chip(ui, &format!("next in {}", eta(n as f64)), theme::TEAL_500), None => theme::chip(ui, "no next run", theme::TEXT_FAINT) }
+                    });
+                    ui.separator();
                     ui.horizontal(|ui| {
                         let mut enabled = s.enabled;
-                        if ui.checkbox(&mut enabled, "enabled").changed() { let mut g = self.rt.lock().unwrap(); if let Some(x) = g.state.schedules.iter_mut().find(|x| x.id == s.id) { x.enabled = enabled; } g.save(); }
-                        if ui.button("Delete").clicked() { let mut g = self.rt.lock().unwrap(); g.state.schedules.retain(|x| x.id != s.id); g.save(); }
-                        if ui.button("Start now").clicked() { let ids: Vec<String> = self.rt.lock().unwrap().state.tasks.iter().filter(|t| t.queue_id == s.queue_id && t.status == TaskStatus::Queued).map(|t| t.id.clone()).collect(); for id in ids { self.start_task(&id); } }
+                        if ui.checkbox(&mut enabled, "Enabled").changed() { let mut g = self.rt.lock().unwrap(); if let Some(x) = g.state.schedules.iter_mut().find(|x| x.id == s.id) { x.enabled = enabled; } g.save(); }
+                        if theme::ghost_btn(ui, "Start now").clicked() { let ids: Vec<String> = self.rt.lock().unwrap().state.tasks.iter().filter(|t| t.queue_id == s.queue_id && t.status == TaskStatus::Queued).map(|t| t.id.clone()).collect(); for id in ids { self.start_task(&id); } }
+                        if theme::ghost_btn(ui, "Delete").clicked() { let mut g = self.rt.lock().unwrap(); g.state.schedules.retain(|x| x.id != s.id); g.save(); }
                     });
                 });
+                ui.add_space(6.0);
             }
-            ui.label(format!("Now (UTC day/secs): {day} / {secs}"));
+            ui.label(egui::RichText::new(format!("Clock: UTC day {day}, {secs}s into day (local-tz conversion not applied).")).color(theme::TEXT_FAINT).small());
         }
     }
 
     fn ui_grabber(&mut self, ui: &mut egui::Ui) {
         ui.heading("Site Grabber");
-        ui.horizontal(|ui| { ui.label("URL:"); ui.text_edit_singleline(&mut self.grab_url); ui.label("Depth:"); ui.add(egui::DragValue::new(&mut self.grab_depth)); ui.label("Scope(0 host,1 domain,2 all):"); ui.add(egui::DragValue::new(&mut self.grab_scope)); });
-        ui.horizontal(|ui| { ui.label("Extensions (comma, empty=all):"); ui.text_edit_singleline(&mut self.grab_exts); });
-        if ui.button("Explore").clicked() && !self.grab_url.trim().is_empty() {
-            let proj = GrabberProject { start_url: self.grab_url.clone(), depth: self.grab_depth, scope: self.grab_scope, extensions: self.grab_exts.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(), max_pages: 200, ..Default::default() };
-            self.grab_project_json = serde_json::to_string_pretty(&proj).unwrap_or_default();
-            let rt = self.rt.clone(); let client = engine::build_client("");
-            let crawler = Crawler { project: proj };
-            // blocking call on tokio: use block_on in spawned thread via channel - simpler: spawn and poll via messages
-            let files_slot = Arc::new(Mutex::new(Vec::new()));
-            let slot2 = files_slot.clone();
-            let rt2 = self.tokio_rt.clone();
-            std::thread::spawn(move || {
-                let res = rt2.block_on(async move { crawler.crawl(&client).await });
-                match res { Ok((_pages, files)) => { *slot2.lock().unwrap() = files; rt.lock().unwrap().log("Grabber explore done"); } Err(e) => { rt.lock().unwrap().log(format!("Grabber error: {e}")); } }
+        ui.add_space(4.0);
+        theme::panel().show(ui, |ui| {
+            egui::Grid::new("grab-grid").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("Start URL:"); ui.add(egui::TextEdit::singleline(&mut self.grab_url).desired_width(420.0));
+                ui.label("Depth:"); ui.add(egui::DragValue::new(&mut self.grab_depth).range(0..=10)); ui.end_row();
+                ui.label("Extensions:"); ui.add(egui::TextEdit::singleline(&mut self.grab_exts).hint_text("zip,mp4,pdf (empty = all)").desired_width(420.0));
+                ui.label("Scope:"); egui::ComboBox::from_id_salt("grab-scope").selected_text(["Same host", "Same domain", "Any host"][self.grab_scope.min(2) as usize]).show_ui(ui, |ui| { for (i, l) in ["Same host", "Same domain", "Any host"].iter().enumerate() { ui.selectable_value(&mut self.grab_scope, i as u8, *l); } }); ui.end_row();
             });
-            // store handle via messages poll: check slot on next frames - stash in grab_files when user clicks Refresh
-            self.grab_files = Vec::new();
-            // keep slot in a static-ish way: use add_url hack - instead store in thread and read via Persisted? Simplest: button below re-runs synchronously not possible.
-            // ponytail: explore runs async; click "Refresh results" after a moment.
-            GRAB_SLOT.with(|s| *s.borrow_mut() = Some(files_slot));
-        }
-        if ui.button("Refresh results").clicked() { GRAB_SLOT.with(|s| { if let Some(slot) = &*s.borrow() { self.grab_files = slot.lock().unwrap().clone(); } }); }
-        ui.horizontal(|ui| {
-            if ui.button("Select all").clicked() { for f in &mut self.grab_files { f.selected = true; } }
-            if ui.button("Select none").clicked() { for f in &mut self.grab_files { f.selected = false; } }
-            if ui.button("Enqueue selected").clicked() { for f in self.grab_files.iter().filter(|f| f.selected) { self.rt.lock().unwrap().add_url(&f.url.clone(), "main", "", ""); } }
-            if ui.button("Export .txt").clicked() { if let Some(p) = rfd::FileDialog::new().add_filter("txt", &["txt"]).save_file() { let _ = std::fs::write(p, self.grab_files.iter().map(|f| f.url.clone()).collect::<Vec<_>>().join("\n")); } }
-            if ui.button("Export CSV").clicked() { if let Some(p) = rfd::FileDialog::new().add_filter("csv", &["csv"]).save_file() { let mut s = "url,size,mime,page\n".to_string(); for f in &self.grab_files { s.push_str(&format!("{},{},{},{}\n", f.url, f.size.map(|v| v.to_string()).unwrap_or_default(), f.mime, f.page_url)); } let _ = std::fs::write(p, s); } }
-            if ui.button("Save project").clicked() { if let Some(p) = rfd::FileDialog::new().add_filter("json", &["json"]).save_file() { let _ = std::fs::write(p, &self.grab_project_json); } }
-            if ui.button("Load project").clicked() { if let Some(p) = rfd::FileDialog::new().pick_file() { if let Ok(t) = std::fs::read_to_string(p) { self.grab_project_json = t.clone(); if let Ok(proj) = serde_json::from_str::<GrabberProject>(&t) { self.grab_url = proj.start_url; self.grab_depth = proj.depth; self.grab_scope = proj.scope; } } } }
-            if ui.button("Mirror site...").clicked() {
-                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                    let proj = GrabberProject { start_url: self.grab_url.clone(), depth: self.grab_depth, scope: self.grab_scope, extensions: self.grab_exts.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(), max_pages: 200, mirror: true, ..Default::default() };
-                    let rt = self.rt.clone(); let rt2 = self.tokio_rt.clone();
-                    std::thread::spawn(move || { let res = rt2.block_on(async move { crate::grabber::mirror_site(&engine::build_client(""), &proj, &dir).await }); match res { Ok(v) => rt.lock().unwrap().log(format!("Mirror done: {} files", v.len())), Err(e) => rt.lock().unwrap().log(format!("Mirror error: {e}")) } });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if theme::primary_btn(ui, "Explore").clicked() && !self.grab_url.trim().is_empty() {
+                    let proj = GrabberProject { start_url: self.grab_url.clone(), depth: self.grab_depth, scope: self.grab_scope, extensions: self.grab_exts.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(), max_pages: 200, ..Default::default() };
+                    self.grab_project_json = serde_json::to_string_pretty(&proj).unwrap_or_default();
+                    let rt = self.rt.clone(); let client = engine::build_client("");
+                    let crawler = Crawler { project: proj };
+                    let files_slot = Arc::new(Mutex::new(Vec::new()));
+                    let slot2 = files_slot.clone();
+                    let rt2 = self.tokio_rt.clone();
+                    std::thread::spawn(move || {
+                        let res = rt2.block_on(async move { crawler.crawl(&client).await });
+                        match res { Ok((_pages, files)) => { *slot2.lock().unwrap() = files; rt.lock().unwrap().log("Grabber explore done"); } Err(e) => { rt.lock().unwrap().log(format!("Grabber error: {e}")); } }
+                    });
+                    self.grab_files = Vec::new();
+                    GRAB_SLOT.with(|s| *s.borrow_mut() = Some(files_slot));
                 }
-            }
+                if theme::ghost_btn(ui, "Refresh results").clicked() { GRAB_SLOT.with(|s| { if let Some(slot) = &*s.borrow() { self.grab_files = slot.lock().unwrap().clone(); } }); }
+                if theme::ghost_btn(ui, "Mirror site…").clicked() {
+                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        let proj = GrabberProject { start_url: self.grab_url.clone(), depth: self.grab_depth, scope: self.grab_scope, extensions: self.grab_exts.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(), max_pages: 200, mirror: true, ..Default::default() };
+                        let rt = self.rt.clone(); let rt2 = self.tokio_rt.clone();
+                        std::thread::spawn(move || { let res = rt2.block_on(async move { crate::grabber::mirror_site(&engine::build_client(""), &proj, &dir).await }); match res { Ok(v) => rt.lock().unwrap().log(format!("Mirror done: {} files", v.len())), Err(e) => rt.lock().unwrap().log(format!("Mirror error: {e}")) } });
+                    }
+                }
+                ui.label(egui::RichText::new("Explore crawls pages; Enqueue adds selected files as downloads with page referrer.").color(theme::TEXT_FAINT).small());
+            });
         });
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for f in &mut self.grab_files { ui.horizontal(|ui| { ui.checkbox(&mut f.selected, ""); ui.label(&f.url); ui.label(f.size.map(fmt_bytes).unwrap_or_default()); ui.label(&f.mime); }); }
+        ui.add_space(6.0);
+        theme::panel().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("{} files found · {} selected", self.grab_files.len(), self.grab_files.iter().filter(|f| f.selected).count())).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::primary_btn(ui, "Enqueue selected").clicked() { for f in self.grab_files.iter().filter(|f| f.selected) { let id = self.rt.lock().unwrap().add_url(&f.url.clone(), "main", &f.page_url.clone(), ""); let _ = id; } }
+                    if theme::ghost_btn(ui, "Select none").clicked() { for f in &mut self.grab_files { f.selected = false; } }
+                    if theme::ghost_btn(ui, "Select all").clicked() { for f in &mut self.grab_files { f.selected = true; } }
+                    if theme::ghost_btn(ui, "Export .txt").clicked() { if let Some(p) = rfd::FileDialog::new().add_filter("txt", &["txt"]).save_file() { let _ = std::fs::write(p, self.grab_files.iter().map(|f| f.url.clone()).collect::<Vec<_>>().join("\n")); } }
+                    if theme::ghost_btn(ui, "Export CSV").clicked() { if let Some(p) = rfd::FileDialog::new().add_filter("csv", &["csv"]).save_file() { let mut s = "url,size,mime,page\n".to_string(); for f in &self.grab_files { s.push_str(&format!("{},{},{},{}\n", f.url, f.size.map(|v| v.to_string()).unwrap_or_default(), f.mime, f.page_url)); } let _ = std::fs::write(p, s); } }
+                    if theme::ghost_btn(ui, "Save project").clicked() { if let Some(p) = rfd::FileDialog::new().add_filter("json", &["json"]).save_file() { let _ = std::fs::write(p, &self.grab_project_json); } }
+                    if theme::ghost_btn(ui, "Load project").clicked() { if let Some(p) = rfd::FileDialog::new().pick_file() { if let Ok(t) = std::fs::read_to_string(p) { self.grab_project_json = t.clone(); if let Ok(proj) = serde_json::from_str::<GrabberProject>(&t) { self.grab_url = proj.start_url; self.grab_depth = proj.depth; self.grab_scope = proj.scope; } } } }
+                });
+            });
+            ui.separator();
+            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                if self.grab_files.is_empty() { ui.label(egui::RichText::new("No results yet. Explore a site, then Refresh results.").color(theme::TEXT_FAINT).small()); }
+                for f in &mut self.grab_files {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut f.selected, "");
+                        ui.label(egui::RichText::new(&f.url).color(theme::TEXT));
+                        ui.label(egui::RichText::new(f.size.map(fmt_bytes).unwrap_or_default()).color(theme::TEXT_MUTED).small());
+                        ui.label(egui::RichText::new(&f.mime).color(theme::TEXT_FAINT).small());
+                    });
+                }
+            });
         });
-        ui.label("Project JSON:");
-        ui.text_edit_multiline(&mut self.grab_project_json);
+        ui.add_space(6.0);
+        ui.collapsing("Project JSON", |ui| { ui.add(egui::TextEdit::multiline(&mut self.grab_project_json).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace)); });
     }
 
     fn ui_options(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Options");
-        let mut g = self.rt.lock().unwrap();
-        ui.label(format!("Config: {}", platform::config_dir().display()));
-        ui.horizontal(|ui| { ui.label("Download dir:"); ui.label(g.state.settings.download_dir.display().to_string()); if ui.button("Browse...").clicked() { if let Some(p) = rfd::FileDialog::new().pick_folder() { g.state.settings.download_dir = p; } } });
-        ui.add(egui::Slider::new(&mut g.state.settings.max_connections, 1..=32).text("Connections per file"));
-        ui.add(egui::Slider::new(&mut g.state.settings.global_max_concurrent, 1..=16).text("Simultaneous downloads"));
-        ui.add(egui::Slider::new(&mut g.state.settings.speed_limit_kbps, 0..=100_000).text("Speed limit KB/s (0=unlimited)"));
-        ui.horizontal(|ui| { ui.label("Proxy (http://user:pass@host:port):"); ui.text_edit_singleline(&mut g.state.settings.proxy_url); });
-        let mut autostart = g.state.settings.autostart; let mut sm = g.state.settings.start_minimized; let mut ctt = g.state.settings.close_to_tray; let mut clip = g.state.settings.clipboard_monitor;
-        ui.checkbox(&mut sm, "Start minimized"); ui.checkbox(&mut ctt, "Close to tray"); ui.checkbox(&mut clip, "Monitor clipboard for URLs");
-        if ui.checkbox(&mut autostart, "Launch at OS startup").changed() { let _ = platform::set_autostart(autostart); }
-        if autostart != g.state.settings.autostart { let _ = platform::set_autostart(autostart); }
-        g.state.settings.start_minimized = sm; g.state.settings.close_to_tray = ctt; g.state.settings.clipboard_monitor = clip; g.state.settings.autostart = autostart;
-        if ui.button("Repair browser integration (register native hosts)").clicked() { match platform::register_native_hosts(&crate::sibling_host_path()) { Ok(p) => g.log(format!("Registered {} host manifests", p.len())), Err(e) => g.log(format!("Register failed: {e}")) } let _ = platform::register_protocol(); }
-        if ui.button("Remove browser integration + autostart").clicked() { let _ = platform::unregister_native_hosts(); let _ = platform::set_autostart(false); g.state.settings.autostart = false; }
-        ui.label(format!("Native host manifests (mockable fn): {:?}", platform::native_host_manifest_paths(&std::env::home_dir().unwrap_or_default()).iter().map(|(_, p)| p.display().to_string()).collect::<Vec<_>>()));
-        if ui.button("Save").clicked() { let autostart_now = g.state.settings.autostart; save_state(&g.state); drop(g); let _ = platform::set_autostart(autostart_now);}
+        ui.heading("Configuration");
+        ui.add_space(4.0);
+        // IDM Configuration has 9 tabs: General/File types/Save To/Downloads/Connection/Proxy/Site logins/Dial-Up/Sounds.
+        // Clone groups into left section list + right form (desktop property sheet feel).
+        ui.horizontal_top(|ui| {
+            theme::panel().show(ui, |ui| {
+                ui.set_min_width(150.0);
+                for (i, name) in ["General", "File types", "Save to", "Downloads", "Connection", "Proxy", "Browser", "About"].iter().enumerate() {
+                    let on = self.options_tab == i as u8;
+                    let b = egui::Button::new(egui::RichText::new(*name).color(if on { theme::TEXT } else { theme::TEXT_MUTED })).fill(if on { theme::STEEL_DIM } else { egui::Color32::TRANSPARENT }).min_size(egui::vec2(140.0, 24.0));
+                    if ui.add(b).clicked() { self.options_tab = i as u8; }
+                }
+            });
+            ui.add_space(6.0);
+            theme::panel().show(ui, |ui| {
+                ui.set_min_width(520.0);
+                let mut g = self.rt.lock().unwrap();
+                match self.options_tab {
+                    0 => {
+                        ui.label(egui::RichText::new("General").strong());
+                        ui.separator();
+                        ui.checkbox(&mut g.state.settings.start_minimized, "Start minimized");
+                        ui.checkbox(&mut g.state.settings.close_to_tray, "Close to tray");
+                        ui.checkbox(&mut g.state.settings.clipboard_monitor, "Automatically start downloading URLs placed to clipboard");
+                        let mut autostart = g.state.settings.autostart;
+                        if ui.checkbox(&mut autostart, "Launch on OS startup").changed() { let _ = platform::set_autostart(autostart); g.state.settings.autostart = autostart; }
+                        ui.separator();
+                        ui.horizontal(|ui| { ui.label("Download directory:"); ui.label(egui::RichText::new(g.state.settings.download_dir.display().to_string()).monospace().small()); if theme::ghost_btn(ui, "Browse…").clicked() { if let Some(p) = rfd::FileDialog::new().pick_folder() { g.state.settings.download_dir = p; } } });
+                        ui.label(egui::RichText::new(format!("Config directory: {}", platform::config_dir().display())).color(theme::TEXT_FAINT).small());
+                    }
+                    1 => {
+                        ui.label(egui::RichText::new("File types (categories)").strong());
+                        ui.separator();
+                        for (cat, exts) in [("Compressed", "zip rar 7z tar gz bz2 xz"), ("Documents", "pdf doc docx xls xlsx ppt pptx txt epub"), ("Music", "mp3 flac ogg wav m4a aac"), ("Programs", "exe msi dmg pkg deb rpm appimage"), ("Video", "mp4 mkv avi mov webm ts m3u8 mpd")] {
+                            ui.horizontal(|ui| { ui.label(egui::RichText::new(cat).strong()); ui.label(egui::RichText::new(exts).color(theme::TEXT_MUTED).monospace().small()); });
+                        }
+                        ui.label(egui::RichText::new("Category assigned from filename at Add time; sidebar filters by category.").color(theme::TEXT_FAINT).small());
+                    }
+                    2 => {
+                        ui.label(egui::RichText::new("Save to").strong());
+                        ui.separator();
+                        ui.horizontal(|ui| { ui.label("Default download directory:"); if theme::ghost_btn(ui, "Browse…").clicked() { if let Some(p) = rfd::FileDialog::new().pick_folder() { g.state.settings.download_dir = p; } } });
+                        ui.label(egui::RichText::new(g.state.settings.download_dir.display().to_string()).monospace().small());
+                        ui.label(egui::RichText::new("Per-category folders + remember-last-path: stored per task dest_dir at Add time.").color(theme::TEXT_FAINT).small());
+                    }
+                    3 => {
+                        ui.label(egui::RichText::new("Downloads").strong());
+                        ui.separator();
+                        ui.add(egui::Slider::new(&mut g.state.settings.max_connections, 1..=32).text("Connections per file"));
+                        ui.add(egui::Slider::new(&mut g.state.settings.global_max_concurrent, 1..=16).text("Simultaneous downloads"));
+                        ui.add(egui::Slider::new(&mut g.state.settings.speed_limit_kbps, 0..=100_000).text("Speed limit KB/s (0 = unlimited)"));
+                        ui.label(egui::RichText::new("Progress dialog: double-click a download. Download-complete dialog can be dismissed; “Don’t show again” = close it (state not persisted per-dialog).").color(theme::TEXT_FAINT).small());
+                    }
+                    4 => {
+                        ui.label(egui::RichText::new("Connection").strong());
+                        ui.separator();
+                        ui.label(egui::RichText::new("Default max connections number: 8 (per-file connections in Downloads tab).").color(theme::TEXT_MUTED));
+                        ui.label(egui::RichText::new("Connect timeout 15s · read timeout 60s · per-segment retry with backoff.").color(theme::TEXT_FAINT).small());
+                    }
+                    5 => {
+                        ui.label(egui::RichText::new("Proxy / SOCKS").strong());
+                        ui.separator();
+                        ui.horizontal(|ui| { ui.label("Proxy:"); ui.add(egui::TextEdit::singleline(&mut g.state.settings.proxy_url).hint_text("http://user:pass@host:port or socks5://host:port").desired_width(360.0)); });
+                        ui.label(egui::RichText::new("Empty = direct. Applied to HTTP engine + streams. Grabber uses direct client.").color(theme::TEXT_FAINT).small());
+                    }
+                    6 => {
+                        ui.label(egui::RichText::new("Browser integration").strong());
+                        ui.separator();
+                        if theme::ghost_btn(ui, "Repair browser integration (register native hosts + protocol)").clicked() { match platform::register_native_hosts(&crate::sibling_host_path()) { Ok(p) => g.log(format!("Registered {} host manifests", p.len())), Err(e) => g.log(format!("Register failed: {e}")) } let _ = platform::register_protocol(); }
+                        if theme::ghost_btn(ui, "Remove browser integration + autostart").clicked() { let _ = platform::unregister_native_hosts(); let _ = platform::set_autostart(false); g.state.settings.autostart = false; }
+                        ui.label(egui::RichText::new(format!("Chromium extension ID (pinned): {}", idmcraft_lib::platform::CHROME_EXT_ID)).color(theme::TEXT_FAINT).small().monospace());
+                        ui.label(egui::RichText::new("Load unpacked: extensions/chromium (MV3) · extensions/firefox (MV2). Native host: idmcraft-host.").color(theme::TEXT_FAINT).small());
+                    }
+                    _ => {
+                        ui.label(egui::RichText::new("About").strong());
+                        ui.separator();
+                        ui.label("idmcraft 0.1.0 — clean-room cross-platform download manager.");
+                        ui.label("Rust + egui. No proprietary IDM code, binaries, icons, or licensing logic.");
+                        ui.label(egui::RichText::new("Sounds / Dial-Up / VPN tabs from IDM not cloned: desktop notifications use OS defaults; dial-up/VPN obsolete on target OSes.").color(theme::TEXT_FAINT).small());
+                    }
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if theme::primary_btn(ui, "Save").clicked() { let a = g.state.settings.autostart; save_state(&g.state); drop(g); let _ = platform::set_autostart(a); return; }
+                    ui.label(egui::RichText::new("Changes apply after Save (autostart applies on toggle).").color(theme::TEXT_FAINT).small());
+                });
+            });
+        });
     }
 }
 

@@ -1,5 +1,30 @@
 # Reverse engineering log — IDM 6.43 (clean-room, observable behavior only)
 
+## RE round 3 — registry record schema + Configuration tabs (2026-10-16)
+
+Registry evidence (`HKCU\Software\DownloadManager`, value NAMES/types only, no values read):
+
+- Per-download records = numeric subkeys (177 present; key = download ID; `maxID` counter key). Fields include: `LocalFileName`, `LocalPath`, `LogFileName`, `Host`, `Path`, `FileName`, `User`, `EncPassword` (binary), `UA`, `Referer`, `Port`, `categoryID`, `cFlags`, `owWPage` (parent web page), `Url0` (primary URL; suffix-0 implies mirror list `Url1…`), `U0_u`/`U0_EncP` (per-URL credentials), `CstmHdrs` (custom headers), `AccH`/`OrgAccEncH` (accept headers), `FRFileSize`/`FileSize` (binary u64), `LastModified`, `dateAdded`, `lastTryDate`, `Status` (DWORD), `queueID` (DWORD), `TPswitch`, `bRetAfFR`... Clone maps: DownloadTask {url + (new) mirrors, username/password per mirror, headers, referrer, category, queue, status, size, dates} — see model.rs additions.
+- `ListSettings` binary blobs per column (`FileName, DateAdded, Queue, Size, Status, Timeleft, TransferRate, LastTry, Description, SaveTo, Referer, Parent_wp, Order639`) = persisted column order/width — confirms UIA column set exactly.
+- `FoldersTree\{Compressed,Documents,Music,Programs,Video}` = {`ID`, `mask` (extension mask), `pathW`, `rememberLastPath`, `forSiteOnly`, `sites`} — category definition shape.
+- `Scheduler` = {`isLimitEnabled`, `m_MBytes`, `m_hours`, `showLimitExceededWarning`} — quota scheduler (stop after X MB per Y hours) separate from time schedules. Clone: quota fields on Schedule (planned).
+- `DwnlPanel` = DWORD per extension (FLV MP3 MP4 M4V F4V M4A MPG MPEG AVI WMV WMA WAV ASF RM OGG OGV MOV 3GP QT WEBM TS MKV AAC VTT TTML TTML2 DFXP SRT) + `PanelView`, `DonlCaptWP` — video download panel shown per file type; subtitles types included. Clone: panel per type incl. subtitles.
+- `Queue` = single REG_SZ blob (serialized queues). `GrabberSts` = {bDontShowCnfNameDlg, maxProjectID}.
+
+Runtime evidence (pywinauto win32, IDM 6.43.15.3): **Configuration dialog has 9 tab pages** (tab texts custom-drawn; identified by page content + LNG sections):
+
+1. **General** — Launch on startup; clipboard URL auto-start; IE-based browser monitoring; capture-from browser list + Add browser; force/prevent-download keys; context-menu items editor; download panels customizer; advanced integration status.
+2. **File types** — automatically-start file types list (+Default); excluded sites; excluded addresses (+Edit list).
+3. **Save To / Categories** — category combo (General…), extension-mask edit, per-category default dir + Browse, change-folder-on-last-selected, set file date from server, temporary directory.
+4. **Downloads** — customize progress dialog; show start-download dialog vs add-only-to-queue; show complete dialog; start immediately while showing File Info; queue-selection panels on “Download Later”/batch close; ignore file modification time on resume; duplicate-link action combo; User-Agent for manual downloads; virus-check settings.
+5. **Connection** — per-site “Max connections number” exceptions list (New/Delete/Edit); download limits quota (X MBytes every Y hours + warning toggle); default max conn. number = 8; connections limits; TLS 1.3 option.
+6. **Proxy** — get system / none / system / PAC script / manual; address+port+user+password; per-protocol use (http/https/ftp); Advanced/SOCKS; bypass list; FTP PASV.
+7. **Site logins (Passwords)** — per-server credential list.
+8. **Dial-Up / VPN** — Windows dial-up/VPN connection, user/password, redial attempts/interval.
+9. **Sounds** — per-event sound files (list + Browse/Play).
+
+Clone Configuration UI restructured to property-sheet sections mirroring this map (General/File types/Save to/Downloads/Connection/Proxy/Browser/About); Dial-Up/VPN + Sounds listed As-Not-Cloned with reason (obsolete / OS-default).
+
 Source machine: Windows, `C:\Program Files (x86)\Internet Download Manager`. No proprietary code/binaries copied. Extension `manifest.json` files read from `.crx`/`.xpi` containers; behavior inferred from manifests, file layout, registry keys, `DwnlData` segment layout, and public UI surface. No decompilation of IDMan.exe logic beyond file/registry observation.
 
 ## Install inventory (observed)
