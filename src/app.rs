@@ -412,6 +412,11 @@ impl DownloadApp {
                 for id in ids { if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) { t.status = TaskStatus::Paused; } }
             }
         }
+        // Drag-and-drop: URL text / .url files dropped on window become downloads.
+        for file in ctx.input(|i| i.raw.dropped_files.clone()) {
+            let text = file.path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).map(|c| c.lines().find_map(|l| l.strip_prefix("URL=").map(|u| u.trim().to_string())).unwrap_or_default()).filter(|u| u.starts_with("http")).or_else(|| file.name.split_whitespace().find(|w| w.starts_with("http")).map(|w| w.to_string()));
+            if let Some(url) = text { let mut g = self.rt.lock().unwrap(); g.add_url(&url, "main", "", ""); g.log(format!("Dropped URL added: {url}")); }
+        }
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
 }
