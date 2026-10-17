@@ -4,6 +4,7 @@ use crate::model::*;
 use crate::platform;
 use crate::queue::plan_starts;
 use crate::scheduler::{next_run_in, should_start, should_stop};
+use crate::icons::{icon, Icon};
 use crate::theme;
 use crate::{Runtime, save_state};
 use std::sync::atomic::Ordering;
@@ -50,6 +51,10 @@ pub struct IdmApp {
     last_notified: Option<String>,
     speed_hist: Vec<f32>,
     last_dl_total: u64,
+    /// Per-task rate samples (drives Transfer rate column + ETA per row).
+    rate_map: std::collections::HashMap<String, Vec<(std::time::Instant, u64)>>,
+    /// Live segment/part summary per task, from part dir contents.
+    seg_info: std::collections::HashMap<String, String>,
 }
 
 /// Live tray state: keep icon+menu alive; poll MenuEvent receiver each tick for Show/Add/Quit.
@@ -60,7 +65,7 @@ impl IdmApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, rt: Arc<Mutex<Runtime>>, hidden: bool) -> Self {
         let tokio_rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio rt"));
         let tray = Self::make_tray();
-        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_scope: 0, grab_exts: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0 }
+        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_scope: 0, grab_exts: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new() }
     }
 
     fn make_tray() -> Option<TrayNav> {
@@ -137,6 +142,41 @@ impl IdmApp {
         });
     }
 
+    /// Sample per-task rates from Controls counters (called every tick). Drives
+    /// Transfer rate + ETA columns; before this, every row shared the global rate.
+    fn sample_rates(&mut self) {
+        let now = std::time::Instant::now();
+        let snap: Vec<(String, u64)> = { let g = self.rt.lock().unwrap(); g.controls.iter().map(|(k, c)| (k.clone(), c.downloaded.load(std::sync::atomic::Ordering::Relaxed))).collect() };
+        for (id, n) in snap {
+            let v = self.rate_map.entry(id).or_default();
+            if v.last().map(|(_, b)| *b != n).unwrap_or(true) { v.push((now, n)); }
+            if v.len() > 24 { v.drain(..v.len() - 24); }
+        }
+        self.rate_map.retain(|id, _| { let g = self.rt.lock().unwrap(); g.controls.contains_key(id) || g.state.tasks.iter().any(|t| &t.id == id && matches!(t.status, TaskStatus::Downloading | TaskStatus::Paused)) });
+        // Segment/part summary for downloading tasks: count part files in work dir.
+        let tasks: Vec<(String, std::path::PathBuf, u64)> = { let g = self.rt.lock().unwrap(); g.state.tasks.iter().filter(|t| t.status == TaskStatus::Downloading).map(|t| (t.id.clone(), t.dest_dir.join(format!(".idmcraft-{}", t.id)), t.total.unwrap_or(0))).collect() };
+        for (id, dir, _total) in tasks {
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                let parts: Vec<(String, u64)> = rd.flatten().filter_map(|e| { let p = e.path(); let sz = e.metadata().map(|m| m.len()).unwrap_or(0); p.file_name().and_then(|f| f.to_str()).map(|f| (f.to_string(), sz)) }).filter(|(f, _)| f.starts_with("part")).collect();
+                if !parts.is_empty() {
+                    let done_bytes: u64 = parts.iter().map(|(_, s)| *s).sum();
+                    let _ = done_bytes;
+                    let txt = format!("{} parts", parts.len());
+                    self.seg_info.insert(id, txt);
+                }
+            }
+        }
+    }
+
+    fn task_rate(&self, id: &str) -> f64 {
+        let Some(v) = self.rate_map.get(id) else { return 0.0; };
+        if v.len() < 2 { return 0.0; }
+        let (t0, b0) = v[0]; let (t1, b1) = v[v.len() - 1];
+        let dt = t1.duration_since(t0).as_secs_f64();
+        if dt <= 0.05 { return 0.0; }
+        b1.saturating_sub(b0) as f64 / dt
+    }
+
     fn poll(&mut self, ctx: &egui::Context) {
         // Tray menu events (cheap, event-driven): Show / Add URL / Quit
         let tray_act = self.tray.as_ref().and_then(|t| t._nav.as_ref()).map(|nav| {
@@ -153,6 +193,7 @@ impl IdmApp {
             _ => {}
         }
         crate::drain_inbox(&self.rt);
+        self.sample_rates();
         // progress sync
         {
             let mut g = self.rt.lock().unwrap();
@@ -315,20 +356,30 @@ impl eframe::App for IdmApp {
             .frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::same(6.0))).show(ctx, |ui| {
                 ui.label(egui::RichText::new("WORKSPACE").color(theme::TEXT_FAINT).small().strong());
                 ui.add_space(4.0);
-                for (tab, label) in [(Tab::Downloads, "Downloads"), (Tab::Queues, "Queues"), (Tab::Scheduler, "Scheduler"), (Tab::Grabber, "Site Grabber"), (Tab::Options, "Options")] {
+                for (tab, label, ic) in [(Tab::Downloads, "Downloads", Icon::Download), (Tab::Queues, "Queues", Icon::Queue), (Tab::Scheduler, "Scheduler", Icon::Clock), (Tab::Grabber, "Site Grabber", Icon::Globe), (Tab::Options, "Options", Icon::Settings)] {
                     let on = self.tab == tab;
-                    let b = egui::Button::new(egui::RichText::new(label).color(if on { egui::Color32::WHITE } else { theme::TEXT_MUTED })).fill(if on { theme::PRIMARY } else { egui::Color32::TRANSPARENT }).min_size(egui::vec2(188.0, 30.0));
-                    if ui.add(b).clicked() { self.tab = tab; }
+                    let col = if on { egui::Color32::WHITE } else { theme::TEXT_MUTED };
+                    ui.horizontal(|ui| {
+                        let (irect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                        icon(ui.painter(), &ic, irect, col);
+                        let b = egui::Button::new(egui::RichText::new(label).color(col)).fill(if on { theme::PRIMARY } else { egui::Color32::TRANSPARENT }).min_size(egui::vec2(162.0, 26.0));
+                        if ui.add(b).clicked() { self.tab = tab; }
+                    });
                 }
                 ui.add_space(14.0);
                 ui.separator();
-                ui.label(egui::RichText::new("CATEGORIES").color(theme::TEXT_FAINT).small().strong());
+                ui.horizontal(|ui| { let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover()); icon(ui.painter(), &Icon::Folder, irect, theme::TEXT_FAINT); ui.label(egui::RichText::new("CATEGORIES").color(theme::TEXT_FAINT).small().strong()); });
                 ui.add_space(4.0);
-                let cats = ["All Downloads", "Compressed", "Documents", "Music", "Programs", "Video", "Audio", "General", "Unfinished", "Finished", "Grabber projects", "Queues"];
-                for c in cats {
-                    let on = self.category == c;
-                    let b = egui::Button::new(egui::RichText::new(c).color(if on { theme::TEAL_500 } else { theme::TEXT_MUTED })).fill(egui::Color32::TRANSPARENT).min_size(egui::vec2(188.0, 24.0));
-                    if ui.add(b).clicked() { self.category = c.to_string(); self.tab = Tab::Downloads; }
+                let cats: &[(&str, Icon)] = &[("All Downloads", Icon::Download), ("Compressed", Icon::Archive), ("Documents", Icon::Document), ("Music", Icon::Music), ("Programs", Icon::Program), ("Video", Icon::Video), ("Audio", Icon::Music), ("General", Icon::File), ("Unfinished", Icon::Clock), ("Finished", Icon::Check), ("Grabber projects", Icon::Globe), ("Queues", Icon::Queue)];
+                for (c, ic) in cats {
+                    let on = self.category == *c;
+                    let col = if on { theme::TEAL_500 } else { theme::TEXT_MUTED };
+                    ui.horizontal(|ui| {
+                        let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                        icon(ui.painter(), ic, irect, col);
+                        let b = egui::Button::new(egui::RichText::new(*c).color(col)).fill(egui::Color32::TRANSPARENT).min_size(egui::vec2(164.0, 24.0));
+                        if ui.add(b).clicked() { self.category = c.to_string(); self.tab = Tab::Downloads; }
+                    });
                 }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.label(egui::RichText::new("ffmpeg: PATH/beside exe only").color(theme::TEXT_FAINT).small());
@@ -411,6 +462,19 @@ fn quota_exhausted(g: &Runtime, queue_id: &str, now: u64) -> bool {
     })
 }
 
+/// Category icon by extension (sidebar + row glyphs).
+fn cat_icon(filename: &str) -> Icon {
+    let e = filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match e.as_str() {
+        "mp4" | "mkv" | "avi" | "mov" | "webm" | "ts" | "m3u8" | "mpd" => Icon::Video,
+        "mp3" | "flac" | "ogg" | "wav" | "m4a" | "aac" => Icon::Music,
+        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" => Icon::Archive,
+        "exe" | "msi" | "dmg" | "pkg" | "deb" | "rpm" | "appimage" => Icon::Program,
+        "pdf" | "doc" | "docx" | "txt" | "epub" | "xls" | "xlsx" | "ppt" | "pptx" => Icon::Document,
+        _ => Icon::File,
+    }
+}
+
 // free helpers used by menus
 fn stop_task(app: &mut IdmApp, id: &str) { let mut g = app.rt.lock().unwrap(); if let Some(c) = g.controls.get(id) { c.paused.store(true, Ordering::Relaxed); }
     if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) { t.status = TaskStatus::Paused; } g.save(); }
@@ -468,7 +532,7 @@ impl IdmApp {
             let q = self.search.to_ascii_lowercase();
             cat_ok && (q.is_empty() || t.filename.to_ascii_lowercase().contains(&q) || t.url.to_ascii_lowercase().contains(&q))
         });
-        let rate_now = self.speed_hist.last().copied().unwrap_or(0.0) as f64;
+        let rate_now = self.speed_hist.last().copied().unwrap_or(0.0) as f64; let _ = rate_now;
         match self.sort_col {
             0 => tasks.sort_by_key(|a| a.filename.to_lowercase()),
             1 => tasks.sort_by_key(|t| t.queue_id.clone()),
@@ -512,17 +576,22 @@ impl IdmApp {
                 let fill = if sel { theme::STEEL_DIM } else { theme::SURFACE };
                 let resp = egui::Frame::none().fill(fill).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::symmetric(8.0, 4.0)).show(ui, |ui| {
                     egui::Grid::new(format!("dl-{}", t.id)).num_columns(8).spacing([10.0, 4.0]).min_col_width(60.0).show(ui, |ui| {
-                        ui.label(egui::RichText::new(&t.filename).color(theme::TEXT).strong());
+                        let task_rate = self.task_rate(&t.id);
+                        ui.horizontal(|ui| { let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover()); icon(ui.painter(), &cat_icon(&t.filename), irect, theme::TEXT_MUTED); ui.label(egui::RichText::new(&t.filename).color(theme::TEXT).strong()); });
                         ui.label(egui::RichText::new(if t.queue_id.is_empty() { "main" } else { &t.queue_id }).color(theme::TEXT_MUTED).small());
                         ui.label(egui::RichText::new(match t.total { Some(n) => fmt_bytes(n), None => "—".into() }).color(theme::TEXT_MUTED).small());
                         let sc = theme::status_color(t.status);
                         ui.label(egui::RichText::new(format!("{:?}", t.status)).color(sc).small().strong());
-                        // ETA
-                        let eta_txt = if t.status == TaskStatus::Downloading { if let Some(total) = t.total { if rate_now > 0.0 && total > t.downloaded { eta((total - t.downloaded) as f64 / rate_now) } else { "—".into() } } else { "—".into() } } else { "—".into() };
+                        // ETA from THIS task's own rate (was global rate for all rows)
+                        let eta_txt = if t.status == TaskStatus::Downloading { if let Some(total) = t.total { if task_rate > 1.0 && total > t.downloaded { eta((total - t.downloaded) as f64 / task_rate) } else { "—".into() } } else { "—".into() } } else { "—".into() };
                         ui.label(egui::RichText::new(eta_txt).color(theme::TEXT_MUTED).small());
-                        ui.label(egui::RichText::new(if t.status == TaskStatus::Downloading { fmt_rate(rate_now as f32) } else { "—".into() }).color(theme::TEXT_MUTED).small());
+                        ui.label(egui::RichText::new(if t.status == TaskStatus::Downloading { fmt_rate(task_rate as f32) } else { "—".into() }).color(theme::TEXT_MUTED).small());
                         let frac = match t.total { Some(total) if total > 0 => (t.downloaded as f32 / total as f32).clamp(0.0, 1.0), _ => 0.0 };
-                        ui.add(egui::ProgressBar::new(frac).desired_width(140.0).fill(theme::PRIMARY).text(format!("{:.0}%", frac * 100.0)));
+                        ui.vertical(|ui| {
+                            ui.add(egui::ProgressBar::new(frac).desired_width(150.0).fill(theme::PRIMARY).text(format!("{:.1}%", frac * 100.0)));
+                            ui.label(egui::RichText::new(format!("{} of {}", fmt_bytes(t.downloaded), t.total.map(fmt_bytes).unwrap_or_else(|| "?".into()))).color(theme::TEXT_FAINT).small());
+                            if t.status == TaskStatus::Downloading { if let Some(si) = self.seg_info.get(&t.id) { ui.label(egui::RichText::new(si.clone()).color(theme::TEXT_FAINT).small()); } }
+                        });
                         ui.horizontal(|ui| {
                             if t.status == TaskStatus::Downloading {
                                 if ui.small_button("Stop").clicked() { to_stop = Some(t.id.clone()); }
@@ -608,8 +677,13 @@ impl IdmApp {
             let frac = match t.total { Some(total) if total > 0 => (t.downloaded as f32 / total as f32).clamp(0.0, 1.0), _ => 0.0 };
             ui.add(egui::ProgressBar::new(frac).desired_width(400.0).fill(theme::PRIMARY).text(format!("{:.1}%", frac * 100.0)));
             ui.add_space(6.0);
+            let task_rate = self.task_rate(&t.id);
+            let eta_txt = match t.total { Some(total) if t.status == TaskStatus::Downloading && task_rate > 1.0 && total > t.downloaded => eta((total - t.downloaded) as f64 / task_rate), _ => "—".into() };
             egui::Grid::new("prog-grid").num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
                 ui.label(egui::RichText::new("Status").color(theme::TEXT_MUTED)); ui.label(format!("{:?}", t.status)); ui.end_row();
+                ui.label(egui::RichText::new("Transfer rate").color(theme::TEXT_MUTED)); ui.label(if t.status == TaskStatus::Downloading { fmt_rate(task_rate as f32) } else { "—".into() }); ui.end_row();
+                ui.label(egui::RichText::new("Time left").color(theme::TEXT_MUTED)); ui.label(eta_txt); ui.end_row();
+                ui.label(egui::RichText::new("Segments").color(theme::TEXT_MUTED)); ui.label(self.seg_info.get(&t.id).cloned().unwrap_or_else(|| format!("{} connections", t.segments))); ui.end_row();
                 ui.label(egui::RichText::new("Downloaded").color(theme::TEXT_MUTED)); ui.label(format!("{} / {}", fmt_bytes(t.downloaded), t.total.map(fmt_bytes).unwrap_or_else(|| "—".into()))); ui.end_row();
                 ui.label(egui::RichText::new("Save to").color(theme::TEXT_MUTED)); ui.label(t.dest_dir.display().to_string()); ui.end_row();
                 ui.label(egui::RichText::new("Queue").color(theme::TEXT_MUTED)); ui.label(if t.queue_id.is_empty() { "main".into() } else { t.queue_id.clone() }); ui.end_row();
