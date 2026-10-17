@@ -67,8 +67,23 @@ pub fn in_scope(start: &Url, cand: &Url, scope: u8) -> bool {
 
 fn ext_of(url: &str) -> String { url.split(['?', '#']).next().unwrap_or(url).rsplit('.').next().unwrap_or("").to_ascii_lowercase() }
 
+/// First `<base href>` wins per HTML spec; resolved against page URL. Relative links then resolve against it, not the page.
+pub fn document_base(html: &str, page: &Url) -> Url {
+    let lower = html.to_ascii_lowercase();
+    if let Some(idx) = lower.find("<base") {
+        let slice = &lower[idx..(idx + 600).min(lower.len())];
+        if let Some(ai) = slice.find("href=") {
+            let rest = html[idx + ai + 5..].trim_start();
+            let val = if let Some(s) = rest.strip_prefix('"') { s.split('"').next().unwrap_or("") } else if let Some(s) = rest.strip_prefix('\'') { s.split('\'').next().unwrap_or("") } else { rest.split(|c: char| c.is_whitespace() || c == '>').next().unwrap_or("") };
+            if !val.is_empty() { if let Ok(u) = page.join(val) { return u; } }
+        }
+    }
+    page.clone()
+}
+
 pub fn extract_links(html: &str, base: &Url) -> (Vec<Url>, Vec<Url>) {
     // returns (page_links, file_links) - heuristic: assets from src/href with extension treated as files via caller anyway; here split <a href> vs asset tags
+    let base = &document_base(html, base);
     let mut pages = Vec::new(); let mut files = Vec::new();
     let lower = html.to_ascii_lowercase();
     let bytes = lower.as_bytes(); let mut i = 0;
@@ -180,7 +195,7 @@ impl Crawler {
             if !is_html { continue; }
             let html = resp.text().await.unwrap_or_default();
             // page text exclude/include via substring check on html if regex is plain word (regex compiled via simple contains fallback)
-            let (links, assets) = extract_links(&html, &url);
+            let (links, assets) = links_with_doc_base(&html, &url);
             let mut candidates: Vec<Url> = Vec::new();
             candidates.extend(links.iter().cloned()); candidates.extend(assets.iter().cloned());
             for cand in candidates {
@@ -321,7 +336,14 @@ pub async fn mirror_site(client: &reqwest::Client, project: &GrabberProject, out
     Ok(downloaded)
 }
 
+/// Resolve links against the document's `<base href>` when present (falls back to page URL), matching browser semantics.
+pub fn links_with_doc_base(html: &str, page_url: &Url) -> (Vec<Url>, Vec<Url>) { extract_links(html, &document_base(html, page_url)) }
+
 pub fn rewrite_links(html: &str, page_url: &Url, mapping: &HashMap<String, String>, mirror_root: &std::path::Path, page_rel: &str) -> String {
+    // Source <base href> must not survive: mirrored output carries its own base; relative hrefs were resolved against source base for mapping.
+    let lower0 = html.to_ascii_lowercase();
+    let html_owned;
+    let html = if let Some(i) = lower0.find("<base") { let mut s = html.to_string(); if let Some(j) = s[i..].find('>') { s.replace_range(i..=i + j, ""); } html_owned = s; &html_owned } else { html };
     let _ = (mirror_root, page_rel);
     // Resolve href/src values (relative, root-relative, absolute) against the
     // page URL first, then swap in the mapped mirror path.
@@ -345,7 +367,8 @@ pub fn rewrite_links(html: &str, page_url: &Url, mapping: &HashMap<String, Strin
         let replacement = if skip {
             None
         } else {
-            page_url.join(val).ok().and_then(|resolved| {
+            // Browser resolves href/src against <base href> if present, else page URL.
+            document_base(html, page_url).join(val).ok().and_then(|resolved| {
                 mapping.get(&resolved.to_string()).or_else(|| mapping.get(&canonicalize(&resolved))).cloned()
             })
         };
@@ -372,6 +395,16 @@ pub fn rewrite_links(html: &str, page_url: &Url, mapping: &HashMap<String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn document_base_href_resolution() {
+        let page = Url::parse("https://ex.com/dir/p.html").unwrap();
+        let html = r#"<head><base href="https://cdn.ex.com/static/"></head><img src="a.png"><a href="b.html">b</a>"#;
+        let (pages, files) = links_with_doc_base(html, &page);
+        assert!(files.iter().any(|u| u.as_str() == "https://cdn.ex.com/static/a.png"));
+        assert!(pages.iter().any(|u| u.as_str() == "https://cdn.ex.com/static/b.html"));
+        let out = rewrite_links(r#"<head><base href="/root/"></head><a href="z.html">z</a>"#, &page, &HashMap::new(), std::path::Path::new("/tmp"), "index.html");
+        assert!(!out.to_ascii_lowercase().contains("<base"), "{out}");
+    }
+
     #[test] fn extract_and_scope() {
         let base = Url::parse("https://example.com/a/index.html").unwrap();
         let (pages, files) = extract_links(r#"<a href="/b/">b</a><img src="pic.png"><a href="https://other.com/x.zip">x</a>"#, &base);

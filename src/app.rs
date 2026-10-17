@@ -52,16 +52,18 @@ pub struct IdmApp {
     last_dl_total: u64,
 }
 
-struct TrayState { _tray: Option<tray_icon::TrayIcon>, }
+/// Live tray state: keep icon+menu alive; poll MenuEvent receiver each tick for Show/Add/Quit.
+struct TrayState { _nav: Option<TrayNav> }
+struct TrayNav { _tray: tray_icon::TrayIcon, _menu: tray_icon::menu::Menu, show_id: tray_icon::menu::MenuId, add_id: tray_icon::menu::MenuId, quit_id: tray_icon::menu::MenuId }
 
 impl IdmApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, rt: Arc<Mutex<Runtime>>, hidden: bool) -> Self {
         let tokio_rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio rt"));
         let tray = Self::make_tray();
-        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_scope: 0, grab_exts: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), last_tick: std::time::Instant::now(), tray: Some(TrayState { _tray: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0 }
+        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_scope: 0, grab_exts: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0 }
     }
 
-    fn make_tray() -> Option<tray_icon::TrayIcon> {
+    fn make_tray() -> Option<TrayNav> {
         // 16x16 RGBA icon generated in code (no proprietary asset).
         let mut rgba = vec![0u8; 16 * 16 * 4];
         for i in 0..256 { rgba[i * 4] = 30; rgba[i * 4 + 1] = 58; rgba[i * 4 + 2] = 95; rgba[i * 4 + 3] = 255; }
@@ -70,8 +72,10 @@ impl IdmApp {
         let show = tray_icon::menu::MenuItem::new("Show idmcraft", true, None);
         let add = tray_icon::menu::MenuItem::new("Add URL...", true, None);
         let quit = tray_icon::menu::MenuItem::new("Quit", true, None);
+        let (show_id, add_id, quit_id) = (show.id().clone(), add.id().clone(), quit.id().clone());
         let _ = menu.append_items(&[&show, &add, &quit]);
-        tray_icon::TrayIconBuilder::new().with_icon(icon).with_menu(Box::new(menu)).with_tooltip("idmcraft").build().ok()
+        let tray = tray_icon::TrayIconBuilder::new().with_icon(icon).with_menu(Box::new(menu.clone())).with_tooltip("idmcraft").build().ok()?;
+        Some(TrayNav { _tray: tray, _menu: menu, show_id, add_id, quit_id })
     }
 
     fn start_task(&mut self, id: &str) {
@@ -134,6 +138,20 @@ impl IdmApp {
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
+        // Tray menu events (cheap, event-driven): Show / Add URL / Quit
+        let tray_act = self.tray.as_ref().and_then(|t| t._nav.as_ref()).map(|nav| {
+            let mut act = "";
+            while let Ok(ev) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+                if ev.id == nav.show_id { act = "show"; } else if ev.id == nav.add_id { act = "add"; } else if ev.id == nav.quit_id { act = "quit"; }
+            }
+            act
+        }).unwrap_or("");
+        match tray_act {
+            "show" => { ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true)); ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false)); ctx.send_viewport_cmd(egui::ViewportCommand::Focus); }
+            "add" => { ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true)); ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false)); ctx.send_viewport_cmd(egui::ViewportCommand::Focus); self.tab = Tab::Downloads; self.show_add = true; }
+            "quit" => { self.rt.lock().unwrap().save(); ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+            _ => {}
+        }
         crate::drain_inbox(&self.rt);
         // progress sync
         {
