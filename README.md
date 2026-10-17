@@ -13,6 +13,7 @@ Runs on Windows 10/11 x86_64, macOS 13 or later (Intel and Apple Silicon), and L
 - DASH (MPD) and HLS downloads, including AES-128 HLS. DRM-protected streams are refused
 - Site Grabber with depth, scope, size, and extension filters, plus a site mirror that rewrites links to local relative paths
 - Chromium MV3 and Firefox extensions that hand downloads to the desktop app through a native messaging host
+- Drag-and-drop URLs or .url files onto main window
 - System tray, autostart, single-instance lock, and the `downloadcraft://` URL protocol
 - `--smoke-test` for CI
 
