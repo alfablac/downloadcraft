@@ -26,7 +26,8 @@
 | Browser manifest sniffing (webRequest) → download panel candidates | Done | Chromium + Firefox candidates map, panel merge |
 | Content-Type manifest dispatch (no extension in URL) | Done | `stream::probe_manifest` |
 | Release v0.1.0 published (matrix + release job green, SHA256SUMS verified) | Done | GitHub Release v0.1.0 assets; NSIS/AppImage best-effort in CI |
-| FTP/SFTP/FTPS, HLS AES-128 decrypt, IDM live-DASH panel behavior | Not cloned / refused | FTPS needs TLS stack decision; AES-HLS treated as encrypted (refusal per spec); live-DASH IDM behavior unverified |
+| FTP/SFTP/FTPS, IDM live-DASH panel behavior | Not cloned / refused | FTPS needs TLS stack decision; live-DASH IDM behavior unverified |
+| HLS AES-128 decrypt (plain key over HTTP, not DRM) | Done | `hls::decrypt_segment` + `stream` encrypted temp-parts path; unit vectors + `tests/hls_aes.rs` e2e (sequence IV, explicit IV); SAMPLE-AES/other methods → Protected |
 | DASH nested BaseURL, `$Number%05d$`/`$RepresentationID$` | Done | unit tests |
 | DASH multi-Representation A/V mux | Done (ffmpeg when present) | e2e with fake segs concat; ffmpeg mux fn |
 | DASH multi-Period order | Done | unit test |

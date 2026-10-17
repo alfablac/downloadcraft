@@ -108,7 +108,7 @@ fn append_reps(parsed: &Mpd, tracks: &mut engine::MediaTracks, task: &DownloadTa
 pub async fn download_hls(client: reqwest::Client, mut task: DownloadTask, ctrl: Arc<engine::Controls>) -> Result<DownloadTask, String> {
     let base = url::Url::parse(&task.url).map_err(|e| e.to_string())?;
     let text = fetch_text(&client, &task, &task.url).await?;
-    if hls::has_key(&text) { task.status = TaskStatus::Protected; task.error = "Encrypted HLS (EXT-X-KEY) is not supported".into(); return Ok(task); }
+    if let Some(m) = hls::key_method(&text) { if m != "AES-128" && m != "NONE" { task.status = TaskStatus::Protected; task.error = format!("Encrypted HLS METHOD={m} is not supported"); return Ok(task); } }
     if text.contains("#EXT-X-STREAM-INF") {
         let master = hls::parse_master(&text, &base);
         if master.variants.is_empty() { return Err("HLS master has no variants".into()); }
@@ -147,34 +147,73 @@ pub async fn download_hls(client: reqwest::Client, mut task: DownloadTask, ctrl:
     download_hls_media(client, task, ctrl).await
 }
 
+async fn fetch_key(client: &reqwest::Client, task: &DownloadTask, url: &str) -> Result<[u8; 16], String> {
+    let mut req = client.get(url);
+    if !task.referrer.is_empty() { req = req.header("Referer", &task.referrer); }
+    if !task.cookies.is_empty() { req = req.header("Cookie", &task.cookies); }
+    for (k, v) in &task.headers { req = req.header(k.as_str(), v.as_str()); }
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() { return Err(format!("HTTP {} for key {url}", resp.status())); }
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    <[u8; 16]>::try_from(bytes.as_ref()).map_err(|_| format!("AES-128 key must be 16 bytes, got {}", bytes.len()))
+}
+
 async fn download_hls_media(client: reqwest::Client, task: DownloadTask, ctrl: Arc<engine::Controls>) -> Result<DownloadTask, String> {
     let base = url::Url::parse(&task.url).map_err(|e| e.to_string())?;
     let text = fetch_text(&client, &task, &task.url).await?;
-    if hls::has_key(&text) { let mut t = task.clone(); t.status = TaskStatus::Protected; t.error = "Encrypted HLS (EXT-X-KEY) is not supported".into(); return Ok(t); }
+    if let Some(m) = hls::key_method(&text) { if m != "AES-128" && m != "NONE" { let mut t = task.clone(); t.status = TaskStatus::Protected; t.error = format!("Encrypted HLS METHOD={m} is not supported"); return Ok(t); } }
     let media = hls::resolve_implicit_ranges(hls::parse_media(&text, &base));
     if media.segments.is_empty() { return Err("HLS media playlist has no segments".into()); }
     // Live HLS: if no ENDLIST, poll until ENDLIST appears or cancelled
     let mut media = media;
     if !media.end_list {
         let mut seen = media.segments.clone();
+        let mut seen_keys = media.key_infos.clone();
+        let mut seen_ranges = media.byte_ranges.clone();
         loop {
             if ctrl.cancelled.load(std::sync::atomic::Ordering::Relaxed) { break; }
             tokio::time::sleep(std::time::Duration::from_secs_f64(media.target_duration.max(1.0) / 2.0)).await;
             let t2 = fetch_text(&client, &task, &task.url).await?;
             let m2 = hls::resolve_implicit_ranges(hls::parse_media(&t2, &base));
-            for s in &m2.segments { if !seen.contains(s) { seen.push(s.clone()); } }
-            if m2.end_list { media.byte_ranges = m2.byte_ranges; break; }
+            for (i, s) in m2.segments.iter().enumerate() { if !seen.contains(s) { seen.push(s.clone()); seen_keys.push(m2.key_infos.get(i).cloned().unwrap_or(None)); seen_ranges.push(m2.byte_ranges.get(i).copied().flatten()); } }
+            if m2.end_list { media = m2; break; }
         }
-        media.segments = seen;
+        if !media.end_list { media.segments = seen; media.key_infos = seen_keys; media.byte_ranges = seen_ranges; }
     }
-    // BYTERANGE segments need Range requests: download via fetch_bytes per segment to temp then concat
+    // Encrypted playlists: any non-AES-128 method refused; AES-128 handled below.
+    // EXT-X-MAP init segment is clear (never decrypted).
+    let encrypted = media.key_infos.iter().any(|k| k.is_some());
+    if encrypted {
+        for (i, ki) in media.key_infos.iter().enumerate() {
+            if let Some(ki) = ki {
+                if ki.method != "AES-128" { let mut t = task.clone(); t.status = TaskStatus::Protected; t.error = format!("Encrypted HLS METHOD={} is not supported", ki.method); return Ok(t); }
+                if ki.uri.is_none() { return Err(format!("EXT-X-KEY AES-128 segment {i} missing URI")); }
+            }
+        }
+    }
+    // BYTERANGE or encrypted segments need per-segment fetch to temp then concat
+    // (plain path streams raw bytes via download_media; decrypt needs whole segment).
     let has_ranges = media.byte_ranges.iter().any(|r| r.is_some()) || media.map_byte_range.is_some();
-    if has_ranges {
+    if has_ranges || encrypted {
         let work = task.dest_dir.join(format!(".idmcraft-hls-{}", task.id));
         std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
         let mut parts: Vec<std::path::PathBuf> = Vec::new();
         if let Some(init) = &media.init_uri { let p = work.join("init.bin"); engine::fetch_bytes(&client, &task, init, media.map_byte_range, &p).await?; parts.push(p); }
-        for (i, seg) in media.segments.iter().enumerate() { let p = work.join(format!("{i}.seg")); engine::fetch_bytes(&client, &task, seg, media.byte_ranges.get(i).copied().flatten(), &p).await?; parts.push(p); }
+        // Key cache by URI: keys may rotate mid-playlist.
+        let mut key_cache: std::collections::HashMap<String, [u8; 16]> = std::collections::HashMap::new();
+        for (i, seg) in media.segments.iter().enumerate() {
+            let p = work.join(format!("{i}.seg"));
+            engine::fetch_bytes(&client, &task, seg, media.byte_ranges.get(i).copied().flatten(), &p).await?;
+            if let Some(Some(ki)) = media.key_infos.get(i) {
+                let key_uri = ki.uri.as_deref().unwrap();
+                let key = match key_cache.get(key_uri) { Some(k) => *k, None => { let k = fetch_key(&client, &task, key_uri).await?; key_cache.insert(key_uri.to_string(), k); k } };
+                let iv = ki.iv.unwrap_or_else(|| hls::iv_for_sequence(media.media_sequence + i as u64));
+                let raw = tokio::fs::read(&p).await.map_err(|e| e.to_string())?;
+                let plain = hls::decrypt_segment(&key, &iv, &raw)?;
+                tokio::fs::write(&p, &plain).await.map_err(|e| e.to_string())?;
+            }
+            parts.push(p);
+        }
         let dest = task.dest_dir.join(&task.filename);
         {
             let mut out = tokio::fs::File::create(&dest).await.map_err(|e| e.to_string())?;
