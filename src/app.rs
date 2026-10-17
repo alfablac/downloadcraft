@@ -236,15 +236,18 @@ impl DownloadApp {
     /// Once per poll: 6s window rate -> EMA. Done here, not in draw code, so
     /// repaint frequency cannot change smoothing.
     fn update_smooth_rates(&mut self) {
+        let now = std::time::Instant::now();
         let ids: Vec<String> = self.rate_map.keys().cloned().collect();
         for id in ids {
+            // egui stops calling update while window hidden/in tray; Instant
+            // window then spans idle period and makes resume appear 0 B/s.
             let raw = {
                 let Some(v) = self.rate_map.get(&id) else { continue; };
-                if v.len() < 2 { 0.0 } else {
-                    let (t0, b0) = v[0]; let (t1, b1) = v[v.len() - 1];
-                    let dt = t1.duration_since(t0).as_secs_f64();
-                    if dt < 0.8 { continue; } else { b1.saturating_sub(b0) as f64 / dt }
-                }
+                let recent: Vec<(std::time::Instant, u64)> = v.iter().copied().filter(|(t, _)| now.duration_since(*t).as_secs_f64() <= 2.0).collect();
+                if recent.len() < 2 { continue; }
+                let (t0, b0) = recent[0]; let (t1, b1) = recent[recent.len() - 1];
+                let dt = t1.duration_since(t0).as_secs_f64();
+                if dt < 0.8 { continue; } else { b1.saturating_sub(b0) as f64 / dt }
             };
             let e = self.rate_smooth.entry(id).or_insert(raw);
             *e = if raw > 0.0 { *e * 0.65 + raw * 0.35 } else { *e * 0.8 };
