@@ -5,8 +5,8 @@
   <key>CFBundleName</key><string>downloadcraft</string>
   <key>CFBundleDisplayName</key><string>downloadcraft</string>
   <key>CFBundleIdentifier</key><string>com.downloadcraft.app</string>
-  <key>CFBundleVersion</key><string>0.3.2</string>
-  <key>CFBundleShortVersionString</key><string>0.3.2</string>
+  <key>CFBundleVersion</key><string>0.3.3</string>
+  <key>CFBundleShortVersionString</key><string>0.3.3</string>
   <key>CFBundleExecutable</key><string>downloadcraft</string>
   <key>CFBundleIconFile</key><string>downloadcraft</string>
   <key>CFBundlePackageType</key><string>APPL</string>
