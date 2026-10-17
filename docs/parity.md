@@ -11,7 +11,7 @@
 | Queues: caps, priority, drag order (Up/Down), FIFO order field | Done | `queue::plan_starts` unit + GUI buttons |
 | Categories by extension | Done | `model::category_for` |
 | Clipboard URL monitor | Done | app poll (arboard), per-OS via crate |
-| Drag-and-drop URLs | Partial | Clipboard + inbox + Add box (egui text-drop limited); browser drag via extension |
+| Drag-and-drop URLs | Done | Window drop handler (URL text + `.url` files, `raw.dropped_files`) + clipboard + inbox + Add box; browser drag via extension |
 | Add by URL with cookies/headers/referrer | Done | Add dialog fields + task model |
 | DASH SegmentTemplate / Timeline / List / SegmentBase | Done | mpd unit + e2e; SegmentBase = single-file download once (init_range parsed, no double-fetch) |
 | HLS BYTERANGE implicit offset, audio rendition mux | Done | hls `resolve_implicit_ranges` unit; stream mux via ffmpeg, video kept + error on mux fail |
@@ -33,7 +33,10 @@
 | DASH multi-Period order | Done | unit test |
 | DASH dynamic/live | Done (poll model) | dynamic fixture e2e; RE round 5: IDM manual-add saves MPD as plain file, no poll; browser-panel path unverified (see RE doc) |
 | DASH ContentProtection refusal | Done | e2e |
-| HLS variants, audio groups, EXT-X-MAP, BYTERANGE, live, EXT-X-KEY refusal | Done | hls unit + e2e; KEY→Protected |
+| HLS variants, audio groups, EXT-X-MAP, BYTERANGE, live, EXT-X-KEY | Done | hls unit + e2e; AES-128 decrypted (`tests/hls_aes.rs`), SAMPLE-AES→Protected |
+| DASH subtitle AdaptationSets | Done | Sidecar file beside final media (`dash_subtitle_sidecar_and_media_cache_resume`); REA round 6 |
+| DASH kill-resume segment cache | Done | `seg-<kind>-<i>.bin` replay, manifest snapshot before fetch (same e2e) |
+| Content-Type-only manifest detection (`video/vnd.mpeg.dash.mpd`, `application/vnd.apple.mpegurl`) | Done | `stream::probe_manifest` (REA round 6 MIME map) |
 | Browser ext Chromium MV3 + Firefox, native host, per-OS registration paths | Done | extensions/, `platform::native_host_manifest_paths` unit |
 | Video panel (qualities) | Done | content.js panel + rep_label |
 | Queues scheduler start/stop, recurrence, missed policy flag, next-run | Done | scheduler unit + GUI |

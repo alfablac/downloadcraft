@@ -7,7 +7,7 @@ Registry evidence (`HKCU\Software\DownloadManager`, value NAMES/types only, no v
 - Per-download records = numeric subkeys (177 present; key = download ID; `maxID` counter key). Fields include: `LocalFileName`, `LocalPath`, `LogFileName`, `Host`, `Path`, `FileName`, `User`, `EncPassword` (binary), `UA`, `Referer`, `Port`, `categoryID`, `cFlags`, `owWPage` (parent web page), `Url0` (primary URL; suffix-0 implies mirror list `Url1…`), `U0_u`/`U0_EncP` (per-URL credentials), `CstmHdrs` (custom headers), `AccH`/`OrgAccEncH` (accept headers), `FRFileSize`/`FileSize` (binary u64), `LastModified`, `dateAdded`, `lastTryDate`, `Status` (DWORD), `queueID` (DWORD), `TPswitch`, `bRetAfFR`... Clone maps: DownloadTask {url + (new) mirrors, username/password per mirror, headers, referrer, category, queue, status, size, dates} — see model.rs additions.
 - `ListSettings` binary blobs per column (`FileName, DateAdded, Queue, Size, Status, Timeleft, TransferRate, LastTry, Description, SaveTo, Referer, Parent_wp, Order639`) = persisted column order/width — confirms UIA column set exactly.
 - `FoldersTree\{Compressed,Documents,Music,Programs,Video}` = {`ID`, `mask` (extension mask), `pathW`, `rememberLastPath`, `forSiteOnly`, `sites`} — category definition shape.
-- `Scheduler` = {`isLimitEnabled`, `m_MBytes`, `m_hours`, `showLimitExceededWarning`} — quota scheduler (stop after X MB per Y hours) separate from time schedules. Clone: quota fields on Schedule (planned).
+- `Scheduler` = {`isLimitEnabled`, `m_MBytes`, `m_hours`, `showLimitExceededWarning`} — quota scheduler (stop after X MB per Y hours) separate from time schedules. Clone: quota fields on Schedule (done — `quota_mb`/`quota_hours`, gate in scheduler).
 - `DwnlPanel` = DWORD per extension (FLV MP3 MP4 M4V F4V M4A MPG MPEG AVI WMV WMA WAV ASF RM OGG OGV MOV 3GP QT WEBM TS MKV AAC VTT TTML TTML2 DFXP SRT) + `PanelView`, `DonlCaptWP` — video download panel shown per file type; subtitles types included. Clone: panel per type incl. subtitles.
 - `Queue` = single REG_SZ blob (serialized queues). `GrabberSts` = {bDontShowCnfNameDlg, maxProjectID}.
 
@@ -47,6 +47,18 @@ Method: local fixtures under `%TEMP%\opencode\idm-fixtures\` (`server.py` Thread
 | Registry + post-run state | `HKCU\Software\DownloadManager` 74 value names, none MPD/HLS/DASH-specific (only `PanelExceptionServers` matched); fixture tasks appeared in main list as plain filenames (`live.mpd`, `vod.mpd`, `playlist.m3u8`) and were deleted after | No persisted MPD/HLS config evidence | — |
 
 Parity recommendation (A) live/dynamic DASH: **keep clone behavior** (poll `minimumUpdatePeriod`, dedupe, assemble) — IDM manual-add treats MPD as plain file, panel path Unverified; do not claim IDM parity. (B) HLS EXT-X-KEY: **keep clone behavior** (decrypt AES-128, refuse SAMPLE-AES → `Protected`) — same reasoning; IDM AES/SAMPLE-AES handling Unverified, not observed. Anything panel-path = **Unverified — do not guess IDM internals.**
+
+## RE round 6 — REA on shipped extension containers + IDMan.exe (2026-10-17)
+
+Tool: `rea-agents@6.5.0` CLI (MCP registration for opencode `aligned` per `doctor`, skill v42; REA MCP tools absent from this session — client restart required; CLI fallback used, per skill). Attempt 1: default npx cache corrupt (`ERR_MODULE_NOT_FOUND AbortablePromise-*.js`). Attempt 2: fresh `npm_config_cache` → success.
+
+- **REA Evidence** `ev_1ea020b0b313244e7d11eaaa0de66a589030f990e3438a6c18a62b46f4a0dabd` (`analyze_javascript_application` on extracted `IDMGCExt.crx`): 27 sources inventoried/parsed; graph confirms `connectNative("com.tonec.idm")`, 6 `onBeforeRequest` sites. Limitations: static AST only, dynamic expressions unresolved, no runtime execution. Full record: `%TEMP%\opencode\idm-rea\evidence-chrome.json` (38 MB, not committed).
+- **CRX v3 containers** (header = 12 + header_len@8): `IDMGCExt.crx` MV3 `6.43.1`, `minimum_chrome_version 109`, service worker, permissions incl `scripting,declarativeNetRequest,downloads*`; `IDMEdgeExt.crx` MV2 `6.43.1` persistent background; `idmmzcc3.xpi` MV2 `6.43.1` gecko `mozilla_cc3@internetdownloadmanager.com`, signed META-INF present; `IDMOpExt.nex` MV2 `6.41.8`. All: content script `all_frames:true, run_at:document_start`, matches http/https/ftp/file.
+- **Native protocol shape (observed literals only, no code copied):** persistent port, numeric opcode message arrays (`[18,...]` connect, `[15,...]`/`[16,...]` relay, `[21,url,referrer...]` page report, `[41,...]` media-element report, `[45,...]` script report), `?d=` → internal `idmreg:` handoff, `x-idm-*` request-header inject/strip (`x-idm-status`, `x-idm-request-id` in Edge/FF builds), 1.5 s reconnect timer. Clone keeps own JSON `{type,url,referrer,cookies,filename}` — wire format is IDM-internal, not cloned.
+- **MIME→extension map (observed):** `video/vnd.mpeg.dash.mpd→MPD`, `application/vnd.apple.mpegurl`/`video/mpegurl`/`application/x-mpegurl→M3U8`, `text/plain→…VTT|SRT|M3U8|MPD…`. Clone applied: `probe_manifest` now accepts `dash`/`mpd` + `mpegurl`/`m3u` substrings; extension sniff sets already covered both families.
+- **Installed-state wiring (observed):** Chrome profile `Default/Extensions/ngpampappnmepgilojfohadhhmbhlaek/6.43.1_0` (manifest carries store `key`, differs from CRX-extracted hash — signed store copy), Edge `llbjbkhnmlidjebalopleeepgdfgcpec` MV2 `6.43.1`, Firefox profile XPI present. Registry `com.tonec.idm` → Chrome/Edge `IDMMsgHost.json`, Mozilla `IDMMsgHostMoz.json`; Brave host key **missing** on this machine (IDM registered Chrome/Edge/Mozilla only here).
+- **IDMan.exe 6.43.15.3**: `Status: NotSigned` (Get-AuthenticodeSignature) — unsigned build on this machine; no inference drawn beyond that.
+- **Clone actions from round 6:** extension content scripts aligned `document_start`+`all_frames` (both engines); DASH subtitle AdaptationSets → sidecar file (parity table row 13 was Partial); media segment cache = kill-resume source; drag-and-drop URL/`.url` drop onto main window.
 
 ## Install inventory (observed)
 
@@ -108,7 +120,7 @@ Per-download folder `<sanitized-host+path>_<numeric id>` containing sequential p
 
 ## 1b. HLS findings
 
-Master: BANDWIDTH/RESOLUTION/CODECS/AUDIO/SUBTITLES groups parsed; variant = highest bandwidth or `x-variant-index`. Media: `EXT-X-MAP` init, `EXT-X-BYTERANGE` (incl. MAP range), `EXT-X-DISCONTINUITY` tolerated (concat order preserved), live = no `EXT-X-ENDLIST` → poll at `targetduration/2`, dedupe, stop at ENDLIST/cancel. TS/fMP4: byte concat (TS concat is playable; fMP4 init+segments concat is standard). `EXT-X-KEY` (non-NONE) → `Protected` refusal. No DRM circumvention.
+Master: BANDWIDTH/RESOLUTION/CODECS/AUDIO/SUBTITLES groups parsed; variant = highest bandwidth or `x-variant-index`. Media: `EXT-X-MAP` init, `EXT-X-BYTERANGE` (incl. MAP range), `EXT-X-DISCONTINUITY` tolerated (concat order preserved), live = no `EXT-X-ENDLIST` → poll at `targetduration/2`, dedupe, stop at ENDLIST/cancel. TS/fMP4: byte concat (TS concat is playable; fMP4 init+segments concat is standard). `EXT-X-KEY METHOD=AES-128` (plain key over HTTP, not DRM) → fetched + CBC-decrypted (`tests/hls_aes.rs`); `SAMPLE-AES`/other methods → `Protected` refusal. No DRM circumvention.
 
 ## Feature inventory from IDM UI/docs (observable)
 
