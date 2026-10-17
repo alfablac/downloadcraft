@@ -86,8 +86,12 @@ pub struct DownloadApp {
     new_queue_name: String,
     grab_url: String,
     grab_depth: usize,
+    grab_ext_depth: usize,
     grab_scope: u8,
     grab_exts: String,
+    grab_parent_dirs: bool,
+    grab_only_paths: String,
+    grab_exclude_paths: String,
     grab_files: Vec<FoundFile>,
     grab_project_json: String,
     grab_status: String,
@@ -131,7 +135,7 @@ impl DownloadApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, rt: Arc<Mutex<Runtime>>, hidden: bool) -> Self {
         let tokio_rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio rt"));
         let tray = Self::make_tray();
-        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_scope: 0, grab_exts: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), grab_status: "Enter a start URL, then Explore.".into(), grab_busy: false, last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, options_notice: "Changes save automatically.".into(), show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new(), rate_smooth: std::collections::HashMap::new(), handles: std::collections::HashMap::new(), allow_close: false }
+        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_ext_depth: 0, grab_scope: 0, grab_exts: String::new(), grab_parent_dirs: false, grab_only_paths: String::new(), grab_exclude_paths: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), grab_status: "Enter a start URL, then Explore.".into(), grab_busy: false, last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, options_notice: "Changes save automatically.".into(), show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new(), rate_smooth: std::collections::HashMap::new(), handles: std::collections::HashMap::new(), allow_close: false }
     }
 
     fn make_tray() -> Option<TrayNav> {
@@ -421,6 +425,13 @@ fn run_completion(g: &Runtime, queue_id: &str, task_id: &str) {
     }
 }
 
+impl DownloadApp {
+    fn grab_project(&self, mirror: bool) -> GrabberProject {
+        let split = |s: &str| s.split(';').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+        GrabberProject { start_url: self.grab_url.clone(), depth: self.grab_depth, external_depth: self.grab_ext_depth, scope: self.grab_scope, extensions: self.grab_exts.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(), max_pages: 200, mirror, dont_explore_parent_dirs: self.grab_parent_dirs, only_paths: split(&self.grab_only_paths), exclude_paths: split(&self.grab_exclude_paths), ..Default::default() }
+    }
+}
+
 impl eframe::App for DownloadApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.rt.lock().unwrap().save();
@@ -501,6 +512,8 @@ impl eframe::App for DownloadApp {
         // ── Left rail: navigation + categories (IDM category tree, modern rail) ──
         egui::SidePanel::left("rail").resizable(false).exact_width(208.0)
             .frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::same(6.0))).show(ctx, |ui| {
+            // Panel allocation can exceed first-frame content width; fill it or a grey strip shows beside rail.
+            ui.painter().rect_filled(ui.max_rect(), 0.0, theme::SURFACE);
             ui.set_width(ui.available_width());
                 ui.label(egui::RichText::new("WORKSPACE").color(theme::TEXT_FAINT).small().strong());
                 ui.add_space(4.0);
@@ -1092,11 +1105,30 @@ impl DownloadApp {
                     ui.label(egui::RichText::new("Scope").color(theme::TEXT_MUTED).small().strong());
                     egui::ComboBox::from_id_salt("grab-scope").selected_text(["Same host", "Same domain", "Any host"][self.grab_scope.min(2) as usize]).show_ui(ui, |ui| { for (i, l) in ["Same host", "Same domain", "Any host"].iter().enumerate() { ui.selectable_value(&mut self.grab_scope, i as u8, *l); } });
                 });
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("External levels").color(theme::TEXT_MUTED).small().strong());
+                    ui.add(egui::DragValue::new(&mut self.grab_ext_depth).range(0..=10));
+                });
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("Parent dirs").color(theme::TEXT_MUTED).small().strong());
+                    ui.checkbox(&mut self.grab_parent_dirs, "Don't explore");
+                });
+            });
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("Only paths/domains (; separated)").color(theme::TEXT_MUTED).small().strong());
+                    ui.add(egui::TextEdit::singleline(&mut self.grab_only_paths).hint_text("/files/;cdn.example.com").desired_width((ui.available_width() * 0.45).clamp(220.0, 520.0)));
+                });
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("Exclude paths/domains (; separated)").color(theme::TEXT_MUTED).small().strong());
+                    ui.add(egui::TextEdit::singleline(&mut self.grab_exclude_paths).hint_text("/logout;/ads/").desired_width((ui.available_width() * 0.45).clamp(220.0, 520.0)));
+                });
             });
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 if icon_btn_enabled(ui, Icon::Search, "Explore", true, 92.0, !self.grab_url.trim().is_empty()).clicked() {
-                    let proj = GrabberProject { start_url: self.grab_url.clone(), depth: self.grab_depth, scope: self.grab_scope, extensions: self.grab_exts.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(), max_pages: 200, ..Default::default() };
+                    let proj = self.grab_project(false);
                     self.grab_project_json = serde_json::to_string_pretty(&proj).unwrap_or_default();
                     self.grab_busy = true;
                     self.grab_status = "Exploring site...".into();
@@ -1116,7 +1148,7 @@ impl DownloadApp {
                 let _ = icon_btn_enabled(ui, Icon::Check, "Results update automatically", false, 188.0, false);
                 if icon_btn_enabled(ui, Icon::Globe, "Mirror site", false, 104.0, !self.grab_url.trim().is_empty()).clicked() {
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        let proj = GrabberProject { start_url: self.grab_url.clone(), depth: self.grab_depth, scope: self.grab_scope, extensions: self.grab_exts.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(), max_pages: 200, mirror: true, ..Default::default() };
+                        let proj = self.grab_project(true);
                         self.grab_busy = true;
                         self.grab_status = format!("Mirroring site to {}...", dir.display());
                         let slot = Arc::new(Mutex::new(GrabOutcome::default()));
@@ -1148,7 +1180,7 @@ impl DownloadApp {
                     if icon_btn_enabled(ui, Icon::Document, "Export .txt", false, 102.0, !self.grab_files.is_empty()).clicked() { if let Some(p) = rfd::FileDialog::new().add_filter("txt", &["txt"]).save_file() { let _ = std::fs::write(p, self.grab_files.iter().map(|f| f.url.clone()).collect::<Vec<_>>().join("\n")); } }
                     if icon_btn_enabled(ui, Icon::Document, "Export CSV", false, 102.0, !self.grab_files.is_empty()).clicked() { if let Some(p) = rfd::FileDialog::new().add_filter("csv", &["csv"]).save_file() { let mut s = "url,size,mime,page\n".to_string(); for f in &self.grab_files { s.push_str(&format!("{},{},{},{}\n", f.url, f.size.map(|v| v.to_string()).unwrap_or_default(), f.mime, f.page_url)); } let _ = std::fs::write(p, s); } }
                     if icon_btn_enabled(ui, Icon::FolderOpen, "Save project", false, 112.0, !self.grab_files.is_empty()).clicked() { if let Some(p) = rfd::FileDialog::new().add_filter("json", &["json"]).save_file() { let _ = std::fs::write(p, &self.grab_project_json); } }
-                    if icon_btn(ui, Icon::FolderOpen, "Load project", false, 112.0).clicked() { if let Some(p) = rfd::FileDialog::new().pick_file() { if let Ok(t) = std::fs::read_to_string(p) { self.grab_project_json = t.clone(); if let Ok(proj) = serde_json::from_str::<GrabberProject>(&t) { self.grab_url = proj.start_url; self.grab_depth = proj.depth; self.grab_scope = proj.scope; } } } }
+                    if icon_btn(ui, Icon::FolderOpen, "Load project", false, 112.0).clicked() { if let Some(p) = rfd::FileDialog::new().pick_file() { if let Ok(t) = std::fs::read_to_string(p) { self.grab_project_json = t.clone(); if let Ok(proj) = serde_json::from_str::<GrabberProject>(&t) { self.grab_url = proj.start_url; self.grab_depth = proj.depth; self.grab_ext_depth = proj.external_depth; self.grab_scope = proj.scope; self.grab_parent_dirs = proj.dont_explore_parent_dirs; self.grab_only_paths = proj.only_paths.join(";"); self.grab_exclude_paths = proj.exclude_paths.join(";"); } } } }
                 });
             });
             ui.separator();

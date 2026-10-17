@@ -158,6 +158,46 @@ async fn grabber_fixture_site() {
 }
 
 #[tokio::test]
+async fn grabber_idm_parity_discovery() {
+    // Raw script-URL extraction itself is covered by grabber unit test script_css_and_depth_rules.
+    let index = r#"<html><head><style>.a{background:url(/img/bg.png)}</style></head>
+    <a href="/dir/sub/page.html">sub</a><a href="/outside.html">out</a><a href="/dl?id=3">endpoint</a><a href="/files/keep.zip">keep</a><a href="/ads/skip.zip">ad</a></html>"#;
+    let sub = r#"<html><a href="/files/sub.zip">s</a></html>"#;
+    let outside = r#"<html><a href="/files/outside.zip">o</a></html>"#;
+    let base = serve(vec![
+        ("/dir/index.html".to_string(), index.as_bytes().to_vec(), "text/html".to_string()),
+        ("/dir/sub/page.html".to_string(), sub.as_bytes().to_vec(), "text/html".to_string()),
+        ("/outside.html".to_string(), outside.as_bytes().to_vec(), "text/html".to_string()),
+        ("/dl".to_string(), b"ZIPDATA".to_vec(), "application/zip".to_string()),
+        ("/img/bg.png".to_string(), b"PNG".to_vec(), "image/png".to_string()),
+        ("/files/keep.zip".to_string(), b"ZIP".to_vec(), "application/zip".to_string()),
+        ("/files/sub.zip".to_string(), b"ZIP".to_vec(), "application/zip".to_string()),
+        ("/files/outside.zip".to_string(), b"ZIP".to_vec(), "application/zip".to_string()),
+        ("/ads/skip.zip".to_string(), b"ZIP".to_vec(), "application/zip".to_string()),
+        ("/robots.txt".to_string(), b"User-agent: *\nAllow: /\n".to_vec(), "text/plain".to_string()),
+    ]);
+    let crawl = |proj: downloadcraft_lib::grabber::GrabberProject| async move {
+        downloadcraft_lib::grabber::Crawler { project: proj }.crawl(&build_client("")).await.unwrap()
+    };
+    // Parent-dir guard + exclude path filter + script endpoint discovery.
+    let proj = downloadcraft_lib::grabber::GrabberProject { start_url: format!("{base}/dir/index.html"), depth: 3, scope: 0, max_pages: 50, dont_explore_parent_dirs: true, exclude_paths: vec!["/ads/".into()], ..Default::default() };
+    let (pages, files) = crawl(proj).await;
+    let urls: Vec<&str> = files.iter().map(|f| f.url.as_str()).collect();
+    std::fs::write(std::env::temp_dir().join("dc_dbg.txt"), format!("pages={pages:?}\nfiles={urls:?}")).unwrap();
+    assert!(urls.iter().any(|u| u.contains("/dl?id=3")), "endpoint discovery: {urls:?}");
+    assert!(urls.iter().any(|u| u.ends_with("/img/bg.png")), "css url(): {urls:?}");
+    assert!(urls.iter().any(|u| u.ends_with("/files/keep.zip")), "{urls:?}");
+    assert!(urls.iter().any(|u| u.ends_with("/files/sub.zip")), "in-dir sub page crawled: {urls:?}");
+    assert!(!urls.iter().any(|u| u.contains("/ads/")), "exclude_paths: {urls:?}");
+    assert!(!urls.iter().any(|u| u.ends_with("/files/outside.zip")), "parent-dir guard must not expand /outside.html: {urls:?} pages={pages:?}");
+    // Only-paths filter restricts files.
+    let proj = downloadcraft_lib::grabber::GrabberProject { start_url: format!("{base}/dir/index.html"), depth: 1, scope: 0, max_pages: 50, only_paths: vec!["/files/".into()], ..Default::default() };
+    let (_p, files) = crawl(proj).await;
+    assert!(files.iter().all(|f| f.url.contains("/files/")), "only_paths: {:?}", files.iter().map(|f| &f.url).collect::<Vec<_>>());
+    assert!(files.iter().any(|f| f.url.ends_with("/files/keep.zip")));
+}
+
+#[tokio::test]
 async fn grabber_start_http_error_surfaces() {
     let base = serve(vec![("/index.html".into(), b"<html></html>".to_vec(), "text/html".into())]);
     let proj = downloadcraft_lib::grabber::GrabberProject { start_url: format!("{base}/missing"), depth: 1, scope: 0, max_pages: 10, ..Default::default() };

@@ -20,6 +20,12 @@ pub struct GrabberProject {
     #[serde(default = "def_true")] pub respect_robots: bool,
     #[serde(default)] pub crawl_delay_ms: u64,
     #[serde(default)] pub mirror: bool,
+    /// Levels to follow on hosts other than start host (IDM Grabber: levels on other sites).
+    #[serde(default)] pub external_depth: usize,
+    #[serde(default)] pub dont_explore_parent_dirs: bool,
+    /// Semicolon-style include filters in GUI; stored split. Matches URL/path substring.
+    #[serde(default)] pub only_paths: Vec<String>,
+    #[serde(default)] pub exclude_paths: Vec<String>,
 }
 fn def_depth() -> usize { 2 } fn def_pages() -> usize { 200 } fn def_true() -> bool { true }
 
@@ -65,7 +71,26 @@ pub fn in_scope(start: &Url, cand: &Url, scope: u8) -> bool {
     match scope { 0 => host_of(start) == host_of(cand), 1 => domain_of(start) == domain_of(cand), _ => true }
 }
 
-fn ext_of(url: &str) -> String { url.split(['?', '#']).next().unwrap_or(url).rsplit('.').next().unwrap_or("").to_ascii_lowercase() }
+fn path_allowed(project: &GrabberProject, canon: &str) -> bool {
+    if project.exclude_paths.iter().any(|x| !x.trim().is_empty() && canon.contains(x.trim())) { return false; }
+    let only: Vec<&str> = project.only_paths.iter().map(|x| x.trim()).filter(|x| !x.is_empty()).collect();
+    if !only.is_empty() && !only.iter().any(|x| canon.contains(x)) { return false; }
+    true
+}
+
+fn under_start_dir(start: &Url, cand: &Url) -> bool {
+    if host_of(start) != host_of(cand) { return true; }
+    let sp = start.path();
+    let dir = sp.rsplit_once('/').map(|(d, _)| format!("{d}/")).unwrap_or_else(|| "/".into());
+    cand.path().starts_with(&dir) || cand.path() == sp
+}
+
+fn ext_of(url: &str) -> String {
+    // Extension from last path segment only; dots in host/port/query are not extensions.
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let seg = path.rsplit('/').next().unwrap_or("");
+    seg.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default()
+}
 
 /// First `<base href>` wins per HTML spec; resolved against page URL. Relative links then resolve against it, not the page.
 pub fn document_base(html: &str, page: &Url) -> Url {
@@ -111,6 +136,26 @@ pub fn extract_links(html: &str, base: &Url) -> (Vec<Url>, Vec<Url>) {
             pos = idx + needle.len();
         }
         let _ = (bytes, &mut i);
+    }
+    // URLs assigned by scripts or written as plain text (IDM "Process JavaScript" discovery, static only).
+    for needle in ["https://", "http://"] {
+        let mut pos = 0;
+        while let Some(idx) = lower[pos..].find(needle).map(|x| x + pos) {
+            let rest = &html[idx..];
+            let val = rest.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '\\')).next().unwrap_or("").trim_end_matches(['.', ',', ';']);
+            if let Ok(u) = base.join(val) { pages.push(u); }
+            pos = idx + needle.len();
+        }
+    }
+    // CSS url(...) references in style blocks / inline styles.
+    {
+        let mut pos = 0;
+        while let Some(idx) = lower[pos..].find("url(").map(|x| x + pos) {
+            let rest = html[idx + 4..].trim_start().trim_start_matches(['"', '\'']);
+            let val = rest.split(['"', '\'', ')']).next().unwrap_or("").trim();
+            if !val.is_empty() && !val.starts_with("data:") { if let Ok(u) = base.join(val) { files.push(u); } }
+            pos = idx + 4;
+        }
     }
     (pages, files)
 }
@@ -196,61 +241,96 @@ impl Crawler {
         let exclude_re = simple_re(&self.project.exclude_regex);
         let _ = include_re;
         let mut visited: HashSet<String> = HashSet::new();
-        let mut queue: VecDeque<(Url, usize)> = VecDeque::new();
-        queue.push_back((start.clone(), 0));
+        // (url, depth, external_depth, is_start, referring page, leaf: fetch but never expand links)
+        let mut queue: VecDeque<(Url, usize, usize, bool, String, bool)> = VecDeque::new();
+        queue.push_back((start.clone(), 0, 0, true, String::new(), false));
         visited.insert(canonicalize(&start));
         let mut pages: Vec<String> = Vec::new();
         let mut files: Vec<FoundFile> = Vec::new();
         let mut seen_files: BTreeSet<String> = BTreeSet::new();
         let mut total_bytes: u64 = 0;
-        while let Some((url, depth)) = queue.pop_front() {
+        while let Some((url, depth, ext_depth, is_start, referrer, leaf)) = queue.pop_front() {
             if pages.len() >= self.project.max_pages { break; }
             if self.project.respect_robots && !robots_allows(&robots, url.path()) { continue; }
             if self.project.crawl_delay_ms > 0 { tokio::time::sleep(std::time::Duration::from_millis(self.project.crawl_delay_ms)).await; }
-            let resp = match client.get(url.clone()).header(reqwest::header::USER_AGENT, CRAWL_UA).header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,*/*").send().await { Ok(r) => r, Err(e) => { if pages.is_empty() { return Err(format!("start page request failed: {e}")); } continue; } };
+            let resp = match client.get(url.clone()).header(reqwest::header::USER_AGENT, CRAWL_UA).header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,*/*").send().await { Ok(r) => r, Err(e) => { if is_start { return Err(format!("start page request failed: {e}")); } continue; } };
             if !resp.status().is_success() {
-                if pages.is_empty() { return Err(format!("start page returned HTTP {}", resp.status())); }
+                if is_start { return Err(format!("start page returned HTTP {}", resp.status())); }
                 continue;
             }
             let url = resp.url().clone();
             visited.insert(canonicalize(&url));
             let ct = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("text/html").to_string();
+            let size = resp.headers().get(reqwest::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
             let is_html = ct.contains("html");
-            pages.push(canonicalize(&url));
             if !is_html {
-                if pages.len() == 1 { return Err(format!("start page did not return HTML ({ct})")); }
+                if is_start { return Err(format!("start page did not return HTML ({ct})")); }
+                // Linked resource with no usable extension: IDM-style discovery by response type.
+                let canon = canonicalize(&url);
+                let ext = ext_of(&canon);
+                if !ext.is_empty() && !self.project.extensions.is_empty() && !self.project.extensions.iter().any(|e| e.trim_start_matches('.').eq_ignore_ascii_case(&ext)) { continue; }
+                if !path_allowed(&self.project, &canon) { continue; }
+                if !self.project.include_regex.is_empty() { if let Some(re) = &include_re { if !re.is_match(&canon) { continue; } } }
+                if seen_files.contains(&canon) { continue; }
+                if self.project.min_size > 0 { match size { Some(z) if z >= self.project.min_size => {}, _ => continue } }
+                if self.project.max_size > 0 { if let Some(z) = size { if z > self.project.max_size { continue; } } }
+                if !self.project.mime_allow.is_empty() && !self.project.mime_allow.iter().any(|m| ct.contains(m)) { continue; }
+                if self.project.max_files > 0 && files.len() >= self.project.max_files { continue; }
+                if let Some(z) = size { total_bytes += z; if self.project.max_total_bytes > 0 && total_bytes > self.project.max_total_bytes { continue; } }
+                seen_files.insert(canon.clone());
+                files.push(FoundFile { url: canon, size, mime: ct.clone(), page_url: referrer, selected: true });
                 continue;
             }
+            pages.push(canonicalize(&url));
+            if leaf { continue; }
             let html = resp.text().await.unwrap_or_default();
             // page text exclude/include via substring check on html if regex is plain word (regex compiled via simple contains fallback)
             let (links, assets) = links_with_doc_base(&html, &url);
             let mut candidates: Vec<Url> = Vec::new();
             candidates.extend(links.iter().cloned()); candidates.extend(assets.iter().cloned());
+            let mut pending_files: Vec<Url> = Vec::new();
             for cand in candidates {
                 let canon = canonicalize(&cand);
                 let ext = ext_of(&canon);
-                let is_page_like = ext.is_empty() || ["html", "htm", "php", "asp", "aspx"].contains(&ext.as_str()) || cand.path().ends_with('/');
-                // filters
-                if !self.project.extensions.is_empty() && !is_page_like && !self.project.extensions.iter().any(|e| e.trim_start_matches('.').eq_ignore_ascii_case(&ext)) { /* still may be page */ if !is_page_like { continue; } }
+                let is_page_like = ext.is_empty() || ["html", "htm", "php", "asp", "aspx", "jsp", "cgi"].contains(&ext.as_str()) || cand.path().ends_with('/');
+                if !path_allowed(&self.project, &canon) { continue; }
                 if let Some(re) = &exclude_re { if re.is_match(&canon) { continue; } }
-                if !self.project.include_regex.is_empty() { if let Some(re) = &include_re { if !re.is_match(&canon) { /* include applies to files; pages still crawl */ if !is_page_like { continue; } } } }
                 if is_page_like {
-                    if depth < self.project.depth && in_scope(&start, &cand, self.project.scope) && !visited.contains(&canon) {
-                        visited.insert(canon); queue.push_back((cand, depth + 1));
+                    if !in_scope(&start, &cand, self.project.scope) { continue; }
+                    // IDM: "levels on other sites" counts hops past the start domain, not host.
+                    let same_site = host_of(&start).eq_ignore_ascii_case(&host_of(&cand)) || registrable_domain(&host_of(&start)) == registrable_domain(&host_of(&cand));
+                    let (nd, ne) = if same_site { (depth + 1, ext_depth) } else { (depth, ext_depth + 1) };
+                    let blocked_parent = self.project.dont_explore_parent_dirs && !under_start_dir(&start, &cand);
+                    if (same_site && depth < self.project.depth || !same_site && ext_depth < self.project.external_depth) && !visited.contains(&canon) {
+                        // Parent-dir guard: fetch linked page once (may be a file endpoint) but never expand its links.
+                        visited.insert(canon); queue.push_back((cand, nd, ne, false, url.to_string(), blocked_parent));
                     }
                 } else {
                     if !in_scope(&start, &cand, self.project.scope) { continue; }
+                    if !self.project.extensions.is_empty() && !self.project.extensions.iter().any(|e| e.trim_start_matches('.').eq_ignore_ascii_case(&ext)) { continue; }
+                    if !self.project.include_regex.is_empty() { if let Some(re) = &include_re { if !re.is_match(&canon) { continue; } } }
                     if seen_files.contains(&canon) { continue; }
-                    // HEAD for size/mime where possible (GET fallback in tests uses HEAD support)
-                    let (size, mime) = head_info(client, &cand).await;
-                    // Unknown size cannot satisfy a positive minimum: skip.
-                    if self.project.min_size > 0 { match size { Some(s) if s >= self.project.min_size => {}, _ => continue } }
-                    if self.project.max_size > 0 { if let Some(s) = size { if s > self.project.max_size { continue; } } }
+                    seen_files.insert(canon.clone());
+                    pending_files.push(cand);
+                }
+            }
+            // Bounded parallel metadata probes: one slow asset cannot stall page discovery.
+            for chunk in pending_files.chunks(8) {
+                let mut set = tokio::task::JoinSet::new();
+                for (i, cand) in chunk.iter().cloned().enumerate() {
+                    let client = client.clone();
+                    set.spawn(async move { let info = head_info(&client, &cand).await; (i, cand, info) });
+                }
+                let mut got: Vec<(usize, Url, (Option<u64>, String))> = Vec::new();
+                while let Some(r) = set.join_next().await { if let Ok(v) = r { got.push(v); } }
+                got.sort_by_key(|(i, _, _)| *i);
+                for (_, cand, (size, mime)) in got {
+                    if self.project.min_size > 0 { match size { Some(z) if z >= self.project.min_size => {}, _ => continue } }
+                    if self.project.max_size > 0 { if let Some(z) = size { if z > self.project.max_size { continue; } } }
                     if !self.project.mime_allow.is_empty() && !mime.is_empty() && !self.project.mime_allow.iter().any(|m| mime.contains(m)) { continue; }
                     if self.project.max_files > 0 && files.len() >= self.project.max_files { continue; }
-                    if let Some(s) = size { total_bytes += s; if self.project.max_total_bytes > 0 && total_bytes > self.project.max_total_bytes { continue; } }
-                    seen_files.insert(canon.clone());
-                    files.push(FoundFile { url: canon, size, mime, page_url: url.to_string(), selected: true });
+                    if let Some(z) = size { total_bytes += z; if self.project.max_total_bytes > 0 && total_bytes > self.project.max_total_bytes { continue; } }
+                    files.push(FoundFile { url: canonicalize(&cand), size, mime, page_url: url.to_string(), selected: true });
                 }
             }
         }
@@ -549,6 +629,14 @@ mod tests {
         assert!(files.iter().any(|u| u.path().ends_with("book.pdf")));
         assert!(files.iter().any(|u| u.path().ends_with("small.png")));
         assert!(files.iter().any(|u| u.path().ends_with("big.png")));
+    }
+    #[test] fn script_css_and_depth_rules() {
+        let base = Url::parse("https://example.com/dir/index.html").unwrap();
+        let (_p, files) = extract_links(r#"<style>.a{background:url(bg.png)}</style><script>let u="https://cdn.example.com/file.zip";</script>"#, &base);
+        assert!(files.iter().any(|u| u.path().ends_with("bg.png")));
+        assert!(_p.iter().any(|u| u.as_str() == "https://cdn.example.com/file.zip"));
+        assert!(under_start_dir(&base, &Url::parse("https://example.com/dir/a/b.html").unwrap()));
+        assert!(!under_start_dir(&base, &Url::parse("https://example.com/other.html").unwrap()));
     }
     #[test] fn canon_dedupe() { assert_eq!(canonicalize(&Url::parse("https://EXAMPLE.com/a#frag").unwrap()), canonicalize(&Url::parse("https://example.com/a").unwrap())); }
 }
