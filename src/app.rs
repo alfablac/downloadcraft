@@ -144,6 +144,10 @@ impl DownloadApp {
     }
 
     fn start_task(&mut self, id: &str) {
+        // Never spawn a second worker for same task: it replaces Controls entry,
+        // and Stop would then cancel only newest worker while old one keeps downloading.
+        if self.handles.get(id).is_some_and(|h| !h.is_finished()) { return; }
+        if self.rt.lock().unwrap().controls.contains_key(id) { return; }
         let (task_opt, settings) = { let g = self.rt.lock().unwrap(); (g.state.tasks.iter().find(|t| t.id == id).cloned(), g.state.settings.clone()) };
         let Some(task) = task_opt else { return; };
         {
@@ -159,7 +163,9 @@ impl DownloadApp {
         let handle = self.tokio_rt.spawn(async move {
             let result = crate::stream::download_url(client, task, ctrl).await;
             let mut g = rt.lock().unwrap();
-            g.controls.remove(&tid);
+            // Only this worker may unregister its own Controls. A stopped worker
+            // racing a fresh Resume must not remove the new worker's entry.
+            if g.controls.get(&tid).is_some_and(|c| Arc::ptr_eq(c, &ctrl2)) { g.controls.remove(&tid); }
             match result {
                 Ok(done) => {
                     let status = done.status; let err = done.error.clone(); let fname = done.filename.clone();
@@ -583,10 +589,22 @@ fn cat_icon(filename: &str) -> Icon {
 
 // free helpers used by menus
 fn stop_task(app: &mut DownloadApp, id: &str) {
-    // Stop terminates transfer (connection drops, parts kept for resume). Pause-wait held worker + socket forever.
+    // Stop must terminate worker, not only set a flag: phases waiting on a socket,
+    // probe, or whole-body fetch can ignore flag indefinitely. Abort drops future;
+    // parts stay on disk for Resume. Controls entry removed here because aborted
+    // worker never runs its cleanup closure.
+    if let Some(h) = app.handles.remove(id) { h.abort(); }
     let mut g = app.rt.lock().unwrap();
-    if let Some(c) = g.controls.get(id) { c.cancelled.store(true, Ordering::Relaxed); c.paused.store(false, Ordering::Relaxed); }
-    if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) { t.status = TaskStatus::Paused; }
+    let downloaded = if let Some(c) = g.controls.remove(id) {
+        c.cancelled.store(true, Ordering::Relaxed);
+        c.paused.store(false, Ordering::Relaxed);
+        c.downloaded.load(Ordering::Relaxed)
+    } else { 0 };
+    if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) {
+        t.status = TaskStatus::Paused;
+        if downloaded > 0 { t.downloaded = downloaded; }
+    }
+    app.rate_smooth.remove(id);
     g.save();
 }
 fn remove_task(app: &mut DownloadApp, id: &str) {

@@ -186,8 +186,8 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
         let tmp = task.dest_dir.join(format!(".partial-{}", task.filename));
         let mut file = tokio::fs::File::create(&tmp).await.map_err(|e| e.to_string())?;
         let mut stream = resp.bytes_stream(); let mut n: u64 = 0;
-        while let Some(chunk) = stream.next().await {
-            wait_not_paused(&ctrl).await?;
+        loop {
+            let Some(chunk) = next_chunk(&mut stream, &ctrl).await? else { break };
             let chunk = chunk.map_err(|e| e.to_string())?;
             throttle(&ctrl, chunk.len() as u64).await;
             file.write_all(&chunk).await.map_err(|e| e.to_string())?;

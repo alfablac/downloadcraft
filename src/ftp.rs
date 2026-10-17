@@ -130,7 +130,18 @@ pub async fn download_ftp(mut task: DownloadTask, ctrl: Arc<Controls>) -> Result
             task.status = TaskStatus::Paused; task.downloaded = downloaded;
             return Ok(task);
         }
-        let n = data.read(&mut buf).await.map_err(|e| e.to_string())?;
+        // Wake periodically while server stalls so cancelled flag ends transfer.
+        let n = loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), data.read(&mut buf)).await {
+                Ok(r) => break r.map_err(|e| e.to_string())?,
+                Err(_) if ctrl.cancelled.load(Ordering::Relaxed) => {
+                    file.flush().await.map_err(|e| e.to_string())?;
+                    task.status = TaskStatus::Paused; task.downloaded = downloaded;
+                    return Ok(task);
+                }
+                Err(_) => {}
+            }
+        };
         if n == 0 { break; }
         file.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
         downloaded += n as u64;

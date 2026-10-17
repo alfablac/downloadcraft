@@ -2,10 +2,11 @@
 set -euo pipefail
 VERSION="${1:-0.1.0}"
 ROOT="$(pwd)"
-mkdir -p dist staging/usr/bin staging/usr/share/applications staging/DEBIAN
+mkdir -p dist staging/usr/bin staging/usr/share/applications staging/usr/share/icons/hicolor/512x512/apps staging/DEBIAN
 cp target/release/downloadcraft staging/usr/bin/
 cp target/release/downloadcraft-host staging/usr/bin/
 cp packaging/downloadcraft.desktop staging/usr/share/applications/
+cp assets/downloadcraft.png staging/usr/share/icons/hicolor/512x512/apps/downloadcraft.png
 cat > staging/DEBIAN/control <<EOF
 Package: downloadcraft
 Version: ${VERSION}
@@ -20,6 +21,7 @@ dpkg-deb --build staging "dist/downloadcraft_${VERSION}_amd64.deb" || echo "dpkg
 mkdir -p AppDir/usr/bin
 cp target/release/downloadcraft target/release/downloadcraft-host AppDir/usr/bin/
 cp packaging/downloadcraft.desktop AppDir/
+cp assets/downloadcraft.png AppDir/downloadcraft.png
 cat > AppDir/AppRun <<'EOF'
 #!/bin/sh
 exec "$(dirname "$0")/usr/bin/downloadcraft" "$@"

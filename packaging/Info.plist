@@ -8,6 +8,7 @@
   <key>CFBundleVersion</key><string>0.1.0</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundleExecutable</key><string>downloadcraft</string>
+  <key>CFBundleIconFile</key><string>downloadcraft</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>CFBundleURLTypes</key>

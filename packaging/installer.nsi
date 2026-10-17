@@ -6,6 +6,8 @@ RequestExecutionLevel user
 Page directory
 Page instfiles
 UninstPage uninstConfirm
+Icon "..\assets\downloadcraft.ico"
+UninstallIcon "..\assets\downloadcraft.ico"
 UninstPage instfiles
 
 Section "Install"
@@ -16,6 +18,7 @@ Section "Install"
   CreateDirectory "$SMPROGRAMS\downloadcraft"
   CreateShortcut "$SMPROGRAMS\downloadcraft\downloadcraft.lnk" "$INSTDIR\downloadcraft.exe"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\downloadcraft" "DisplayName" "downloadcraft"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\downloadcraft" "DisplayIcon" "$INSTDIR\downloadcraft.exe"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\downloadcraft" "UninstallString" "$INSTDIR\Uninstall.exe"
   Exec '"$INSTDIR\downloadcraft.exe" --register-hosts'
 SectionEnd

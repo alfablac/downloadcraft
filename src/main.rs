@@ -1,3 +1,7 @@
+// GUI subsystem on Windows: no console window, launching from PowerShell/cmd
+// must not keep caller shell busy until app exits (was CUI subsystem exe).
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod app;
 #[allow(dead_code)]
 mod icons;
