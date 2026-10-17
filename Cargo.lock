@@ -902,7 +902,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
 name = "downloadcraft"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "aes",
  "arboard",
