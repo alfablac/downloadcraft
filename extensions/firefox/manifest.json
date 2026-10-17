@@ -6,6 +6,6 @@
   "browser_specific_settings": { "gecko": { "id": "downloadcraft@downloadcraft.local", "strict_min_version": "109.0" } },
   "background": { "scripts": ["background.js"], "persistent": true },
   "permissions": ["contextMenus", "downloads", "cookies", "tabs", "nativeMessaging", "webRequest", "webRequestBlocking", "notifications", "<all_urls>", "storage"],
-  "content_scripts": [{ "matches": ["http://*/*", "https://*/*"], "js": ["content.js"], "run_at": "document_idle", "all_frames": false }],
+  "content_scripts": [{ "matches": ["http://*/*", "https://*/*"], "js": ["content.js"], "run_at": "document_start", "all_frames": true }],
   "browser_action": { "default_title": "downloadcraft" }
 }
