@@ -12,11 +12,29 @@ pub fn build_client(proxy: &str) -> reqwest::Client {
     b.build().unwrap_or_default()
 }
 
+/// Minimal RFC 4648 base64 (no dep for one header).
+fn b64(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in data.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[(n >> 18) as usize & 63] as char); out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
 fn headers_for(task: &DownloadTask) -> reqwest::header::HeaderMap {
     let mut h = reqwest::header::HeaderMap::new();
     if !task.referrer.is_empty() { if let Ok(v) = task.referrer.parse() { h.insert(reqwest::header::REFERER, v); } }
     if !task.cookies.is_empty() { if let Ok(v) = task.cookies.parse() { h.insert(reqwest::header::COOKIE, v); } }
     for (k, v) in &task.headers { if let (Ok(n), Ok(vv)) = (k.parse::<reqwest::header::HeaderName>(), v.parse()) { h.insert(n, vv); } }
+    if !task.username.is_empty() && !h.contains_key(reqwest::header::AUTHORIZATION) {
+        let raw = format!("{}:{}", task.username, task.password);
+        if let Ok(v) = format!("Basic {}", b64(raw.as_bytes())).parse() { h.insert(reqwest::header::AUTHORIZATION, v); }
+    }
     h
 }
 
@@ -103,7 +121,15 @@ fn save_state(part_dir: &Path, url: &str, etag: &Option<String>, total: u64, seg
 
 /// Segmented HTTP download with resume. Segment files: part{i} in dest_dir/.idmcraft-{id}/
 pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl: Arc<Controls>) -> Result<DownloadTask, String> {
-    let probe = probe(&client, &task).await?;
+    // Mirror failover (IDM Url0..UrlN): first URL whose probe succeeds wins; task.url rewritten to it.
+    let mut urls = vec![task.url.clone()]; urls.extend(task.mirrors.iter().cloned());
+    let mut found: Option<(String, Probe)> = None; let mut last_err = String::new();
+    for u in urls {
+        let cand = DownloadTask { url: u.clone(), ..task.clone() };
+        match probe(&client, &cand).await { Ok(p) => { found = Some((u, p)); break; } Err(e) => last_err = e }
+    }
+    let Some((used_url, probe)) = found else { return Err(format!("all mirrors failed (last: {last_err})")); };
+    task.url = used_url;
     task.total = probe.total;
     std::fs::create_dir_all(&task.dest_dir).map_err(|e| e.to_string())?;
     let dest = task.dest_dir.join(&task.filename);

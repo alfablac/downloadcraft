@@ -20,6 +20,10 @@ pub struct IdmApp {
     add_url: String,
     add_referrer: String,
     add_cookies: String,
+    add_user: String,
+    add_pass: String,
+    add_mirrors: String,
+    add_desc: String,
     add_queue: String,
     new_queue_name: String,
     grab_url: String,
@@ -54,7 +58,7 @@ impl IdmApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, rt: Arc<Mutex<Runtime>>, hidden: bool) -> Self {
         let tokio_rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio rt"));
         let tray = Self::make_tray();
-        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_scope: 0, grab_exts: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), last_tick: std::time::Instant::now(), tray: Some(TrayState { _tray: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0 }
+        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_scope: 0, grab_exts: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), last_tick: std::time::Instant::now(), tray: Some(TrayState { _tray: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0 }
     }
 
     fn make_tray() -> Option<tray_icon::TrayIcon> {
@@ -527,8 +531,18 @@ impl IdmApp {
             ui.add_space(6.0);
             egui::Grid::new("add-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.label("Queue"); ui.add(egui::TextEdit::singleline(&mut self.add_queue).desired_width(200.0)); ui.end_row();
+                ui.label("Save to"); ui.label(egui::RichText::new(self.rt.lock().unwrap().state.settings.download_dir.display().to_string()).monospace().small()); ui.end_row();
                 ui.label("Referrer"); ui.add(egui::TextEdit::singleline(&mut self.add_referrer).desired_width(300.0)); ui.end_row();
                 ui.label("Cookies"); ui.add(egui::TextEdit::singleline(&mut self.add_cookies).desired_width(300.0)); ui.end_row();
+                ui.label("Mirrors"); ui.add(egui::TextEdit::singleline(&mut self.add_mirrors).hint_text("mirror URLs, comma separated (failover)").desired_width(300.0)); ui.end_row();
+                ui.label("Description"); ui.add(egui::TextEdit::singleline(&mut self.add_desc).desired_width(300.0)); ui.end_row();
+            });
+            ui.add_space(4.0);
+            // IDM Add URL: "Use authorization" + Login/Password
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Authorization (Basic)").color(theme::TEXT_MUTED).small().strong());
+                ui.label("Login:"); ui.add(egui::TextEdit::singleline(&mut self.add_user).desired_width(130.0));
+                ui.label("Password:"); ui.add(egui::TextEdit::singleline(&mut self.add_pass).password(true).desired_width(130.0));
             });
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -536,7 +550,8 @@ impl IdmApp {
                     let url = self.add_url.trim().to_string();
                     if !url.is_empty() {
                         let (referrer, cookies, queue) = (self.add_referrer.clone(), self.add_cookies.clone(), if self.add_queue.is_empty() { "main".into() } else { self.add_queue.clone() });
-                        let id = { let mut g = self.rt.lock().unwrap(); let id = g.add_url(&url, &queue, &referrer, &cookies); let segs = g.state.settings.max_connections; if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) { t.segments = segs; } g.save(); id };
+                        let (user, pass, mirrors, desc) = (self.add_user.clone(), self.add_pass.clone(), self.add_mirrors.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>(), self.add_desc.clone());
+                        let id = { let mut g = self.rt.lock().unwrap(); let id = g.add_url(&url, &queue, &referrer, &cookies); let segs = g.state.settings.max_connections; if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) { t.segments = segs; t.username = user; t.password = pass; t.mirrors = mirrors; t.description = desc; } g.save(); id };
                         self.start_task(&id);
                         self.add_url.clear(); self.show_add = false;
                     }

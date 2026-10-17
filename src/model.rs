@@ -35,6 +35,13 @@ pub struct DownloadTask {
     #[serde(default)] pub attempts: u32,
     #[serde(default)] pub next_retry_at: u64,
     #[serde(default)] pub created_at: u64,
+    /// Mirror URLs (IDM registry Url1..UrlN beside primary Url0).
+    #[serde(default)] pub mirrors: Vec<String>,
+    /// Per-URL credentials (IDM U0_u/U0_EncP). Stored plain in state.json — ponytail: no OS keychain; add keyring when credential theft matters.
+    #[serde(default)] pub username: String,
+    #[serde(default)] pub password: String,
+    #[serde(default)] pub last_try_at: u64,
+    #[serde(default)] pub description: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +89,9 @@ pub struct Schedule {
     #[serde(default)] pub power_confirmed: bool,
     /// Optional bandwidth window: kbps applied while schedule window active. 0 = unlimited.
     #[serde(default)] pub limit_kbps: u64,
+    /// Quota scheduler (IDM Scheduler reg: isLimitEnabled/m_MBytes/m_hours): stop queue after quota_mb per quota_hours. 0 = off.
+    #[serde(default)] pub quota_mb: u64,
+    #[serde(default)] pub quota_hours: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
