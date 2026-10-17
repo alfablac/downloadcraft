@@ -72,10 +72,13 @@ pub fn document_base(html: &str, page: &Url) -> Url {
     let lower = html.to_ascii_lowercase();
     if let Some(idx) = lower.find("<base") {
         let slice = &lower[idx..(idx + 600).min(lower.len())];
-        if let Some(ai) = slice.find("href=") {
-            let rest = html[idx + ai + 5..].trim_start();
-            let val = if let Some(s) = rest.strip_prefix('"') { s.split('"').next().unwrap_or("") } else if let Some(s) = rest.strip_prefix('\'') { s.split('\'').next().unwrap_or("") } else { rest.split(|c: char| c.is_whitespace() || c == '>').next().unwrap_or("") };
-            if !val.is_empty() { if let Ok(u) = page.join(val) { return u; } }
+        if let Some(ai) = slice.find("href") {
+            let after = &slice[ai + 4..];
+            if let Some(eq) = after.find('=') {
+                let rest = html[idx + ai + 4 + eq + 1..].trim_start();
+                let val = if let Some(s) = rest.strip_prefix('"') { s.split('"').next().unwrap_or("") } else if let Some(s) = rest.strip_prefix('\'') { s.split('\'').next().unwrap_or("") } else { rest.split(|c: char| c.is_whitespace() || c == '>').next().unwrap_or("") };
+                if !val.is_empty() { if let Ok(u) = page.join(val) { return u; } }
+            }
         }
     }
     page.clone()
@@ -364,28 +367,53 @@ pub fn rewrite_links(html: &str, page_url: &Url, mapping: &HashMap<String, Strin
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
     'scan: while !rest.is_empty() {
-        let mut hit: Option<(usize, usize, char)> = None; // (value start, prefix len, quote)
-        for attr in ["href", "src"] {
-            for quote in ['"', '\''] {
-                let needle = format!("{attr}={quote}");
-                if let Some(idx) = rest.find(&needle) {
-                    let start = idx + needle.len();
-                    if hit.is_none_or(|(s, _, _)| start < s) { hit = Some((start, needle.len(), quote)); }
+        // Find earliest href/src/srcset attr, case-insensitive, spaces around '=' allowed.
+        // (needle search on lowercased copy; offsets align for ASCII HTML markup.)
+        let lower = rest.to_ascii_lowercase();
+        let mut hit: Option<(usize, usize, Option<char>, bool)> = None; // value start,len, quote, is_srcset
+        for attr in ["href", "srcset", "src"] {
+            let mut pos = 0;
+            while let Some(idx) = lower[pos..].find(attr).map(|x| x + pos) {
+                let after = idx + attr.len();
+                let tail = lower[after..].trim_start();
+                if tail.starts_with('=') {
+                    let eq_end = after + (lower[after..].len() - tail.len()) + 1;
+                    let valpart = lower[eq_end..].trim_start();
+                    let vstart = eq_end + (lower[eq_end..].len() - valpart.len());
+                    if valpart.starts_with('"') || valpart.starts_with('\'') {
+                        let quote = valpart.chars().next();
+                        if hit.is_none_or(|(s, _, _, _)| vstart + 1 < s) { hit = Some((vstart + 1, attr.len(), quote, attr == "srcset")); }
+                    } else if !valpart.is_empty() && hit.is_none_or(|(s, _, _, _)| vstart < s) {
+                        hit = Some((vstart, attr.len(), None, attr == "srcset"));
+                    }
+                    break;
                 }
+                pos = after;
             }
         }
-        let Some((vstart, _, quote)) = hit else { break 'scan };
-        let Some(vend) = rest[vstart..].find(quote).map(|i| i + vstart) else { break 'scan };
+        let Some((vstart, _, quote, is_srcset)) = hit else { break 'scan };
+        let (vend, vend_skip) = match quote {
+            Some(q) => match rest[vstart..].find(q) { Some(i) => (i + vstart, 1), None => break 'scan },
+            None => (rest[vstart..].find(|c: char| c.is_whitespace() || c == '>').map(|i| i + vstart).unwrap_or(rest.len()), 0),
+        };
         let val = &rest[vstart..vend];
-        let skip = val.is_empty() || val.starts_with(['#', '?']) || ["javascript:", "mailto:", "data:", "tel:"].iter().any(|s| val.to_ascii_lowercase().starts_with(s));
-        let replacement = if skip {
-            None
-        } else {
+        let lookup = |u: &str| -> Option<String> {
+            if u.is_empty() || u.starts_with(['#', '?']) || ["javascript:", "mailto:", "data:", "tel:"].iter().any(|s| u.to_ascii_lowercase().starts_with(s)) { return None; }
             // Browser resolves href/src against <base href> if present, else page URL.
-            doc_base.join(val).ok().and_then(|resolved| {
+            doc_base.join(u).ok().and_then(|resolved| {
                 mapping.get(&resolved.to_string()).or_else(|| mapping.get(&canonicalize(&resolved))).cloned()
             })
         };
+        let replacement = if is_srcset {
+            let mut changed = false;
+            let newv = val.split(',').map(|entry| {
+                let e = entry.trim();
+                let mut it = e.splitn(2, char::is_whitespace);
+                let u = it.next().unwrap_or("");
+                match lookup(u) { Some(r) => { changed = true; match it.next() { Some(d) => format!("{r} {d}"), None => r } }, None => e.to_string() }
+            }).collect::<Vec<_>>().join(", ");
+            if changed { Some(newv) } else { None }
+        } else { lookup(val) };
         match replacement {
             Some(rel) => {
                 out.push_str(&rest[..vstart]);
@@ -397,6 +425,7 @@ pub fn rewrite_links(html: &str, page_url: &Url, mapping: &HashMap<String, Strin
                 rest = &rest[vend..];
             }
         }
+        let _ = vend_skip;
     }
     out.push_str(rest);
     // Absolute URLs outside attributes (plain text, meta content, etc.).
@@ -473,6 +502,16 @@ mod tests {
         map.insert("https://cdn.ex.com/static/a.png".to_string(), "../a.png".to_string());
         let out = rewrite_links(r#"<head><base href="https://cdn.ex.com/static/"></head><img src="a.png">"#, &page, &map, std::path::Path::new("/tmp"), "dir/p.html");
         assert!(out.contains(r#"src="../a.png""#), "{out}");
+        assert!(!out.to_ascii_lowercase().contains("<base"), "{out}");
+    }
+    #[test] fn rewrite_handles_case_spaces_srcset() {
+        let page = Url::parse("https://ex.com/dir/p.html").unwrap();
+        let mut map = HashMap::new();
+        map.insert("https://cdn.ex.com/static/a.png".to_string(), "../a.png".to_string());
+        map.insert("https://cdn.ex.com/static/b.png".to_string(), "../b.png".to_string());
+        let out = rewrite_links(r#"<head><base href="https://cdn.ex.com/static/"></head><IMG SRC = "a.png"><img srcset='a.png 1x, b.png 2x'>"#, &page, &map, std::path::Path::new("/tmp"), "dir/p.html");
+        assert!(out.contains(r#"SRC = "../a.png""#), "{out}");
+        assert!(out.contains("../a.png 1x, ../b.png 2x"), "{out}");
         assert!(!out.to_ascii_lowercase().contains("<base"), "{out}");
     }
     #[test] fn canon_dedupe() { assert_eq!(canonicalize(&Url::parse("https://EXAMPLE.com/a#frag").unwrap()), canonicalize(&Url::parse("https://example.com/a").unwrap())); }

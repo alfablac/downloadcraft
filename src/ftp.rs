@@ -90,6 +90,9 @@ pub async fn download_ftp(mut task: DownloadTask, ctrl: Arc<Controls>) -> Result
     };
     if let Some(t) = total {
         task.total = Some(t);
+        ctrl.total.store(t, Ordering::Relaxed);
+        ctrl.parts_are_segments.store(false, Ordering::Relaxed);
+        *ctrl.parts.lock().unwrap() = vec![(offset.min(t), t)];
         if t > 0 && offset == t {
             if dest.exists() { tokio::fs::remove_file(&dest).await.map_err(|e| e.to_string())?; }
             tokio::fs::rename(&part, &dest).await.map_err(|e| e.to_string())?;
@@ -100,6 +103,7 @@ pub async fn download_ftp(mut task: DownloadTask, ctrl: Arc<Controls>) -> Result
         if offset > t { let _ = tokio::fs::remove_file(&part).await; offset = 0; }
     }
     ctrl.downloaded.store(offset, Ordering::Relaxed);
+    if total.is_none() { ctrl.parts_are_segments.store(false, Ordering::Relaxed); *ctrl.parts.lock().unwrap() = vec![(offset, 0)]; }
     task.downloaded = offset;
     task.status = TaskStatus::Downloading;
 
@@ -113,7 +117,7 @@ pub async fn download_ftp(mut task: DownloadTask, ctrl: Arc<Controls>) -> Result
 
     if offset > 0 {
         let (code, _) = ftp.cmd(&format!("REST {offset}")).await?;
-        if code != 350 { offset = 0; ctrl.downloaded.store(0, Ordering::Relaxed); } // server cannot resume: restart below via truncate
+        if code != 350 { offset = 0; ctrl.downloaded.store(0, Ordering::Relaxed); if let Some(part) = ctrl.parts.lock().unwrap().first_mut() { part.0 = 0; } } // server cannot resume: restart below via truncate
     }
     ftp.expect(&format!("RETR {path}"), &[125, 150]).await?;
 
@@ -131,6 +135,7 @@ pub async fn download_ftp(mut task: DownloadTask, ctrl: Arc<Controls>) -> Result
         file.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
         downloaded += n as u64;
         ctrl.downloaded.store(downloaded, Ordering::Relaxed);
+        if let Some(part) = ctrl.parts.lock().unwrap().first_mut() { part.0 = downloaded; }
         task.downloaded = downloaded;
     }
     file.flush().await.map_err(|e| e.to_string())?;
@@ -144,7 +149,7 @@ pub async fn download_ftp(mut task: DownloadTask, ctrl: Arc<Controls>) -> Result
     if dest.exists() { tokio::fs::remove_file(&dest).await.map_err(|e| e.to_string())?; }
     tokio::fs::rename(&part, &dest).await.map_err(|e| e.to_string())?;
     task.downloaded = downloaded;
-    if task.total.is_none() { task.total = Some(downloaded); }
+    if task.total.is_none() { task.total = Some(downloaded); ctrl.total.store(downloaded, Ordering::Relaxed); if let Some(part) = ctrl.parts.lock().unwrap().first_mut() { *part = (downloaded, downloaded); } }
     task.status = TaskStatus::Complete;
     Ok(task)
 }
@@ -208,6 +213,9 @@ mod tests {
         let ctrl = Arc::new(Controls::new(0));
         let done = download_ftp(task, ctrl.clone()).await.unwrap();
         assert_eq!(ctrl.downloaded.load(Ordering::Relaxed), payload_len as u64);
+        assert_eq!(ctrl.total.load(Ordering::Relaxed), payload_len as u64);
+        assert!(!ctrl.parts_are_segments.load(Ordering::Relaxed));
+        assert_eq!(ctrl.parts.lock().unwrap().clone(), vec![(payload_len as u64, payload_len as u64)]);
         (done, dir, st)
     }
 

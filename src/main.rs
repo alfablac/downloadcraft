@@ -95,7 +95,7 @@ fn main() {
             if let Ok(pid) = txt.trim().parse::<u32>() {
                 if pid != std::process::id() && process_alive(pid) {
                     for a in &args[1..] {
-                        if a.starts_with("http") {
+                        if a.starts_with("http://") || a.starts_with("https://") || a.starts_with("downloadcraft://") {
                             let f = platform::inbox_dir().join(format!("fwd-{}.txt", model::new_id()));
                             let _ = std::fs::write(f, format!("url={a}\n"));
                         }
@@ -163,7 +163,7 @@ fn run_gui(initial_urls: Vec<String>, hidden: bool) {
 fn process_alive(pid: u32) -> bool {
     #[cfg(windows)]
     {
-        std::process::Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH"]).output().map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string())).unwrap_or(false)
+        std::process::Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]).output().map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\""))).unwrap_or(false)
     }
     #[cfg(unix)]
     { std::process::Command::new("kill").args(["-0", &pid.to_string()]).status().map(|s| s.success()).unwrap_or(false) }
@@ -183,6 +183,7 @@ pub fn drain_inbox(rt: &Arc<Mutex<Runtime>>) {
         for e in rd.flatten() {
             let p = e.path();
             if let Some(mut t) = parse_kv_file(&p) {
+                if let Some(enc) = t.url.strip_prefix("downloadcraft://add?url=") { t.url = url_decode(enc); }
                 let mut g = rt.lock().unwrap();
                 if t.id.is_empty() { t.id = new_id(); }
                 if t.filename.is_empty() { t.filename = filename_from_url(&t.url); }

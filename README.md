@@ -45,7 +45,7 @@ The desktop app registers the native messaging host and protocol every time it s
 
 Chromium: load `extensions/chromium` as an unpacked extension.
 
-Firefox: a ready XPI is at `extensions/downloadcraft-firefox.xpi`. Install it from about:addons, gear menu, Install Add-on From File. Firefox release builds refuse unsigned add-ons permanently; use Firefox Developer Edition or Nightly, or set `xpinstall.signatures.required` to false in about:config on builds that allow it. For a temporary install, load `extensions/firefox` from about:debugging, This Firefox, Load Temporary Add-on. Rebuild the XPI with `scripts/package-firefox.ps1`.
+Firefox: a ready XPI is at `extensions/downloadcraft-firefox.xpi`. Remove the old idmcraft add-on first; it asks for the old native host name, which no longer exists. Start downloadcraft once so it registers the current host, then install the XPI from about:addons, gear menu, Install Add-on From File. Firefox release builds refuse unsigned add-ons permanently; use Firefox Developer Edition or Nightly, or set `xpinstall.signatures.required` to false in about:config on builds that allow it. For a temporary install, load `extensions/firefox` from about:debugging, This Firefox, Load Temporary Add-on. Rebuild the XPI with `scripts/package-firefox.ps1`.
 
 Native host name: `com.downloadcraft.host`.
 

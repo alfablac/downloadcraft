@@ -199,8 +199,10 @@ async fn download_hls_media(client: reqwest::Client, task: DownloadTask, ctrl: A
     if has_ranges || encrypted {
         let work = task.dest_dir.join(format!(".downloadcraft-hls-{}", task.id));
         std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+        ctrl.parts_are_segments.store(true, std::sync::atomic::Ordering::Relaxed);
+        *ctrl.parts.lock().unwrap() = vec![(0, media.segments.len() as u64)];
         let mut parts: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(init) = &media.init_uri { let p = work.join("init.bin"); engine::fetch_bytes(&client, &task, init, media.map_byte_range, &p).await?; parts.push(p); }
+        if let Some(init) = &media.init_uri { let p = work.join("init.bin"); let n = engine::fetch_bytes_counted(&client, &task, init, media.map_byte_range, &p).await?; ctrl.downloaded.fetch_add(n, std::sync::atomic::Ordering::Relaxed); parts.push(p); }
         // Key cache by URI: keys may rotate mid-playlist.
         let mut key_cache: std::collections::HashMap<String, [u8; 16]> = std::collections::HashMap::new();
         for (i, seg) in media.segments.iter().enumerate() {
@@ -208,6 +210,7 @@ async fn download_hls_media(client: reqwest::Client, task: DownloadTask, ctrl: A
             let p = work.join(format!("{i}.seg"));
             let n = engine::fetch_bytes_counted(&client, &task, seg, media.byte_ranges.get(i).copied().flatten(), &p).await?;
             ctrl.downloaded.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            if let Some(part) = ctrl.parts.lock().unwrap().first_mut() { part.0 = (i + 1) as u64; }
             if let Some(Some(ki)) = media.key_infos.get(i) {
                 let key_uri = ki.uri.as_deref().unwrap();
                 let key = match key_cache.get(key_uri) { Some(k) => *k, None => { let k = fetch_key(&client, &task, key_uri).await?; key_cache.insert(key_uri.to_string(), k); k } };

@@ -41,9 +41,11 @@ fn headers_for(task: &DownloadTask) -> reqwest::header::HeaderMap {
 pub struct Controls { pub paused: AtomicBool, pub cancelled: AtomicBool, pub downloaded: AtomicU64, pub limit_kbps: AtomicU64, pub rate: std::sync::Mutex<(std::time::Instant, u64, Option<std::time::Instant>, u64, f64)>,
     /// Total bytes when known (0 = unknown). GUI needs this live; task.total only lands at finish.
     pub total: AtomicU64,
-    /// Segmented: per-part (done, expected) bytes. Manifests: single (done_segments, total_segments).
-    pub parts: std::sync::Mutex<Vec<(u64, u64)>> }
-impl Controls { pub fn new(limit: u64) -> Self { Self { paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), downloaded: AtomicU64::new(0), limit_kbps: AtomicU64::new(limit), rate: std::sync::Mutex::new((std::time::Instant::now(), 0, None, 0, 0.0)), total: AtomicU64::new(0), parts: std::sync::Mutex::new(Vec::new()) } } }
+    /// Per-part (done, expected). Segmented HTTP/FTP/single-file use bytes;
+    /// manifest downloads use segment counts and set `parts_are_segments`.
+    pub parts: std::sync::Mutex<Vec<(u64, u64)>>,
+    pub parts_are_segments: AtomicBool }
+impl Controls { pub fn new(limit: u64) -> Self { Self { paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), downloaded: AtomicU64::new(0), limit_kbps: AtomicU64::new(limit), rate: std::sync::Mutex::new((std::time::Instant::now(), 0, None, 0, 0.0)), total: AtomicU64::new(0), parts: std::sync::Mutex::new(Vec::new()), parts_are_segments: AtomicBool::new(false) } } }
 
 fn compute_rate(prev_bytes: u64, cur_bytes: u64, dt_secs: f64) -> f64 {
     if dt_secs <= 0.0 || cur_bytes <= prev_bytes { 0.0 } else { (cur_bytes - prev_bytes) as f64 / dt_secs }
@@ -176,7 +178,11 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
         let resp = client.get(&task.url).headers(headers_for(&task)).send().await.map_err(|e| e.to_string())?;
         if !resp.status().is_success() { return Err(format!("HTTP {}", resp.status())); }
         task.total = resp.content_length().or(task.total);
-        if let Some(t) = task.total { ctrl.total.store(t, Ordering::Relaxed); }
+        if let Some(t) = task.total {
+            ctrl.total.store(t, Ordering::Relaxed);
+            ctrl.parts_are_segments.store(false, Ordering::Relaxed);
+            *ctrl.parts.lock().unwrap() = vec![(0, t)];
+        }
         let tmp = task.dest_dir.join(format!(".partial-{}", task.filename));
         let mut file = tokio::fs::File::create(&tmp).await.map_err(|e| e.to_string())?;
         let mut stream = resp.bytes_stream(); let mut n: u64 = 0;
@@ -186,6 +192,7 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
             throttle(&ctrl, chunk.len() as u64).await;
             file.write_all(&chunk).await.map_err(|e| e.to_string())?;
             n += chunk.len() as u64; ctrl.downloaded.store(n, Ordering::Relaxed); task.downloaded = n;
+            if let Some(t) = task.total { if let Some(part) = ctrl.parts.lock().unwrap().first_mut() { part.0 = n.min(t); } }
         }
         file.flush().await.map_err(|e| e.to_string())?;
         drop(file);
@@ -232,6 +239,7 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
     }
     ctrl.downloaded.store(resumed, Ordering::Relaxed); task.downloaded = resumed;
     ctrl.total.store(total, Ordering::Relaxed);
+    ctrl.parts_are_segments.store(false, Ordering::Relaxed);
     { let mut pg = ctrl.parts.lock().unwrap(); *pg = segs.iter().map(|x| (x.done, x.end + 1 - x.start)).collect(); }
     // Work-stealing pool: fixed worker count (= initial segment count). Idle
     // worker splits largest remaining in-flight segment, steals its tail.
@@ -244,7 +252,7 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
         let (client, task_c, ctrl, segs, active, part_dir, etag) = (client.clone(), task.clone(), ctrl.clone(), segs.clone(), active.clone(), part_dir.clone(), etag.clone());
         handles.push(tokio::spawn(async move {
             loop {
-                let Some(i) = claim_or_split(&segs, &active, &part_dir, &task_c.url, &etag, total).await else { return Ok::<(), String>(()) };
+                let Some(i) = claim_or_split(&segs, &active, &part_dir, &task_c.url, &etag, total, &ctrl).await else { return Ok::<(), String>(()) };
                 let r = run_segment(i, &segs, &client, &task_c, &part_dir, &etag, total, &ctrl).await;
                 active.lock().await.remove(&i);
                 if ctrl.cancelled.load(Ordering::Relaxed) { return Err("cancelled".to_string()); }
@@ -252,7 +260,14 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
             }
         }));
     }
-    for h in handles { h.await.map_err(|e| e.to_string())??; }
+    for h in handles {
+        match h.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) if ctrl.cancelled.load(Ordering::Relaxed) || e == "cancelled" => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
     if ctrl.cancelled.load(Ordering::Relaxed) { task.status = TaskStatus::Paused; task.downloaded = ctrl.downloaded.load(Ordering::Relaxed); return Ok(task); }
     // Assemble in byte order: split tails appended (index != byte order).
     let order: Vec<usize> = { let s = segs.lock().await; let mut v: Vec<usize> = (0..s.len()).collect(); v.sort_by_key(|&i| s[i].start); v };
@@ -280,7 +295,7 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
 /// Claim work: prefer unclaimed unfinished segment; else split largest
 /// remaining active segment (tail half >= MIN_SPLIT) and claim new tail.
 /// None when all segments done.
-async fn claim_or_split(segs: &Arc<tokio::sync::Mutex<Vec<SegmentState>>>, active: &Arc<tokio::sync::Mutex<std::collections::HashSet<usize>>>, part_dir: &Path, url: &str, etag: &Arc<str>, total: u64) -> Option<usize> {
+async fn claim_or_split(segs: &Arc<tokio::sync::Mutex<Vec<SegmentState>>>, active: &Arc<tokio::sync::Mutex<std::collections::HashSet<usize>>>, part_dir: &Path, url: &str, etag: &Arc<str>, total: u64, ctrl: &Controls) -> Option<usize> {
     let mut s = segs.lock().await;
     let mut act = active.lock().await;
     let remaining = |sg: &SegmentState| (sg.end + 1).saturating_sub(sg.start + sg.done);
@@ -304,6 +319,7 @@ async fn claim_or_split(segs: &Arc<tokio::sync::Mutex<Vec<SegmentState>>>, activ
     s.push(SegmentState { start: np + 1, end: old_end, done: 0 });
     act.insert(new_idx);
     let snapshot: Vec<SegmentState> = s.iter().map(|x| SegmentState { start: x.start, end: x.end, done: x.done }).collect();
+    { let mut pg = ctrl.parts.lock().unwrap(); *pg = snapshot.iter().map(|x| (x.done, x.end + 1 - x.start)).collect(); }
     drop(act); drop(s);
     let et_opt = if etag.is_empty() { None } else { Some(etag.to_string()) };
     save_state(part_dir, url, &et_opt, total, &snapshot);
@@ -321,7 +337,7 @@ async fn run_segment(i: usize, segs: &Arc<tokio::sync::Mutex<Vec<SegmentState>>>
         if done > end - start { return Ok(()); }
         let range_start = start + done;
         if range_start > end { return Ok(()); }
-        match download_range(client, task, range_start, end, part_dir.join(format!("part{i}")).as_path(), ctrl, done).await {
+        match download_range(client, task, range_start, end, part_dir.join(format!("part{i}")).as_path(), ctrl, done, Some(i)).await {
             Ok(written) => {
                 let keep = { let s = segs.lock().await; let sg = &s[i]; (sg.end + 1).saturating_sub(start + done).min(written) };
                 { let mut s = segs.lock().await; s[i].done = (s[i].done + keep).min(s[i].end + 1 - s[i].start); }
@@ -341,7 +357,8 @@ async fn run_segment(i: usize, segs: &Arc<tokio::sync::Mutex<Vec<SegmentState>>>
     }
 }
 
-async fn download_range(client: &reqwest::Client, task: &DownloadTask, start: u64, end: u64, dest: &Path, ctrl: &Controls, prior: u64) -> Result<u64, String> {
+#[allow(clippy::too_many_arguments)]
+async fn download_range(client: &reqwest::Client, task: &DownloadTask, start: u64, end: u64, dest: &Path, ctrl: &Controls, prior: u64, part_index: Option<usize>) -> Result<u64, String> {
     let resp = client.get(&task.url).headers(headers_for(task)).header("Range", format!("bytes={start}-{end}")).send().await.map_err(|e| e.to_string())?;
     if resp.status().as_u16() != 206 { return Err(format!("expected 206 got {}", resp.status())); }
     // Truncate to caller-known done: drops bytes from interrupted attempt.
@@ -356,7 +373,14 @@ async fn download_range(client: &reqwest::Client, task: &DownloadTask, start: u6
             Ok(chunk) => {
                 throttle(ctrl, chunk.len() as u64).await;
                 match file.write_all(&chunk).await {
-                    Ok(()) => { n += chunk.len() as u64; ctrl.downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed); }
+                    Ok(()) => {
+                        n += chunk.len() as u64;
+                        ctrl.downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                        if let Some(pi) = part_index {
+                            let mut pg = ctrl.parts.lock().unwrap();
+                            if let Some(part) = pg.get_mut(pi) { part.0 = (prior + n).min(part.1); }
+                        }
+                    }
                     Err(e) => { err = Some(e.to_string()); break; }
                 }
             }
@@ -365,7 +389,11 @@ async fn download_range(client: &reqwest::Client, task: &DownloadTask, start: u6
     }
     if err.is_none() { if let Err(e) = file.flush().await { err = Some(e.to_string()); } }
     // Live-counted bytes roll back on failure: retry truncates part to `prior` and recounts.
-    if let Some(e) = err { ctrl.downloaded.fetch_sub(n, Ordering::Relaxed); return Err(e); }
+    if let Some(e) = err {
+        ctrl.downloaded.fetch_sub(n, Ordering::Relaxed);
+        if let Some(pi) = part_index { if let Some(part) = ctrl.parts.lock().unwrap().get_mut(pi) { part.0 = prior.min(part.1); } }
+        return Err(e);
+    }
     let expected = end - start + 1;
     if n != expected { return Err(format!("short range: got {n} expected {expected}")); }
     Ok(n)
@@ -393,7 +421,7 @@ pub async fn download_media(client: reqwest::Client, task: DownloadTask, ctrl: A
     let mut track_files: Vec<PathBuf> = Vec::new();
     // Segment sizes unknown upfront: progress in bytes, task.total stays None.
     let mut done_bytes: u64 = 0; task.total = None; task.downloaded = 0; ctrl.downloaded.store(0, Ordering::Relaxed);
-    { let total_segs: u64 = tracks.iter().map(|(_, sg)| sg.len() as u64).sum(); *ctrl.parts.lock().unwrap() = vec![(0, total_segs)]; }
+    { let total_segs: u64 = tracks.iter().map(|(_, sg)| sg.len() as u64).sum(); ctrl.parts_are_segments.store(true, Ordering::Relaxed); *ctrl.parts.lock().unwrap() = vec![(0, total_segs)]; }
     for (kind, segs) in &tracks {
         let out = work.join(format!("track-{kind}.bin"));
         {

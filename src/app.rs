@@ -31,6 +31,23 @@ impl SegView {
     }
 }
 
+impl SegView {
+    /// Overall completion when byte total is unavailable but segment counts are.
+    fn fraction(&self) -> Option<f32> {
+        let (done, expected) = self.parts.first().copied()?;
+        if self.manifest && expected > 0 { Some((done as f32 / expected as f32).clamp(0.0, 1.0)) } else { None }
+    }
+}
+
+/// IDM-style displayed completion: byte fraction first, segment fraction for manifests.
+fn display_fraction(task: &DownloadTask, view: Option<&SegView>) -> Option<f32> {
+    if let Some(total) = task.total.filter(|t| *t > 0) {
+        return Some((task.downloaded as f32 / total as f32).clamp(0.0, 1.0));
+    }
+    if task.status == TaskStatus::Complete { return Some(1.0); }
+    view.and_then(|v| v.fraction())
+}
+
 /// Draw per-part strip: each cell width proportional to expected size, fill = done fraction.
 fn parts_strip(ui: &mut egui::Ui, view: &SegView, width: f32) {
     if view.parts.is_empty() { return; }
@@ -199,16 +216,14 @@ impl DownloadApp {
     fn sample_rates(&mut self) {
         let now = std::time::Instant::now();
         // Snapshot controls: (id, downloaded, total, parts)
-        type Snap = (String, u64, u64, Vec<(u64, u64)>);
-        let snap: Vec<Snap> = { let g = self.rt.lock().unwrap(); g.controls.iter().map(|(k, c)| (k.clone(), c.downloaded.load(Ordering::Relaxed), c.total.load(Ordering::Relaxed), c.parts.lock().unwrap().clone())).collect() };
-        for (id, n, _total, parts) in &snap {
+        type Snap = (String, u64, u64, Vec<(u64, u64)>, bool);
+        let snap: Vec<Snap> = { let g = self.rt.lock().unwrap(); g.controls.iter().map(|(k, c)| (k.clone(), c.downloaded.load(Ordering::Relaxed), c.total.load(Ordering::Relaxed), c.parts.lock().unwrap().clone(), c.parts_are_segments.load(Ordering::Relaxed))).collect() };
+        for (id, n, _total, parts, manifest) in &snap {
             let v = self.rate_map.entry(id.clone()).or_default();
-            v.push((now, *n));
+            if v.last().map(|(t, b)| now.duration_since(*t).as_millis() >= 100 && *b != *n).unwrap_or(true) { v.push((now, *n)); }
             v.retain(|(t, _)| now.duration_since(*t).as_secs_f64() <= 6.0);
             if !parts.is_empty() {
-                // Single (done,total) entry with small total = manifest segment counter.
-                let manifest = parts.len() == 1;
-                self.seg_info.insert(id.clone(), SegView { parts: parts.clone(), manifest });
+                self.seg_info.insert(id.clone(), SegView { parts: parts.clone(), manifest: *manifest });
             }
         }
         self.rate_map.retain(|id, _| { let g = self.rt.lock().unwrap(); g.controls.contains_key(id) || g.state.tasks.iter().any(|t| &t.id == id && matches!(t.status, TaskStatus::Downloading | TaskStatus::Paused)) });
@@ -236,18 +251,17 @@ impl DownloadApp {
     /// Once per poll: 6s window rate -> EMA. Done here, not in draw code, so
     /// repaint frequency cannot change smoothing.
     fn update_smooth_rates(&mut self) {
-        let now = std::time::Instant::now();
         let ids: Vec<String> = self.rate_map.keys().cloned().collect();
         for id in ids {
-            // egui stops calling update while window hidden/in tray; Instant
-            // window then spans idle period and makes resume appear 0 B/s.
+            // Anchor to newest sample, not wall clock: egui can stop repainting
+            // in tray while worker keeps moving bytes.
             let raw = {
                 let Some(v) = self.rate_map.get(&id) else { continue; };
-                let recent: Vec<(std::time::Instant, u64)> = v.iter().copied().filter(|(t, _)| now.duration_since(*t).as_secs_f64() <= 2.0).collect();
-                if recent.len() < 2 { continue; }
-                let (t0, b0) = recent[0]; let (t1, b1) = recent[recent.len() - 1];
-                let dt = t1.duration_since(t0).as_secs_f64();
-                if dt < 0.8 { continue; } else { b1.saturating_sub(b0) as f64 / dt }
+                if v.len() < 2 { continue; }
+                let (t_end, b_end) = v[v.len() - 1];
+                let (t0, b0) = v.iter().copied().find(|(t, _)| t_end.duration_since(*t).as_secs_f64() <= 5.0).unwrap_or(v[v.len() - 1]);
+                let dt = t_end.duration_since(t0).as_secs_f64();
+                if dt < 1.0 { continue; } else { b_end.saturating_sub(b0) as f64 / dt }
             };
             let e = self.rate_smooth.entry(id).or_insert(raw);
             *e = if raw > 0.0 { *e * 0.65 + raw * 0.35 } else { *e * 0.8 };
@@ -536,11 +550,12 @@ impl eframe::App for DownloadApp {
                 });
             });
         }
-        // speed history sample (1/tick)
-        let cur: u64 = { let g = self.rt.lock().unwrap(); g.state.tasks.iter().filter(|t| t.status == TaskStatus::Downloading).map(|t| t.downloaded).sum() };
-        let dt = self.last_tick.elapsed().as_secs_f32().max(0.05);
-        let rate = (cur.saturating_sub(self.last_dl_total)) as f32 / dt;
-        self.last_dl_total = cur;
+        // Global sparkline uses same smoothed per-task rates shown in rows.
+        // End-of-frame aggregate byte deltas jump with chunk bursts and repaint cadence.
+        let ids: Vec<String> = { let g = self.rt.lock().unwrap(); g.state.tasks.iter().filter(|t| t.status == TaskStatus::Downloading).map(|t| t.id.clone()).collect() };
+        let rate = ids.iter().map(|id| self.task_rate(id) as f32).sum::<f32>();
+        self.last_tick = std::time::Instant::now();
+        self.last_dl_total = ids.iter().map(|id| self.rate_map.get(id).and_then(|v| v.last()).map(|(_, b)| *b).unwrap_or(0)).sum();
         if self.speed_hist.len() > 40 { self.speed_hist.remove(0); }
         self.speed_hist.push(rate);
     }
@@ -709,16 +724,18 @@ impl DownloadApp {
                         let eta_txt = if t.status == TaskStatus::Downloading { if let Some(total) = t.total { if task_rate > 1.0 && total > t.downloaded { eta((total - t.downloaded) as f64 / task_rate) } else { "—".into() } } else { "—".into() } } else { "—".into() };
                         ui.label(egui::RichText::new(eta_txt).color(theme::TEXT_MUTED).small());
                         ui.label(egui::RichText::new(if t.status == TaskStatus::Downloading { fmt_rate(task_rate as f32) } else { "—".into() }).color(theme::TEXT_MUTED).small());
-                        let frac = match t.total { Some(total) if total > 0 => (t.downloaded as f32 / total as f32).clamp(0.0, 1.0), _ => 0.0 };
+                        let seg_view = self.seg_info.get(&t.id);
+                        let frac_opt = display_fraction(t, seg_view);
+                        let frac = frac_opt.unwrap_or(0.0);
                         ui.vertical(|ui| {
-                            if t.total.is_some() {
+                            if frac_opt.is_some() {
                                 ui.add(egui::ProgressBar::new(frac).desired_width(150.0).fill(theme::PRIMARY).text(format!("{:.1}%", frac * 100.0)));
                             } else if t.status == TaskStatus::Downloading {
                                 ui.add(egui::ProgressBar::new(0.0).desired_width(150.0).fill(theme::PRIMARY).animate(true).text("receiving".to_string()));
                             } else {
                                 ui.add(egui::ProgressBar::new(frac).desired_width(150.0).fill(theme::PRIMARY).text(format!("{:.1}%", frac * 100.0)));
                             }
-                            ui.label(egui::RichText::new(format!("{} of {}", fmt_bytes(t.downloaded), t.total.map(fmt_bytes).unwrap_or_else(|| "?".into()))).color(theme::TEXT_FAINT).small());
+                            ui.label(egui::RichText::new(if t.total.is_some() { format!("{} of {}", fmt_bytes(t.downloaded), t.total.map(fmt_bytes).unwrap_or_else(|| "?".into())) } else if let Some(v) = seg_view.filter(|v| v.manifest) { format!("{} | {}", fmt_bytes(t.downloaded), v.label()) } else { format!("{} of ?", fmt_bytes(t.downloaded)) }).color(theme::TEXT_FAINT).small());
                             if t.status == TaskStatus::Downloading { if let Some(si) = self.seg_info.get(&t.id).cloned() { parts_strip(ui, &si, 150.0); ui.label(egui::RichText::new(si.label()).color(theme::TEXT_FAINT).small()); } }
                         });
                         ui.horizontal(|ui| {
@@ -803,8 +820,15 @@ impl DownloadApp {
             ui.label(egui::RichText::new(&t.filename).strong().size(15.0));
             ui.label(egui::RichText::new(&t.url).color(theme::TEXT_FAINT).small());
             ui.add_space(8.0);
-            let frac = match t.total { Some(total) if total > 0 => (t.downloaded as f32 / total as f32).clamp(0.0, 1.0), _ => 0.0 };
-            ui.add(egui::ProgressBar::new(frac).desired_width(400.0).fill(theme::PRIMARY).text(format!("{:.1}%", frac * 100.0)));
+            let frac_opt = display_fraction(&t, self.seg_info.get(&t.id));
+            let frac = frac_opt.unwrap_or(0.0);
+            if frac_opt.is_some() {
+                ui.add(egui::ProgressBar::new(frac).desired_width(400.0).fill(theme::PRIMARY).text(format!("{:.1}%", frac * 100.0)));
+            } else if t.status == TaskStatus::Downloading {
+                ui.add(egui::ProgressBar::new(0.0).desired_width(400.0).fill(theme::PRIMARY).animate(true).text("receiving".to_string()));
+            } else {
+                ui.add(egui::ProgressBar::new(frac).desired_width(400.0).fill(theme::PRIMARY).text(format!("{:.1}%", frac * 100.0)));
+            }
             ui.add_space(6.0);
             let task_rate = self.task_rate(&t.id);
             let eta_txt = match t.total { Some(total) if t.status == TaskStatus::Downloading && task_rate > 1.0 && total > t.downloaded => eta((total - t.downloaded) as f64 / task_rate), _ => "—".into() };
@@ -1133,4 +1157,33 @@ fn move_task(tasks: &mut [DownloadTask], id: &str, delta: i64) {
 pub fn fmt_bytes(n: u64) -> String {
     const U: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let mut v = n as f64; let mut i = 0; while v >= 1024.0 && i < U.len() - 1 { v /= 1024.0; i += 1; } format!("{v:.1} {}", U[i])
+}
+
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    fn task(total: Option<u64>, downloaded: u64) -> DownloadTask {
+        DownloadTask { total, downloaded, ..Default::default() }
+    }
+
+    #[test]
+    fn byte_total_wins_and_single_part_is_not_manifest() {
+        let view = SegView { parts: vec![(25, 100)], manifest: false };
+        assert_eq!(display_fraction(&task(Some(200), 50), Some(&view)), Some(0.25));
+        assert_eq!(view.fraction(), None);
+    }
+
+    #[test]
+    fn manifest_segment_count_supplies_fraction_when_bytes_unknown() {
+        let view = SegView { parts: vec![(3, 12)], manifest: true };
+        assert_eq!(display_fraction(&task(None, 999), Some(&view)), Some(0.25));
+    }
+
+    #[test]
+    fn unknown_total_without_manifest_count_stays_indeterminate() {
+        let view = SegView { parts: vec![(10, 0)], manifest: false };
+        assert_eq!(display_fraction(&task(None, 10), Some(&view)), None);
+    }
 }

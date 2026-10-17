@@ -194,3 +194,54 @@ async fn http_progress_publishes_total_and_parts() {
     assert_eq!(parts.iter().map(|(_, e)| *e).sum::<u64>(), body.len() as u64);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn segmented_parts_publish_live_bytes_before_part_finishes() {
+    let body: Vec<u8> = (0..120_000u32).map(|i| (i % 251) as u8).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server_body = body.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let data = server_body.clone();
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                if let Some(range) = req.lines().find(|l| l.to_ascii_lowercase().starts_with("range:")) {
+                    let spec = range.split("bytes=").nth(1).unwrap_or("0-").trim();
+                    let mut it = spec.split('-');
+                    let start: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let end: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(data.len() - 1);
+                    let slice = &data[start..=end.min(data.len() - 1)];
+                    let split = (slice.len() / 2).max(1);
+                    let _ = s.write_all(format!("HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nAccept-Ranges: bytes\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n", slice.len(), start, end, data.len()).as_bytes());
+                    if slice.len() > 1 {
+                        let _ = s.write_all(&slice[..split]);
+                        let _ = s.flush();
+                        std::thread::sleep(std::time::Duration::from_millis(900));
+                        let _ = s.write_all(&slice[split..]);
+                    }
+                } else {
+                    let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n", data.len()).as_bytes());
+                    let _ = s.write_all(&data);
+                }
+            });
+        }
+    });
+    let dir = tmpdir("liveparts");
+    let task = DownloadTask { id: "lp1".into(), url: format!("http://127.0.0.1:{port}/f.bin"), filename: "f.bin".into(), dest_dir: dir.clone(), segments: 2, ..Default::default() };
+    let ctrl = Arc::new(Controls::new(0));
+    let c2 = ctrl.clone();
+    let handle = tokio::spawn(async move { download_url(build_client(""), task, c2).await });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let parts = ctrl.parts.lock().unwrap().clone();
+    assert!(!ctrl.parts_are_segments.load(std::sync::atomic::Ordering::Relaxed), "segmented HTTP parts are bytes, not segment counters");
+    assert_eq!(parts.len(), 2, "parts snapshot: {parts:?}");
+    assert!(parts.iter().any(|(done, expected)| *done > 0 && done < expected), "part byte progress must move before a part finishes: {parts:?}");
+    ctrl.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+    let done = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await.expect("cancel stuck").unwrap().unwrap();
+    assert_eq!(done.status, TaskStatus::Paused, "err={}", done.error);
+    let _ = std::fs::remove_dir_all(&dir);
+}
