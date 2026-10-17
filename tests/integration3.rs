@@ -190,8 +190,9 @@ async fn progress_live_then_cancel_stops() {
     let ctrl = Arc::new(Controls::new(0));
     let c2 = ctrl.clone();
     let handle = tokio::spawn(async move { downloadcraft_lib::engine::download_media(build_client(""), task, c2, vec![("video".into(), vec![(None, format!("http://127.0.0.1:{port}/v.mp4"))])]).await });
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    let mid = ctrl.downloaded.load(std::sync::atomic::Ordering::Relaxed);
+    // Poll for first-chunk progress (fixed 400ms sleep flaked on loaded CI runners).
+    let mut mid = 0u64;
+    for _ in 0..50 { mid = ctrl.downloaded.load(std::sync::atomic::Ordering::Relaxed); if mid >= 5000 { break; } tokio::time::sleep(std::time::Duration::from_millis(100)).await; }
     assert!(mid >= 5000, "progress frozen mid-download: ctrl.downloaded={mid}");
     ctrl.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
     let done = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await.expect("cancel did not stop download").unwrap().unwrap();
