@@ -49,7 +49,9 @@ pub const R_CTRL: f32 = 6.0;
 pub const R_CHIP: f32 = 4.0;
 pub const R_PANEL: f32 = 8.0;
 /// Uniform clickable-control height (buttons, TextEdit, ComboBox, DragValue).
-pub const BTN_H: f32 = 32.0;
+pub const BTN_H: f32 = 26.0;
+/// Sidebar nav row height (IDM-compact density).
+pub const ROW_H_NAV: f32 = 22.0;
 /// STEEL as text (links, status, accents): STEEL fill color is 3.0-3.5:1 as text (fail); this is 6.1-7.3:1.
 pub const STEEL_TEXT: Color32 = Color32::from_rgb(0x7F, 0xB3, 0xAA);
 
@@ -98,11 +100,11 @@ pub fn apply(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     // Download-manager UI: labels are never text-selection targets (was I-beam cursor + stolen row clicks).
     style.interaction.selectable_labels = false;
-    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    style.spacing.button_padding = egui::vec2(12.0, 8.0);
-    style.spacing.interact_size = egui::vec2(40.0, BTN_H);
-    style.spacing.window_margin = egui::Margin::same(16.0);
-    style.spacing.menu_margin = egui::Margin::same(8.0);
+    style.spacing.item_spacing = egui::vec2(6.0, 4.0);
+    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    style.spacing.interact_size = egui::vec2(36.0, BTN_H);
+    style.spacing.window_margin = egui::Margin::same(12.0);
+    style.spacing.menu_margin = egui::Margin::same(6.0);
     style.spacing.slider_width = 160.0;
     style.spacing.scroll.floating = true;
     style.spacing.scroll.bar_width = 10.0;
@@ -110,9 +112,9 @@ pub fn apply(ctx: &egui::Context) {
     style.visuals.slider_trailing_fill = true;
     style.animation_time = 0.15;
     style.text_styles = [
-        (TextStyle::Heading, FontId::proportional(16.0)),
-        (TextStyle::Body, FontId::proportional(13.0)),
-        (TextStyle::Button, FontId::proportional(13.0)),
+        (TextStyle::Heading, FontId::proportional(15.0)),
+        (TextStyle::Body, FontId::proportional(12.5)),
+        (TextStyle::Button, FontId::proportional(12.0)),
         (TextStyle::Small, FontId::proportional(11.0)),
         (TextStyle::Monospace, FontId::monospace(12.0)),
     ].into();
@@ -129,7 +131,7 @@ pub fn ghost_btn(ui: &mut egui::Ui, label: &str) -> egui::Response {
 }
 /// Small status label — bordered box, 4px radius.
 pub fn chip(ui: &mut egui::Ui, label: &str, color: Color32) {
-    egui::Frame::none().fill(SURFACE_RAISED).stroke(egui::Stroke::new(1.0f32, BORDER)).rounding(R_CHIP).inner_margin(egui::Margin::symmetric(8.0, 3.0))
+    egui::Frame::none().fill(SURFACE_RAISED).stroke(egui::Stroke::new(1.0f32, BORDER)).rounding(R_CHIP).inner_margin(egui::Margin::symmetric(6.0, 2.0))
         .show(ui, |ui| { ui.label(egui::RichText::new(label).color(color).small()); });
 }
 /// Panel frame (desktop group box), 8px radius.

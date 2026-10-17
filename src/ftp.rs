@@ -17,7 +17,7 @@ impl Ftp {
         let mut text = String::new();
         loop {
             let mut line = String::new();
-            let n = self.rd.read_line(&mut line).await.map_err(|e| e.to_string())?;
+            let n = tokio::time::timeout(std::time::Duration::from_secs(30), self.rd.read_line(&mut line)).await.map_err(|_| "FTP reply timeout".to_string())?.map_err(|e| e.to_string())?;
             if n == 0 { return Err("FTP connection closed".into()); }
             let code: u16 = line.get(..3).and_then(|s| s.parse().ok()).unwrap_or(0);
             text.push_str(line.trim_end());

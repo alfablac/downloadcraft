@@ -40,3 +40,5 @@ path = "src/bin/downloadcraft_host.rs"
 
 [profile.release]
 lto = "thin"
+strip = true
+codegen-units = 1

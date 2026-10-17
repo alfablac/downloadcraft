@@ -30,7 +30,7 @@ pub fn should_start(s: &Schedule, day: i64, secs_of_day: u32) -> bool {
 }
 pub fn should_stop(s: &Schedule, day: i64, secs_of_day: u32) -> bool {
     if !s.enabled { return false; }
-    if s.last_started_day != day && s.recurrence != Recurrence::Daily { /* still allow stop if window passed today */ }
+    if s.last_stopped_day == day { return false; } // latched: manual Resume after stop wins until tomorrow
     match s.stop_secs { Some(stop) => secs_of_day >= stop && secs_of_day >= s.start_secs, None => false }
 }
 /// Seconds until next start (approx, day granularity). None if Once in past.
@@ -53,6 +53,9 @@ pub fn next_run_in(s: &Schedule, day: i64, secs_of_day: u32) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn stop_latches_after_apply() { let base = Schedule { id: "1".into(), queue_id: "main".into(), enabled: true, recurrence: Recurrence::Daily, start_secs: 3600, stop_secs: Some(7200), ..Default::default() }; assert!(should_stop(&base, 10, 7200)); let s2 = Schedule { last_stopped_day: 10, ..base.clone() }; assert!(!should_stop(&s2, 10, 8000)); assert!(should_stop(&s2, 11, 7200)); }
+    #[test] fn stop_latch_unset_fires_all_day() { let s = Schedule { id: "1".into(), queue_id: "main".into(), enabled: true, recurrence: Recurrence::Daily, start_secs: 3600, stop_secs: Some(7200), ..Default::default() }; assert!(should_stop(&s, 10, 86399)); assert!(!should_stop(&s, 10, 7199)); }
+    #[test] fn stop_latch_suppresses_rest_of_day() { let s = Schedule { last_stopped_day: 10, id: "1".into(), queue_id: "main".into(), enabled: true, recurrence: Recurrence::Daily, start_secs: 3600, stop_secs: Some(7200), ..Default::default() }; assert!(!should_stop(&s, 10, 43200)); assert!(!should_stop(&s, 10, 86399)); }
     #[test] fn weekdays_logic() {
         let mut s = Schedule { id: "1".into(), queue_id: "main".into(), enabled: true, recurrence: Recurrence::Weekdays, start_secs: 3600, ..Default::default() };
         let mon = days_from_civil(2026, 10, 19); // Monday

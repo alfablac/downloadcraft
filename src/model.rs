@@ -89,6 +89,9 @@ pub struct Schedule {
     #[serde(default)] pub files_at_once: usize,
     #[serde(default)] pub run_missed: bool,
     #[serde(default)] pub last_started_day: i64,
+    /// Day stop was last applied. Latched so scheduler stop fires once/day and
+    /// cannot re-Pause a task the user resumed manually after stop time.
+    #[serde(default)] pub last_stopped_day: i64,
     #[serde(default)] pub on_complete: CompletionAction,
     #[serde(default)] pub power_confirmed: bool,
     /// Optional bandwidth window: kbps applied while schedule window active. 0 = unlimited.
