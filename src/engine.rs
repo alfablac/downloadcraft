@@ -506,6 +506,7 @@ async fn fetch_into_inner(client: &reqwest::Client, task: &DownloadTask, url: &s
         match fetch_once_counted_impl(client, task, url, file, ctrl).await {
             Ok(n) => return Ok(n),
             Err(e) => {
+                if ctrl.cancelled.load(Ordering::Relaxed) { return Err(e); }
                 attempt += 1; if attempt > 4 { return Err(e); }
                 // Roll back partial bytes so retry does not duplicate/count twice.
                 file.set_len(start).await.map_err(|x| x.to_string())?;
