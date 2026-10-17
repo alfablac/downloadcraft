@@ -17,7 +17,8 @@ async fn probe_manifest(client: &reqwest::Client, task: &DownloadTask) -> Manife
     if !resp.status().is_success() { return Manifest::File; }
     let ct = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
     let ct = ct.split(';').next().unwrap_or("").trim();
-    if ct.contains("dash+xml") { Manifest::Dash } else if ct.contains("mpegurl") { Manifest::Hls } else { Manifest::File }
+    // IDM MIME map (REA round 6): video/vnd.mpeg.dash.mpd, application/vnd.apple.mpegurl.
+    if ct.contains("dash") || ct.contains("mpd") { Manifest::Dash } else if ct.contains("mpegurl") || ct.contains("m3u") { Manifest::Hls } else { Manifest::File }
 }
 
 /// Resolve URL to download task(s): URL .mpd/.m3u8 hint first, else probe Content-Type, else plain HTTP.

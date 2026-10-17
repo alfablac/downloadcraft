@@ -418,24 +418,35 @@ pub async fn download_media(client: reqwest::Client, task: DownloadTask, ctrl: A
     let mut task = task;
     let work = task.dest_dir.join(format!(".downloadcraft-media-{}", task.id));
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    // Manifest snapshot BEFORE fetch: kill-resume reuses seg caches below.
+    let _ = std::fs::write(work.join("tracks.json"), serde_json::to_string(&tracks.iter().map(|(k, s)| (k.clone(), s.len())).collect::<Vec<_>>()).unwrap_or_default());
     let mut track_files: Vec<PathBuf> = Vec::new();
+    let mut subtitle_files: Vec<PathBuf> = Vec::new();
     // Segment sizes unknown upfront: progress in bytes, task.total stays None.
     let mut done_bytes: u64 = 0; task.total = None; task.downloaded = 0; ctrl.downloaded.store(0, Ordering::Relaxed);
     { let total_segs: u64 = tracks.iter().map(|(_, sg)| sg.len() as u64).sum(); ctrl.parts_are_segments.store(true, Ordering::Relaxed); *ctrl.parts.lock().unwrap() = vec![(0, total_segs)]; }
-    for (kind, segs) in &tracks {
+    for (kind, segs) in tracks.iter() {
         let out = work.join(format!("track-{kind}.bin"));
         {
             let mut file = tokio::fs::File::create(&out).await.map_err(|e| e.to_string())?;
             let mut seen_init: Option<String> = None;
-            for (init, seg_url) in segs {
+            for (i, (init, seg_url)) in segs.iter().enumerate() {
                 wait_not_paused(&ctrl).await?;
-                // resume: skip segments already fully? ponytail: media resume restarts track file; HTTP resume path covers kill-resume spec strictly,
-                // manifest snapshot stored below allows re-run; segment files cached per index.
-                let cache = work.join(format!("{kind}-{}.seg", track_files.len() * 100000 + done_bytes as usize));
-                let _ = cache;
+                // Kill-resume: cached segment file from prior run is replayed, not refetched.
+                let cache = work.join(format!("seg-{kind}-{i}.bin"));
                 let seg_result = async {
                     if let Some(init) = init { if seen_init.as_deref() != Some(init.as_str()) { seen_init = Some(init.clone()); done_bytes += fetch_into_inner(&client, &task, init, &mut file, &ctrl).await?; } }
-                    done_bytes += fetch_into_inner(&client, &task, seg_url, &mut file, &ctrl).await?;
+                    if !cache.exists() {
+                        let mut cf = tokio::fs::File::create(&cache).await.map_err(|e| e.to_string())?;
+                        // Streaming fetch counts live progress; undo that count here —
+                        // append below counts segment exactly once (fetch or replay).
+                        let n = fetch_into_inner(&client, &task, seg_url, &mut cf, &ctrl).await?;
+                        ctrl.downloaded.fetch_sub(n, Ordering::Relaxed);
+                        cf.flush().await.map_err(|e| e.to_string())?;
+                    }
+                    let bytes = tokio::fs::read(&cache).await.map_err(|e| e.to_string())?;
+                    done_bytes += bytes.len() as u64; ctrl.downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    file.write_all(&bytes).await.map_err(|e| e.to_string())?;
                     Ok::<(), String>(())
                 }.await;
                 if seg_result.is_ok() { let mut pg = ctrl.parts.lock().unwrap(); if let Some(first) = pg.first_mut() { first.0 += 1; } }
@@ -450,12 +461,22 @@ pub async fn download_media(client: reqwest::Client, task: DownloadTask, ctrl: A
             }
             file.flush().await.map_err(|e| e.to_string())?;
         }
-        track_files.push(out);
+        if kind == "text" { subtitle_files.push(out); } else { track_files.push(out); }
     }
-    // Manifest snapshot for resume documentation
-    let _ = std::fs::write(work.join("tracks.json"), serde_json::to_string(&tracks.iter().map(|(k, s)| (k.clone(), s.len())).collect::<Vec<_>>()).unwrap_or_default());
+    // Subtitle tracks land as sidecar next to final file (ffmpeg stream mapping for
+    // arbitrary subtitle segment bytes is unreliable; sidecar is what players pick up).
     let dest = task.dest_dir.join(&task.filename);
-    if track_files.len() == 1 {
+    let text_url_ext = tracks.iter().find(|(k, _)| k == "text").and_then(|(_, s)| s.first()).map(|(_, u)| u.rsplit('.').next().unwrap_or("vtt").split(['?', '#']).next().unwrap_or("vtt").to_string());
+    for (i, sub) in subtitle_files.iter().enumerate() {
+        let stem = task.filename.rsplit_once('.').map(|(s, _)| s).unwrap_or(&task.filename);
+        let ext = text_url_ext.clone().unwrap_or_else(|| "vtt".into());
+        let suffix = if subtitle_files.len() > 1 { format!(".{i}") } else { String::new() };
+        let _ = tokio::fs::copy(sub, task.dest_dir.join(format!("{stem}{suffix}.{ext}"))).await;
+    }
+    if track_files.is_empty() && !subtitle_files.is_empty() {
+        // Subtitle-only download: sidecar IS the product.
+        tokio::fs::copy(&subtitle_files[0], &dest).await.map_err(|e| e.to_string())?;
+    } else if track_files.len() == 1 {
         tokio::fs::rename(&track_files[0], &dest).await.map_err(|e| e.to_string())?;
     } else {
         // Try ffmpeg mux; fallback: keep first track and note error (muxer missing handled by caller docs)

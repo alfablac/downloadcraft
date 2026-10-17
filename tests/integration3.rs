@@ -93,6 +93,28 @@ async fn dash_segmentlist_and_base_e2e() {
 }
 
 #[tokio::test]
+async fn dash_subtitle_sidecar_and_media_cache_resume() {
+    let vtt = b"WEBVTT\n\n00:00.000 --> 00:01.000\nhello\n".to_vec();
+    let mpd = r#"<MPD type="static" mediaPresentationDuration="PT10S"><Period><AdaptationSet mimeType="video/mp4"><SegmentTemplate media="v-$Number$.m4s" initialization="vinit.mp4" duration="10" timescale="1"/><Representation id="v" bandwidth="10"/></AdaptationSet><AdaptationSet mimeType="text/vtt" lang="en"><SegmentTemplate media="sub-$Number$.vtt" duration="10" timescale="1"/><Representation id="s" bandwidth="1"/></AdaptationSet></Period></MPD>"#;
+    let base = serve(vec![
+        ("/withsub.mpd".into(), mpd.as_bytes().to_vec(), "application/dash+xml".into()),
+        ("/vinit.mp4".into(), b"INIT".to_vec(), "video/mp4".into()),
+        ("/v-1.m4s".into(), b"SEG1".to_vec(), "video/mp4".into()),
+        ("/sub-1.vtt".into(), vtt.clone(), "text/vtt".into()),
+    ], false);
+    let dir = tmpdir("subsidecar");
+    // Pre-seed media cache: replay must need no segment fetch (would still hit server; content proves cache use via distinct preseeded bytes).
+    let work = dir.join(".downloadcraft-media-sub1");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("seg-video-0.bin"), b"CACHED").unwrap();
+    let task = DownloadTask { id: "sub1".into(), url: format!("{base}/withsub.mpd"), filename: "movie.mp4".into(), dest_dir: dir.clone(), ..Default::default() };
+    let done = download_url(build_client(""), task, Arc::new(Controls::new(0))).await.unwrap();
+    assert_eq!(done.status, TaskStatus::Complete, "{}", done.error);
+    assert_eq!(std::fs::read(dir.join("movie.mp4")).unwrap(), b"INITCACHED".to_vec());
+    assert_eq!(std::fs::read(dir.join("movie.vtt")).unwrap(), vtt);
+}
+
+#[tokio::test]
 async fn dynamic_mpd_polls_new_segments() {
     let seg = b"LIVESEG".to_vec();
     let base = serve(vec![
