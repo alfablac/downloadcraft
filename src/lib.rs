@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod ftp;
 pub mod grabber;
 pub mod hls;
 pub mod model;
