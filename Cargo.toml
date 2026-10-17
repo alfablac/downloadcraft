@@ -1,6 +1,6 @@
 [package]
 name = "downloadcraft"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2021"
 description = "Clean-room cross-platform download manager (IDM feature clone)"
 license = "MIT"
