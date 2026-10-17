@@ -70,6 +70,7 @@ fn parse_kv_file(path: &std::path::Path) -> Option<DownloadTask> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") { println!("downloadcraft {}", env!("CARGO_PKG_VERSION")); return; }
     if args.iter().any(|a| a == "--smoke-test") {
         if let Err(e) = platform::ensure_dirs() { eprintln!("smoke: ensure_dirs failed: {e}"); std::process::exit(1); }
         // native-host handshake against self
@@ -162,7 +163,7 @@ fn run_gui(initial_urls: Vec<String>, hidden: bool) {
     // drain inbox
     drain_inbox(&rt);
     let rt_clone = rt.clone();
-    let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 720.0]).with_min_inner_size([760.0, 520.0]).with_title("downloadcraft").with_visible(!hidden), ..Default::default() };
+    let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 720.0]).with_min_inner_size([760.0, 520.0]).with_title(format!("downloadcraft v{}", env!("CARGO_PKG_VERSION"))).with_visible(!hidden), ..Default::default() };
     let _ = eframe::run_native("downloadcraft", options, Box::new(move |cc| Ok(Box::new(app::DownloadApp::new(cc, rt_clone, hidden)))));
 }
 

@@ -61,6 +61,7 @@ pub struct Queue {
     #[serde(default)] pub on_complete_arg: String,
 }
 fn def_one() -> usize { 1 }
+fn def_true() -> bool { true }
 impl Default for Queue {
     fn default() -> Self { Self { id: "main".into(), name: "Main".into(), max_concurrent: 3, auto_start: true, retry_count: 3, retry_interval_secs: 10, on_complete: CompletionAction::None, on_complete_arg: String::new() } }
 }
@@ -73,13 +74,16 @@ Daily, Weekdays, Weekly }
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct Schedule {
     pub id: String,
+    #[serde(default)] pub name: String,
     pub queue_id: String,
     #[serde(default)] pub enabled: bool,
     #[serde(default)] pub recurrence: Recurrence,
     /// days-bitmask Mon=1 Tue=2 Wed=4 Thu=8 Fri=16 Sat=32 Sun=64 (Weekly)
     #[serde(default)] pub weekdays_mask: u8,
-    /// YYYYMMDD for Once
+    /// YYYYMMDD for Once; also anchor date for repeat_days cycle
     #[serde(default)] pub once_date: u32,
+    /// Repeat each N days (Daily only; 0/1 = every day). IDM Scheduler field.
+    #[serde(default)] pub repeat_days: u32,
     #[serde(default)] pub start_secs: u32,
     #[serde(default)] pub stop_secs: Option<u32>,
     #[serde(default)] pub files_at_once: usize,
@@ -107,12 +111,14 @@ pub struct Settings {
     #[serde(default)] pub close_to_tray: bool,
     #[serde(default)] pub clipboard_monitor: bool,
     #[serde(default)] pub proxy_url: String,
+    /// Master "Turn on scheduler" (IDM Scheduler dialog). Default on.
+    #[serde(default = "def_true")] pub scheduler_enabled: bool,
 }
 fn def_conn() -> u32 { 8 }
 fn def_global() -> usize { 3 }
 impl Default for Settings {
     fn default() -> Self {
-        Self { download_dir: crate::platform::default_download_dir(), max_connections: 8, global_max_concurrent: 3, speed_limit_kbps: 0, autostart: false, start_minimized: false, close_to_tray: true, clipboard_monitor: false, proxy_url: String::new() }
+        Self { download_dir: crate::platform::default_download_dir(), max_connections: 8, global_max_concurrent: 3, speed_limit_kbps: 0, autostart: false, start_minimized: false, close_to_tray: true, clipboard_monitor: false, proxy_url: String::new(), scheduler_enabled: true }
     }
 }
 

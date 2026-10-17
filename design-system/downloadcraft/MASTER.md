@@ -10,12 +10,14 @@
 **Generated:** 2026-10-16 23:04:24
 **Category:** Productivity Tool
 
-> **OVERRIDE (2026-10-16, user direction):** Desktop-app feel, not web.
-> Graphite neutral grays (no blue-black tint), ZERO corner radius everywhere,
-> hard 1px borders for window/panel separation, flat bordered buttons,
-> dense native-tool layout. Palette below is superseded by `src/theme.rs`
-> tokens (G_950..G_100 graphite ramp + desaturated steel accent).
-> No pills, no rounded cards, no shadows-as-hierarchy.
+> **OVERRIDE (2026-10-17, user direction):** Desktop-app feel, not web.
+> Graphite neutral grays (no blue-black tint), 6px radius controls / 8px panels
+> (supersedes 2026-10-16 ZERO-radius rule — squared buttons felt broken),
+> 1px borders (width constant in every state — no layout shift), 32px uniform
+> control height, 8px spacing scale, hover/pressed/disabled visibly distinct,
+> text contrast >= 4.5:1 (STEEL_TEXT #7FB3AA for steel-as-text, ERR #D97A6E).
+> Palette below superseded by `src/theme.rs` tokens.
+> No translate/shadow hovers, no 44px touch targets (desktop pointer app).
 
 ---
 

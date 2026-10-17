@@ -62,7 +62,7 @@ fn parts_strip(ui: &mut egui::Ui, view: &SegView, width: f32) {
         let frac = if *exp > 0 { (*done as f32 / *exp as f32).clamp(0.0, 1.0) } else { 0.0 };
         if frac > 0.0 {
             let fill = egui::Rect::from_min_size(cell.min, egui::vec2(cell.width() * frac, cell.height()));
-            painter.rect_filled(fill, 0.0, theme::PRIMARY);
+            painter.rect_filled(fill, 2.0, theme::PRIMARY);
         }
         x += w;
     }
@@ -112,6 +112,7 @@ pub struct DownloadApp {
     show_add: bool,
     show_progress_for: Option<String>,
     selected: Option<String>,
+    selected_schedule: Option<String>,
     completed_notice: Option<String>,
     last_notified: Option<String>,
     speed_hist: Vec<f32>,
@@ -136,7 +137,7 @@ impl DownloadApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, rt: Arc<Mutex<Runtime>>, hidden: bool) -> Self {
         let tokio_rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio rt"));
         let tray = Self::make_tray();
-        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_ext_depth: 0, grab_scope: 0, grab_exts: String::new(), grab_parent_dirs: false, grab_only_paths: String::new(), grab_exclude_paths: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), grab_status: "Enter a start URL, then Explore.".into(), grab_busy: false, grab_auto_explore: false, last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, options_notice: "Changes save automatically.".into(), show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new(), rate_smooth: std::collections::HashMap::new(), handles: std::collections::HashMap::new(), allow_close: false }
+        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_ext_depth: 0, grab_scope: 0, grab_exts: String::new(), grab_parent_dirs: false, grab_only_paths: String::new(), grab_exclude_paths: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), grab_status: "Enter a start URL, then Explore.".into(), grab_busy: false, grab_auto_explore: false, last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, options_notice: "Changes save automatically.".into(), show_add: false, show_progress_for: None, selected: None, selected_schedule: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new(), rate_smooth: std::collections::HashMap::new(), handles: std::collections::HashMap::new(), allow_close: false }
     }
 
     fn make_tray() -> Option<TrayNav> {
@@ -378,10 +379,11 @@ impl DownloadApp {
         // scheduler tick (every poll, cheap)
         {
             let (day, secs) = today_parts(); self.minutes_today = (day, secs);
+            let master = self.rt.lock().unwrap().state.settings.scheduler_enabled;
             let mut to_start: Vec<String> = Vec::new(); let mut to_stop: Vec<String> = Vec::new();
             {
                 let mut g = self.rt.lock().unwrap();
-                for s in g.state.schedules.clone() {
+                for s in if master { g.state.schedules.clone() } else { Vec::new() } {
                     if should_start(&s, day, secs) {
                         // mark started
                         if let Some(sch) = g.state.schedules.iter_mut().find(|x| x.id == s.id) { sch.last_started_day = day; }
@@ -472,13 +474,13 @@ impl eframe::App for DownloadApp {
             }
         }
         if self.hidden { return; }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title("downloadcraft — Download Manager".into()));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("downloadcraft v{} — Download Manager", env!("CARGO_PKG_VERSION"))));
 
         // ── Top bar: brand + menus (IDM: Tasks/File/Downloads/View/Help) ──
         egui::TopBottomPanel::top("topbar").frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::symmetric(8.0, 4.0))).show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("downloadcraft").color(theme::TEXT).strong().size(17.0));
-                theme::chip(ui, "v0.2.0", theme::TEAL_500);
+                theme::chip(ui, &format!("v{}", env!("CARGO_PKG_VERSION")), theme::STEEL_TEXT);
                 ui.add_space(14.0);
                 egui::menu::bar(ui, |ui| {
                     ui.menu_button("Tasks", |ui| {
@@ -514,7 +516,7 @@ impl eframe::App for DownloadApp {
                         if ui.button("Options").clicked() { self.tab = Tab::Options; ui.close_menu(); }
                     });
                     ui.menu_button("Help", |ui| {
-                        if ui.button("About downloadcraft").clicked() { self.show_about = true; ui.close_menu(); }
+                        if ui.button(format!("About downloadcraft v{}", env!("CARGO_PKG_VERSION"))).clicked() { self.show_about = true; ui.close_menu(); }
                     });
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -705,45 +707,52 @@ fn icon_btn(ui: &mut egui::Ui, ic: Icon, label: &str, primary: bool, min_w: f32)
 }
 
 fn icon_btn_enabled(ui: &mut egui::Ui, ic: Icon, label: &str, primary: bool, min_w: f32, enabled: bool) -> egui::Response {
-    let fill = if !enabled { theme::SURFACE } else if primary { theme::STEEL_DIM } else { theme::SURFACE_RAISED };
-    let fg = if enabled { theme::TEXT } else { theme::TEXT_FAINT };
-    // min_w = total framed width. Frame adds 14px horizontal margin; counting it
-    // twice overflowed the 208px rail by 10px and pushed CentralPanel right (grey bar).
-    let resp = egui::Frame::none().fill(fill).stroke(egui::Stroke::new(1.0f32, theme::BORDER_STRONG)).inner_margin(egui::Margin::symmetric(7.0, 4.0)).show(ui, |ui| {
-        ui.set_min_width((min_w - 14.0).max(0.0));
-        ui.horizontal(|ui| {
-            let (irect, _) = ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
-            icon(ui.painter(), &ic, irect, fg);
-            ui.label(egui::RichText::new(label).color(fg));
-        });
-    }).response;
-    let resp = resp.interact(if enabled { egui::Sense::click() } else { egui::Sense::hover() });
+    // Allocate first, paint after state known: previous Frame-then-interact painted
+    // one flat box regardless of hover/press (buttons looked dead, clicks unreliable).
+    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(min_w, theme::BTN_H), sense);
+    let (fill, stroke, fg) = if !enabled { (theme::SURFACE, theme::BORDER, theme::TEXT_FAINT) }
+        else if primary { if resp.is_pointer_button_down_on() { (theme::STEEL_DIM, theme::STEEL, egui::Color32::WHITE) } else if resp.hovered() { (theme::STEEL_DIM, theme::STEEL_TEXT, egui::Color32::WHITE) } else { (theme::STEEL, theme::STEEL, egui::Color32::WHITE) } }
+        else if resp.is_pointer_button_down_on() { (theme::STEEL_DIM, theme::STEEL, theme::TEXT) }
+        else if resp.hovered() { (theme::SURFACE_HOVER, theme::BORDER_STRONG, theme::TEXT) }
+        else { (theme::SURFACE_RAISED, theme::BORDER, theme::TEXT) };
+    ui.painter().rect(rect, egui::Rounding::same(theme::R_CTRL), fill, egui::Stroke::new(1.0f32, stroke));
+    if enabled && resp.has_focus() { ui.painter().rect_stroke(rect.expand(2.0), egui::Rounding::same(theme::R_CTRL + 2.0), egui::Stroke::new(2.0f32, theme::STEEL_TEXT)); }
     if enabled && resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(8.0, 0.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    child.spacing_mut().item_spacing.x = 6.0;
+    let (irect, _) = child.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+    icon(child.painter(), &ic, irect, fg);
+    child.add(egui::Label::new(egui::RichText::new(label).color(fg)).selectable(false));
     resp
 }
 
 /// Download-table column widths shared by header and rows (separate Grids auto-sized
 /// independently, so header and row columns never lined up). Name column takes remainder.
 fn dl_cols(avail: f32, compact: bool) -> Vec<f32> {
-    let fixed: &[f32] = if compact { &[78.0, 86.0, 180.0, 150.0] } else { &[56.0, 78.0, 86.0, 70.0, 88.0, 180.0, 150.0] };
-    let gaps = 10.0 * fixed.len() as f32;
+    let fixed: &[f32] = if compact { &[78.0, 86.0, 190.0, 160.0] } else { &[56.0, 78.0, 86.0, 70.0, 88.0, 190.0, 160.0] };
+    let gaps = theme::SP_SM * fixed.len() as f32;
     let mut v = vec![(avail - fixed.iter().sum::<f32>() - gaps).max(120.0)];
     v.extend_from_slice(fixed);
     v
 }
 
+pub const ROW_H: f32 = 46.0;
 fn cell<R>(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::left_to_right(egui::Align::Center), |ui| { ui.set_width(w); add(ui) }).inner
+    // Fixed height: zero-height allocation left every column on its own baseline.
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::hover());
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    child.set_width(w);
+    add(&mut child)
 }
 
 /// Bordered action group: related controls stay together and wrap as one unit.
 fn action_group(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::symmetric(6.0, 4.0)).show(ui, |ui| {
-        ui.vertical(|ui| {
-            ui.label(egui::RichText::new(label).color(theme::TEXT_FAINT).small().strong());
-            ui.horizontal_wrapped(add);
-        });
+    ui.vertical(|ui| {
+        ui.label(egui::RichText::new(label).color(theme::TEXT_FAINT).small().strong());
+        ui.horizontal_wrapped(add);
     });
+    ui.add_space(8.0);
 }
 
 impl DownloadApp {
@@ -819,7 +828,7 @@ impl DownloadApp {
         let cols = dl_cols(ui.available_width() - 18.0, compact_table);
         // IDM columns on wide windows; compact set on narrow windows (no squeezed overlap).
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        egui::Frame::none().fill(theme::SURFACE_RAISED).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::symmetric(8.0, 4.0)).show(ui, |ui| {
+        egui::Frame::none().fill(theme::SURFACE_RAISED).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).rounding(theme::R_CTRL).inner_margin(egui::Margin::symmetric(10.0, 4.0)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 for (i, h) in if compact_table { vec!["File Name", "Size", "Status", "Progress", ""] } else { vec!["File Name", "Q", "Size", "Status", "Time left", "Transfer rate", "Progress", ""] }.iter().enumerate() {
@@ -848,33 +857,30 @@ impl DownloadApp {
             for t in &tasks {
                 let sel = self.selected.as_deref() == Some(t.id.as_str());
                 let fill = if sel { theme::STEEL_DIM } else { theme::SURFACE };
-                let resp = egui::Frame::none().fill(fill).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::symmetric(8.0, 4.0)).show(ui, |ui| {
+                let resp = egui::Frame::none().fill(fill).stroke(egui::Stroke::new(1.0f32, if sel { theme::STEEL } else { theme::BORDER })).rounding(theme::R_CTRL).inner_margin(egui::Margin::symmetric(10.0, 2.0)).show(ui, |ui| {
                     ui.horizontal(|ui| { ui.spacing_mut().item_spacing.x = 10.0; let mut ci = 0usize; let mut nw = || { ci += 1; cols[ci - 1] };
                         let task_rate = self.task_rate(&t.id);
-                        cell(ui, nw(), |ui| { let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover()); icon(ui.painter(), &cat_icon(&t.filename), irect, theme::TEXT_MUTED); ui.add(egui::Label::new(egui::RichText::new(&t.filename).color(theme::TEXT).strong()).truncate()).on_hover_text(&t.filename); });
-                        if !compact_table { let w = nw(); cell(ui, w, |ui| ui.label(egui::RichText::new(if t.queue_id.is_empty() { "main" } else { &t.queue_id }).color(theme::TEXT_MUTED).small())); }
-                        let w = nw(); cell(ui, w, |ui| ui.label(egui::RichText::new(match t.total { Some(n) => fmt_bytes(n), None => "—".into() }).color(theme::TEXT_MUTED).small()));
+                        cell(ui, nw(), |ui| { let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover()); icon(ui.painter(), &cat_icon(&t.filename), irect, theme::TEXT_MUTED); ui.add(egui::Label::new(egui::RichText::new(&t.filename).color(theme::TEXT).strong()).truncate().selectable(false)).on_hover_text(&t.filename); });
+                        if !compact_table { let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(if t.queue_id.is_empty() { "main" } else { &t.queue_id }).color(theme::TEXT_MUTED).small()).selectable(false))); }
+                        let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(match t.total { Some(n) => fmt_bytes(n), None => "—".into() }).color(theme::TEXT_MUTED).small()).selectable(false)));
                         let sc = theme::status_color(t.status);
-                        let w = nw(); cell(ui, w, |ui| ui.label(egui::RichText::new(format!("{:?}", t.status)).color(sc).small().strong()));
+                        let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(format!("{:?}", t.status)).color(sc).small().strong()).selectable(false)));
                         if !compact_table {
                             // ETA from THIS task's own rate (was global rate for all rows)
                             let eta_txt = if t.status == TaskStatus::Downloading { if let Some(total) = t.total { if task_rate > 1.0 && total > t.downloaded { eta((total - t.downloaded) as f64 / task_rate) } else { "—".into() } } else { "—".into() } } else { "—".into() };
-                            let w = nw(); cell(ui, w, |ui| ui.label(egui::RichText::new(eta_txt).color(theme::TEXT_MUTED).small()));
-                            let w = nw(); cell(ui, w, |ui| ui.label(egui::RichText::new(if t.status == TaskStatus::Downloading { fmt_rate(task_rate as f32) } else { "—".into() }).color(theme::TEXT_MUTED).small()));
+                            let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(eta_txt).color(theme::TEXT_MUTED).small()).selectable(false)));
+                            let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(if t.status == TaskStatus::Downloading { fmt_rate(task_rate as f32) } else { "—".into() }).color(theme::TEXT_MUTED).small()).selectable(false)));
                         }
                         let seg_view = self.seg_info.get(&t.id);
                         let frac_opt = display_fraction(t, seg_view);
                         let frac = frac_opt.unwrap_or(0.0);
                         let w = nw(); cell(ui, w, |ui| ui.vertical(|ui| {
-                            if frac_opt.is_some() {
-                                ui.add(egui::ProgressBar::new(frac).desired_width(170.0).fill(theme::PRIMARY).text(format!("{:.1}%", frac * 100.0)));
-                            } else if t.status == TaskStatus::Downloading {
-                                ui.add(egui::ProgressBar::new(0.0).desired_width(170.0).fill(theme::PRIMARY).animate(true).text("receiving".to_string()));
-                            } else {
-                                ui.add(egui::ProgressBar::new(frac).desired_width(170.0).fill(theme::PRIMARY).text(format!("{:.1}%", frac * 100.0)));
-                            }
-                            ui.label(egui::RichText::new(if t.total.is_some() { format!("{} of {}", fmt_bytes(t.downloaded), t.total.map(fmt_bytes).unwrap_or_else(|| "?".into())) } else if let Some(v) = seg_view.filter(|v| v.manifest) { format!("{} | {}", fmt_bytes(t.downloaded), v.label()) } else { format!("{} of ?", fmt_bytes(t.downloaded)) }).color(theme::TEXT_FAINT).small());
-                            if t.status == TaskStatus::Downloading { if let Some(si) = self.seg_info.get(&t.id).cloned() { parts_strip(ui, &si, 170.0); ui.label(egui::RichText::new(si.label()).color(theme::TEXT_FAINT).small()); } }
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            let bar = egui::ProgressBar::new(frac).desired_width(180.0).desired_height(10.0).rounding(egui::Rounding::same(5.0)).fill(theme::PRIMARY);
+                            if frac_opt.is_some() { ui.add(bar); } else if t.status == TaskStatus::Downloading { ui.add(bar.animate(true)); } else { ui.add(bar); }
+                            let pct = if frac_opt.is_some() { format!("{:.1}% · ", frac * 100.0) } else { String::new() };
+                            ui.add(egui::Label::new(egui::RichText::new(format!("{}{}", pct, if t.total.is_some() { format!("{} of {}", fmt_bytes(t.downloaded), t.total.map(fmt_bytes).unwrap_or_else(|| "?".into())) } else if let Some(v) = seg_view.filter(|v| v.manifest) { format!("{} | {}", fmt_bytes(t.downloaded), v.label()) } else { format!("{} of ?", fmt_bytes(t.downloaded)) })).color(if sel { theme::TEXT_MUTED } else { theme::TEXT_FAINT }).small()).selectable(false));
+                            if t.status == TaskStatus::Downloading { if let Some(si) = self.seg_info.get(&t.id).cloned() { parts_strip(ui, &si, 180.0); } }
                         }));
                         let w = nw(); cell(ui, w, |ui| {
                             if t.status == TaskStatus::Downloading {
@@ -1068,54 +1074,113 @@ impl DownloadApp {
                 ui.add_space(6.0);
             }
         } else {
-            ui.heading("Scheduler");
-            ui.add_space(4.0);
-            theme::panel().show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if theme::primary_btn(ui, "+ Add schedule (main queue)").clicked() { let mut g = self.rt.lock().unwrap(); g.state.schedules.push(Schedule { id: crate::model::new_id(), queue_id: "main".into(), enabled: true, recurrence: Recurrence::Daily, start_secs: 3600, stop_secs: Some(7200), files_at_once: 3, ..Default::default() }); g.save(); }
-                    ui.label(egui::RichText::new("Start/stop windows per queue · files at once · optional speed limit").color(theme::TEXT_FAINT).small());
+            // IDM Scheduler layout: left list (New/Delete), right grouped editor.
+            ui.horizontal(|ui| {
+                ui.heading("Scheduler");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut master = self.rt.lock().unwrap().state.settings.scheduler_enabled;
+                    if ui.checkbox(&mut master, "Turn on scheduler").changed() { let mut g = self.rt.lock().unwrap(); g.state.settings.scheduler_enabled = master; g.save(); }
                 });
             });
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             let schedules = self.rt.lock().unwrap().state.schedules.clone();
+            let queues = self.rt.lock().unwrap().state.queues.clone();
             let (day, secs) = self.minutes_today;
-            if schedules.is_empty() { ui.label(egui::RichText::new("No schedules.").color(theme::TEXT_FAINT)); }
-            for s in schedules {
-                theme::panel().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("Queue {}", s.queue_id)).strong());
-                        theme::chip(ui, &format!("{:?}", s.recurrence), theme::TEXT_MUTED);
-                        theme::chip(ui, &format!("start {:02}:{:02}", s.start_secs / 3600, (s.start_secs % 3600) / 60), theme::TEXT_MUTED);
-                        if let Some(st) = s.stop_secs { theme::chip(ui, &format!("stop {:02}:{:02}", st / 3600, (st % 3600) / 60), theme::TEXT_MUTED); }
-                        match next_run_in(&s, day, secs) { Some(n) => theme::chip(ui, &format!("next in {}", eta(n as f64)), theme::TEAL_500), None => theme::chip(ui, "no next run", theme::TEXT_FAINT) }
-                    });
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        let mut enabled = s.enabled;
-                        if ui.checkbox(&mut enabled, "Enabled").changed() { let mut g = self.rt.lock().unwrap(); if let Some(x) = g.state.schedules.iter_mut().find(|x| x.id == s.id) { x.enabled = enabled; } g.save(); }
-                        if icon_btn(ui, Icon::Play, "Start now", false, 92.0).clicked() { let ids: Vec<String> = self.rt.lock().unwrap().state.tasks.iter().filter(|t| t.queue_id == s.queue_id && t.status == TaskStatus::Queued).map(|t| t.id.clone()).collect(); for id in ids { self.start_task(&id); } }
-                        if icon_btn(ui, Icon::Delete, "Delete", false, 76.0).clicked() { let mut g = self.rt.lock().unwrap(); g.state.schedules.retain(|x| x.id != s.id); g.save(); }
-                    });
-                    // IDM Scheduler: recurrence + weekdays + quota (no more than X MB every Y hours)
-                    ui.horizontal(|ui| {
-                        let mut rec = s.recurrence;
-                        egui::ComboBox::from_id_salt(format!("sch-rec-{}", s.id)).selected_text(format!("{rec:?}")).show_ui(ui, |ui| { for r in [Recurrence::Daily, Recurrence::Weekdays, Recurrence::Weekly, Recurrence::Once] { ui.selectable_value(&mut rec, r, format!("{r:?}")); } });
-                        if rec != s.recurrence { let mut g = self.rt.lock().unwrap(); if let Some(x) = g.state.schedules.iter_mut().find(|x| x.id == s.id) { x.recurrence = rec; } g.save(); }
-                        for (i, d) in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].iter().enumerate() {
-                            let bit = 1u8 << i; let mut on = s.weekdays_mask & bit != 0;
-                            if ui.checkbox(&mut on, *d).changed() { let mut g = self.rt.lock().unwrap(); if let Some(x) = g.state.schedules.iter_mut().find(|x| x.id == s.id) { if on { x.weekdays_mask |= bit; } else { x.weekdays_mask &= !bit; } } g.save(); }
+            if self.selected_schedule.is_none() || !schedules.iter().any(|x| Some(&x.id) == self.selected_schedule.as_ref()) { self.selected_schedule = schedules.first().map(|x| x.id.clone()); }
+            ui.horizontal_top(|ui| {
+                // Left: schedule list
+                ui.vertical(|ui| {
+                    ui.set_width(220.0);
+                    ui.label(egui::RichText::new("Schedules").color(theme::TEXT_MUTED).small().strong());
+                    egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                        for x in &schedules {
+                            let label = if x.name.trim().is_empty() { format!("Start at {:02}:{:02} · {}", x.start_secs / 3600, (x.start_secs % 3600) / 60, x.queue_id) } else { x.name.clone() };
+                            if ui.selectable_label(self.selected_schedule.as_deref() == Some(x.id.as_str()), label).clicked() { self.selected_schedule = Some(x.id.clone()); }
                         }
                     });
                     ui.horizontal(|ui| {
-                        let (mut qmb, mut qh) = (s.quota_mb, s.quota_hours);
-                        ui.label("Download no more than"); ui.add(egui::DragValue::new(&mut qmb).range(0..=1_000_000)); ui.label("MB every"); ui.add(egui::DragValue::new(&mut qh).range(0..=720)); ui.label("hours (0 = off)");
-                        ui.label(egui::RichText::new(format!("used {} this window", fmt_bytes(s.quota_used_bytes))).color(theme::TEXT_FAINT).small());
-                        if qmb != s.quota_mb || qh != s.quota_hours { let mut g = self.rt.lock().unwrap(); if let Some(x) = g.state.schedules.iter_mut().find(|x| x.id == s.id) { x.quota_mb = qmb; x.quota_hours = qh; } g.save(); }
+                        if theme::primary_btn(ui, "New").clicked() { let id = crate::model::new_id(); let mut g = self.rt.lock().unwrap(); g.state.schedules.push(Schedule { id: id.clone(), queue_id: "main".into(), enabled: true, recurrence: Recurrence::Daily, start_secs: 3600, stop_secs: Some(7200), files_at_once: 3, ..Default::default() }); g.save(); self.selected_schedule = Some(id); }
+                        ui.add_enabled_ui(self.selected_schedule.is_some(), |ui| { if theme::ghost_btn(ui, "Delete").clicked() { if let Some(id) = self.selected_schedule.take() { let mut g = self.rt.lock().unwrap(); g.state.schedules.retain(|x| x.id != id); g.save(); } } });
                     });
                 });
-                ui.add_space(6.0);
-            }
-            ui.label(egui::RichText::new(format!("Clock: UTC day {day}, {secs}s into day (local-tz conversion not applied).")).color(theme::TEXT_FAINT).small());
+                ui.separator();
+                // Right: editor for selected schedule
+                ui.vertical(|ui| {
+                    let Some(sel) = self.selected_schedule.clone() else { ui.label(egui::RichText::new("No schedule selected. Use New.").color(theme::TEXT_FAINT)); return; };
+                    let Some(sch) = schedules.iter().find(|x| x.id == sel).cloned() else { return; };
+                    let edit = |app: &DownloadApp, f: &dyn Fn(&mut Schedule)| { let mut g = app.rt.lock().unwrap(); if let Some(x) = g.state.schedules.iter_mut().find(|x| x.id == sel) { f(x); } g.save(); };
+                    ui.horizontal(|ui| {
+                        ui.label("Name:"); let mut name = sch.name.clone(); if ui.add(egui::TextEdit::singleline(&mut name).desired_width(220.0)).changed() { edit(self, &move |x: &mut Schedule| x.name = name.clone()); }
+                        let mut en = sch.enabled; if ui.checkbox(&mut en, "Enabled").changed() { edit(self, &move |x: &mut Schedule| x.enabled = en); }
+                        match next_run_in(&sch, day, secs) { Some(n) => theme::chip(ui, &format!("next in {}", eta(n as f64)), theme::STEEL_TEXT), None => theme::chip(ui, "no next run", theme::TEXT_FAINT) }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Start time").color(theme::TEXT_MUTED).small().strong());
+                    ui.horizontal(|ui| {
+                        ui.label("Queue:");
+                        egui::ComboBox::from_id_salt("sch-queue").selected_text(queues.iter().find(|q| q.id == sch.queue_id).map(|q| q.name.clone()).unwrap_or_else(|| sch.queue_id.clone())).show_ui(ui, |ui| { for q in &queues { if ui.selectable_label(sch.queue_id == q.id, &q.name).clicked() { let qid = q.id.clone(); edit(self, &move |x: &mut Schedule| x.queue_id = qid.clone()); } } });
+                        let (hh, mut mm) = (sch.start_secs / 3600, (sch.start_secs % 3600) / 60); let mut pm = hh >= 12; let mut h12 = if hh % 12 == 0 { 12 } else { hh % 12 };
+                        ui.label("at"); ui.add(egui::DragValue::new(&mut h12).range(1..=12).speed(1)); ui.label(":"); ui.add(egui::DragValue::new(&mut mm).range(0..=59).speed(1));
+                        egui::ComboBox::from_id_salt("sch-ampm").selected_text(if pm { "PM" } else { "AM" }).show_ui(ui, |ui| { ui.selectable_value(&mut pm, false, "AM"); ui.selectable_value(&mut pm, true, "PM"); });
+                        let new_start = ((h12 % 12) + if pm { 12 } else { 0 }) * 3600 + mm * 60;
+                        if new_start != sch.start_secs { edit(self, &move |x: &mut Schedule| x.start_secs = new_start); }
+                        // silence unused warnings for hh clone
+                        let _ = hh;
+                    });
+                    ui.horizontal(|ui| {
+                        let mut rec = sch.recurrence;
+                        ui.radio_value(&mut rec, Recurrence::Once, "Once"); ui.radio_value(&mut rec, Recurrence::Daily, "Every day"); ui.radio_value(&mut rec, Recurrence::Weekdays, "Weekdays"); ui.radio_value(&mut rec, Recurrence::Weekly, "Weekly");
+                        if rec != sch.recurrence { edit(self, &move |x: &mut Schedule| x.recurrence = rec); }
+                        if sch.recurrence == Recurrence::Once {
+                            ui.label("on (YYYYMMDD):"); let mut d = sch.once_date; ui.add(egui::DragValue::new(&mut d).range(0..=99991231).speed(1));
+                            if d != sch.once_date { edit(self, &move |x: &mut Schedule| x.once_date = d); }
+                        }
+                        if sch.recurrence == Recurrence::Daily {
+                            ui.label("Repeat each"); let mut rd = sch.repeat_days; ui.add(egui::DragValue::new(&mut rd).range(0..=365)); ui.label("days");
+                            if rd != sch.repeat_days { edit(self, &move |x: &mut Schedule| x.repeat_days = rd); }
+                        }
+                    });
+                    if sch.recurrence == Recurrence::Weekly {
+                        ui.horizontal(|ui| { for (i, d) in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].iter().enumerate() { let bit = 1u8 << i; let mut on = sch.weekdays_mask & bit != 0; if ui.checkbox(&mut on, *d).changed() { edit(self, &move |x: &mut Schedule| { if on { x.weekdays_mask |= bit; } else { x.weekdays_mask &= !bit; } }); } } });
+                    }
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Stop time").color(theme::TEXT_MUTED).small().strong());
+                    ui.horizontal(|ui| {
+                        let mut has_stop = sch.stop_secs.is_some(); if ui.checkbox(&mut has_stop, "Stop at").changed() { edit(self, &move |x: &mut Schedule| x.stop_secs = if has_stop { Some(x.start_secs + 3600) } else { None }); }
+                        if let Some(stop) = sch.stop_secs {
+                            let (mut mm2, mut h12b) = ((stop % 3600) / 60, { let h = (stop / 3600) % 24; if h % 12 == 0 { 12 } else { h % 12 } }); let mut pmb = (stop / 3600) % 24 >= 12;
+                            ui.add(egui::DragValue::new(&mut h12b).range(1..=12).speed(1)); ui.label(":"); ui.add(egui::DragValue::new(&mut mm2).range(0..=59).speed(1));
+                            egui::ComboBox::from_id_salt("sch-stop-ampm").selected_text(if pmb { "PM" } else { "AM" }).show_ui(ui, |ui| { ui.selectable_value(&mut pmb, false, "AM"); ui.selectable_value(&mut pmb, true, "PM"); });
+                            let ns = ((h12b % 12) + if pmb { 12 } else { 0 }) * 3600 + mm2 * 60;
+                            if ns != stop { edit(self, &move |x: &mut Schedule| x.stop_secs = Some(ns)); }
+                            ui.label(egui::RichText::new(format!("(after {})", eta((stop as i64 - sch.start_secs as i64).max(0) as f64))).color(theme::TEXT_FAINT).small());
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Files in queue").color(theme::TEXT_MUTED).small().strong());
+                    ui.horizontal(|ui| {
+                        ui.label("Start download files simultaneously:"); let mut f = sch.files_at_once; ui.add(egui::DragValue::new(&mut f).range(0..=32)); ui.label("(0 = all; queue cap also applies)");
+                        if f != sch.files_at_once { edit(self, &move |x: &mut Schedule| x.files_at_once = f); }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("When queue finishes:"); let mut oc = sch.on_complete;
+                        egui::ComboBox::from_id_salt("sch-oncomplete").selected_text(format!("{oc:?}")).show_ui(ui, |ui| { for a in [CompletionAction::None, CompletionAction::OpenFile, CompletionAction::RunCommand, CompletionAction::ExitApp, CompletionAction::Shutdown, CompletionAction::Sleep] { ui.selectable_value(&mut oc, a, format!("{a:?}")); } });
+                        if oc != sch.on_complete { edit(self, &move |x: &mut Schedule| x.on_complete = oc); }
+                        if sch.on_complete == CompletionAction::RunCommand { let mut arg = String::new(); if let Some(q) = queues.iter().find(|q| q.id == sch.queue_id) { arg = q.on_complete_arg.clone(); } ui.add(egui::TextEdit::singleline(&mut arg).hint_text("command (set on queue)").desired_width(200.0)); }
+                        if matches!(sch.on_complete, CompletionAction::Shutdown | CompletionAction::Sleep) { let mut cf = sch.power_confirmed; if ui.checkbox(&mut cf, "Confirmed: PC power action").changed() { edit(self, &move |x: &mut Schedule| x.power_confirmed = cf); } }
+                    });
+                    ui.horizontal(|ui| {
+                        let (mut qmb, mut qh) = (sch.quota_mb, sch.quota_hours);
+                        ui.label("Download no more than"); ui.add(egui::DragValue::new(&mut qmb).range(0..=1_000_000)); ui.label("MB every"); ui.add(egui::DragValue::new(&mut qh).range(0..=720)); ui.label("hours (0 = off)");
+                        ui.label(egui::RichText::new(format!("used {} this window", fmt_bytes(sch.quota_used_bytes))).color(theme::TEXT_FAINT).small());
+                        if qmb != sch.quota_mb || qh != sch.quota_hours { edit(self, &move |x: &mut Schedule| { x.quota_mb = qmb; x.quota_hours = qh; }); }
+                    });
+                    ui.horizontal(|ui| {
+                        if icon_btn(ui, Icon::Play, "Start now", false, 96.0).clicked() { let ids: Vec<String> = self.rt.lock().unwrap().state.tasks.iter().filter(|t| t.queue_id == sch.queue_id && t.status == TaskStatus::Queued).map(|t| t.id.clone()).collect(); for id in ids { self.start_task(&id); } }
+                        let mut missed = sch.run_missed; if ui.checkbox(&mut missed, "Run missed jobs at start").changed() { edit(self, &move |x: &mut Schedule| x.run_missed = missed); }
+                    });
+                });
+            });
         }
     }
 
@@ -1349,7 +1414,7 @@ impl DownloadApp {
                 _ => {
                     ui.label(egui::RichText::new("About").strong());
                     ui.separator();
-                    ui.label("downloadcraft 0.2.0");
+                    ui.label(format!("downloadcraft v{}", env!("CARGO_PKG_VERSION")));
                     ui.label("Cross-platform download manager written in Rust with egui.");
                     ui.label(egui::RichText::new("No proprietary code, binaries, icons, or licensing logic.").color(theme::TEXT_FAINT).small());
                 }

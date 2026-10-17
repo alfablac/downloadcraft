@@ -20,7 +20,9 @@ pub fn should_start(s: &Schedule, day: i64, secs_of_day: u32) -> bool {
     if secs_of_day < s.start_secs { return false; }
     if s.last_started_day == day { return false; }
     match s.recurrence {
-        Recurrence::Daily => true,
+        Recurrence::Daily => {
+            if s.repeat_days > 1 && s.once_date != 0 { let anchor = day_of_yyyymmdd(s.once_date); (day - anchor).rem_euclid(s.repeat_days as i64) == 0 } else { true }
+        }
         Recurrence::Weekdays => weekday(day) <= 4,
         Recurrence::Weekly => { let bit = 1u8 << weekday(day); s.weekdays_mask & bit != 0 }
         Recurrence::Once => s.once_date != 0 && day_of_yyyymmdd(s.once_date) == day,
@@ -34,11 +36,11 @@ pub fn should_stop(s: &Schedule, day: i64, secs_of_day: u32) -> bool {
 /// Seconds until next start (approx, day granularity). None if Once in past.
 pub fn next_run_in(s: &Schedule, day: i64, secs_of_day: u32) -> Option<i64> {
     if !s.enabled { return None; }
-    for offset in 0..8i64 {
+    for offset in 0..370i64 {
         let d = day + offset;
         let fake = Schedule { last_started_day: 0, ..s.clone() };
         // check date matches recurrence ignoring last_started
-        let date_ok = match s.recurrence { Recurrence::Daily => true, Recurrence::Weekdays => weekday(d) <= 4, Recurrence::Weekly => s.weekdays_mask & (1u8 << weekday(d)) != 0, Recurrence::Once => s.once_date != 0 && day_of_yyyymmdd(s.once_date) == d };
+        let date_ok = match s.recurrence { Recurrence::Daily => { if s.repeat_days > 1 && s.once_date != 0 { (d - day_of_yyyymmdd(s.once_date)).rem_euclid(s.repeat_days as i64) == 0 } else { true } }, Recurrence::Weekdays => weekday(d) <= 4, Recurrence::Weekly => s.weekdays_mask & (1u8 << weekday(d)) != 0, Recurrence::Once => s.once_date != 0 && day_of_yyyymmdd(s.once_date) == d };
         let _ = fake;
         if !date_ok { continue; }
         let delta = offset * 86400 + s.start_secs as i64 - secs_of_day as i64;
