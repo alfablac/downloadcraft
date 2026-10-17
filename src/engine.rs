@@ -38,8 +38,27 @@ fn headers_for(task: &DownloadTask) -> reqwest::header::HeaderMap {
     h
 }
 
-pub struct Controls { pub paused: AtomicBool, pub cancelled: AtomicBool, pub downloaded: AtomicU64, pub limit_kbps: AtomicU64, pub rate: std::sync::Mutex<(std::time::Instant, u64)> }
-impl Controls { pub fn new(limit: u64) -> Self { Self { paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), downloaded: AtomicU64::new(0), limit_kbps: AtomicU64::new(limit), rate: std::sync::Mutex::new((std::time::Instant::now(), 0)) } } }
+pub struct Controls { pub paused: AtomicBool, pub cancelled: AtomicBool, pub downloaded: AtomicU64, pub limit_kbps: AtomicU64, pub rate: std::sync::Mutex<(std::time::Instant, u64, Option<std::time::Instant>, u64, f64)> }
+impl Controls { pub fn new(limit: u64) -> Self { Self { paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), downloaded: AtomicU64::new(0), limit_kbps: AtomicU64::new(limit), rate: std::sync::Mutex::new((std::time::Instant::now(), 0, None, 0, 0.0)) } } }
+
+fn compute_rate(prev_bytes: u64, cur_bytes: u64, dt_secs: f64) -> f64 {
+    if dt_secs <= 0.0 || cur_bytes <= prev_bytes { 0.0 } else { (cur_bytes - prev_bytes) as f64 / dt_secs }
+}
+
+/// Per-task smoothed rate (bytes/s) from `ctrl.downloaded`. First call only
+/// sets baseline and returns 0. Tuple fields 0..=1 stay owned by `throttle`.
+pub fn rate_bps(ctrl: &Controls) -> f64 {
+    let cur = ctrl.downloaded.load(Ordering::Relaxed);
+    let now = std::time::Instant::now();
+    let mut g = ctrl.rate.lock().unwrap();
+    let Some(prev_t) = g.2 else { g.2 = Some(now); g.3 = cur; return 0.0; };
+    let dt = now.duration_since(prev_t).as_secs_f64();
+    if dt <= 0.0 { return g.4; }
+    let inst = compute_rate(g.3, cur, dt);
+    g.4 = if g.4 == 0.0 { inst } else { 0.25 * inst + 0.75 * g.4 };
+    g.2 = Some(now); g.3 = cur;
+    g.4
+}
 
 async fn throttle(ctrl: &Controls, bytes: u64) {
     let limit = ctrl.limit_kbps.load(Ordering::Relaxed);
@@ -48,7 +67,7 @@ async fn throttle(ctrl: &Controls, bytes: u64) {
     loop {
         let wait = {
             let mut g = ctrl.rate.lock().unwrap();
-            if g.0.elapsed() >= std::time::Duration::from_secs(1) { *g = (std::time::Instant::now(), 0); }
+            if g.0.elapsed() >= std::time::Duration::from_secs(1) { g.0 = std::time::Instant::now(); g.1 = 0; }
             let budget = limit.saturating_mul(1024);
             if bytes > budget {
                 if g.1 == 0 { g.1 = bytes; return; }
@@ -342,8 +361,8 @@ pub async fn download_media(client: reqwest::Client, task: DownloadTask, ctrl: A
     let work = task.dest_dir.join(format!(".idmcraft-media-{}", task.id));
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let mut track_files: Vec<PathBuf> = Vec::new();
-    let total_segs: u64 = tracks.iter().map(|(_, s)| s.len() as u64).sum();
-    let mut done_segs: u64 = 0;
+    // Segment sizes unknown upfront: progress in bytes, task.total stays None.
+    let mut done_bytes: u64 = 0; task.total = None; task.downloaded = 0; ctrl.downloaded.store(0, Ordering::Relaxed);
     for (kind, segs) in &tracks {
         let out = work.join(format!("track-{kind}.bin"));
         {
@@ -353,13 +372,12 @@ pub async fn download_media(client: reqwest::Client, task: DownloadTask, ctrl: A
                 wait_not_paused(&ctrl).await?;
                 // resume: skip segments already fully? ponytail: media resume restarts track file; HTTP resume path covers kill-resume spec strictly,
                 // manifest snapshot stored below allows re-run; segment files cached per index.
-                let cache = work.join(format!("{kind}-{}.seg", track_files.len() * 100000 + done_segs as usize));
+                let cache = work.join(format!("{kind}-{}.seg", track_files.len() * 100000 + done_bytes as usize));
                 let _ = cache;
-                if let Some(init) = init { if seen_init.as_deref() != Some(init.as_str()) { seen_init = Some(init.clone()); fetch_into(&client, &task, init, &mut file, &ctrl).await?; } }
-                fetch_into(&client, &task, seg_url, &mut file, &ctrl).await?;
-                done_segs += 1;
-                ctrl.downloaded.store(done_segs, Ordering::Relaxed);
-                task.downloaded = done_segs; task.total = Some(total_segs);
+                if let Some(init) = init { if seen_init.as_deref() != Some(init.as_str()) { seen_init = Some(init.clone()); done_bytes += fetch_into_inner(&client, &task, init, &mut file, &ctrl).await?; } }
+                done_bytes += fetch_into_inner(&client, &task, seg_url, &mut file, &ctrl).await?;
+                ctrl.downloaded.store(done_bytes, Ordering::Relaxed);
+                task.downloaded = done_bytes; task.total = None;
             }
             file.flush().await.map_err(|e| e.to_string())?;
         }
@@ -378,7 +396,7 @@ pub async fn download_media(client: reqwest::Client, task: DownloadTask, ctrl: A
                 // Fallback: rename video/first track so file exists, record error
                 tokio::fs::copy(&track_files[0], &dest).await.map_err(|e| e.to_string())?;
                 let _ = tokio::fs::remove_dir_all(&work).await;
-                task.status = TaskStatus::Error; task.error = format!("mux failed ({e}); kept first track only");
+                task.status = TaskStatus::Error; task.error = format!("mux failed ({e}); kept first track only"); task.downloaded = done_bytes; task.total = None;
                 return Ok(task);
             }
         }
@@ -386,45 +404,51 @@ pub async fn download_media(client: reqwest::Client, task: DownloadTask, ctrl: A
     let _ = tokio::fs::remove_dir_all(&work).await;
     finish_check(&dest, &task).await?;
     task.status = TaskStatus::Complete;
-    task.downloaded = total_segs;
+    task.downloaded = done_bytes;
+    task.total = None;
     Ok(task)
 }
 
-async fn fetch_into(client: &reqwest::Client, task: &DownloadTask, url: &str, file: &mut tokio::fs::File, ctrl: &Controls) -> Result<(), String> {
+async fn fetch_into_inner(client: &reqwest::Client, task: &DownloadTask, url: &str, file: &mut tokio::fs::File, ctrl: &Controls) -> Result<u64, String> {
     let mut attempt = 0;
-    let pos = file.seek(std::io::SeekFrom::Current(0)).await.map_err(|e| e.to_string())?;
+    let start = file.seek(std::io::SeekFrom::Current(0)).await.map_err(|e| e.to_string())?;
     loop {
-        match fetch_once(client, task, url, file, ctrl).await {
-            Ok(()) => return Ok(()),
+        match fetch_once_counted_impl(client, task, url, file, ctrl).await {
+            Ok(n) => return Ok(n),
             Err(e) => {
                 attempt += 1; if attempt > 4 { return Err(e); }
-                // Roll back partial bytes so retry does not duplicate.
-                file.set_len(pos).await.map_err(|x| x.to_string())?;
-                file.seek(std::io::SeekFrom::Start(pos)).await.map_err(|x| x.to_string())?;
+                // Roll back partial bytes so retry does not duplicate/count twice.
+                file.set_len(start).await.map_err(|x| x.to_string())?;
+                file.seek(std::io::SeekFrom::Start(start)).await.map_err(|x| x.to_string())?;
                 tokio::time::sleep(std::time::Duration::from_millis(400 * attempt)).await;
             }
         }
     }
 }
-async fn fetch_once(client: &reqwest::Client, task: &DownloadTask, url: &str, file: &mut tokio::fs::File, ctrl: &Controls) -> Result<(), String> {
+async fn fetch_once_counted_impl(client: &reqwest::Client, task: &DownloadTask, url: &str, file: &mut tokio::fs::File, ctrl: &Controls) -> Result<u64, String> {
     let req = client.get(url).headers(headers_for(task));
     // byte-range segment stored in headers via special marker? HLS BYTERANGE passed through task headers Range by caller when needed.
     let resp = req.send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() { return Err(format!("HTTP {} for {url}", resp.status())); }
     let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await { let chunk = chunk.map_err(|e| e.to_string())?; throttle(ctrl, chunk.len() as u64).await; file.write_all(&chunk).await.map_err(|e| e.to_string())?; }
-    Ok(())
+    let mut n = 0u64;
+    while let Some(chunk) = stream.next().await { let chunk = chunk.map_err(|e| e.to_string())?; throttle(ctrl, chunk.len() as u64).await; file.write_all(&chunk).await.map_err(|e| e.to_string())?; n += chunk.len() as u64; }
+    Ok(n)
 }
 
 /// Fetch segment honoring optional byte range (HLS EXT-X-BYTERANGE).
 pub async fn fetch_bytes(client: &reqwest::Client, task: &DownloadTask, url: &str, range: Option<(u64, Option<u64>)>, dest: &Path) -> Result<(), String> {
+    fetch_bytes_counted(client, task, url, range, dest).await.map(|_| ())
+}
+pub async fn fetch_bytes_counted(client: &reqwest::Client, task: &DownloadTask, url: &str, range: Option<(u64, Option<u64>)>, dest: &Path) -> Result<u64, String> {
     let mut req = client.get(url).headers(headers_for(task));
     if let Some((len, off)) = range { let start = off.unwrap_or(0); req = req.header("Range", format!("bytes={start}-{}", start + len - 1)); }
     let resp = req.send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() && resp.status().as_u16() != 206 { return Err(format!("HTTP {}", resp.status())); }
     let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    let n = bytes.len() as u64;
     tokio::fs::write(dest, &bytes).await.map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(n)
 }
 
 pub async fn mux_tracks(tracks: &[PathBuf], dest: &Path) -> Result<(), String> {
@@ -458,7 +482,21 @@ mod tests {
         assert_eq!(plan_segments(5, 8).len(), 5);
     }
     #[test]
-    fn split_point_halves_remaining() {
+    fn compute_rate_cases() {
+        assert_eq!(compute_rate(0, 1000, 2.0), 500.0);
+        assert_eq!(compute_rate(500, 1500, 0.5), 2000.0);
+        assert_eq!(compute_rate(0, 1000, 0.0), 0.0, "zero dt");
+        assert_eq!(compute_rate(0, 1000, -1.0), 0.0, "negative dt");
+        assert_eq!(compute_rate(1000, 1000, 1.0), 0.0, "no progress");
+        assert_eq!(compute_rate(1000, 500, 1.0), 0.0, "counter reset");
+    }
+    #[test]
+    fn rate_bps_first_call_zero() {
+        let c = Controls::new(0);
+        c.downloaded.store(1234, Ordering::Relaxed);
+        assert_eq!(rate_bps(&c), 0.0);
+    }
+    #[test]    fn split_point_halves_remaining() {
         let kb = 1024u64;
         assert_eq!(split_point(0, 1024 * kb - 1, 0), Some(512 * kb - 1));
         assert_eq!(split_point(0, 512 * kb - 2, 0), None, "remaining < 512KB never splits");
