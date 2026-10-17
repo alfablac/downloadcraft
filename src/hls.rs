@@ -87,7 +87,7 @@ type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 /// Decrypt one AES-128-CBC segment, stripping PKCS7 padding.
 pub fn decrypt_segment(key: &[u8; 16], iv: &[u8; 16], data: &[u8]) -> Result<Vec<u8>, String> {
     use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
-    if data.is_empty() || data.len() % 16 != 0 { return Err(format!("ciphertext length {} not multiple of 16", data.len())); }
+    if data.is_empty() || !data.len().is_multiple_of(16) { return Err(format!("ciphertext length {} not multiple of 16", data.len())); }
     let mut buf = data.to_vec();
     let pt = Aes128CbcDec::new(key.into(), iv.into()).decrypt_padded_mut::<Pkcs7>(&mut buf).map_err(|e| format!("AES-128 decrypt failed: {e}"))?;
     Ok(pt.to_vec())
