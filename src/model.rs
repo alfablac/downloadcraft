@@ -92,6 +92,8 @@ pub struct Schedule {
     /// Quota scheduler (IDM Scheduler reg: isLimitEnabled/m_MBytes/m_hours): stop queue after quota_mb per quota_hours. 0 = off.
     #[serde(default)] pub quota_mb: u64,
     #[serde(default)] pub quota_hours: u64,
+    #[serde(default)] pub quota_window_start: u64,
+    #[serde(default)] pub quota_used_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

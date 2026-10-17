@@ -97,6 +97,16 @@ impl IdmApp {
                     g.log(format!("Finished {fname}: {:?} {err}", status));
                     if status == TaskStatus::Complete {
                         let queue_id = g.state.tasks.iter().find(|t| t.id == tid).map(|t| t.queue_id.clone()).unwrap_or_default();
+                        // quota accounting (IDM download limits): accumulate bytes into schedule window
+                        let bytes = g.state.tasks.iter().find(|t| t.id == tid).map(|t| t.downloaded).unwrap_or(0);
+                        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                        let mut quota_hit = false;
+                        for s in g.state.schedules.iter_mut().filter(|s| s.queue_id == queue_id && s.quota_mb > 0) {
+                            if s.quota_window_start == 0 || now.saturating_sub(s.quota_window_start) >= s.quota_hours.max(1) * 3600 { s.quota_window_start = now; s.quota_used_bytes = 0; }
+                            s.quota_used_bytes += bytes;
+                            if s.quota_used_bytes >= s.quota_mb * 1024 * 1024 { quota_hit = true; }
+                        }
+                        g.log(format!("Quota queue {queue_id}: hit={quota_hit}"));
                         // completion action only when queue drained (was: first task could exit/shutdown mid-queue)
                         let drained = !g.state.tasks.iter().any(|t| t.queue_id == queue_id && matches!(t.status, TaskStatus::Queued | TaskStatus::Downloading));
                         if drained { run_completion(&g, &queue_id, &tid); }
@@ -157,7 +167,7 @@ impl IdmApp {
                 if !g.state.queues.iter().any(|q| q.auto_start) { Vec::new() } else {
                     let active: Vec<(String, String)> = g.controls.keys().map(|id| (id.clone(), g.state.tasks.iter().find(|t| &t.id == id).map(|t| t.queue_id.clone()).unwrap_or_default())).collect();
                     plan_starts(&g.state.tasks, &g.state.queues, &active, g.state.settings.global_max_concurrent).into_iter()
-                        .filter(|id| { g.state.tasks.iter().find(|t| &t.id == id).map(|t| t.next_retry_at <= now && g.state.queues.iter().find(|q| q.id == t.queue_id).map(|q| q.auto_start).unwrap_or(false)).unwrap_or(false) })
+                        .filter(|id| { g.state.tasks.iter().find(|t| &t.id == id).map(|t| t.next_retry_at <= now && g.state.queues.iter().find(|q| q.id == t.queue_id).map(|q| q.auto_start).unwrap_or(false) && !quota_exhausted(&g, &t.queue_id, now)).unwrap_or(false) })
                         .collect()
                 }
             };
@@ -374,6 +384,13 @@ impl eframe::App for IdmApp {
         if self.speed_hist.len() > 40 { self.speed_hist.remove(0); }
         self.speed_hist.push(rate);
     }
+}
+
+/// IDM download-limits quota: true when schedule for queue exhausted its MB/hours window.
+fn quota_exhausted(g: &Runtime, queue_id: &str, now: u64) -> bool {
+    g.state.schedules.iter().filter(|s| s.queue_id == queue_id && s.quota_mb > 0).any(|s| {
+        s.quota_window_start != 0 && now.saturating_sub(s.quota_window_start) < s.quota_hours.max(1) * 3600 && s.quota_used_bytes >= s.quota_mb * 1024 * 1024
+    })
 }
 
 // free helpers used by menus
@@ -673,6 +690,22 @@ impl IdmApp {
                         if ui.checkbox(&mut enabled, "Enabled").changed() { let mut g = self.rt.lock().unwrap(); if let Some(x) = g.state.schedules.iter_mut().find(|x| x.id == s.id) { x.enabled = enabled; } g.save(); }
                         if theme::ghost_btn(ui, "Start now").clicked() { let ids: Vec<String> = self.rt.lock().unwrap().state.tasks.iter().filter(|t| t.queue_id == s.queue_id && t.status == TaskStatus::Queued).map(|t| t.id.clone()).collect(); for id in ids { self.start_task(&id); } }
                         if theme::ghost_btn(ui, "Delete").clicked() { let mut g = self.rt.lock().unwrap(); g.state.schedules.retain(|x| x.id != s.id); g.save(); }
+                    });
+                    // IDM Scheduler: recurrence + weekdays + quota (no more than X MB every Y hours)
+                    ui.horizontal(|ui| {
+                        let mut rec = s.recurrence;
+                        egui::ComboBox::from_id_salt(format!("sch-rec-{}", s.id)).selected_text(format!("{rec:?}")).show_ui(ui, |ui| { for r in [Recurrence::Daily, Recurrence::Weekdays, Recurrence::Weekly, Recurrence::Once] { ui.selectable_value(&mut rec, r, format!("{r:?}")); } });
+                        if rec != s.recurrence { let mut g = self.rt.lock().unwrap(); if let Some(x) = g.state.schedules.iter_mut().find(|x| x.id == s.id) { x.recurrence = rec; } g.save(); }
+                        for (i, d) in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].iter().enumerate() {
+                            let bit = 1u8 << i; let mut on = s.weekdays_mask & bit != 0;
+                            if ui.checkbox(&mut on, *d).changed() { let mut g = self.rt.lock().unwrap(); if let Some(x) = g.state.schedules.iter_mut().find(|x| x.id == s.id) { if on { x.weekdays_mask |= bit; } else { x.weekdays_mask &= !bit; } } g.save(); }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        let (mut qmb, mut qh) = (s.quota_mb, s.quota_hours);
+                        ui.label("Download no more than"); ui.add(egui::DragValue::new(&mut qmb).range(0..=1_000_000)); ui.label("MB every"); ui.add(egui::DragValue::new(&mut qh).range(0..=720)); ui.label("hours (0 = off)");
+                        ui.label(egui::RichText::new(format!("used {} this window", fmt_bytes(s.quota_used_bytes))).color(theme::TEXT_FAINT).small());
+                        if qmb != s.quota_mb || qh != s.quota_hours { let mut g = self.rt.lock().unwrap(); if let Some(x) = g.state.schedules.iter_mut().find(|x| x.id == s.id) { x.quota_mb = qmb; x.quota_hours = qh; } g.save(); }
                     });
                 });
                 ui.add_space(6.0);
