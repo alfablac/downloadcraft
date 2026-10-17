@@ -68,6 +68,9 @@ fn parts_strip(ui: &mut egui::Ui, view: &SegView, width: f32) {
     }
 }
 
+#[derive(Default)]
+struct GrabOutcome { done: bool, apply_files: bool, files: Vec<FoundFile>, message: String }
+
 pub struct DownloadApp {
     rt: Arc<Mutex<Runtime>>,
     tokio_rt: Arc<tokio::runtime::Runtime>,
@@ -87,6 +90,8 @@ pub struct DownloadApp {
     grab_exts: String,
     grab_files: Vec<FoundFile>,
     grab_project_json: String,
+    grab_status: String,
+    grab_busy: bool,
     last_tick: std::time::Instant,
     #[allow(dead_code)]
     tray: Option<TrayState>,
@@ -126,7 +131,7 @@ impl DownloadApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, rt: Arc<Mutex<Runtime>>, hidden: bool) -> Self {
         let tokio_rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio rt"));
         let tray = Self::make_tray();
-        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_scope: 0, grab_exts: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, options_notice: "Changes save automatically.".into(), show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new(), rate_smooth: std::collections::HashMap::new(), handles: std::collections::HashMap::new(), allow_close: false }
+        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_scope: 0, grab_exts: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), grab_status: "Enter a start URL, then Explore.".into(), grab_busy: false, last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, options_notice: "Changes save automatically.".into(), show_add: false, show_progress_for: None, selected: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new(), rate_smooth: std::collections::HashMap::new(), handles: std::collections::HashMap::new(), allow_close: false }
     }
 
     fn make_tray() -> Option<TrayNav> {
@@ -301,6 +306,18 @@ impl DownloadApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         crate::drain_inbox(&self.rt);
+        if self.grab_busy {
+            GRAB_SLOT.with(|s| {
+                if let Some(slot) = &*s.borrow() {
+                    let done = { let o = slot.lock().unwrap(); if o.done { Some((o.apply_files, o.files.clone(), o.message.clone())) } else { None } };
+                    if let Some((apply, files, message)) = done {
+                        if apply { self.grab_files = files; }
+                        self.grab_status = message;
+                        self.grab_busy = false;
+                    }
+                }
+            });
+        }
         self.sample_rates();
         self.update_smooth_rates();
         // progress sync
@@ -415,6 +432,8 @@ impl eframe::App for DownloadApp {
     }
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         theme::apply(ctx);
+        // Paint full viewport first: panel gaps otherwise show OS black (#09) as a vertical bar.
+        ctx.layer_painter(egui::LayerId::background()).rect_filled(ctx.screen_rect(), 0.0, theme::BG);
         self.poll(ctx);
         // Close-to-tray: window X hides to tray (setting existed but was never wired).
         if !self.allow_close && ctx.input(|i| i.viewport().close_requested()) {
@@ -480,9 +499,9 @@ impl eframe::App for DownloadApp {
         });
 
         // ── Left rail: navigation + categories (IDM category tree, modern rail) ──
-        egui::SidePanel::left("rail").resizable(true).width_range(176.0..=240.0).default_width(200.0)
+        egui::SidePanel::left("rail").resizable(false).exact_width(208.0)
             .frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::same(6.0))).show(ctx, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.set_width(ui.available_width());
                 ui.label(egui::RichText::new("WORKSPACE").color(theme::TEXT_FAINT).small().strong());
                 ui.add_space(4.0);
                 for (tab, label, ic) in [(Tab::Downloads, "Downloads", Icon::Download), (Tab::Queues, "Queues", Icon::Queue), (Tab::Scheduler, "Scheduler", Icon::Clock), (Tab::Grabber, "Site Grabber", Icon::Globe), (Tab::Options, "Options", Icon::Settings)] {
@@ -506,7 +525,6 @@ impl eframe::App for DownloadApp {
                 ui.separator();
                 ui.label(egui::RichText::new("ffmpeg: PATH/beside exe only").color(theme::TEXT_FAINT).small());
                 ui.label(egui::RichText::new("DRM content refused").color(theme::TEXT_FAINT).small());
-            });
             });
 
         // ── Bottom status bar ──
@@ -752,12 +770,12 @@ impl DownloadApp {
         let mut to_stop: Option<String> = None;
         let mut to_remove: Option<String> = None;
         let mut to_progress: Option<String> = None;
-        // Table header (IDM columns). Narrow windows scroll instead of squeezing columns together.
-        egui::ScrollArea::both().auto_shrink([false, true]).show(ui, |ui| {
-        ui.set_min_width(920.0);
+        let compact_table = ui.available_width() < 760.0;
+        // IDM columns on wide windows; compact set on narrow windows (no squeezed overlap).
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         egui::Frame::none().fill(theme::SURFACE_RAISED).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::symmetric(8.0, 4.0)).show(ui, |ui| {
-            egui::Grid::new("dl-head").num_columns(8).spacing([10.0, 4.0]).min_col_width(60.0).show(ui, |ui| {
-                for (i, h) in ["File Name", "Q", "Size", "Status", "Time left", "Transfer rate", "Progress", ""].iter().enumerate() {
+            egui::Grid::new("dl-head").num_columns(if compact_table { 5 } else { 8 }).spacing([10.0, 4.0]).min_col_width(48.0).show(ui, |ui| {
+                for (i, h) in if compact_table { vec!["File Name", "Size", "Status", "Progress", ""] } else { vec!["File Name", "Q", "Size", "Status", "Time left", "Transfer rate", "Progress", ""] }.iter().enumerate() {
                     if ui.add(egui::Button::new(egui::RichText::new(*h).color(theme::TEXT_MUTED).small().strong()).fill(egui::Color32::TRANSPARENT)).clicked() {
                         if self.sort_col == i as u8 { self.sort_asc = !self.sort_asc; } else { self.sort_col = i as u8; self.sort_asc = true; }
                     }
@@ -783,17 +801,19 @@ impl DownloadApp {
                 let sel = self.selected.as_deref() == Some(t.id.as_str());
                 let fill = if sel { theme::STEEL_DIM } else { theme::SURFACE };
                 let resp = egui::Frame::none().fill(fill).stroke(egui::Stroke::new(1.0f32, theme::BORDER)).inner_margin(egui::Margin::symmetric(8.0, 4.0)).show(ui, |ui| {
-                    egui::Grid::new(format!("dl-{}", t.id)).num_columns(8).spacing([10.0, 4.0]).min_col_width(60.0).show(ui, |ui| {
+                    egui::Grid::new(format!("dl-{}", t.id)).num_columns(if compact_table { 5 } else { 8 }).spacing([10.0, 4.0]).min_col_width(48.0).show(ui, |ui| {
                         let task_rate = self.task_rate(&t.id);
                         ui.horizontal(|ui| { let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover()); icon(ui.painter(), &cat_icon(&t.filename), irect, theme::TEXT_MUTED); ui.add(egui::Label::new(egui::RichText::new(&t.filename).color(theme::TEXT).strong()).truncate()).on_hover_text(&t.filename); });
-                        ui.label(egui::RichText::new(if t.queue_id.is_empty() { "main" } else { &t.queue_id }).color(theme::TEXT_MUTED).small());
+                        if !compact_table { ui.label(egui::RichText::new(if t.queue_id.is_empty() { "main" } else { &t.queue_id }).color(theme::TEXT_MUTED).small()); }
                         ui.label(egui::RichText::new(match t.total { Some(n) => fmt_bytes(n), None => "—".into() }).color(theme::TEXT_MUTED).small());
                         let sc = theme::status_color(t.status);
                         ui.label(egui::RichText::new(format!("{:?}", t.status)).color(sc).small().strong());
-                        // ETA from THIS task's own rate (was global rate for all rows)
-                        let eta_txt = if t.status == TaskStatus::Downloading { if let Some(total) = t.total { if task_rate > 1.0 && total > t.downloaded { eta((total - t.downloaded) as f64 / task_rate) } else { "—".into() } } else { "—".into() } } else { "—".into() };
-                        ui.label(egui::RichText::new(eta_txt).color(theme::TEXT_MUTED).small());
-                        ui.label(egui::RichText::new(if t.status == TaskStatus::Downloading { fmt_rate(task_rate as f32) } else { "—".into() }).color(theme::TEXT_MUTED).small());
+                        if !compact_table {
+                            // ETA from THIS task's own rate (was global rate for all rows)
+                            let eta_txt = if t.status == TaskStatus::Downloading { if let Some(total) = t.total { if task_rate > 1.0 && total > t.downloaded { eta((total - t.downloaded) as f64 / task_rate) } else { "—".into() } } else { "—".into() } } else { "—".into() };
+                            ui.label(egui::RichText::new(eta_txt).color(theme::TEXT_MUTED).small());
+                            ui.label(egui::RichText::new(if t.status == TaskStatus::Downloading { fmt_rate(task_rate as f32) } else { "—".into() }).color(theme::TEXT_MUTED).small());
+                        }
                         let seg_view = self.seg_info.get(&t.id);
                         let frac_opt = display_fraction(t, seg_view);
                         let frac = frac_opt.unwrap_or(0.0);
@@ -1078,27 +1098,36 @@ impl DownloadApp {
                 if icon_btn_enabled(ui, Icon::Search, "Explore", true, 92.0, !self.grab_url.trim().is_empty()).clicked() {
                     let proj = GrabberProject { start_url: self.grab_url.clone(), depth: self.grab_depth, scope: self.grab_scope, extensions: self.grab_exts.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(), max_pages: 200, ..Default::default() };
                     self.grab_project_json = serde_json::to_string_pretty(&proj).unwrap_or_default();
+                    self.grab_busy = true;
+                    self.grab_status = "Exploring site...".into();
                     let rt = self.rt.clone(); let client = engine::build_client("");
                     let crawler = Crawler { project: proj };
-                    let files_slot = Arc::new(Mutex::new(Vec::new()));
+                    let files_slot = Arc::new(Mutex::new(GrabOutcome::default()));
                     let slot2 = files_slot.clone();
                     let rt2 = self.tokio_rt.clone();
                     std::thread::spawn(move || {
                         let res = rt2.block_on(async move { crawler.crawl(&client).await });
-                        match res { Ok((_pages, files)) => { *slot2.lock().unwrap() = files; rt.lock().unwrap().log("Grabber explore done"); } Err(e) => { rt.lock().unwrap().log(format!("Grabber error: {e}")); } }
+                        let mut out = slot2.lock().unwrap(); out.done = true; out.apply_files = true;
+                        match res { Ok((pages, files)) => { out.message = format!("Done. {} pages explored, {} files found.", pages.len(), files.len()); out.files = files; rt.lock().unwrap().log("Grabber explore done"); } Err(e) => { out.message = format!("Explore failed: {e}"); rt.lock().unwrap().log(format!("Grabber error: {e}")); } }
                     });
                     self.grab_files = Vec::new();
                     GRAB_SLOT.with(|s| *s.borrow_mut() = Some(files_slot));
                 }
-                if icon_btn(ui, Icon::Check, "Refresh results", false, 124.0).clicked() { GRAB_SLOT.with(|s| { if let Some(slot) = &*s.borrow() { self.grab_files = slot.lock().unwrap().clone(); } }); }
+                let _ = icon_btn_enabled(ui, Icon::Check, "Results update automatically", false, 188.0, false);
                 if icon_btn_enabled(ui, Icon::Globe, "Mirror site", false, 104.0, !self.grab_url.trim().is_empty()).clicked() {
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                         let proj = GrabberProject { start_url: self.grab_url.clone(), depth: self.grab_depth, scope: self.grab_scope, extensions: self.grab_exts.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(), max_pages: 200, mirror: true, ..Default::default() };
+                        self.grab_busy = true;
+                        self.grab_status = format!("Mirroring site to {}...", dir.display());
+                        let slot = Arc::new(Mutex::new(GrabOutcome::default()));
+                        let slot2 = slot.clone();
+                        GRAB_SLOT.with(|s| *s.borrow_mut() = Some(slot));
                         let rt = self.rt.clone(); let rt2 = self.tokio_rt.clone();
-                        std::thread::spawn(move || { let res = rt2.block_on(async move { crate::grabber::mirror_site(&engine::build_client(""), &proj, &dir).await }); match res { Ok(v) => rt.lock().unwrap().log(format!("Mirror done: {} files", v.len())), Err(e) => rt.lock().unwrap().log(format!("Mirror error: {e}")) } });
+                        std::thread::spawn(move || { let res = rt2.block_on(async move { crate::grabber::mirror_site(&engine::build_client(""), &proj, &dir).await }); let mut out = slot2.lock().unwrap(); out.done = true; out.apply_files = false; match res { Ok(v) => { out.message = format!("Mirror done: {} files written.", v.len()); rt.lock().unwrap().log(format!("Mirror done: {} files", v.len())); }, Err(e) => { out.message = format!("Mirror failed: {e}"); rt.lock().unwrap().log(format!("Mirror error: {e}")); } } });
                     }
                 }
                 ui.label(egui::RichText::new("Explore crawls pages; Enqueue adds selected files as downloads with page referrer.").color(theme::TEXT_FAINT).small());
+                ui.label(egui::RichText::new(&self.grab_status).color(if self.grab_busy { theme::TEAL_500 } else { theme::TEXT_MUTED }).small());
             });
         });
         ui.add_space(6.0);
@@ -1124,7 +1153,7 @@ impl DownloadApp {
             });
             ui.separator();
             egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                if self.grab_files.is_empty() { ui.label(egui::RichText::new("No results yet. Explore a site, then Refresh results.").color(theme::TEXT_FAINT).small()); }
+                if self.grab_files.is_empty() { ui.label(egui::RichText::new(if self.grab_busy { "Working..." } else { "No files found yet." }).color(theme::TEXT_FAINT).small()); }
                 for f in &mut self.grab_files {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut f.selected, "");
@@ -1285,7 +1314,7 @@ impl DownloadApp {
 
 }
 
-thread_local! { static GRAB_SLOT: std::cell::RefCell<Option<Arc<Mutex<Vec<FoundFile>>>>> = const { std::cell::RefCell::new(None) }; }
+thread_local! { static GRAB_SLOT: std::cell::RefCell<Option<Arc<Mutex<GrabOutcome>>>> = const { std::cell::RefCell::new(None) }; }
 
 fn move_task(tasks: &mut [DownloadTask], id: &str, delta: i64) {
     let mut sorted: Vec<usize> = (0..tasks.len()).collect();

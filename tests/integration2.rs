@@ -156,3 +156,11 @@ async fn grabber_fixture_site() {
     let (_p, files2) = downloadcraft_lib::grabber::Crawler { project: proj2 }.crawl(&build_client("")).await.unwrap();
     assert!(files2.iter().all(|f| f.url.ends_with(".pdf")), "{files2:?}");
 }
+
+#[tokio::test]
+async fn grabber_start_http_error_surfaces() {
+    let base = serve(vec![("/index.html".into(), b"<html></html>".to_vec(), "text/html".into())]);
+    let proj = downloadcraft_lib::grabber::GrabberProject { start_url: format!("{base}/missing"), depth: 1, scope: 0, max_pages: 10, ..Default::default() };
+    let err = downloadcraft_lib::grabber::Crawler { project: proj }.crawl(&build_client("")).await.unwrap_err();
+    assert!(err.contains("404") || err.contains("start page"), "{err}");
+}

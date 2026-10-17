@@ -91,7 +91,7 @@ pub fn extract_links(html: &str, base: &Url) -> (Vec<Url>, Vec<Url>) {
     let lower = html.to_ascii_lowercase();
     let bytes = lower.as_bytes(); let mut i = 0;
     // simple tag scanner
-    for (tag, attr) in [("a", "href"), ("link", "href"), ("img", "src"), ("script", "src"), ("video", "src"), ("audio", "src"), ("source", "src")] {
+    for (tag, attr) in [("a", "href"), ("iframe", "src"), ("link", "href"), ("img", "src"), ("img", "srcset"), ("script", "src"), ("video", "src"), ("audio", "src"), ("source", "src"), ("source", "srcset"), ("embed", "src")] {
         let needle = format!("<{tag}");
         let mut pos = 0;
         while let Some(idx) = lower[pos..].find(&needle).map(|x| x + pos) {
@@ -101,8 +101,11 @@ pub fn extract_links(html: &str, base: &Url) -> (Vec<Url>, Vec<Url>) {
                 let rest = &html[idx + ai + attr.len() + 1..];
                 let rest_trim = rest.trim_start();
                 let val = if let Some(stripped) = rest_trim.strip_prefix('"') { stripped.split('"').next().unwrap_or("") } else if let Some(stripped) = rest_trim.strip_prefix('\'') { stripped.split('\'').next().unwrap_or("") } else { rest_trim.split(|c: char| c.is_whitespace() || c == '>').next().unwrap_or("") };
-                if !val.is_empty() && !val.starts_with('#') && !val.starts_with("javascript:") && !val.starts_with("mailto:") && !val.starts_with("data:") {
-                    if let Ok(u) = base.join(val) { if u.scheme() == "http" || u.scheme() == "https" { if tag == "a" { pages.push(u); } else { files.push(u); } } }
+                let vals: Vec<&str> = if attr == "srcset" { val.split(',').filter_map(|e| e.split_whitespace().next()).collect() } else { vec![val] };
+                for v in vals {
+                    if !v.is_empty() && !v.starts_with('#') && !v.starts_with("javascript:") && !v.starts_with("mailto:") && !v.starts_with("data:") {
+                        if let Ok(u) = base.join(v) { if u.scheme() == "http" || u.scheme() == "https" { if tag == "a" || tag == "iframe" { pages.push(u); } else { files.push(u); } } }
+                    }
                 }
             }
             pos = idx + needle.len();
@@ -166,15 +169,28 @@ pub fn robots_allows(robots_txt: &str, path: &str) -> bool {
     best.map(|(_, allowed)| allowed).unwrap_or(true)
 }
 
+
+pub fn normalize_start_url(raw: &str) -> Result<Url, String> {
+    let raw = raw.trim();
+    match Url::parse(raw) {
+        Ok(u) if u.scheme() == "http" || u.scheme() == "https" => Ok(u),
+        Ok(u) => Err(format!("unsupported start URL scheme {}", u.scheme())),
+        Err(_) if !raw.contains("://") => Url::parse(&format!("https://{raw}")).map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+const CRAWL_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+
 pub struct Crawler { pub project: GrabberProject }
 
 impl Crawler {
     pub async fn crawl(&self, client: &reqwest::Client) -> Result<(Vec<String>, Vec<FoundFile>), String> {
-        let start = Url::parse(&self.project.start_url).map_err(|e| e.to_string())?;
+        let start = normalize_start_url(&self.project.start_url)?;
         let mut robots = String::new();
         if self.project.respect_robots {
             let robots_url = start.join("/robots.txt").map_err(|e| e.to_string())?;
-            if let Ok(r) = client.get(robots_url).send().await { if r.status().is_success() { robots = r.text().await.unwrap_or_default(); } }
+            if let Ok(r) = client.get(robots_url).header(reqwest::header::USER_AGENT, CRAWL_UA).send().await { if r.status().is_success() { robots = r.text().await.unwrap_or_default(); } }
         }
         let include_re = compile_opt(&self.project.include_regex);
         let exclude_re = simple_re(&self.project.exclude_regex);
@@ -191,11 +207,20 @@ impl Crawler {
             if pages.len() >= self.project.max_pages { break; }
             if self.project.respect_robots && !robots_allows(&robots, url.path()) { continue; }
             if self.project.crawl_delay_ms > 0 { tokio::time::sleep(std::time::Duration::from_millis(self.project.crawl_delay_ms)).await; }
-            let resp = match client.get(url.clone()).send().await { Ok(r) => r, Err(_) => continue };
+            let resp = match client.get(url.clone()).header(reqwest::header::USER_AGENT, CRAWL_UA).header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,*/*").send().await { Ok(r) => r, Err(e) => { if pages.is_empty() { return Err(format!("start page request failed: {e}")); } continue; } };
+            if !resp.status().is_success() {
+                if pages.is_empty() { return Err(format!("start page returned HTTP {}", resp.status())); }
+                continue;
+            }
+            let url = resp.url().clone();
+            visited.insert(canonicalize(&url));
             let ct = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("text/html").to_string();
             let is_html = ct.contains("html");
             pages.push(canonicalize(&url));
-            if !is_html { continue; }
+            if !is_html {
+                if pages.len() == 1 { return Err(format!("start page did not return HTML ({ct})")); }
+                continue;
+            }
             let html = resp.text().await.unwrap_or_default();
             // page text exclude/include via substring check on html if regex is plain word (regex compiled via simple contains fallback)
             let (links, assets) = links_with_doc_base(&html, &url);
@@ -234,7 +259,8 @@ impl Crawler {
 }
 
 async fn head_info(client: &reqwest::Client, url: &Url) -> (Option<u64>, String) {
-    match client.head(url.clone()).send().await {
+    let req = client.head(url.clone()).header(reqwest::header::USER_AGENT, CRAWL_UA);
+    match tokio::time::timeout(std::time::Duration::from_secs(10), req.send()).await.map_err(|_| "timeout".to_string()).and_then(|r| r.map_err(|e| e.to_string())) {
         Ok(r) => {
             let size = r.headers().get(reqwest::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
             let mime = r.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
@@ -318,7 +344,7 @@ pub fn relative_link(from_rel: &str, to_rel: &str) -> String {
 pub async fn mirror_site(client: &reqwest::Client, project: &GrabberProject, out_dir: &std::path::Path) -> Result<Vec<String>, String> {
     let crawler = Crawler { project: project.clone() };
     let (pages, files) = crawler.crawl(client).await?;
-    let start = Url::parse(&project.start_url).map_err(|e| e.to_string())?;
+    let start = normalize_start_url(&project.start_url)?;
     let mut mapping: HashMap<String, String> = HashMap::new();
     let mut downloaded: Vec<String> = Vec::new();
     let mut jobs: Vec<String> = pages.clone();
@@ -513,6 +539,16 @@ mod tests {
         assert!(out.contains(r#"SRC = "../a.png""#), "{out}");
         assert!(out.contains("../a.png 1x, ../b.png 2x"), "{out}");
         assert!(!out.to_ascii_lowercase().contains("<base"), "{out}");
+    }
+    #[test] fn normalize_and_new_link_tags() {
+        assert_eq!(normalize_start_url("example.com/a").unwrap().as_str(), "https://example.com/a");
+        assert!(normalize_start_url("ftp://example.com/a").is_err());
+        let base = Url::parse("https://example.com/a/index.html").unwrap();
+        let (pages, files) = extract_links(r#"<iframe src="frame.html"></iframe><embed src="book.pdf"><img srcset="small.png 1x, big.png 2x">"#, &base);
+        assert!(pages.iter().any(|u| u.path().ends_with("frame.html")));
+        assert!(files.iter().any(|u| u.path().ends_with("book.pdf")));
+        assert!(files.iter().any(|u| u.path().ends_with("small.png")));
+        assert!(files.iter().any(|u| u.path().ends_with("big.png")));
     }
     #[test] fn canon_dedupe() { assert_eq!(canonicalize(&Url::parse("https://EXAMPLE.com/a#frag").unwrap()), canonicalize(&Url::parse("https://example.com/a").unwrap())); }
 }
