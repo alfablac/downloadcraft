@@ -73,10 +73,11 @@
     if (panel.dataset.confirmId) { api.runtime.sendMessage({ type: "downloadcraft-confirm-result", id: Number(panel.dataset.confirmId), action: "browser" }); delete panel.dataset.confirmId; }
     const box = panel.querySelector(".downloadcraft-items");
     box.innerHTML = "";
-    items.forEach((it) => {
+    items.forEach((it, i) => {
       const b = document.createElement("button");
       b.textContent = it.label;
-      b.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #555;padding:4px 6px;";
+      if (i === 0) { b.setAttribute("aria-selected", "true"); b.dataset.selected = "1"; }
+      b.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #555;padding:4px 6px;" + (i === 0 ? "outline:2px solid #8ab4f8;" : "");
       b.addEventListener("click", () => { api.runtime.sendMessage({ type: "downloadcraft-video-panel", url: it.url, filename: it.filename || filenameFromUrl(it.url), mime: it.mime || it.type || "" }); panel.remove(); });
       box.appendChild(b);
     });
@@ -136,7 +137,7 @@
       direct.forEach((u) => byUrl.set(u, { url: u, label: labelFor(video, u), filename: filenameFromUrl(u) }));
       manifestUrls.forEach((u) => { if (!byUrl.has(u)) byUrl.set(u, { url: u, label: filenameFromUrl(u), filename: filenameFromUrl(u) }); });
       candidates.forEach((c) => { if (c && c.url && !c.url.startsWith("blob:")) byUrl.set(c.url, { url: c.url, label: candidateLabel(c), filename: filenameFromUrl(c.url), type: c.type, mime: c.type }); });
-      showPanel(video, [...byUrl.values()]);
+      showPanel(video, (typeof rankCandidates === "function" ? rankCandidates : (x) => x)([...byUrl.values()]));
     });
   }
   const btnFor = new WeakMap();
@@ -244,7 +245,7 @@
         [...document.querySelectorAll("video, audio")].forEach((v) => directUrls(v).forEach((u) => byUrl.set(u, { url: u, label: filenameFromUrl(u), filename: filenameFromUrl(u) })));
         manifestUrls.forEach((u) => { if (!byUrl.has(u)) byUrl.set(u, { url: u, label: filenameFromUrl(u), filename: filenameFromUrl(u) }); });
         candidates.forEach((c) => { if (c && c.url && !c.url.startsWith("blob:")) byUrl.set(c.url, { url: c.url, label: candidateLabel(c), filename: filenameFromUrl(c.url), type: c.type, mime: c.type }); });
-        showPanel(anchor, [...byUrl.values()]);
+        showPanel(anchor, (typeof rankCandidates === "function" ? rankCandidates : (x) => x)([...byUrl.values()]));
       });
     }
     if (msg.type === "downloadcraft-grab-all") {

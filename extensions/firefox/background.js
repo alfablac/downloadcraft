@@ -219,7 +219,7 @@ browser.runtime.onMessage.addListener((msg, sender) => {
   if (msg && msg.type === "getCandidates") {
     pruneCandidates();
     const tabId = sender.tab && sender.tab.id;
-    const list = [...candidates.values()].filter((c) => tabId == null || c.tabId === tabId || c.tabId === -1);
+    const list = (typeof rankCandidates === "function" ? rankCandidates : (x) => x)([...candidates.values()].filter((c) => tabId == null || c.tabId === tabId || c.tabId === -1));
     return Promise.resolve({ type: "candidates", candidates: list });
   }
   if (msg && (msg.type === "downloadcraft-download" || msg.type === "downloadcraft-video-panel")) return safeSend(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer });

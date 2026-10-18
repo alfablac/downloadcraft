@@ -111,9 +111,8 @@
       const mans = [], medias = [];
       candidates.forEach((c) => { if (c && c.url) (/mpd|m3u8|dash|mpegurl/i.test(c.type || c.url) ? mans : medias).push(c); });
       const all = [...direct.map((u) => ({ url: u })), ...mans, ...medias];
-      const seenU = new Set();
-      const items = [];
-      all.forEach((c) => { if (!seenU.has(c.url)) { seenU.add(c.url); items.push(c); } });
+      // rankCandidates (rank.js) dedupes + orders file > playlist > segment.
+      const items = (typeof rankCandidates === "function" ? rankCandidates : (x) => x)(all);
       if (!items.length) {
         // Nothing sniffed yet: stream may exist but player has not fetched
         // past the manifest gate. Tell user instead of silent dead click.
@@ -135,10 +134,11 @@
       d.style.cssText = "color:#bbb;padding:4px 2px;word-break:break-word;";
       box.appendChild(d);
     }
-    items.forEach((it) => {
+    items.forEach((it, i) => {
       const b = document.createElement("button");
       b.textContent = it.label;
-      b.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #555;padding:4px 6px;";
+      if (i === 0) { b.setAttribute("aria-selected", "true"); b.dataset.selected = "1"; }
+      b.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #555;padding:4px 6px;" + (i === 0 ? "outline:2px solid #8ab4f8;" : "");
       b.addEventListener("click", () => { sendStream(it); panel.remove(); });
       box.appendChild(b);
     });
@@ -259,7 +259,7 @@
         const byUrl = new Map();
         [...manifestUrls, ...pageMediaUrls()].forEach((u) => byUrl.set(u, { url: u, label: filenameFromUrl(u), filename: filenameFromUrl(u), type: "" }));
         candidates.forEach((c) => { if (c && c.url && !c.url.startsWith("blob:")) byUrl.set(c.url, { url: c.url, label: `${filenameFromUrl(c.url)} (${c.type || "media"})`, filename: filenameFromUrl(c.url), type: c.type }); });
-        const items = [...byUrl.values()];
+        const items = (typeof rankCandidates === "function" ? rankCandidates : (x) => x)([...byUrl.values()]);
         if (items.length) showPanel(document.body, items);
       });
       return;

@@ -1,4 +1,5 @@
 // webcraft Chromium MV3 background. Native host: com.webcraft.host
+try { importScripts("rank.js"); } catch (e) {}
 const HOST = "com.webcraft.host";
 // Native messaging: single in-flight queue. Host originally replied without
 // an id, so sends are serialized and the first reply settles the in-flight
@@ -172,7 +173,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === "getCandidates") {
     pruneCandidates();
     const tabId = sender.tab && sender.tab.id;
-    const list = [...candidates.values()].filter((c) => tabId == null || c.tabId === tabId || c.tabId === -1);
+    const list = (typeof rankCandidates === "function" ? rankCandidates : (x) => x)([...candidates.values()].filter((c) => tabId == null || c.tabId === tabId || c.tabId === -1));
     sendResponse({ type: "candidates", candidates: list });
     return false;
   }
