@@ -1,6 +1,6 @@
-# downloadcraft
+# webcraft
 
-downloadcraft is a download manager written in Rust with egui. It covers the parts of Internet Download Manager that can be observed from outside: segmented downloads, queues, schedules, DASH and HLS, a site grabber, and browser integration. The code was written from scratch. It has no IDM code, binaries, icons, or activation logic, and it is not affiliated with Tonec.
+webcraft is a download manager written in Rust with egui. It covers the parts of Internet Download Manager that can be observed from outside: segmented downloads, queues, schedules, DASH and HLS, a site grabber, and browser integration. The code was written from scratch. It has no IDM code, binaries, icons, or activation logic, and it is not affiliated with Tonec.
 
 Runs on Windows 10/11 x86_64, macOS 13 or later (Intel and Apple Silicon), and Linux x86_64 (Ubuntu 22.04 or later, X11 and Wayland).
 
@@ -14,7 +14,7 @@ Runs on Windows 10/11 x86_64, macOS 13 or later (Intel and Apple Silicon), and L
 - Site Grabber with depth, scope, size, and extension filters, plus a site mirror that rewrites links to local relative paths
 - Chromium MV3 and Firefox extensions that hand downloads to the desktop app through a native messaging host
 - Drag-and-drop URLs or .url files onto main window
-- System tray, autostart, single-instance lock, and the `downloadcraft://` URL protocol
+- System tray, autostart, single-instance lock, and the `webcraft://` URL protocol (legacy `downloadcraft://` links still accepted)
 - `--smoke-test` for CI
 
 Multi-track downloads are muxed with ffmpeg when ffmpeg is on PATH or beside the exe. Single-track downloads do not need it. The app never downloads ffmpeg at runtime.
@@ -25,20 +25,20 @@ Multi-track downloads are muxed with ffmpeg when ffmpeg is on PATH or beside the
 cargo build --release
 cargo test
 cargo clippy --all-targets -- -D warnings
-./target/release/downloadcraft --smoke-test
+./target/release/webcraft --smoke-test
 ```
 
 On Windows, cargo may not be on PATH in a fresh PowerShell session. Use `$HOME\.cargo\bin\cargo.exe` or add `$HOME\.cargo\bin` to PATH first.
 
 ## Install
 
-Windows: run `downloadcraft-*-windows-setup.exe` (NSIS, per-user, no admin) or unpack the portable zip. Uninstall from Settings, Apps, downloadcraft, or run `$LOCALAPPDATA\Programs\downloadcraft\Uninstall.exe`. Uninstall removes autostart and the browser host registration.
+Windows: run `webcraft-*-windows-setup.exe` (NSIS, per-user, no admin) or unpack the portable zip. Uninstall from Settings, Apps, webcraft, or run `$LOCALAPPDATA\Programs\webcraft\Uninstall.exe`. Uninstall removes autostart and the browser host registration.
 
-macOS: open the `.dmg` and drag `downloadcraft.app` to Applications. Builds are unsigned, so first launch needs right-click, Open. To uninstall, delete the app, `~/Library/LaunchAgents/com.downloadcraft.plist`, and the `com.downloadcraft.host.json` files under `~/Library/Application Support/*/NativeMessagingHosts`. Running Options, Remove browser integration first does the host part for you.
+macOS: open the `.dmg` and drag `webcraft.app` to Applications. Builds are unsigned, so first launch needs right-click, Open. To uninstall, delete the app, `~/Library/LaunchAgents/com.webcraft.plist`, and the `com.webcraft.host.json` files under `~/Library/Application Support/*/NativeMessagingHosts`. Running Options, Remove browser integration first does the host part for you.
 
-Linux: make the AppImage executable and run it, unpack the tarball, or install the package with `sudo apt install ./downloadcraft_*_amd64.deb`. The .deb registers the desktop entry and protocol handler. Tray on GNOME needs AppIndicator support. Uninstall with `sudo apt remove downloadcraft` and remove `~/.config/autostart/downloadcraft.desktop`, or turn autostart off in Options first.
+Linux: make the AppImage executable and run it, unpack the tarball, or install the package with `sudo apt install ./webcraft_*_amd64.deb`. The .deb registers the desktop entry and protocol handler. Tray on GNOME needs AppIndicator support. Uninstall with `sudo apt remove webcraft` and remove `~/.config/autostart/webcraft.desktop`, or turn autostart off in Options first.
 
-Older installs still work. On first launch, downloadcraft copies `state.json` and any pending inbox messages from the previous config directory if the new one has no state yet. It does not overwrite existing downloadcraft state.
+Older installs still work. On first launch, webcraft copies `state.json`, `capture-filter.json`, and any pending inbox messages from the previous (downloadcraft, or older idmcraft) config directory if the new one has no state yet. It does not overwrite existing webcraft state.
 
 ## Browser integration
 
@@ -46,9 +46,9 @@ The desktop app registers the native messaging host and protocol every time it s
 
 Chromium: load `extensions/chromium` as an unpacked extension.
 
-Firefox: a ready XPI is at `extensions/downloadcraft-firefox.xpi`. Remove the previous add-on first; it asks for a native host name that no longer exists. Start downloadcraft once so it registers the current host, then install the XPI from about:addons, gear menu, Install Add-on From File. Firefox release builds refuse unsigned add-ons permanently; use Firefox Developer Edition or Nightly, or set `xpinstall.signatures.required` to false in about:config on builds that allow it. For a temporary install, load `extensions/firefox` from about:debugging, This Firefox, Load Temporary Add-on. Rebuild the XPI with `scripts/package-firefox.ps1`.
+Firefox: a ready XPI is at `extensions/webcraft-firefox.xpi`. Remove the previous add-on first; it asks for a native host name that no longer exists. Start webcraft once so it registers the current host, then install the XPI from about:addons, gear menu, Install Add-on From File. Firefox release builds refuse unsigned add-ons permanently; use Firefox Developer Edition or Nightly, or set `xpinstall.signatures.required` to false in about:config on builds that allow it. For a temporary install, load `extensions/firefox` from about:debugging, This Firefox, Load Temporary Add-on. Rebuild the XPI with `scripts/package-firefox.ps1`.
 
-Native host name: `com.downloadcraft.host`.
+Native host name: `com.webcraft.host`. The legacy name `com.downloadcraft.host` is also registered for one release cycle so already-installed extensions keep working.
 
 ## Interface
 

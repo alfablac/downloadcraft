@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generate downloadcraft app icon assets (original download-arrow mark).
+"""Generate webcraft app icon assets (original download-arrow mark).
 
 Run: python scripts/make_icon.py
-Outputs assets/downloadcraft.ico, .png, .icns.
+Outputs assets/webcraft.ico, .png, .icns.
 """
 from pathlib import Path
 
@@ -37,10 +37,10 @@ def render(size: int) -> Image.Image:
 def main() -> None:
     OUT.mkdir(exist_ok=True)
     base = render(512)
-    base.save(OUT / "downloadcraft.png")
+    base.save(OUT / "webcraft.png")
     sizes = [16, 20, 24, 32, 48, 64, 128, 256]
-    base.save(OUT / "downloadcraft.ico", sizes=[(x, x) for x in sizes])
-    base.save(OUT / "downloadcraft.icns", sizes=[(x, x) for x in [16, 32, 64, 128, 256, 512]])
+    base.save(OUT / "webcraft.ico", sizes=[(x, x) for x in sizes])
+    base.save(OUT / "webcraft.icns", sizes=[(x, x) for x in [16, 32, 64, 128, 256, 512]])
     print(f"wrote {OUT}")
 
 

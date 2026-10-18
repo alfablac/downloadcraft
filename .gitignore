@@ -7,7 +7,7 @@ rustc-ice-*.txt
 dist/
 staging/
 AppDir/
-downloadcraft.app/
+webcraft.app/
 *.zip
 *.tar.gz
 *.dmg
@@ -16,3 +16,6 @@ downloadcraft.app/
 *.exe
 !extensions/**
 .DS_Store
+/host.json
+/host-firefox.json
+check.txt
