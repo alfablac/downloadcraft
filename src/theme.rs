@@ -199,16 +199,79 @@ pub fn ghost_btn(ui: &mut egui::Ui, label: &str) -> egui::Response {
             .min_size(egui::vec2(0.0, BTN_H)),
     )
 }
-/// Small status label — bordered box, 4px radius.
-pub fn chip(ui: &mut egui::Ui, label: &str, color: Color32) {
+/// Darken base toward BG for badge fill. Text-safe hues stay legible on tint:
+/// fill ~20% base over BG, border ~55% base. No new palette entries.
+fn badge_tint(base: Color32) -> (Color32, Color32) {
+    let mix = |a: Color32, b: Color32, t: f32| {
+        let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+        Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+    };
+    (mix(BG, base, 0.22), mix(BG, base, 0.55))
+}
+
+/// Small non-interactive badge: tinted fill + colored border/text, 4px radius.
+/// Replaces button-like chips for tags (category, type, status, queue meta).
+/// Fixed small font keeps badge <= ROW_H; proportional would overflow 22px rows.
+const BADGE_FONT: f32 = 9.0;
+
+pub fn badge(ui: &mut egui::Ui, label: &str, color: Color32) {
+    let (fill, border) = badge_tint(color);
     egui::Frame::none()
-        .fill(SURFACE_RAISED)
-        .stroke(egui::Stroke::new(1.0f32, BORDER))
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0f32, border))
         .rounding(R_CHIP)
-        .inner_margin(egui::Margin::symmetric(SP_SM, SP_XS / 2.0))
+        .inner_margin(egui::Margin::symmetric(6.0, 1.0))
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(label).color(color).small());
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(label)
+                        .color(color)
+                        .size(BADGE_FONT)
+                        .strong(),
+                )
+                .truncate()
+                .selectable(false),
+            );
         });
+}
+
+/// Natural badge width for label at BADGE_FONT (for fixed table cells).
+pub fn badge_width(ui: &egui::Ui, label: &str) -> f32 {
+    ui.fonts(|f| {
+        f.layout_no_wrap(label.into(), egui::FontId::proportional(BADGE_FONT), Color32::WHITE)
+            .size()
+            .x
+    }) + 14.0 // 6+6 inner margin + 1+1 border
+}
+
+/// File category -> badge hue. Distinct hues per category; General neutral.
+pub fn category_color(category: &str) -> Color32 {
+    match category {
+        "Video" => Color32::from_rgb(0xC4, 0x8A, 0xD8), // violet
+        "Audio" => Color32::from_rgb(0xD8, 0x9A, 0x5F), // orange
+        "Documents" => Color32::from_rgb(0x6E, 0xA8, 0xD8), // blue
+        "Compressed" => Color32::from_rgb(0xC9, 0xB4, 0x58), // gold
+        "Programs" => OK,
+        "Unfinished" => WARN,
+        "Finished" => OK,
+        _ => TEXT_MUTED, // General / All Downloads / unknown
+    }
+}
+
+/// Protocol type -> badge hue. Avoid ERR (means Error status).
+pub fn proto_color(k: crate::stream::ProtoKind) -> Color32 {
+    use crate::stream::ProtoKind::*;
+    match k {
+        Torrent => WARN,
+        Dash | Hls => Color32::from_rgb(0xC4, 0x8A, 0xD8),
+        YtDlp => Color32::from_rgb(0xD8, 0x7A, 0x6E),
+        Sftp => OK,
+        Ftp | Ftps => STEEL_TEXT,
+        Nntp => Color32::from_rgb(0x6E, 0xA8, 0xD8),
+        Metalink => Color32::from_rgb(0xC9, 0xB4, 0x58),
+        Http => TEXT_MUTED,
+        File => TEXT_FAINT,
+    }
 }
 /// Panel frame (desktop group box), 8px radius.
 #[allow(dead_code)]

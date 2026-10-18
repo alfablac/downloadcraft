@@ -1890,7 +1890,7 @@ impl eframe::App for DownloadApp {
                             .count()
                     };
                     let speed = self.speed_hist.last().copied().unwrap_or(0.0);
-                    theme::chip(
+                    theme::badge(
                         ui,
                         &format!("{active} active · {}", fmt_rate(speed)),
                         theme::TEXT_MUTED,
@@ -2269,21 +2269,6 @@ fn quota_exhausted(g: &Runtime, queue_id: &str, now: u64) -> bool {
                 && now.saturating_sub(s.quota_window_start) < s.quota_hours.max(1) * 3600
                 && s.quota_used_bytes >= s.quota_mb * 1024 * 1024
         })
-}
-
-/// Category icon by extension (sidebar + row glyphs).
-/// Protocol label color. Short text carries meaning; color secondary (only
-/// ~5 text-safe hues in theme). Avoid ERR: already means Error status.
-fn proto_color(k: crate::stream::ProtoKind) -> egui::Color32 {
-    use crate::stream::ProtoKind::*;
-    match k {
-        Torrent => theme::WARN,
-        Ftp | Ftps | Dash | Hls => theme::STEEL_TEXT,
-        Sftp => theme::OK,
-        YtDlp => theme::STEEL_TEXT,
-        Nntp | Metalink => theme::TEXT_MUTED,
-        Http | File => theme::TEXT_FAINT,
-    }
 }
 
 /// Rail "TYPE" filter buckets over derived ProtoKind. Orthogonal to extension
@@ -3066,7 +3051,7 @@ impl DownloadApp {
         // Header + actions (IDM toolbar: Add URL, Resume, Stop, Stop All, Delete, Options…)
         ui.horizontal_wrapped(|ui| {
             ui.heading("Downloads");
-            theme::chip(ui, &self.category.clone(), theme::TEXT_MUTED);
+            theme::badge(ui, &self.category.clone(), theme::category_color(&self.category));
         });
         ui.add_space(4.0);
         let selected_task = self.selected.as_ref().and_then(|id| {
@@ -3272,7 +3257,7 @@ impl DownloadApp {
 
                     ui.horizontal(|ui| { ui.spacing_mut().item_spacing.x = COL_GAP; let mut ci = 0usize; let mut nw = || { ci += 1; cols[ci - 1] };
                         let task_rate = self.task_rate(&t.id);
-                        cell(ui, nw(), |ui| { let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover()); icon(ui.painter(), &cat_icon(&t.filename), irect, theme::TEXT_MUTED); let kind = crate::stream::proto_kind(&t); ui.add(egui::Label::new(egui::RichText::new(kind.label()).color(proto_color(kind)).small().strong()).truncate().selectable(false)).on_hover_text(format!("{} - {}", kind.full_name(), t.url)); ui.add(egui::Label::new(egui::RichText::new(&t.filename).color(theme::TEXT).small()).truncate().selectable(false)).on_hover_text(if t.error.is_empty() { t.filename.clone() } else { format!("{}\nError: {}", t.filename, t.error) }); });
+                        cell(ui, nw(), |ui| { let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover()); icon(ui.painter(), &cat_icon(&t.filename), irect, theme::TEXT_MUTED); let kind = crate::stream::proto_kind(&t); let bw = theme::badge_width(ui, kind.label()); if ui.available_width() - bw >= 60.0 { theme::badge(ui, kind.label(), theme::proto_color(kind)); } ui.add(egui::Label::new(egui::RichText::new(&t.filename).color(theme::TEXT).small()).truncate().selectable(false)).on_hover_text(if t.error.is_empty() { format!("{} - {}\n{}", kind.full_name(), t.filename, t.url) } else { format!("{}\nError: {}", t.filename, t.error) }); });
                         if !compact_table { let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(if t.queue_id.is_empty() { "main" } else { &t.queue_id }).color(theme::TEXT_MUTED).small()).truncate().selectable(false)).on_hover_text(if t.queue_id.is_empty() { "main".to_string() } else { t.queue_id.clone() })); }
                         let w = nw(); cell_r(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(match t.total { Some(n) => fmt_bytes(n), None => "—".into() }).color(theme::TEXT_MUTED).small()).truncate().selectable(false)).on_hover_text(match t.total { Some(n) => fmt_bytes(n), None => "unknown size".to_string() }));
                         let sc = theme::status_color(t.status);
@@ -3392,6 +3377,16 @@ impl DownloadApp {
                     egui::Label::new(egui::RichText::new(&t.url).color(theme::STEEL_TEXT).small())
                         .wrap(),
                 );
+                ui.horizontal(|ui| {
+                    let kind = crate::stream::proto_kind(&t);
+                    theme::badge(ui, kind.label(), theme::proto_color(kind));
+                    let cat = if t.category.is_empty() {
+                        crate::model::category_for(&t.filename)
+                    } else {
+                        t.category.as_str()
+                    };
+                    theme::badge(ui, cat, theme::category_color(cat));
+                });
                 ui.add_space(6.0);
                 ui.add_space(6.0);
                 let mut focus_name = false;
@@ -3860,16 +3855,20 @@ impl DownloadApp {
                 } else {
                     theme::status_color(t.status)
                 };
-                theme::chip(ui, &format!("{:?}", t.status), sc);
-                theme::chip(ui, kind.label(), theme::TEXT_MUTED);
-                theme::chip(
+                theme::badge(ui, &format!("{:?}", t.status), sc);
+                theme::badge(ui, kind.label(), theme::proto_color(kind));
+                theme::badge(
                     ui,
                     if t.category.is_empty() {
                         crate::model::category_for(&t.filename)
                     } else {
                         &t.category
                     },
-                    theme::TEXT_MUTED,
+                    theme::category_color(if t.category.is_empty() {
+                        crate::model::category_for(&t.filename)
+                    } else {
+                        &t.category
+                    }),
                 );
             });
             ui.add_space(theme::SP_SM);
@@ -4447,16 +4446,16 @@ impl DownloadApp {
                 theme::panel().show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(&q.name).strong());
-                        theme::chip(ui, &format!("max {}", q.max_concurrent), theme::TEXT_MUTED);
+                        theme::badge(ui, &format!("max {}", q.max_concurrent), theme::TEXT_MUTED);
                         if q.auto_start {
-                            theme::chip(ui, "auto-start", theme::TEAL_500);
+                            theme::badge(ui, "auto-start", theme::TEAL_500);
                         }
-                        theme::chip(
+                        theme::badge(
                             ui,
                             &format!("retry {}x/{}s", q.retry_count, q.retry_interval_secs),
                             theme::TEXT_MUTED,
                         );
-                        theme::chip(
+                        theme::badge(
                             ui,
                             &format!("on complete: {:?}", q.on_complete),
                             theme::TEXT_MUTED,
@@ -4700,12 +4699,12 @@ impl DownloadApp {
                         ui.end_row();
                     });
                     ui.horizontal(|ui| match next_run_in(&sch, day, secs) {
-                        Some(n) => theme::chip(
+                        Some(n) => theme::badge(
                             ui,
                             &format!("next in {}", eta(n as f64)),
                             theme::STEEL_TEXT,
                         ),
-                        None => theme::chip(ui, "no next run", theme::TEXT_FAINT),
+                        None => theme::badge(ui, "no next run", theme::TEXT_FAINT),
                     });
                     ui.add_space(4.0);
                     ui.label(
