@@ -77,6 +77,81 @@ fn display_fraction(task: &DownloadTask, view: Option<&SegView>) -> Option<f32> 
     view.and_then(|v| v.fraction())
 }
 
+/// Task URL schemes whose engine keeps partial state and continues from it:
+/// segmented/streamed HTTP(S) (probe decides ranges), FTP REST, SFTP seek,
+/// BitTorrent fast-resume, HLS/DASH segment caches. NNTP/yt-dlp excluded.
+fn resume_capable(task: &DownloadTask) -> bool {
+    let l = task.url.to_ascii_lowercase();
+    let path = l.split(['?', '#']).next().unwrap_or(&l);
+    !(l.starts_with("nzb://")
+        || path.ends_with(".nzb")
+        || task.headers.contains_key("x-nzb")
+        || task.headers.contains_key("x-ytdlp")
+        || ytdlp::is_video_page(&task.url))
+}
+
+/// Resume evidence for progress dialog (no probe I/O): live part bytes on
+/// disk mean continuation happened/is possible; reaching part-dir checks
+/// needs segmented layout, so plain `.part` partials (FTP/SFTP) count too.
+fn resume_supported(task: &DownloadTask) -> bool {
+    if !resume_capable(task) {
+        return false;
+    }
+    if task.status == TaskStatus::Complete {
+        return true;
+    }
+    let part_dir = task.dest_dir.join(format!(".downloadcraft-{}", task.id));
+    if std::fs::read_dir(&part_dir)
+        .map(|mut rd| {
+            rd.any(|e| {
+                e.map(|e| {
+                    e.file_name().to_string_lossy().starts_with("part")
+                        && e.metadata().map(|m| m.len() > 0).unwrap_or(false)
+                })
+                .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    task.downloaded > 0
+        && (std::fs::metadata(task.dest_dir.join(format!("{}.part", task.filename)))
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+            || task.dest_dir
+                .join(format!(".downloadcraft-media-{}", task.id))
+                .exists()
+            || task.dest_dir
+                .join(format!(".downloadcraft-hls-{}", task.id))
+                .exists())
+}
+
+/// Per-part state word from (done, expected): expected 0 = unknown length.
+fn part_status_word(done: u64, expected: u64) -> Option<&'static str> {
+    if expected == 0 {
+        None
+    } else if done >= expected {
+        Some("Finished")
+    } else if done > 0 {
+        Some("Receiving")
+    } else {
+        Some("Pending")
+    }
+}
+
+/// Rates (bytes/s) between consecutive per-task samples: (time used for
+/// x-scaling only — sparkline x is index-based, matching global sparkline).
+fn task_speed_series(samples: &[(f64, u64)]) -> Vec<f64> {
+    samples
+        .windows(2)
+        .filter_map(|w| {
+            let dt = w[1].0 - w[0].0;
+            (dt > 0.0).then(|| w[1].1.saturating_sub(w[0].1) as f64 / dt)
+        })
+        .collect()
+}
+
 /// Draw per-part strip: each cell width proportional to expected size, fill = done fraction.
 fn parts_strip(ui: &mut egui::Ui, view: &SegView, width: f32) {
     if view.parts.is_empty() {
@@ -178,6 +253,10 @@ pub struct DownloadApp {
     seg_info: std::collections::HashMap<String, SegView>,
     /// Smoothed displayed rate per task (bytes/s), EMA over 5s window rate.
     rate_smooth: std::collections::HashMap<String, f64>,
+    /// Per-task (epoch_s, downloaded) history for progress-dialog sparkline.
+    /// Derived from `rate_map` each poll; capped 120 samples.
+    task_hist:
+        std::collections::HashMap<String, std::collections::VecDeque<(f64, u64)>>,
     /// Spawned download tasks; Remove aborts handle so background work really stops.
     handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
     /// Tray Quit / Tasks Quit set this so close-to-tray intercept lets window close.
@@ -402,6 +481,7 @@ impl DownloadApp {
             rate_map: std::collections::HashMap::new(),
             seg_info: std::collections::HashMap::new(),
             rate_smooth: std::collections::HashMap::new(),
+            task_hist: std::collections::HashMap::new(),
             handles: std::collections::HashMap::new(),
             allow_close: false,
             dl_widths: None,
@@ -1935,6 +2015,38 @@ impl eframe::App for DownloadApp {
                     });
                 });
         }
+        // Dialog per-task history: reuse rate_map samples (already
+        // (Instant, downloaded)); convert to (epoch_s, bytes).
+        if self.show_progress_for.is_some() {
+            let epoch0 = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let downloading: Vec<String> = {
+                let g = self.rt.lock().unwrap();
+                g.state
+                    .tasks
+                    .iter()
+                    .filter(|t| t.status == TaskStatus::Downloading)
+                    .map(|t| t.id.clone())
+                    .collect()
+            };
+            for id in &downloading {
+                if let Some(hist) = self.rate_map.get(id) {
+                    let samples: Vec<(f64, u64)> = hist
+                        .iter()
+                        .map(|(inst, b)| (epoch0 - inst.elapsed().as_secs_f64(), *b))
+                        .collect();
+                    let entry = self.task_hist.entry(id.clone()).or_default();
+                    *entry = samples.into_iter().collect();
+                    while entry.len() > 120 {
+                        entry.pop_front();
+                    }
+                }
+            }
+            self.task_hist
+                .retain(|id, _| downloading.iter().any(|d| d == id));
+        }
         // Global sparkline uses same smoothed per-task rates shown in rows.
         // End-of-frame aggregate byte deltas jump with chunk bursts and repaint cadence.
         let ids: Vec<String> = {
@@ -3284,6 +3396,13 @@ impl DownloadApp {
                     }
                     _ => "—".into(),
                 };
+                let samples: Vec<(f64, u64)> = self
+                    .task_hist
+                    .get(&t.id)
+                    .map(|d| d.iter().copied().collect())
+                    .unwrap_or_default();
+                let series = task_speed_series(&samples);
+                let peak = series.iter().copied().fold(task_rate, f64::max);
                 form_grid("prog-grid").show(ui, |ui| {
                     form_label(ui, "Status");
                     ui.label(format!("{:?}", t.status));
@@ -3293,6 +3412,78 @@ impl DownloadApp {
                         fmt_rate(task_rate as f32)
                     } else {
                         "—".into()
+                    });
+                    ui.end_row();
+                    form_label(ui, "Peak rate");
+                    ui.label(if samples.is_empty() {
+                        "—".into()
+                    } else {
+                        fmt_rate(peak as f32)
+                    });
+                    ui.end_row();
+                    // Per-task speed graph: rates from task_hist samples
+                    // (rate_map history). Painter polyline, same pattern as
+                    // global sparkline — no egui_plot dep.
+                    form_label(ui, "Speed graph");
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(if samples.is_empty() {
+                                "—".into()
+                            } else {
+                                format!(
+                                    "Now {} · Peak {}",
+                                    fmt_rate(task_rate as f32),
+                                    fmt_rate(peak as f32)
+                                )
+                            })
+                            .color(theme::TEXT_FAINT)
+                            .small(),
+                        );
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), 48.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect_filled(rect, 2.0, theme::G_950);
+                        ui.painter().rect_stroke(
+                            rect,
+                            2.0,
+                            egui::Stroke::new(1.0f32, theme::BORDER),
+                        );
+                        if series.len() > 1 {
+                            let max = peak.max(1.0) as f32;
+                            let n = series.len();
+                            for i in 1..n {
+                                let x0 = rect.left()
+                                    + rect.width() * (i - 1) as f32 / (n - 1).max(1) as f32;
+                                let x1 = rect.left()
+                                    + rect.width() * i as f32 / (n - 1).max(1) as f32;
+                                let y0 = rect.bottom()
+                                    - (series[i - 1] as f32 / max) * rect.height();
+                                let y1 = rect.bottom()
+                                    - (series[i] as f32 / max) * rect.height();
+                                ui.painter().line_segment(
+                                    [egui::pos2(x0, y0), egui::pos2(x1, y1)],
+                                    egui::Stroke::new(1.5f32, theme::TEAL_500),
+                                );
+                            }
+                            if let Some(last) = series.last() {
+                                let y =
+                                    rect.bottom() - (*last as f32 / max) * rect.height();
+                                ui.painter().circle_filled(
+                                    egui::pos2(rect.right() - 1.5, y),
+                                    2.0,
+                                    theme::TEAL_500,
+                                );
+                            }
+                        } else {
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "Collecting…",
+                                egui::FontId::proportional(10.0),
+                                theme::TEXT_FAINT,
+                            );
+                        }
                     });
                     ui.end_row();
                     form_label(ui, "Time left");
@@ -3312,6 +3503,9 @@ impl DownloadApp {
                         fmt_bytes(t.downloaded),
                         t.total.map(fmt_bytes).unwrap_or_else(|| "—".into())
                     ));
+                    ui.end_row();
+                    form_label(ui, "Resume");
+                    ui.label(if resume_supported(&t) { "Yes" } else { "No" });
                     ui.end_row();
                     form_label(ui, "Save to");
                     ui.label(t.dest_dir.display().to_string());
@@ -3338,6 +3532,13 @@ impl DownloadApp {
                                 .small()
                                 .strong(),
                         );
+                        ui.label(
+                            egui::RichText::new(
+                                "Finished: done \u{2265} expected · Receiving: >0 · Pending: 0 (word skipped if size unknown)",
+                            )
+                            .color(theme::TEXT_FAINT)
+                            .small(),
+                        );
                         parts_strip(ui, &view, ui.available_width());
                         if view.manifest {
                             let (d, tot) = view.parts.first().copied().unwrap_or((0, 0));
@@ -3348,7 +3549,7 @@ impl DownloadApp {
                             );
                         } else {
                             egui::Grid::new("prog-parts")
-                                .num_columns(3)
+                                .num_columns(4)
                                 .spacing([12.0, 6.0])
                                 .show(ui, |ui| {
                                     for (i, (done, exp)) in view.parts.iter().enumerate().take(32) {
@@ -3376,6 +3577,14 @@ impl DownloadApp {
                                             .color(theme::TEXT_FAINT)
                                             .small(),
                                         );
+                                        // Status word; unknown length (exp==0): % only, no word.
+                                        ui.label(
+                                            egui::RichText::new(
+                                                part_status_word(*done, *exp).unwrap_or(""),
+                                            )
+                                            .color(theme::TEXT_FAINT)
+                                            .small(),
+                                        );
                                         ui.end_row();
                                     }
                                 });
@@ -3389,6 +3598,23 @@ impl DownloadApp {
                                     .small(),
                                 );
                             }
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Finished")
+                                        .color(theme::OK)
+                                        .small(),
+                                );
+                                ui.label(
+                                    egui::RichText::new("Receiving")
+                                        .color(theme::STEEL_TEXT)
+                                        .small(),
+                                );
+                                ui.label(
+                                    egui::RichText::new("Pending")
+                                        .color(theme::TEXT_FAINT)
+                                        .small(),
+                                );
+                            });
                         }
                     }
                 }
@@ -4949,5 +5175,46 @@ mod progress_tests {
             manifest: false,
         };
         assert_eq!(display_fraction(&task(None, 10), Some(&view)), None);
+    }
+
+    #[test]
+    fn part_status_word_and_speed_series() {
+        assert_eq!(part_status_word(10, 10), Some("Finished"));
+        assert_eq!(part_status_word(5, 10), Some("Receiving"));
+        assert_eq!(part_status_word(0, 10), Some("Pending"));
+        assert_eq!(part_status_word(5, 0), None);
+        // 100 bytes in 2s = 50 B/s; regressing counter saturates to 0.
+        assert_eq!(
+            task_speed_series(&[(0.0, 0), (2.0, 100), (4.0, 50)]),
+            vec![50.0, 0.0]
+        );
+        assert!(task_speed_series(&[(0.0, 7)]).is_empty());
+        assert!(task_speed_series(&[(1.0, 0), (1.0, 9)]).is_empty());
+    }
+
+    #[test]
+    fn resume_supported_classifies_schemes() {
+        let dir = std::env::temp_dir().join(format!("wc-resume-{}", std::process::id()));
+        let mut t = task(None, 0);
+        t.dest_dir = dir.clone();
+        t.url = "https://example.com/f.bin".into();
+        assert!(!resume_supported(&t)); // no partial data on disk
+        t.url = "nzb://https://example.com/f.nzb".into();
+        assert!(!resume_supported(&t));
+        t.url = "https://example.com/f.nzb".into();
+        assert!(!resume_supported(&t));
+        t.url = "https://www.youtube.com/watch?v=aqz-KE-bpKQ".into();
+        assert!(!resume_supported(&t));
+        t.url = "https://example.com/f.bin".into();
+        t.status = TaskStatus::Complete;
+        assert!(resume_supported(&t));
+        // Live partial: .part file with bytes counts as resumable.
+        t.status = TaskStatus::Paused;
+        t.filename = "x".into();
+        t.downloaded = 5;
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x.part"), b"bytes").unwrap();
+        assert!(resume_supported(&t));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
