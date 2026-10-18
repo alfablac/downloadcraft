@@ -1,6 +1,6 @@
 # webcraft
 
-webcraft is a download manager written in Rust with egui. It covers the parts of Internet Download Manager that can be observed from outside: segmented downloads, queues, schedules, DASH and HLS, a site grabber, and browser integration. The code was written from scratch. It has no IDM code, binaries, icons, or activation logic, and it is not affiliated with Tonec.
+webcraft is a download manager written in Rust with egui. It reimplements the observable parts of Internet Download Manager: segmented downloads, queues, schedules, DASH and HLS, a site grabber, and browser integration. The code was written from scratch. It has no IDM code, binaries, icons, or activation logic, and it is not affiliated with Tonec.
 
 Runs on Windows 10/11 x86_64, macOS 13 or later (Intel and Apple Silicon), and Linux x86_64 (Ubuntu 22.04 or later, X11 and Wayland).
 
@@ -13,8 +13,9 @@ Runs on Windows 10/11 x86_64, macOS 13 or later (Intel and Apple Silicon), and L
 - DASH (MPD) and HLS downloads, including AES-128 HLS. DRM-protected streams are refused
 - Site Grabber with depth, scope, size, and extension filters, plus a site mirror that rewrites links to local relative paths
 - Chromium MV3 and Firefox extensions that hand downloads to the desktop app through a native messaging host
-- Drag-and-drop URLs or .url files onto main window
+- Drag-and-drop URLs or .url files onto the main window
 - System tray, autostart, single-instance lock, and the `webcraft://` URL protocol (legacy `downloadcraft://` links still accepted)
+- Tags shown as small colored badges by category and protocol type, in the download list and dialogs
 - `--smoke-test` for CI
 
 Multi-track downloads are muxed with ffmpeg when ffmpeg is on PATH or beside the exe. Single-track downloads do not need it. The app never downloads ffmpeg at runtime.
@@ -34,7 +35,7 @@ On Windows, cargo may not be on PATH in a fresh PowerShell session. Use `$HOME\.
 
 Windows: run `webcraft-*-windows-setup.exe` (NSIS, per-user, no admin) or unpack the portable zip. Uninstall from Settings, Apps, webcraft, or run `$LOCALAPPDATA\Programs\webcraft\Uninstall.exe`. Uninstall removes autostart and the browser host registration.
 
-macOS: open the `.dmg` and drag `webcraft.app` to Applications. Builds are unsigned, so first launch needs right-click, Open. To uninstall, delete the app, `~/Library/LaunchAgents/com.webcraft.plist`, and the `com.webcraft.host.json` files under `~/Library/Application Support/*/NativeMessagingHosts`. Running Options, Remove browser integration first does the host part for you.
+macOS: open the `.dmg` and drag `webcraft.app` to Applications. Builds are unsigned, so the first launch needs right-click, Open. To uninstall, delete the app, `~/Library/LaunchAgents/com.webcraft.plist`, and the `com.webcraft.host.json` files under `~/Library/Application Support/*/NativeMessagingHosts`. Running Options, Remove browser integration first does the host part for you.
 
 Linux: make the AppImage executable and run it, unpack the tarball, or install the package with `sudo apt install ./webcraft_*_amd64.deb`. The .deb registers the desktop entry and protocol handler. Tray on GNOME needs AppIndicator support. Uninstall with `sudo apt remove webcraft` and remove `~/.config/autostart/webcraft.desktop`, or turn autostart off in Options first.
 
