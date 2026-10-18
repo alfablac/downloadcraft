@@ -1,6 +1,6 @@
 [package]
 name = "webcraft"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Clean-room cross-platform download manager (IDM feature clone)"
 license = "MIT"
@@ -30,6 +30,7 @@ egui = "0.29"
 rfd = "0.15"
 arboard = "3"
 tray-icon = "0.19"
+notify-rust = "4"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

@@ -681,6 +681,18 @@ pub fn execute_power(action: PowerAction) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Desktop notification (Windows toast / macOS / Linux dbus via notify-rust).
+/// Best-effort: failure logged nowhere, never blocks download flow.
+/// ponytail: no focus suppression; OS toast fires even when window focused.
+/// Add WINDOW_VISIBLE/focus check here if that becomes annoying.
+pub fn notify(title: &str, body: &str) {
+    let _ = notify_rust::Notification::new()
+        .summary(title)
+        .body(body)
+        .appname("webcraft")
+        .show();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

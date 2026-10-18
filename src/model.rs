@@ -203,6 +203,8 @@ pub struct Settings {
     pub start_minimized: bool,
     #[serde(default)]
     pub close_to_tray: bool,
+    #[serde(default = "def_true")]
+    pub notifications: bool,
     #[serde(default)]
     pub clipboard_monitor: bool,
     #[serde(default)]
@@ -265,6 +267,7 @@ impl Default for Settings {
             autostart: false,
             start_minimized: false,
             close_to_tray: true,
+            notifications: true,
             clipboard_monitor: false,
             proxy_url: String::new(),
             scheduler_enabled: true,
@@ -327,6 +330,20 @@ pub fn sanitize_filename(name: &str) -> String {
 }
 
 pub fn filename_from_url(url: &str) -> String {
+    // Magnet has no path segment: use dn= display name, else placeholder
+    // "torrent" (torrent poll loop replaces it once metadata arrives).
+    if url.trim_start().to_ascii_lowercase().starts_with("magnet:?") {
+        if let Some(q) = url.split_once('?').map(|(_, q)| q) {
+            for pair in q.split('&') {
+                if let Some(v) = pair.strip_prefix("dn=") {
+                    if !v.is_empty() {
+                        return sanitize_filename(&percent_decode(v));
+                    }
+                }
+            }
+        }
+        return "torrent".into();
+    }
     let clean = url.split(['?', '#']).next().unwrap_or(url);
     let last = clean.rsplit('/').next().unwrap_or("");
     let decoded = percent_decode(last);
@@ -500,6 +517,16 @@ mod tests {
     }
 
     #[test]
+    fn filename_from_magnet_uses_dn_or_placeholder() {
+        assert_eq!(
+            filename_from_url("magnet:?xt=urn:btih:abc&dn=My%20File%20%5B1080p%5D"),
+            "My File [1080p]"
+        );
+        assert_eq!(filename_from_url("magnet:?xt=urn:btih:abc"), "torrent");
+        assert_eq!(filename_from_url("magnet:?xt=urn:btih:abc&dn="), "torrent");
+    }
+
+    #[test]
     fn category_subfolder_path() {
         let base = std::path::Path::new("/dl");
         assert_eq!(dest_dir_for(base, "a.mp4", true), base.join("Video"));
@@ -512,5 +539,14 @@ mod tests {
         let s: Settings = serde_json::from_value(v).unwrap();
         assert_eq!(s.folder_template, "");
         assert!(!s.category_subfolders);
+    }
+
+    #[test]
+    fn notifications_default_true_when_absent() {
+        assert!(Settings::default().notifications);
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("notifications");
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert!(s.notifications, "old state without field defaults on");
     }
 }

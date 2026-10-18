@@ -63,6 +63,12 @@ async fn shared_session(settings: &Settings) -> Result<Arc<Session>, String> {
         .cloned()
 }
 
+/// Placeholder names seeded before metadata known (model::filename_from_url
+/// fallback / magnet without dn=); only these may adopt handle.name().
+fn is_placeholder_name(name: &str) -> bool {
+    matches!(name.trim(), "" | "download.bin" | "torrent" | "magnet_")
+}
+
 fn publish(ctrl: &Controls, handle: &ManagedTorrent) -> librqbit::TorrentStats {
     let s = handle.stats();
     if s.total_bytes > 0 {
@@ -114,6 +120,15 @@ pub async fn download_torrent(
 
     std::fs::create_dir_all(&task.dest_dir).map_err(|e| e.to_string())?;
     let session = shared_session(settings).await?;
+    // librqbit 9.0.1: per-torrent limits only via AddTorrentOptions.ratelimits
+    // (librqbit::limits::LimitsConfig, bytes/s); no runtime per-torrent setter
+    // (TorrentStateLive.ratelimits private, Session.ratelimits is global-only).
+    // ponytail: add-time only; live limit change needs delete+re-add — add when librqbit exposes setter.
+    // Mirror engine::throttle convention: kbps * 1024 bytes/s, 0 = unlimited.
+    let bps = std::num::NonZeroU32::new(
+        u32::try_from(ctrl.limit_kbps.load(Ordering::Relaxed).saturating_mul(1024))
+            .unwrap_or(u32::MAX),
+    );
     let handle = session
         .add_torrent(
             add,
@@ -121,6 +136,10 @@ pub async fn download_torrent(
                 // overwrite: files from a deleted/paused session entry must re-check + resume, not error.
                 overwrite: true,
                 output_folder: Some(task.dest_dir.to_string_lossy().into_owned()),
+                ratelimits: librqbit::limits::LimitsConfig {
+                    upload_bps: bps,
+                    download_bps: bps,
+                },
                 ..Default::default()
             }),
         )
@@ -130,9 +149,12 @@ pub async fn download_torrent(
         .ok_or("torrent add returned no handle")?;
     let id = librqbit::api::TorrentIdOrHash::Id(handle.id());
 
-    if let Some(name) = handle.name() {
-        if !name.is_empty() {
+    // Only placeholders adopt metadata name (here + poll loop); user names kept.
+    let mut name_pending = is_placeholder_name(&task.filename);
+    if name_pending {
+        if let Some(name) = handle.name().filter(|n| !n.trim().is_empty()) {
             task.filename = crate::model::sanitize_filename(&name);
+            name_pending = false;
         }
     }
     task.status = TaskStatus::Downloading;
@@ -176,6 +198,13 @@ pub async fn download_torrent(
         // Honour pause flag even before watcher lands (belt + braces).
         if ctrl.paused.load(Ordering::Relaxed) && wait_not_paused(&ctrl).await.is_err() {
             break;
+        }
+        // Metadata may arrive after add (magnet): adopt name once.
+        if name_pending {
+            if let Some(name) = handle.name().filter(|n| !n.trim().is_empty()) {
+                task.filename = crate::model::sanitize_filename(&name);
+                name_pending = false;
+            }
         }
         let s = publish(&ctrl, &handle);
         task.downloaded = s.progress_bytes;

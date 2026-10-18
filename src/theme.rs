@@ -1,6 +1,7 @@
-//! Desktop theme: graphite neutrals, 6px control / 8px panel radius, 1px borders
-//! (width constant in every widget state — no layout shift). Native-tool feel,
-//! not web. No gradients, no shadows-as-hierarchy. Steel accent, sparingly.
+//! Desktop theme: graphite neutrals, 4pt spacing grid, single 6px radius
+//! token (4px chips only), 1px borders (width constant in every widget
+//! state — no layout shift). Native-tool feel, not web. No gradients, no
+//! shadows-as-hierarchy. Steel accent, sparingly.
 use egui::{Color32, FontId, TextStyle};
 
 // Primitive — graphite ramp (neutral gray, no blue cast)
@@ -17,6 +18,7 @@ pub const G_100: Color32 = Color32::from_rgb(0xE8, 0xE8, 0xE8);
 
 // Accent: desaturated steel teal, used sparingly (selection, progress, active nav)
 pub const STEEL: Color32 = Color32::from_rgb(0x4E, 0x7A, 0x74);
+pub const SELECTION_BG: Color32 = Color32::from_rgb(0x2A, 0x3C, 0x38);
 pub const STEEL_DIM: Color32 = Color32::from_rgb(0x3A, 0x4A, 0x47);
 pub const OK: Color32 = Color32::from_rgb(0x5F, 0x9E, 0x6E);
 pub const WARN: Color32 = Color32::from_rgb(0xB8, 0x8A, 0x3D);
@@ -38,18 +40,19 @@ pub const ACCENT: Color32 = STEEL;
 pub const TEAL_500: Color32 = STEEL; // legacy alias (app.rs sparkline/status)
 pub const RED_600: Color32 = ERR;
 
-#[allow(dead_code)]
 pub const SP_XS: f32 = 4.0;
-#[allow(dead_code)]
 pub const SP_SM: f32 = 8.0;
 #[allow(dead_code)]
-pub const SP_MD: f32 = 16.0;
-// Radius: 6px controls (buttons/inputs/rows), 4px chips/strips, 8px panels/windows.
+pub const SP_MD: f32 = 12.0;
+#[allow(dead_code)]
+pub const SP_LG: f32 = 16.0;
+// Radius: single 6px token for controls/panels/windows; 4px chips only.
 pub const R_CTRL: f32 = 6.0;
 pub const R_CHIP: f32 = 4.0;
-pub const R_PANEL: f32 = 8.0;
+pub const R_PANEL: f32 = R_CTRL;
 /// Uniform clickable-control height (buttons, TextEdit, ComboBox, DragValue).
-pub const BTN_H: f32 = 23.0;
+/// 24 = 6*4pt-grid.
+pub const BTN_H: f32 = 24.0;
 /// Sidebar nav row height (IDM-compact density).
 pub const ROW_H_NAV: f32 = 20.0;
 /// STEEL as text (links, status, accents): STEEL fill color is 3.0-3.5:1 as text (fail); this is 6.1-7.3:1.
@@ -131,7 +134,7 @@ pub fn apply(ctx: &egui::Context) {
     v.widgets.active.bg_stroke = egui::Stroke::new(1.0f32, STEEL);
     v.widgets.active.fg_stroke = egui::Stroke::new(1.0f32, TEXT);
     v.widgets.open = v.widgets.hovered;
-    v.selection.bg_fill = STEEL_DIM;
+    v.selection.bg_fill = SELECTION_BG;
     v.selection.stroke = egui::Stroke::new(1.0f32, STEEL_TEXT);
     v.hyperlink_color = STEEL_TEXT;
     ctx.set_visuals(v);
@@ -139,22 +142,38 @@ pub fn apply(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     // Download-manager UI: labels are never text-selection targets (was I-beam cursor + stolen row clicks).
     style.interaction.selectable_labels = false;
-    style.spacing.item_spacing = egui::vec2(6.0, 3.0);
-    style.spacing.button_padding = egui::vec2(8.0, 3.0);
+    style.spacing.item_spacing = egui::vec2(SP_SM, SP_XS);
+    style.spacing.button_padding = egui::vec2(SP_SM, SP_XS);
     style.spacing.interact_size = egui::vec2(32.0, BTN_H);
-    style.spacing.window_margin = egui::Margin::same(12.0);
-    style.spacing.menu_margin = egui::Margin::same(6.0);
+    style.spacing.window_margin = egui::Margin::same(SP_MD);
+    style.spacing.menu_margin = egui::Margin::same(SP_SM);
     style.spacing.slider_width = 160.0;
-    style.spacing.scroll.floating = true;
-    style.spacing.scroll.bar_width = 10.0;
-    style.spacing.scroll.handle_min_length = 24.0;
+    style.spacing.indent = SP_LG;
+    // Floating thin scrollbars: no layout width, transparent track (all bg opacities 0).
+    // foreground_color=false: handle = widget bg_fill (G ramp), not fg text color.
+    style.spacing.scroll = egui::style::ScrollStyle {
+        floating: true,
+        bar_width: 8.0,
+        handle_min_length: 24.0,
+        bar_inner_margin: SP_XS,
+        bar_outer_margin: 0.0,
+        floating_width: SP_XS,
+        floating_allocated_width: 0.0,
+        foreground_color: false,
+        dormant_background_opacity: 0.0,
+        active_background_opacity: 0.0,
+        interact_background_opacity: 0.0,
+        dormant_handle_opacity: 0.0,
+        active_handle_opacity: 0.6,
+        interact_handle_opacity: 1.0,
+    };
     style.visuals.slider_trailing_fill = true;
     style.animation_time = 0.15;
     style.text_styles = [
         (TextStyle::Heading, FontId::proportional(13.0)),
         (TextStyle::Body, FontId::proportional(11.0)),
         (TextStyle::Button, FontId::proportional(11.0)),
-        (TextStyle::Small, FontId::proportional(10.5)),
+        (TextStyle::Small, FontId::proportional(10.0)),
         (TextStyle::Monospace, FontId::monospace(11.0)),
     ]
     .into();
@@ -184,7 +203,7 @@ pub fn chip(ui: &mut egui::Ui, label: &str, color: Color32) {
         .fill(SURFACE_RAISED)
         .stroke(egui::Stroke::new(1.0f32, BORDER))
         .rounding(R_CHIP)
-        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+        .inner_margin(egui::Margin::symmetric(SP_SM, SP_XS / 2.0))
         .show(ui, |ui| {
             ui.label(egui::RichText::new(label).color(color).small());
         });
@@ -196,14 +215,14 @@ pub fn panel() -> egui::Frame {
         .fill(SURFACE)
         .stroke(egui::Stroke::new(1.0f32, BORDER))
         .rounding(R_PANEL)
-        .inner_margin(egui::Margin::same(12.0))
+        .inner_margin(egui::Margin::same(SP_MD))
 }
 /// Sunken list/table frame.
 #[allow(dead_code)]
 pub fn list_frame() -> egui::Frame {
     egui::Frame::none()
         .fill(BG)
-        .stroke(egui::Stroke::new(1.0f32, BORDER_STRONG))
+        .stroke(egui::Stroke::new(1.0f32, BORDER))
         .rounding(R_PANEL)
         .inner_margin(egui::Margin::same(0.0))
 }
