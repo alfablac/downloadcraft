@@ -70,12 +70,23 @@ impl Runtime {
         } else {
             model::filename_from_url(url)
         };
+        // Single funnel: rename template + category subfolder for every
+        // task created via add_url (UI, clipboard, grabber, tray, CLI).
+        let filename = model::apply_folder_template(
+            &self.state.settings.folder_template,
+            &filename,
+            url,
+        );
         let order = self.state.tasks.len() as i64 + 1;
         let task = DownloadTask {
             id: new_id(),
             url: url.to_string(),
+            dest_dir: model::dest_dir_for(
+                &self.state.settings.download_dir,
+                &filename,
+                self.state.settings.category_subfolders,
+            ),
             filename: filename.clone(),
-            dest_dir: self.state.settings.download_dir.clone(),
             queue_id: if queue_id.is_empty() {
                 "main".into()
             } else {
@@ -397,6 +408,19 @@ fn url_decode(s: &str) -> String {
 /// path; returned tasks are finalized (id/filename/queue/dest_dir/order/
 /// category) but NOT pushed to state.tasks — app confirms them first.
 /// Inbox files are deleted here, so unconfirmed captures are lost on restart.
+/// Re-apply rename template + category subfolder to tasks built outside
+/// add_url (browser inbox override). Keeps funnel invariant: stored
+/// dest_dir/filename already reflect current settings at capture time.
+fn apply_task_naming(s: &Settings, t: &mut DownloadTask) {
+    t.filename = model::apply_folder_template(&s.folder_template, &t.filename, &t.url);
+    t.category = category_for(&t.filename).into();
+    t.dest_dir = model::dest_dir_for(
+        &s.download_dir,
+        &t.filename,
+        s.category_subfolders,
+    );
+}
+
 pub fn take_inbox_tasks(rt: &Arc<Mutex<Runtime>>) -> Vec<DownloadTask> {
     let dir = platform::inbox_dir();
     let mut out = Vec::new();
@@ -433,11 +457,18 @@ pub fn take_inbox_tasks(rt: &Arc<Mutex<Runtime>>) -> Vec<DownloadTask> {
                 if t.queue_id.is_empty() {
                     t.queue_id = "main".into();
                 }
-                if t.dest_dir.as_os_str().is_empty() {
-                    t.dest_dir = g.state.settings.download_dir.clone();
+                // Honor explicit savePath; empty gets settings dir, then
+                // naming funnel applies template + category subfolder.
+                let explicit_dir = !t.dest_dir.as_os_str().is_empty();
+                if !explicit_dir {
+                    apply_task_naming(&g.state.settings.clone(), &mut t);
+                } else {
+                    // Explicit dir from browser: still rename, keep dir.
+                    let tpl = g.state.settings.folder_template.clone();
+                    t.filename = model::apply_folder_template(&tpl, &t.filename, &t.url);
+                    t.category = category_for(&t.filename).into();
                 }
                 t.order = g.state.tasks.len() as i64 + 1 + out.len() as i64;
-                t.category = category_for(&t.filename).into();
                 g.log(format!("Inbox: {}", t.url));
                 drop(g);
                 out.push(t);

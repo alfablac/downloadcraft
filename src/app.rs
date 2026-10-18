@@ -7,6 +7,7 @@ use crate::queue::plan_starts;
 use crate::scheduler::{next_run_in, should_start, should_stop};
 use crate::theme;
 use crate::Runtime;
+use downloadcraft_lib::update::{self, CheckOutcome};
 use downloadcraft_lib::ytdlp;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -147,6 +148,8 @@ pub struct DownloadApp {
     tray: Option<TrayState>,
     hidden: bool,
     ytdlp_checked: bool,
+    update_check: Option<CheckOutcome>,
+    update_slot: std::sync::Arc<std::sync::Mutex<Option<CheckOutcome>>>,
     show_about: bool,
     search: String,
     minutes_today: (i64, u32),
@@ -362,6 +365,8 @@ impl DownloadApp {
             tray: Some(TrayState { _nav: tray }),
             hidden,
             ytdlp_checked: false,
+            update_check: None,
+            update_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
             show_about: false,
             search: String::new(),
             minutes_today: today_parts(),
@@ -1087,6 +1092,34 @@ impl DownloadApp {
                 }
             }
             for qid in to_start {
+                // Scheduler trigger: copy sch.on_complete onto queue (run_completion
+                // reads queue, sch.on_complete was never read) and apply speed-window
+                // limit via global mechanism (settings.speed_limit_kbps + controls
+                // atomic, same as Settings apply at save).
+                {
+                    let mut g = self.rt.lock().unwrap();
+                    let sch = g
+                        .state
+                        .schedules
+                        .iter()
+                        .find(|s| s.queue_id == qid)
+                        .cloned();
+                    if let Some(sch) = sch {
+                        if let Some(q) =
+                            g.state.queues.iter_mut().find(|q| q.id == qid)
+                        {
+                            q.on_complete = sch.on_complete;
+                        }
+                        if sch.limit_kbps > 0 {
+                            g.state.settings.speed_limit_kbps = sch.limit_kbps;
+                            for c in g.controls.values() {
+                                c.limit_kbps
+                                    .store(sch.limit_kbps, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        g.save();
+                    }
+                }
                 // route through planner so global/per-queue caps hold (was: direct start, caps bypassed)
                 let ids: Vec<String> = {
                     let g = self.rt.lock().unwrap();
@@ -1210,6 +1243,33 @@ fn today_parts() -> (i64, u32) {
     ((now / 86400), (now % 86400) as u32)
 }
 
+/// Split on whitespace, keeping `"..."` as one token (quotes stripped).
+fn split_cmdline(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut has = false;
+    for c in s.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                has = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if has || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                    has = false;
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if has || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 fn run_completion(g: &Runtime, queue_id: &str, task_id: &str) {
     let Some(q) = g.state.queues.iter().find(|q| q.id == queue_id) else {
         return;
@@ -1223,9 +1283,23 @@ fn run_completion(g: &Runtime, queue_id: &str, task_id: &str) {
         }
         CompletionAction::RunCommand => {
             if !q.on_complete_arg.is_empty() {
-                let parts: Vec<&str> = q.on_complete_arg.split_whitespace().collect();
+                // {file} = completed file full path, quoted if contains spaces.
+                // split_cmdline keeps quoted segment as one arg (quotes stripped,
+                // Command passes it as single argv entry).
+                let arg = if let Some(t) = task {
+                    let ps = t.dest_dir.join(&t.filename).to_string_lossy().into_owned();
+                    let quoted = if ps.contains(' ') {
+                        format!("\"{ps}\"")
+                    } else {
+                        ps
+                    };
+                    q.on_complete_arg.replace("{file}", &quoted)
+                } else {
+                    q.on_complete_arg.clone()
+                };
+                let parts = split_cmdline(&arg);
                 if !parts.is_empty() {
-                    let _ = std::process::Command::new(parts[0])
+                    let _ = std::process::Command::new(&parts[0])
                         .args(&parts[1..])
                         .spawn();
                 }
@@ -1364,6 +1438,10 @@ impl eframe::App for DownloadApp {
                                 ui.close_menu();
                             }
                             ui.separator();
+                            if ui.button("Import URLs file...").clicked() {
+                                import_urls_file(self);
+                                ui.close_menu();
+                            }
                             if ui.button("Export queue (JSON)").clicked() {
                                 export_json(self);
                                 ui.close_menu();
@@ -1873,6 +1951,24 @@ fn remove_task(app: &mut DownloadApp, id: &str) {
     g.save();
 }
 fn resume_all(app: &mut DownloadApp) {
+    // Error tasks exhausted retry budget (attempts>retry). start_task alone
+    // re-enters worker, but first error re-increments past budget -> no real
+    // retry. Reset attempts + retry gate so Retry-all actually retries.
+    {
+        let mut g = app.rt.lock().unwrap();
+        let mut changed = false;
+        for t in g.state.tasks.iter_mut() {
+            if t.status == TaskStatus::Error {
+                t.attempts = 0;
+                t.next_retry_at = 0;
+                t.error.clear();
+                changed = true;
+            }
+        }
+        if changed {
+            g.save();
+        }
+    }
     let ids: Vec<String> = {
         let g = app.rt.lock().unwrap();
         g.state
@@ -1936,6 +2032,38 @@ fn export_json(app: &mut DownloadApp) {
     let path = g.state.settings.download_dir.join("webcraft-export.json");
     let _ = std::fs::write(path, txt);
 }
+fn import_urls_file(app: &mut DownloadApp) {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("Text", &["txt"])
+        .pick_file()
+    else {
+        return;
+    };
+    let Ok(txt) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    // Dedupe vs existing tasks + within file. Mirror add_batch_clipboard.
+    let existing: std::collections::HashSet<String> = {
+        let g = app.rt.lock().unwrap();
+        g.state.tasks.iter().map(|t| t.url.clone()).collect()
+    };
+    let mut seen = existing;
+    let mut added = 0usize;
+    for line in txt.lines() {
+        let u = line.trim();
+        if (u.starts_with("http://") || u.starts_with("https://") || u.contains("://"))
+            && seen.insert(u.to_string())
+        {
+            add_url_task(app, u);
+            added += 1;
+        }
+    }
+    app.rt
+        .lock()
+        .unwrap()
+        .log(format!("Imported {added} URLs from {}", path.display()));
+}
+
 fn add_batch_clipboard(app: &mut DownloadApp) {
     if let Ok(mut cb) = arboard::Clipboard::new() {
         if let Ok(txt) = cb.get_text() {
@@ -2764,6 +2892,9 @@ impl DownloadApp {
             "start" | "later" => {
                 // Basename sanitized on confirm ("" -> "download.bin" via sanitizer).
                 t.filename = crate::model::sanitize_filename(&name_input);
+                t.category = crate::model::category_for(&t.filename).into();
+                // dest_dir already shown/editable in dialog (Browse wins);
+                // funnel set it before dialog, don't override user edit.
                 t.status = if act == "start" {
                     TaskStatus::Queued
                 } else {
@@ -3625,11 +3756,27 @@ impl DownloadApp {
                             if let Some(q) = queues.iter().find(|q| q.id == sch.queue_id) {
                                 arg = q.on_complete_arg.clone();
                             }
-                            ui.add(
-                                egui::TextEdit::singleline(&mut arg)
-                                    .hint_text("command (set on queue)")
-                                    .desired_width(200.0),
-                            );
+                            // Was dead: TextEdit wrote local `arg`, dropped. Write
+                            // back to queue (run_completion reads q.on_complete_arg).
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut arg)
+                                        .hint_text("command, {file} = file")
+                                        .desired_width(200.0),
+                                )
+                                .changed()
+                            {
+                                let mut g = self.rt.lock().unwrap();
+                                if let Some(q) = g
+                                    .state
+                                    .queues
+                                    .iter_mut()
+                                    .find(|q| q.id == sch.queue_id)
+                                {
+                                    q.on_complete_arg = arg.clone();
+                                }
+                                g.save();
+                            }
                         }
                         if matches!(
                             sch.on_complete,
@@ -3639,6 +3786,16 @@ impl DownloadApp {
                             if ui.checkbox(&mut cf, "Confirmed: PC power action").changed() {
                                 edit(self, &move |x: &mut Schedule| x.power_confirmed = cf);
                             }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        let mut lim = sch.limit_kbps;
+                        ui.label("Speed limit KB/s (0 = unlimited):");
+                        if ui
+                            .add(egui::DragValue::new(&mut lim).range(0..=1_000_000))
+                            .changed()
+                        {
+                            edit(self, &move |x: &mut Schedule| x.limit_kbps = lim);
                         }
                     });
                     ui.horizontal(|ui| {
@@ -4212,6 +4369,12 @@ impl DownloadApp {
                     ui.add(egui::Slider::new(&mut settings.global_max_concurrent, 1..=16).text("Simultaneous downloads"));
                     ui.add(egui::Slider::new(&mut settings.speed_limit_kbps, 0..=100_000).text("Speed limit KB/s (0 = unlimited)"));
                     ui.label(egui::RichText::new("Double-click a download to open its progress window.").color(theme::TEXT_FAINT).small());
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("Rename template").color(theme::TEXT_MUTED).small().strong());
+                    ui.add(egui::TextEdit::singleline(&mut settings.folder_template).hint_text("{name}-{date}{ext}").desired_width(ui.available_width()));
+                    ui.label(egui::RichText::new("Tokens: {name} stem, {ext} with dot, {date} YYYY-MM-DD, {host}, {category}. Empty keeps original name. New downloads only.").color(theme::TEXT_FAINT).small());
+                    ui.checkbox(&mut settings.category_subfolders, "Category subfolders");
+                    ui.label(egui::RichText::new("Save new downloads under download folder / category (Video, Music, …). General stays in download folder.").color(theme::TEXT_FAINT).small());
                 }
                 4 => {
                     ui.label(egui::RichText::new("Connection").strong());
@@ -4269,6 +4432,82 @@ impl DownloadApp {
                 }
                 _ => {
                     ui.label(egui::RichText::new("About").strong());
+                    ui.label(egui::RichText::new("App updates").strong());
+                    // ponytail: manual check only (no silent startup check / self-replace in v1);
+                    // download lands as a normal task, user runs the installer.
+                    let checking = matches!(self.update_check, Some(CheckOutcome::Checking));
+                    if ui
+                        .add_enabled(!checking, egui::Button::new("Check updates"))
+                        .clicked()
+                    {
+                        self.update_check = Some(CheckOutcome::Checking);
+                        let rt = self.tokio_rt.clone();
+                        let ctx2 = ui.ctx().clone();
+                        let shared = self.update_slot.clone();
+                        std::thread::spawn(move || {
+                            let res = rt.block_on(update::fetch_latest());
+                            let outcome = match res {
+                                Ok(rel) => update::evaluate(
+                                    &rel,
+                                    env!("CARGO_PKG_VERSION"),
+                                    std::env::consts::OS,
+                                    std::env::consts::ARCH,
+                                ),
+                                Err(e) => CheckOutcome::Failed(e),
+                            };
+                            *shared.lock().unwrap() = Some(outcome);
+                            ctx2.request_repaint();
+                        });
+                    }
+                    if let Some(slot) = self.update_slot.lock().unwrap().take() {
+                        self.update_check = Some(slot);
+                    }
+                    // Clone: Download button needs &mut self (start_task).
+                    match self.update_check.clone() {
+                        None => {}
+                        Some(CheckOutcome::Checking) => {
+                            ui.label("Checking for updates...");
+                        }
+                        Some(CheckOutcome::UpToDate { latest }) => {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(80, 200, 120),
+                                format!("Up to date (latest {latest})"),
+                            );
+                        }
+                        Some(CheckOutcome::Failed(e)) => {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(230, 90, 90),
+                                format!("Update check failed: {e}"),
+                            );
+                        }
+                        Some(CheckOutcome::Available { latest, asset }) => {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(240, 190, 80),
+                                format!("New version {latest} available"),
+                            );
+                            match asset {
+                                Some((name, url)) => {
+                                    ui.label(format!("Asset: {name}"));
+                                    if ui.button("Download update").clicked() {
+                                        let id = self
+                                            .rt
+                                            .lock()
+                                            .unwrap()
+                                            .add_url(&url, "main", "", "");
+                                        // Never self-replace: plain download task.
+                                        self.start_task(&id);
+                                        self.rt
+                                            .lock()
+                                            .unwrap()
+                                            .log(format!("Update download queued: {name}"));
+                                    }
+                                }
+                                None => {
+                                    ui.label("No installer asset for this platform.");
+                                }
+                            }
+                        }
+                    }
                     ui.separator();
                     ui.label(format!("webcraft v{}", env!("CARGO_PKG_VERSION")));
                     ui.label("Cross-platform download manager written in Rust with egui.");

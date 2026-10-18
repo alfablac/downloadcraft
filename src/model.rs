@@ -238,6 +238,13 @@ pub struct Settings {
     /// Keep seeding after download completes instead of pausing torrent.
     #[serde(default)]
     pub torrent_seed_after_complete: bool,
+    /// Rename template for new download filenames: {name} stem, {ext} with
+    /// dot, {date} YYYY-MM-DD, {host}, {category}. Empty = keep original.
+    #[serde(default)]
+    pub folder_template: String,
+    /// Route new downloads into download_dir/<Category>/ (except General).
+    #[serde(default)]
+    pub category_subfolders: bool,
 }
 fn def_nntp_port() -> u16 {
     563
@@ -271,6 +278,8 @@ impl Default for Settings {
             nntp_pass: String::new(),
             torrent_listen_port: 0,
             torrent_seed_after_complete: false,
+            folder_template: String::new(),
+            category_subfolders: false,
         }
     }
 }
@@ -350,6 +359,105 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+// Adapted from downloadcraft (MIT): folder-rule/rename-template ideas
+// (upstream src/model.rs FolderRule/apply_rename_template), rewritten to
+// reuse this crate's Category map instead of a separate rule list.
+
+/// Expand rename template. Pure: date injected so tests pin exact output.
+/// `{name}` stem, `{ext}` extension incl dot ("" if none), `{date}`
+/// YYYY-MM-DD, `{host}` URL host ("" if unparseable), `{category}`.
+/// Empty/whitespace template returns original filename unchanged.
+/// Sanitized via sanitize_filename; blank result falls back to original.
+pub fn expand_template(
+    tpl: &str,
+    stem: &str,
+    ext: &str,
+    host: &str,
+    category: &str,
+    date_str: &str,
+) -> String {
+    if tpl.trim().is_empty() {
+        return format!("{stem}{ext}");
+    }
+    let out = tpl
+        .replace("{name}", stem)
+        .replace("{ext}", ext)
+        .replace("{date}", date_str)
+        .replace("{host}", host)
+        .replace("{category}", category);
+    // Template may reference only {category} etc and omit {ext}; keep ext.
+    let out = if !ext.is_empty() && !out.to_ascii_lowercase().ends_with(&ext.to_ascii_lowercase()) {
+        format!("{out}{ext}")
+    } else {
+        out
+    };
+    let clean = sanitize_filename(out.trim());
+    // sanitize maps ""/dot-only to "download.bin"; treat that as fallback.
+    if clean == "download.bin" && !stem.is_empty() {
+        return format!("{stem}{ext}");
+    }
+    clean
+}
+
+/// Split filename into (stem, ext-with-dot). Dot at index 0 = no ext.
+pub fn split_stem_ext(filename: &str) -> (&str, &str) {
+    match filename.rfind('.') {
+        Some(i) if i > 0 => (&filename[..i], &filename[i..]),
+        _ => (filename, ""),
+    }
+}
+
+/// Current local date as YYYY-MM-DD. No chrono dep: UTC date from epoch
+/// days via scheduler::civil_from_days inverse; local tz offset ignored
+/// (ponytail: UTC date, off-by-one near midnight acceptable).
+pub fn today_str() -> String {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86400) as i64)
+        .unwrap_or(0);
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Inverse of scheduler::days_from_civil (Howard Hinnant algorithm).
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Apply settings rename template to a filename for `url`. Empty template
+/// returns filename unchanged. Category derived from original filename.
+pub fn apply_folder_template(tpl: &str, filename: &str, url: &str) -> String {
+    if tpl.trim().is_empty() {
+        return filename.to_string();
+    }
+    let (stem, ext) = split_stem_ext(filename);
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
+    expand_template(tpl, stem, ext, &host, category_for(filename), &today_str())
+}
+
+/// Destination dir for new task: category subfolder when enabled and
+/// category != "General" (this crate's Other-equivalent), else base.
+pub fn dest_dir_for(base: &std::path::Path, filename: &str, category_subfolders: bool) -> std::path::PathBuf {
+    let cat = category_for(filename);
+    if category_subfolders && cat != "General" {
+        base.join(cat)
+    } else {
+        base.to_path_buf()
+    }
+}
+
 pub fn category_for(filename: &str) -> &'static str {
     let ext = filename
         .rsplit('.')
@@ -363,5 +471,46 @@ pub fn category_for(filename: &str) -> &'static str {
         "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" => "Documents",
         "exe" | "msi" | "dmg" | "deb" | "rpm" | "appimage" | "apk" => "Programs",
         _ => "General",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_template_exact() {
+        assert_eq!(
+            expand_template("{name}-{date}{ext}", "Vid", ".mp4", "cdn.example", "Video", "2026-10-17"),
+            "Vid-2026-10-17.mp4"
+        );
+        assert_eq!(
+            expand_template("{category}_{host}_{name}{ext}", "a", ".mkv", "cdn.example", "Video", "2026-10-17"),
+            "Video_cdn.example_a.mkv"
+        );
+        assert_eq!(
+            expand_template("{name} from {host}", "a", ".mkv", "h", "Video", "2026-10-17"),
+            "a from h.mkv",
+            "missing ext appended"
+        );
+        assert_eq!(expand_template("", "a", ".mp4", "h", "Video", "2026-10-17"), "a.mp4");
+        assert_eq!(expand_template("  ", "a", ".mp4", "h", "Video", "2026-10-17"), "a.mp4");
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(20743), (2026, 10, 17));
+    }
+
+    #[test]
+    fn category_subfolder_path() {
+        let base = std::path::Path::new("/dl");
+        assert_eq!(dest_dir_for(base, "a.mp4", true), base.join("Video"));
+        assert_eq!(dest_dir_for(base, "a.bin", true), base.to_path_buf());
+        assert_eq!(dest_dir_for(base, "a.mp4", false), base.to_path_buf());
+        // Old state without new fields deserializes to defaults.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("folder_template");
+        v.as_object_mut().unwrap().remove("category_subfolders");
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(s.folder_template, "");
+        assert!(!s.category_subfolders);
     }
 }
