@@ -13,7 +13,12 @@ pub fn cache_dir() -> PathBuf { directories::ProjectDirs::from("", "", "download
 pub fn default_download_dir() -> PathBuf { directories::UserDirs::new().and_then(|u| u.download_dir().map(|p| p.to_path_buf())).unwrap_or_else(|| std::env::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("Downloads")) }
 pub fn state_path() -> PathBuf { config_dir().join("state.json") }
 
-/// Restore this process window when another launch writes `show.request`.
+/// Real main-window visibility (visible && !minimized), maintained by watcher
+/// on Windows from HWND state; app writes it on egui-driven show/hide. Tray
+/// label + hidden flag sync from this when native side changes state alone.
+pub static WINDOW_VISIBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Restore/hide this process window when tray/second launch writes `show.request`.
 /// Hidden viewport stops egui update, so request cannot be handled by app poll on Windows.
 pub fn spawn_show_watcher() {
     #[cfg(windows)]
@@ -26,20 +31,52 @@ pub fn spawn_show_watcher() {
             fn ShowWindow(hwnd: Hwnd, cmd: i32) -> Bool;
             fn SetForegroundWindow(hwnd: Hwnd) -> Bool;
             fn PostMessageW(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> Bool;
+            fn IsWindowVisible(hwnd: Hwnd) -> Bool;
+            fn IsIconic(hwnd: Hwnd) -> Bool;
         }
-        extern "system" fn show(hwnd: *mut core::ffi::c_void, _: isize) -> i32 {
+        extern "system" fn find(hwnd: *mut core::ffi::c_void, p: isize) -> i32 {
             unsafe {
                 let mut pid = 0;
                 GetWindowThreadProcessId(hwnd, &mut pid);
-                if pid == std::process::id() { ShowWindow(hwnd, 9); SetForegroundWindow(hwnd); PostMessageW(hwnd, 0x8001, 0, 0); }
+                if pid == std::process::id() { *(p as *mut Hwnd) = hwnd; return 0; }
             }
             1
         }
+        fn our_hwnd() -> Option<Hwnd> {
+            let mut hwnd: Hwnd = std::ptr::null_mut();
+            unsafe { EnumWindows(find, &mut hwnd as *mut Hwnd as isize); }
+            if hwnd.is_null() { None } else { Some(hwnd) }
+        }
+        fn shown(hwnd: Hwnd) -> bool { unsafe { IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 } }
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let Some(hwnd) = our_hwnd() else { continue };
             let req = config_dir().join("show.request");
-            // Do not delete: app poll must consume it to clear hidden state.
-            if req.exists() { unsafe { EnumWindows(show, 0); } }
+            if let Ok(content) = std::fs::read_to_string(&req) {
+                match content.trim() {
+                    // Consume toggle here: leaving it would flip repeatedly.
+                    // App syncs hidden/label from WINDOW_VISIBLE below.
+                    "toggle" => {
+                        let _ = std::fs::remove_file(&req);
+                        unsafe {
+                            if shown(hwnd) { ShowWindow(hwnd, 0); } else { ShowWindow(hwnd, 9); SetForegroundWindow(hwnd); }
+                            PostMessageW(hwnd, 0x8001, 0, 0);
+                        }
+                    }
+                    // Do not delete show/add: app poll must consume it to
+                    // clear hidden state / open Add dialog.
+                    _ => unsafe {
+                        if !shown(hwnd) { ShowWindow(hwnd, 9); SetForegroundWindow(hwnd); }
+                        PostMessageW(hwnd, 0x8001, 0, 0);
+                    },
+                }
+            }
+            // Track native changes (taskbar minimize/restore, toggle above):
+            // wake app on change so tray label follows real visibility.
+            let vis = shown(hwnd);
+            if WINDOW_VISIBLE.swap(vis, std::sync::atomic::Ordering::Relaxed) != vis {
+                unsafe { PostMessageW(hwnd, 0x8001, 0, 0); }
+            }
         }
     });
 }

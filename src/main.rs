@@ -167,7 +167,10 @@ fn run_gui(initial_urls: Vec<String>, hidden: bool) {
     // drain inbox into pending captures (confirm dialog shows on first frame)
     rt.lock().unwrap().pending_captures = take_inbox_tasks(&rt);
     let rt_clone = rt.clone();
-    let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 720.0]).with_min_inner_size([760.0, 520.0]).with_title(format!("downloadcraft v{}", env!("CARGO_PKG_VERSION"))).with_visible(!hidden), ..Default::default() };
+    // Window/taskbar icon: same artwork as .exe resource (assets/downloadcraft.png -> .ico).
+    // Without this eframe/winit falls back to a default blue square.
+    let win_icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/downloadcraft.png")).unwrap_or_default();
+    let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_icon(std::sync::Arc::new(win_icon)).with_inner_size([1180.0, 720.0]).with_min_inner_size([760.0, 520.0]).with_title(format!("downloadcraft v{}", env!("CARGO_PKG_VERSION"))).with_visible(!hidden), ..Default::default() };
     let _ = eframe::run_native("downloadcraft", options, Box::new(move |cc| Ok(Box::new(app::DownloadApp::new(cc, rt_clone, hidden)))));
 }
 

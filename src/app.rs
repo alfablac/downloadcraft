@@ -138,16 +138,19 @@ pub struct DownloadApp {
     capture_just_opened: bool,
 }
 
+/// Tray toggle label for current window visibility.
+fn tray_toggle_label(visible: bool) -> &'static str { if visible { "Hide downloadcraft" } else { "Show downloadcraft" } }
+
 /// Live tray state: keep icon+menu alive; poll MenuEvent receiver each tick for Show/Add/Quit.
 struct TrayState { _nav: Option<TrayNav> }
-struct TrayNav { _tray: tray_icon::TrayIcon, _menu: tray_icon::menu::Menu, show_id: tray_icon::menu::MenuId, add_id: tray_icon::menu::MenuId, quit_id: tray_icon::menu::MenuId }
+struct TrayNav { _tray: tray_icon::TrayIcon, _menu: tray_icon::menu::Menu, show_item: tray_icon::menu::MenuItem, show_id: tray_icon::menu::MenuId, add_id: tray_icon::menu::MenuId, quit_id: tray_icon::menu::MenuId }
 
 impl DownloadApp {
     pub fn new(cc: &eframe::CreationContext<'_>, rt: Arc<Mutex<Runtime>>, hidden: bool) -> Self {
         theme::apply(&cc.egui_ctx);
         // Cap workers: default = CPU cores (32 threads parked forever). Downloads are network-bound; 4 is ample.
         let tokio_rt = Arc::new(tokio::runtime::Builder::new_multi_thread().worker_threads(4).max_blocking_threads(16).enable_all().build().expect("tokio rt"));
-        let tray = Self::make_tray();
+        let tray = Self::make_tray(!hidden);
         // Tray Quit must not depend on egui poll: hidden viewport stops update(),
         // so poll-drained Quit starved and process needed Task Manager. Handler runs
         // on muda event delivery; Quit saves + exits directly. Show/Add write
@@ -163,27 +166,59 @@ impl DownloadApp {
                     if let Ok(txt) = std::fs::read_to_string(&lock) { if txt.trim() == std::process::id().to_string() { let _ = std::fs::remove_file(&lock); } }
                     std::process::exit(0);
                 }
-                if ev.id == show_id || ev.id == add_id {
-                    let _ = std::fs::write(crate::platform::config_dir().join("show.request"), "show");
+                if ev.id == show_id {
+                    let _ = std::fs::write(crate::platform::config_dir().join("show.request"), "toggle");
+                } else if ev.id == add_id {
+                    let _ = std::fs::write(crate::platform::config_dir().join("show.request"), "add");
+                }
+            }));
+            // Double-click tray icon toggles window (Windows-only event;
+            // left button only so right double-click still opens menu).
+            tray_icon::TrayIconEvent::set_event_handler(Some(move |ev: tray_icon::TrayIconEvent| {
+                if matches!(ev, tray_icon::TrayIconEvent::DoubleClick { button: tray_icon::MouseButton::Left, .. }) {
+                    let _ = std::fs::write(crate::platform::config_dir().join("show.request"), "toggle");
                 }
             }));
         }
         Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_ext_depth: 0, grab_scope: 0, grab_exts: String::new(), grab_parent_dirs: false, grab_only_paths: String::new(), grab_exclude_paths: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), grab_status: "Enter a start URL, then Explore.".into(), grab_busy: false, grab_auto_explore: false, last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, options_notice: "Changes save automatically.".into(), show_add: false, show_progress_for: None, selected: None, selected_schedule: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new(), rate_smooth: std::collections::HashMap::new(), handles: std::collections::HashMap::new(), allow_close: false, dl_widths: None, grab_widths: None, capture_task: None, capture_name: String::new(), capture_just_opened: false }
     }
 
-    fn make_tray() -> Option<TrayNav> {
-        // 16x16 RGBA icon generated in code (no proprietary asset).
-        let mut rgba = vec![0u8; 16 * 16 * 4];
-        for i in 0..256 { rgba[i * 4] = 30; rgba[i * 4 + 1] = 58; rgba[i * 4 + 2] = 95; rgba[i * 4 + 3] = 255; }
-        let icon = tray_icon::Icon::from_rgba(rgba, 16, 16).ok()?;
+    fn make_tray(visible: bool) -> Option<TrayNav> {
+        // Tray icon: same PNG as window/.exe icon (was code-generated solid blue square).
+        let data = eframe::icon_data::from_png_bytes(include_bytes!("../assets/downloadcraft.png")).ok()?;
+        let icon = tray_icon::Icon::from_rgba(data.rgba, data.width, data.height).ok()?;
         let menu = tray_icon::menu::Menu::new();
-        let show = tray_icon::menu::MenuItem::new("Show downloadcraft", true, None);
+        let show = tray_icon::menu::MenuItem::new(tray_toggle_label(visible), true, None);
         let add = tray_icon::menu::MenuItem::new("Add URL...", true, None);
         let quit = tray_icon::menu::MenuItem::new("Quit", true, None);
         let (show_id, add_id, quit_id) = (show.id().clone(), add.id().clone(), quit.id().clone());
         let _ = menu.append_items(&[&show, &add, &quit]);
         let tray = tray_icon::TrayIconBuilder::new().with_icon(icon).with_menu(Box::new(menu.clone())).with_tooltip("downloadcraft").build().ok()?;
-        Some(TrayNav { _tray: tray, _menu: menu, show_id, add_id, quit_id })
+        Some(TrayNav { _tray: tray, _menu: menu, show_item: show, show_id, add_id, quit_id })
+    }
+
+    /// Record window visibility: tray toggle label + shared state watcher syncs.
+    fn sync_tray_label(&self) {
+        crate::platform::WINDOW_VISIBLE.store(!self.hidden, std::sync::atomic::Ordering::Relaxed);
+        if let Some(nav) = self.tray.as_ref().and_then(|t| t._nav.as_ref()) { nav.show_item.set_text(tray_toggle_label(!self.hidden)); }
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.hidden = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.sync_tray_label();
+    }
+
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        self.hidden = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.sync_tray_label();
+    }
+
+    fn toggle_window(&mut self, ctx: &egui::Context) {
+        if self.hidden { self.show_window(ctx); } else { self.hide_window(ctx); }
     }
 
     fn start_task(&mut self, id: &str) {
@@ -327,27 +362,39 @@ impl DownloadApp {
         // ran). Live workers keep theirs: start_task inserts Controls then
         // handle synchronously on this thread, so live worker has handle here.
         { let handles = &self.handles; self.rt.lock().unwrap().controls.retain(|id, _| handles.get(id).is_some_and(|h| !h.is_finished())); }
-        // Tray menu events (cheap, event-driven): Show / Add URL / Quit
+        // Tray menu events (cheap, event-driven): Toggle / Add URL / Quit.
+        // Dead while MenuEvent handler is set (handler consumes channel),
+        // kept as fallback toggle path.
         let tray_act = self.tray.as_ref().and_then(|t| t._nav.as_ref()).map(|nav| {
             let mut act = "";
             while let Ok(ev) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-                if ev.id == nav.show_id { act = "show"; } else if ev.id == nav.add_id { act = "add"; } else if ev.id == nav.quit_id { act = "quit"; }
+                if ev.id == nav.show_id { act = "toggle"; } else if ev.id == nav.add_id { act = "add"; } else if ev.id == nav.quit_id { act = "quit"; }
             }
             act
         }).unwrap_or("");
         match tray_act {
-            "show" => { self.hidden = false; ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true)); ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false)); ctx.send_viewport_cmd(egui::ViewportCommand::Focus); }
-            "add" => { self.hidden = false; ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true)); ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false)); ctx.send_viewport_cmd(egui::ViewportCommand::Focus); self.tab = Tab::Downloads; self.show_add = true; }
+            "toggle" => self.toggle_window(ctx),
+            "add" => { self.show_window(ctx); self.tab = Tab::Downloads; self.show_add = true; }
             "quit" => { self.allow_close = true; self.rt.lock().unwrap().save(); ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
             _ => {}
         }
         let show_request = crate::platform::config_dir().join("show.request");
         if show_request.exists() {
+            let content = std::fs::read_to_string(&show_request).unwrap_or_default();
             let _ = std::fs::remove_file(&show_request);
-            self.hidden = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            match content.trim() {
+                "toggle" => self.toggle_window(ctx),
+                "add" => { self.show_window(ctx); self.tab = Tab::Downloads; self.show_add = true; }
+                _ => self.show_window(ctx),
+            }
+        }
+        // Windows: watcher/native taskbar may show/hide HWND behind egui's
+        // back (tray toggle while hidden, taskbar minimize/restore). Follow
+        // real visibility so hidden flag + tray label stay correct.
+        #[cfg(windows)]
+        {
+            let visible = crate::platform::WINDOW_VISIBLE.load(std::sync::atomic::Ordering::Relaxed);
+            if visible == self.hidden { self.hidden = !visible; self.sync_tray_label(); }
         }
         // Extension "Grab site": prefill Grabber and auto-explore.
         { let grabf = crate::platform::config_dir().join("pending-grab.txt"); if let Ok(u) = std::fs::read_to_string(&grabf) { let _ = std::fs::remove_file(&grabf); let u = u.trim().to_string(); if !u.is_empty() { self.grab_url = u; self.tab = Tab::Grabber; self.grab_auto_explore = true; } } }
@@ -357,10 +404,7 @@ impl DownloadApp {
         // sit in rt.pending_captures until confirmed, so no auto-start here.
         let has_capture = self.capture_task.is_some() || !self.rt.lock().unwrap().pending_captures.is_empty();
         if has_capture && (self.hidden || ctx.input(|i| i.viewport().minimized.unwrap_or(false))) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            self.hidden = false;
+            self.show_window(ctx);
         }
         if self.grab_busy {
             GRAB_SLOT.with(|s| {
@@ -524,8 +568,7 @@ impl eframe::App for DownloadApp {
             if to_tray {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                self.hidden = true;
+                self.hide_window(ctx);
                 // One-shot trim on hide: pages go to standby (Private unchanged, fault back on use).
                 #[cfg(windows)]
                 unsafe {
@@ -539,7 +582,7 @@ impl eframe::App for DownloadApp {
         if self.hidden { return; }
 
         // ── Top bar: brand + menus (IDM: Tasks/File/Downloads/View/Help) ──
-        egui::TopBottomPanel::top("topbar").frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::NONE).inner_margin(egui::Margin::symmetric(8.0, 4.0))).show(ctx, |ui| {
+        egui::TopBottomPanel::top("topbar").frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::NONE).inner_margin(egui::Margin { left: 8.0, right: 16.0, top: 4.0, bottom: 4.0 })).show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 egui::menu::bar(ui, |ui| {
                     ui.menu_button("Tasks", |ui| {
@@ -580,6 +623,8 @@ impl eframe::App for DownloadApp {
                     });
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // In right-to-left layout space allocates at far right first: chip sits inset, not flush to window edge.
+                    ui.add_space(4.0);
                     let active = { let g = self.rt.lock().unwrap(); g.state.tasks.iter().filter(|t| t.status == TaskStatus::Downloading).count() };
                     let speed = self.speed_hist.last().copied().unwrap_or(0.0);
                     theme::chip(ui, &format!("{active} active · {}", fmt_rate(speed)), theme::TEXT_MUTED);
@@ -595,15 +640,25 @@ impl eframe::App for DownloadApp {
                 ui.label(egui::RichText::new("WORKSPACE").color(theme::TEXT_FAINT).small().strong());
                 ui.add_space(4.0);
                 for (tab, label, ic) in [(Tab::Downloads, "Downloads", Icon::Download), (Tab::Queues, "Queues", Icon::Queue), (Tab::Scheduler, "Scheduler", Icon::Clock), (Tab::Grabber, "Site Grabber", Icon::Globe), (Tab::Options, "Options", Icon::Settings)] {
-                    if nav_row(ui, ic, label, self.tab == tab).clicked() { self.tab = tab; }
+                    if nav_row(ui, ic, label, self.tab == tab, None).clicked() { self.tab = tab; }
                 }
                 ui.add_space(8.0);
                 ui.separator();
                 ui.horizontal(|ui| { let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover()); icon(ui.painter(), &Icon::Folder, irect, theme::TEXT_FAINT); ui.label(egui::RichText::new("CATEGORIES").color(theme::TEXT_FAINT).small().strong()); });
                 ui.add_space(4.0);
                 let cats: &[(&str, Icon)] = &[("All Downloads", Icon::Download), ("Compressed", Icon::Archive), ("Documents", Icon::Document), ("Programs", Icon::Program), ("Video", Icon::Video), ("Audio", Icon::Music), ("General", Icon::File), ("Unfinished", Icon::Clock), ("Finished", Icon::Check)];
-                for (c, ic) in cats {
-                    if nav_row(ui, *ic, c, self.category == *c).clicked() { self.category = c.to_string(); self.tab = Tab::Downloads; }
+                // Per-category counts, same membership rule as downloads table filter (below).
+                let counts: Vec<usize> = {
+                    let g = self.rt.lock().unwrap();
+                    cats.iter().map(|(c, _)| match *c {
+                        "All Downloads" => g.state.tasks.len(),
+                        "Unfinished" => g.state.tasks.iter().filter(|t| t.status != TaskStatus::Complete).count(),
+                        "Finished" => g.state.tasks.iter().filter(|t| t.status == TaskStatus::Complete).count(),
+                        cat => g.state.tasks.iter().filter(|t| t.category == cat || crate::model::category_for(&t.filename) == cat).count(),
+                    }).collect()
+                };
+                for ((c, ic), n) in cats.iter().zip(counts.iter()) {
+                    if nav_row(ui, *ic, c, self.category == *c, Some(*n)).clicked() { self.category = c.to_string(); self.tab = Tab::Downloads; }
                 }
                 ui.add_space(8.0);
                 ui.separator();
@@ -760,7 +815,7 @@ fn eta(secs: f64) -> String { if !secs.is_finite() || secs < 0.0 { "—".into() 
 
 /// IDM-style toolbar button: icon glyph + label in one bordered, clickable cell.
 /// (egui Button takes text only; separate icon widgets left icon outside hit area and label looked like plain text.)
-fn nav_row(ui: &mut egui::Ui, ic: Icon, label: &str, selected: bool) -> egui::Response {
+fn nav_row(ui: &mut egui::Ui, ic: Icon, label: &str, selected: bool, count: Option<usize>) -> egui::Response {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, theme::ROW_H_NAV), egui::Sense::click());
     let painter = ui.painter();
@@ -770,7 +825,11 @@ fn nav_row(ui: &mut egui::Ui, ic: Icon, label: &str, selected: bool) -> egui::Re
     let icon_rect = egui::Rect::from_min_size(rect.left_top() + egui::vec2(6.0, 3.0), egui::vec2(16.0, 16.0));
     icon(painter, &ic, icon_rect, fg);
     let font = egui::FontId::proportional(13.5);
-    let avail = (rect.right() - (icon_rect.right() + 6.0) - 6.0).max(0.0);
+    // Count badge: measured, not guessed; label truncation reserves its width + gap.
+    let count_color = if selected { egui::Color32::WHITE } else { theme::TEXT_FAINT };
+    let count_galley = count.filter(|n| *n > 0).map(|n| painter.layout_no_wrap(format!("{n}"), font.clone(), count_color));
+    let reserve = count_galley.as_ref().map(|g| g.size().x + 10.0).unwrap_or(0.0);
+    let avail = (rect.right() - (icon_rect.right() + 6.0) - 6.0 - reserve).max(0.0);
     // single row, ellipsis-truncated to avail width; never overflow rail
     let mut job = egui::text::LayoutJob::single_section(label.to_owned(), egui::TextFormat { font_id: font, color: fg, ..Default::default() });
     job.wrap.max_width = avail;
@@ -779,6 +838,11 @@ fn nav_row(ui: &mut egui::Ui, ic: Icon, label: &str, selected: bool) -> egui::Re
     job.wrap.overflow_character = Some('…');
     let galley = painter.layout_job(job);
     painter.galley(egui::pos2(icon_rect.right() + 6.0, rect.center().y - galley.size().y / 2.0), galley, fg);
+    if let Some(g) = count_galley {
+        let cw = g.size().x;
+        let cy = rect.center().y - g.size().y / 2.0;
+        painter.galley(egui::pos2(rect.right() - 6.0 - cw, cy), g, count_color);
+    }
     if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
     resp
 }
@@ -1782,6 +1846,12 @@ pub fn fmt_bytes(n: u64) -> String {
 #[cfg(test)]
 mod progress_tests {
     use super::*;
+
+    #[test]
+    fn tray_toggle_label_follows_visibility() {
+        assert_eq!(tray_toggle_label(true), "Hide downloadcraft");
+        assert_eq!(tray_toggle_label(false), "Show downloadcraft");
+    }
 
     fn task(total: Option<u64>, downloaded: u64) -> DownloadTask {
         DownloadTask { total, downloaded, ..Default::default() }
