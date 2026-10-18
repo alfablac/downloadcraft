@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 fn config_dir() -> PathBuf {
     // Must match main app config_dir without depending on it (host is standalone small binary).
-    directories::ProjectDirs::from("", "", "downloadcraft").map(|d| d.config_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".downloadcraft"))
+    directories::ProjectDirs::from("", "", "webcraft").map(|d| d.config_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".webcraft"))
 }
 
 fn inbox_dir() -> PathBuf {
@@ -34,7 +34,11 @@ pub fn capture_allowed(exts: &[String], min_bytes: u64, filename: &str, url: &st
 }
 
 fn load_capture_filter() -> (Vec<String>, u64) {
-    let Ok(txt) = std::fs::read_to_string(config_dir().join("capture-filter.json")) else { return (Vec::new(), 0) };
+    // Legacy fallback: pre-rename desktop wrote filter under downloadcraft dir.
+    let new_path = config_dir().join("capture-filter.json");
+    let legacy_path = directories::ProjectDirs::from("", "", "downloadcraft").map(|d| d.config_dir().join("capture-filter.json")).unwrap_or_else(|| PathBuf::from(".downloadcraft/capture-filter.json"));
+    let path = if new_path.exists() { new_path } else { legacy_path };
+    let Ok(txt) = std::fs::read_to_string(path) else { return (Vec::new(), 0) };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { return (Vec::new(), 0) };
     let exts = v.get("exts").and_then(|e| e.as_array()).map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.trim().trim_start_matches('.').to_lowercase())).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
     let min = v.get("minBytes").and_then(|m| m.as_u64()).unwrap_or(0);

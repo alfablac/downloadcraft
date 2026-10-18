@@ -2,14 +2,17 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const HOST_NAME: &str = "com.downloadcraft.host";
-pub const PROTOCOL: &str = "downloadcraft";
+pub const HOST_NAME: &str = "com.webcraft.host";
+/// ponytail: legacy host/protocol kept one rename cycle for installed extensions.
+pub const LEGACY_HOST_NAME: &str = "com.downloadcraft.host";
+pub const PROTOCOL: &str = "webcraft";
+pub const LEGACY_PROTOCOL: &str = "downloadcraft";
 pub const FIREFOX_EXT_ID: &str = "downloadcraft@downloadcraft.local";
 pub const CHROME_EXT_ID: &str = "ajkokpbgjajmkenllekaokjbglbcingk";
 
-pub fn config_dir() -> PathBuf { directories::ProjectDirs::from("", "", "downloadcraft").map(|d| d.config_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".downloadcraft")) }
-pub fn data_dir() -> PathBuf { directories::ProjectDirs::from("", "", "downloadcraft").map(|d| d.data_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".downloadcraft")) }
-pub fn cache_dir() -> PathBuf { directories::ProjectDirs::from("", "", "downloadcraft").map(|d| d.cache_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".downloadcraft-cache")) }
+pub fn config_dir() -> PathBuf { directories::ProjectDirs::from("", "", "webcraft").map(|d| d.config_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".webcraft")) }
+pub fn data_dir() -> PathBuf { directories::ProjectDirs::from("", "", "webcraft").map(|d| d.data_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".webcraft")) }
+pub fn cache_dir() -> PathBuf { directories::ProjectDirs::from("", "", "webcraft").map(|d| d.cache_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".webcraft-cache")) }
 pub fn default_download_dir() -> PathBuf { directories::UserDirs::new().and_then(|u| u.download_dir().map(|p| p.to_path_buf())).unwrap_or_else(|| std::env::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("Downloads")) }
 pub fn state_path() -> PathBuf { config_dir().join("state.json") }
 
@@ -44,7 +47,7 @@ pub fn spawn_show_watcher() {
                 // hidden helper HWNDs in-process. Match eframe title instead.
                 let mut buf = [0u16; 64];
                 let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), 64);
-                if n > 0 && String::from_utf16_lossy(&buf[..n as usize]).starts_with("downloadcraft") { *(p as *mut Hwnd) = hwnd; return 0; }
+                if n > 0 && String::from_utf16_lossy(&buf[..n as usize]).starts_with("webcraft") { *(p as *mut Hwnd) = hwnd; return 0; }
             }
             1
         }
@@ -59,22 +62,23 @@ pub fn spawn_show_watcher() {
             let Some(hwnd) = our_hwnd() else { continue };
             let req = config_dir().join("show.request");
             if let Ok(content) = std::fs::read_to_string(&req) {
-                match content.trim() {
-                    // Consume toggle here: leaving it would flip repeatedly.
-                    // App syncs hidden/label from WINDOW_VISIBLE below.
-                    "toggle" => {
-                        let _ = std::fs::remove_file(&req);
+                if content.trim() == "toggle" {
+                    // Toggle is non-idempotent: claim atomically so watcher
+                    // xor app poll flips, never both (= no-op). Claiming here
+                    // hides instantly even when egui idles at 5s repaint.
+                    if claim_show_request().is_some() {
                         unsafe {
                             if shown(hwnd) { ShowWindow(hwnd, 0); } else { ShowWindow(hwnd, 9); SetForegroundWindow(hwnd); }
                             PostMessageW(hwnd, 0x8001, 0, 0);
                         }
                     }
-                    // Do not delete show/add: app poll must consume it to
-                    // clear hidden state / open Add dialog.
-                    _ => unsafe {
+                } else {
+                    // Do not claim show/add: app poll consumes it to clear
+                    // hidden state / open Add dialog. Just show + wake.
+                    unsafe {
                         if !shown(hwnd) { ShowWindow(hwnd, 9); SetForegroundWindow(hwnd); }
                         PostMessageW(hwnd, 0x8001, 0, 0);
-                    },
+                    }
                 }
             }
             // Track native changes (taskbar minimize/restore, toggle above):
@@ -86,19 +90,35 @@ pub fn spawn_show_watcher() {
         }
     });
 }
+/// Atomically claim `show.request` (rename wins): exactly one of watcher /
+/// app poll acts on a request. Returns content when claimed.
+pub fn claim_show_request() -> Option<String> {
+    let req = config_dir().join("show.request");
+    let taken = config_dir().join("show.request.taken");
+    std::fs::rename(&req, &taken).ok()?;
+    let content = std::fs::read_to_string(&taken).unwrap_or_default();
+    let _ = std::fs::remove_file(&taken);
+    Some(content)
+}
+
 pub fn inbox_dir() -> PathBuf { config_dir().join("inbox") }
 pub fn ensure_dirs() -> std::io::Result<()> { for d in [config_dir(), data_dir(), cache_dir(), inbox_dir()] { std::fs::create_dir_all(d)?; } Ok(()) }
 
-/// One-time copy of legacy idmcraft config (state.json + inbox) into downloadcraft dir.
+/// One-time copy of legacy config (state.json + inbox + capture-filter.json)
+/// into webcraft dir. Tries old downloadcraft dir first, then older idmcraft.
 /// Runs only when new state absent and legacy state exists; never overwrites new data.
 pub fn migrate_legacy() {
-    let legacy = directories::ProjectDirs::from("", "", "idmcraft").map(|d| d.config_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".idmcraft"));
-    migrate_legacy_from(&legacy, &config_dir());
+    let new_dir = config_dir();
+    let legacy = directories::ProjectDirs::from("", "", "downloadcraft").map(|d| d.config_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".downloadcraft"));
+    migrate_legacy_from(&legacy, &new_dir);
+    let older = directories::ProjectDirs::from("", "", "idmcraft").map(|d| d.config_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".idmcraft"));
+    migrate_legacy_from(&older, &new_dir);
 }
 pub fn migrate_legacy_from(legacy: &Path, new_dir: &Path) {
     if new_dir.join("state.json").exists() || !legacy.join("state.json").exists() { return; }
     let _ = std::fs::create_dir_all(new_dir);
     let _ = std::fs::copy(legacy.join("state.json"), new_dir.join("state.json"));
+    if legacy.join("capture-filter.json").exists() && !new_dir.join("capture-filter.json").exists() { let _ = std::fs::copy(legacy.join("capture-filter.json"), new_dir.join("capture-filter.json")); }
     let old_inbox = legacy.join("inbox");
     if old_inbox.is_dir() {
         let new_inbox = new_dir.join("inbox");
@@ -120,41 +140,50 @@ pub fn native_host_manifest_paths(home: &Path) -> Vec<(Browser, PathBuf)> {
     #[cfg(target_os = "windows")]
     {
         // Windows uses registry pointing at manifest in install dir; path fn returns manifest file location convention.
-        let base = home.join("AppData").join("Local").join("downloadcraft");
+        let base = home.join("AppData").join("Local").join("webcraft");
         for b in all_browsers() { v.push((b, base.join(if b == Browser::Firefox { "host-firefox.json" } else { "host.json" }))); }
     }
     #[cfg(target_os = "macos")]
     {
         let s = home.join("Library").join("Application Support");
-        v.push((Browser::Chrome, s.join("Google/Chrome/NativeMessagingHosts").join(format!("{HOST_NAME}.json"))));
-        v.push((Browser::Edge, s.join("Microsoft Edge/NativeMessagingHosts").join(format!("{HOST_NAME}.json"))));
-        v.push((Browser::Brave, s.join("BraveSoftware/Brave-Browser/NativeMessagingHosts").join(format!("{HOST_NAME}.json"))));
-        v.push((Browser::Chromium, s.join("Chromium/NativeMessagingHosts").join(format!("{HOST_NAME}.json"))));
-        v.push((Browser::Vivaldi, s.join("Vivaldi/NativeMessagingHosts").join(format!("{HOST_NAME}.json"))));
-        v.push((Browser::Firefox, s.join("Mozilla/NativeMessagingHosts").join(format!("{HOST_NAME}.json"))));
+        for name in [HOST_NAME, LEGACY_HOST_NAME] {
+            v.push((Browser::Chrome, s.join("Google/Chrome/NativeMessagingHosts").join(host_manifest_filename(name))));
+            v.push((Browser::Edge, s.join("Microsoft Edge/NativeMessagingHosts").join(host_manifest_filename(name))));
+            v.push((Browser::Brave, s.join("BraveSoftware/Brave-Browser/NativeMessagingHosts").join(host_manifest_filename(name))));
+            v.push((Browser::Chromium, s.join("Chromium/NativeMessagingHosts").join(host_manifest_filename(name))));
+            v.push((Browser::Vivaldi, s.join("Vivaldi/NativeMessagingHosts").join(host_manifest_filename(name))));
+            v.push((Browser::Firefox, s.join("Mozilla/NativeMessagingHosts").join(host_manifest_filename(name))));
+        }
     }
     #[cfg(target_os = "linux")]
     {
         let c = home.join(".config");
-        v.push((Browser::Chrome, c.join("google-chrome/NativeMessagingHosts").join(format!("{HOST_NAME}.json"))));
-        v.push((Browser::Chromium, c.join("chromium/NativeMessagingHosts").join(format!("{HOST_NAME}.json"))));
-        v.push((Browser::Brave, c.join("BraveSoftware/Brave-Browser/NativeMessagingHosts").join(format!("{HOST_NAME}.json"))));
-        v.push((Browser::Edge, c.join("microsoft-edge/NativeMessagingHosts").join(format!("{HOST_NAME}.json"))));
-        v.push((Browser::Vivaldi, c.join("vivaldi/NativeMessagingHosts").join(format!("{HOST_NAME}.json"))));
-        v.push((Browser::Firefox, home.join(".mozilla/native-messaging-hosts").join(format!("{HOST_NAME}.json"))));
+        for name in [HOST_NAME, LEGACY_HOST_NAME] {
+            v.push((Browser::Chrome, c.join("google-chrome/NativeMessagingHosts").join(host_manifest_filename(name))));
+            v.push((Browser::Chromium, c.join("chromium/NativeMessagingHosts").join(host_manifest_filename(name))));
+            v.push((Browser::Brave, c.join("BraveSoftware/Brave-Browser/NativeMessagingHosts").join(host_manifest_filename(name))));
+            v.push((Browser::Edge, c.join("microsoft-edge/NativeMessagingHosts").join(host_manifest_filename(name))));
+            v.push((Browser::Vivaldi, c.join("vivaldi/NativeMessagingHosts").join(host_manifest_filename(name))));
+            v.push((Browser::Firefox, home.join(".mozilla/native-messaging-hosts").join(host_manifest_filename(name))));
+        }
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    { for b in all_browsers() { v.push((b, home.join(format!("{HOST_NAME}.json")))); } }
+    { for name in [HOST_NAME, LEGACY_HOST_NAME] { for b in all_browsers() { v.push((b, home.join(format!("{name}.json")))); } } }
     v
 }
 
-pub fn host_manifest_json(host_exe: &Path, firefox: bool) -> String {
+pub fn host_manifest_json(host_exe: &Path, firefox: bool) -> String { host_manifest_json_for(HOST_NAME, host_exe, firefox) }
+pub fn host_manifest_json_for(host_name: &str, host_exe: &Path, firefox: bool) -> String {
     if firefox {
-        format!("{{\n  \"name\": \"{HOST_NAME}\",\n  \"description\": \"downloadcraft native host\",\n  \"type\": \"stdio\",\n  \"allowed_extensions\": [\"{FIREFOX_EXT_ID}\"],\n  \"path\": \"{}\"\n}}\n", host_exe.display().to_string().replace('\\', "\\\\"))
+        format!("{{\n  \"name\": \"{host_name}\",\n  \"description\": \"webcraft native host\",\n  \"type\": \"stdio\",\n  \"allowed_extensions\": [\"{FIREFOX_EXT_ID}\"],\n  \"path\": \"{}\"\n}}\n", host_exe.display().to_string().replace('\\', "\\\\"))
     } else {
-        format!("{{\n  \"name\": \"{HOST_NAME}\",\n  \"description\": \"downloadcraft native host\",\n  \"type\": \"stdio\",\n  \"allowed_origins\": [\"chrome-extension://{CHROME_EXT_ID}/\"],\n  \"path\": \"{}\"\n}}\n", host_exe.display().to_string().replace('\\', "\\\\"))
+        format!("{{\n  \"name\": \"{host_name}\",\n  \"description\": \"webcraft native host\",\n  \"type\": \"stdio\",\n  \"allowed_origins\": [\"chrome-extension://{CHROME_EXT_ID}/\"],\n  \"path\": \"{}\"\n}}\n", host_exe.display().to_string().replace('\\', "\\\\"))
     }
 }
+/// Manifest filename inside a NativeMessagingHosts dir for a host name.
+/// ponytail: legacy variant only differs by suffix; drop with LEGACY_HOST_NAME.
+#[cfg(not(target_os = "windows"))]
+fn host_manifest_filename(host_name: &str) -> String { format!("{host_name}.json") }
 
 /// Register native messaging host for all browsers, per-user, no admin.
 pub fn register_native_hosts(host_exe: &Path) -> std::io::Result<Vec<PathBuf>> {
@@ -167,16 +196,22 @@ pub fn register_native_hosts(host_exe: &Path) -> std::io::Result<Vec<PathBuf>> {
         let dir = host_exe.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let chrome_manifest = dir.join("host.json");
         let moz_manifest = dir.join("host-firefox.json");
+        let legacy_chrome = dir.join("host-legacy.json");
+        let legacy_moz = dir.join("host-firefox-legacy.json");
         std::fs::write(&chrome_manifest, host_manifest_json(host_exe, false))?;
         std::fs::write(&moz_manifest, host_manifest_json(host_exe, true))?;
+        std::fs::write(&legacy_chrome, host_manifest_json_for(LEGACY_HOST_NAME, host_exe, false))?;
+        std::fs::write(&legacy_moz, host_manifest_json_for(LEGACY_HOST_NAME, host_exe, true))?;
         register_windows_native_host(&chrome_manifest, &moz_manifest);
-        written.push(chrome_manifest); written.push(moz_manifest);
+        register_windows_native_host_named(LEGACY_HOST_NAME, &legacy_chrome, &legacy_moz);
+        written.push(chrome_manifest); written.push(moz_manifest); written.push(legacy_chrome); written.push(legacy_moz);
     }
     #[cfg(not(target_os = "windows"))]
     {
         for (browser, path) in native_host_manifest_paths(&home) {
             if let Some(p) = path.parent() { std::fs::create_dir_all(p)?; }
-            std::fs::write(&path, host_manifest_json(host_exe, browser == Browser::Firefox))?;
+            let name = if path.file_name().map(|f| f.to_string_lossy().contains(LEGACY_HOST_NAME)).unwrap_or(false) { LEGACY_HOST_NAME } else { HOST_NAME };
+            std::fs::write(&path, host_manifest_json_for(name, host_exe, browser == Browser::Firefox))?;
             written.push(path);
         }
     }
@@ -194,24 +229,28 @@ pub fn unregister_native_hosts() -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn register_windows_native_host(chrome_manifest: &Path, moz_manifest: &Path) {
+fn register_windows_native_host(chrome_manifest: &Path, moz_manifest: &Path) { register_windows_native_host_named(HOST_NAME, chrome_manifest, moz_manifest); }
+#[cfg(target_os = "windows")]
+fn register_windows_native_host_named(host_name: &str, chrome_manifest: &Path, moz_manifest: &Path) {
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     for root in ["Software\\Google\\Chrome\\NativeMessagingHosts", "Software\\Microsoft\\Edge\\NativeMessagingHosts", "Software\\BraveSoftware\\Brave-Browser\\NativeMessagingHosts", "Software\\Chromium\\NativeMessagingHosts", "Software\\Vivaldi\\NativeMessagingHosts"] {
-        if let Ok((k, _)) = hkcu.create_subkey(format!("{root}\\{HOST_NAME}")) { let _ = k.set_value("", &chrome_manifest.to_string_lossy().as_ref()); }
+        if let Ok((k, _)) = hkcu.create_subkey(format!("{root}\\{host_name}")) { let _ = k.set_value("", &chrome_manifest.to_string_lossy().as_ref()); }
     }
-    if let Ok((k, _)) = hkcu.create_subkey(format!("Software\\Mozilla\\NativeMessagingHosts\\{HOST_NAME}")) { let _ = k.set_value("", &moz_manifest.to_string_lossy().as_ref()); }
+    if let Ok((k, _)) = hkcu.create_subkey(format!("Software\\Mozilla\\NativeMessagingHosts\\{host_name}")) { let _ = k.set_value("", &moz_manifest.to_string_lossy().as_ref()); }
 }
 #[cfg(target_os = "windows")]
 fn register_windows_protocol() -> std::io::Result<()> {
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let exe = std::env::current_exe()?;
-    let (proto, _) = hkcu.create_subkey(format!("Software\\Classes\\{PROTOCOL}"))?;
-    proto.set_value("", &"URL:downloadcraft Protocol")?;
-    proto.set_value("URL Protocol", &"")?;
-    let (cmd, _) = proto.create_subkey("shell\\open\\command")?;
-    cmd.set_value("", &format!("\"{}\" \"%1\"", exe.display()).as_str())?;
+    for scheme in [PROTOCOL, LEGACY_PROTOCOL] {
+        let (proto, _) = hkcu.create_subkey(format!("Software\\Classes\\{scheme}"))?;
+        proto.set_value("", &format!("URL:{scheme} Protocol"))?;
+        proto.set_value("URL Protocol", &"")?;
+        let (cmd, _) = proto.create_subkey("shell\\open\\command")?;
+        cmd.set_value("", &format!("\"{}\" \"%1\"", exe.display()).as_str())?;
+    }
     Ok(())
 }
 #[cfg(target_os = "windows")]
@@ -219,16 +258,16 @@ fn unregister_windows_native_host() {
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     for root in ["Software\\Google\\Chrome\\NativeMessagingHosts", "Software\\Microsoft\\Edge\\NativeMessagingHosts", "Software\\BraveSoftware\\Brave-Browser\\NativeMessagingHosts", "Software\\Chromium\\NativeMessagingHosts", "Software\\Vivaldi\\NativeMessagingHosts", "Software\\Mozilla\\NativeMessagingHosts"] {
-        if let Ok(k) = hkcu.open_subkey_with_flags(root, winreg::enums::KEY_WRITE) { let _ = k.delete_subkey_all(HOST_NAME); }
+        if let Ok(k) = hkcu.open_subkey_with_flags(root, winreg::enums::KEY_WRITE) { let _ = k.delete_subkey_all(HOST_NAME); let _ = k.delete_subkey_all(LEGACY_HOST_NAME); }
     }
-    if let Ok(k) = hkcu.open_subkey_with_flags("Software\\Classes", winreg::enums::KEY_WRITE) { let _ = k.delete_subkey_all(PROTOCOL); }
+    if let Ok(k) = hkcu.open_subkey_with_flags("Software\\Classes", winreg::enums::KEY_WRITE) { let _ = k.delete_subkey_all(PROTOCOL); let _ = k.delete_subkey_all(LEGACY_PROTOCOL); }
 }
 
 // ---------- autostart ----------
 pub fn autostart_path_for(home: &Path) -> PathBuf {
-    #[cfg(target_os = "macos")] { home.join("Library/LaunchAgents/com.downloadcraft.plist") }
-    #[cfg(target_os = "linux")] { home.join(".config/autostart/downloadcraft.desktop") }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))] { home.join("downloadcraft-autostart") }
+    #[cfg(target_os = "macos")] { home.join("Library/LaunchAgents/com.webcraft.plist") }
+    #[cfg(target_os = "linux")] { home.join(".config/autostart/webcraft.desktop") }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))] { home.join("webcraft-autostart") }
 }
 
 pub fn set_autostart(enabled: bool) -> std::io::Result<()> {
@@ -238,7 +277,7 @@ pub fn set_autostart(enabled: bool) -> std::io::Result<()> {
         use winreg::{enums::HKEY_CURRENT_USER, RegKey};
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let (k, _) = hkcu.create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")?;
-        if enabled { k.set_value("downloadcraft", &format!("\"{}\" --autostart", exe.display()).as_str())?; } else { let _ = k.delete_value("downloadcraft"); }
+        if enabled { k.set_value("webcraft", &format!("\"{}\" --autostart", exe.display()).as_str())?; } else { let _ = k.delete_value("webcraft"); }
     }
     #[cfg(target_os = "macos")]
     {
@@ -246,7 +285,7 @@ pub fn set_autostart(enabled: bool) -> std::io::Result<()> {
         let path = autostart_path_for(&home);
         if enabled {
             if let Some(p) = path.parent() { std::fs::create_dir_all(p)?; }
-            std::fs::write(&path, format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>com.downloadcraft</string><key>ProgramArguments</key><array><string>{}</string><string>--autostart</string></array><key>RunAtLoad</key><true/></dict></plist>\n", exe.display()))?;
+            std::fs::write(&path, format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>com.webcraft</string><key>ProgramArguments</key><array><string>{}</string><string>--autostart</string></array><key>RunAtLoad</key><true/></dict></plist>\n", exe.display()))?;
         } else { let _ = std::fs::remove_file(path); }
     }
     #[cfg(target_os = "linux")]
@@ -255,7 +294,7 @@ pub fn set_autostart(enabled: bool) -> std::io::Result<()> {
         let path = autostart_path_for(&home);
         if enabled {
             if let Some(p) = path.parent() { std::fs::create_dir_all(p)?; }
-            std::fs::write(&path, format!("[Desktop Entry]\nType=Application\nName=downloadcraft\nExec=\"{}\" --autostart\nX-GNOME-Autostart-enabled=true\nNoDisplay=false\n", exe.display()))?;
+            std::fs::write(&path, format!("[Desktop Entry]\nType=Application\nName=webcraft\nExec=\"{}\" --autostart\nX-GNOME-Autostart-enabled=true\nNoDisplay=false\n", exe.display()))?;
         } else { let _ = std::fs::remove_file(path); }
     }
     Ok(())
@@ -266,7 +305,7 @@ pub fn autostart_enabled() -> bool {
     {
         use winreg::{enums::HKEY_CURRENT_USER, RegKey};
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        return hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run").and_then(|k| k.get_value::<String, _>("downloadcraft")).is_ok();
+        return hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run").and_then(|k| k.get_value::<String, _>("webcraft")).is_ok();
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -283,12 +322,13 @@ pub fn register_protocol() -> std::io::Result<()> {
         let dir = home.join(".local/share/applications");
         std::fs::create_dir_all(&dir)?;
         let exe = std::env::current_exe()?;
-        std::fs::write(dir.join("downloadcraft.desktop"), format!("[Desktop Entry]\nType=Application\nName=downloadcraft\nExec=\"{}\" %u\nMimeType=x-scheme-handler/{PROTOCOL};\nNoDisplay=true\n", exe.display()))?;
-        let _ = Command::new("xdg-mime").args(["default", "downloadcraft.desktop", &format!("x-scheme-handler/{PROTOCOL}")]).status();
+        std::fs::write(dir.join("webcraft.desktop"), format!("[Desktop Entry]\nType=Application\nName=webcraft\nExec=\"{}\" %u\nMimeType=x-scheme-handler/{PROTOCOL};x-scheme-handler/{LEGACY_PROTOCOL};\nNoDisplay=true\n", exe.display()))?;
+        let _ = Command::new("xdg-mime").args(["default", "webcraft.desktop", &format!("x-scheme-handler/{PROTOCOL}")]).status();
+        let _ = Command::new("xdg-mime").args(["default", "webcraft.desktop", &format!("x-scheme-handler/{LEGACY_PROTOCOL}")]).status();
     }
     #[cfg(target_os = "windows")]
     { register_windows_protocol()?; }
-    // macOS: URL scheme declared in app bundle Info.plist (see packaging/downloadcraft.app Info.plist template in docs).
+    // macOS: URL schemes declared in app bundle Info.plist (packaging/Info.plist).
     Ok(())
 }
 
@@ -321,11 +361,11 @@ mod tests {
     use super::*;
     #[test] fn manifest_paths_mock_home() {
         let paths = native_host_manifest_paths(Path::new("/mockhome"));
-        assert_eq!(paths.len(), 6);
-        for (_, p) in &paths { let s = p.to_string_lossy().replace('\\', "/"); assert!(s.contains("/mockhome/") || s.contains("mockhome"), "{s}"); assert!(s.contains(HOST_NAME) || s.contains("host"), "{s}"); }
+        assert_eq!(paths.len(), if cfg!(windows) { 6 } else { 12 });
+        for (_, p) in &paths { let s = p.to_string_lossy().replace('\\', "/"); assert!(s.contains("/mockhome/") || s.contains("mockhome"), "{s}"); assert!(s.contains(HOST_NAME) || s.contains(LEGACY_HOST_NAME) || s.contains("host"), "{s}"); }
     }
     #[test] fn migrate_legacy_copies_only_when_new_empty() {
-        let base = std::env::temp_dir().join(format!("downloadcraft-mig-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("webcraft-mig-{}", std::process::id()));
         let legacy = base.join("old"); let newd = base.join("new");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(legacy.join("inbox")).unwrap();

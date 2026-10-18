@@ -1,5 +1,6 @@
 use crate::engine;
 use crate::grabber::{Crawler, FoundFile, GrabberProject};
+use downloadcraft_lib::ytdlp;
 use crate::model::*;
 use crate::platform;
 use crate::queue::plan_starts;
@@ -37,6 +38,14 @@ impl SegView {
         let (done, expected) = self.parts.first().copied()?;
         if self.manifest && expected > 0 { Some((done as f32 / expected as f32).clamp(0.0, 1.0)) } else { None }
     }
+}
+
+/// WebDAV is plain HTTP(S) download: map webdav:// -> http://, webdavs:// -> https://.
+fn normalize_webdav(url: &str) -> String {
+    let t = url.trim();
+    if let Some(rest) = t.strip_prefix("webdav://") { format!("http://{rest}") }
+    else if let Some(rest) = t.strip_prefix("webdavs://") { format!("https://{rest}") }
+    else { t.to_string() }
 }
 
 /// IDM-style displayed completion: byte fraction first, segment fraction for manifests.
@@ -80,6 +89,7 @@ pub struct DownloadApp {
     add_cookies: String,
     add_user: String,
     add_pass: String,
+    add_key: String,
     add_mirrors: String,
     add_desc: String,
     add_queue: String,
@@ -101,6 +111,7 @@ pub struct DownloadApp {
     #[allow(dead_code)]
     tray: Option<TrayState>,
     hidden: bool,
+    ytdlp_checked: bool,
     show_about: bool,
     search: String,
     minutes_today: (i64, u32),
@@ -114,7 +125,10 @@ pub struct DownloadApp {
     selected: Option<String>,
     selected_schedule: Option<String>,
     completed_notice: Option<String>,
-    last_notified: Option<String>,
+    /// Task ids already Complete when app started (or already notified).
+    /// Seeded in new() so restored history never pops "Download complete";
+    /// only tasks finishing this session notify.
+    seen_completed: std::collections::HashSet<String>,
     speed_hist: Vec<f32>,
     last_dl_total: u64,
     /// Per-task rate samples (drives Transfer rate column + ETA per row).
@@ -139,7 +153,7 @@ pub struct DownloadApp {
 }
 
 /// Tray toggle label for current window visibility.
-fn tray_toggle_label(visible: bool) -> &'static str { if visible { "Hide downloadcraft" } else { "Show downloadcraft" } }
+fn tray_toggle_label(visible: bool) -> &'static str { if visible { "Hide webcraft" } else { "Show webcraft" } }
 
 /// Live tray state: keep icon+menu alive; poll MenuEvent receiver each tick for Show/Add/Quit.
 struct TrayState { _nav: Option<TrayNav> }
@@ -148,6 +162,11 @@ struct TrayNav { _tray: tray_icon::TrayIcon, _menu: tray_icon::menu::Menu, show_
 impl DownloadApp {
     pub fn new(cc: &eframe::CreationContext<'_>, rt: Arc<Mutex<Runtime>>, hidden: bool) -> Self {
         theme::apply(&cc.egui_ctx);
+        // Seed before first poll(): restored Complete tasks are history, not news.
+        let seen_completed: std::collections::HashSet<String> = rt
+            .lock()
+            .map(|g| g.state.tasks.iter().filter(|t| t.status == TaskStatus::Complete).map(|t| t.id.clone()).collect())
+            .unwrap_or_default();
         // Cap workers: default = CPU cores (32 threads parked forever). Downloads are network-bound; 4 is ample.
         let tokio_rt = Arc::new(tokio::runtime::Builder::new_multi_thread().worker_threads(4).max_blocking_threads(16).enable_all().build().expect("tokio rt"));
         let tray = Self::make_tray(!hidden);
@@ -199,12 +218,12 @@ impl DownloadApp {
                 }
             }));
         }
-        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_ext_depth: 0, grab_scope: 0, grab_exts: String::new(), grab_parent_dirs: false, grab_only_paths: String::new(), grab_exclude_paths: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), grab_status: "Enter a start URL, then Explore.".into(), grab_busy: false, grab_auto_explore: false, last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, options_notice: "Changes save automatically.".into(), show_add: false, show_progress_for: None, selected: None, selected_schedule: None, completed_notice: None, last_notified: None, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new(), rate_smooth: std::collections::HashMap::new(), handles: std::collections::HashMap::new(), allow_close: false, dl_widths: None, grab_widths: None, capture_task: None, capture_name: String::new(), capture_just_opened: false }
+        Self { rt, tokio_rt, tab: Tab::Downloads, add_url: String::new(), add_referrer: String::new(), add_cookies: String::new(), add_user: String::new(), add_pass: String::new(), add_key: String::new(), add_mirrors: String::new(), add_desc: String::new(), add_queue: "main".into(), new_queue_name: String::new(), grab_url: String::new(), grab_depth: 2, grab_ext_depth: 0, grab_scope: 0, grab_exts: String::new(), grab_parent_dirs: false, grab_only_paths: String::new(), grab_exclude_paths: String::new(), grab_files: Vec::new(), grab_project_json: String::new(), grab_status: "Enter a start URL, then Explore.".into(), grab_busy: false, grab_auto_explore: false, last_tick: std::time::Instant::now(), tray: Some(TrayState { _nav: tray }), hidden, ytdlp_checked: false, show_about: false, search: String::new(), minutes_today: today_parts(), category: "All Downloads".into(), sort_col: 0, sort_asc: true, options_tab: 0, options_notice: "Changes save automatically.".into(), show_add: false, show_progress_for: None, selected: None, selected_schedule: None, completed_notice: None, seen_completed, speed_hist: Vec::new(), last_dl_total: 0, rate_map: std::collections::HashMap::new(), seg_info: std::collections::HashMap::new(), rate_smooth: std::collections::HashMap::new(), handles: std::collections::HashMap::new(), allow_close: false, dl_widths: None, grab_widths: None, capture_task: None, capture_name: String::new(), capture_just_opened: false }
     }
 
     fn make_tray(visible: bool) -> Option<TrayNav> {
         // Tray icon: same PNG as window/.exe icon (was code-generated solid blue square).
-        let data = eframe::icon_data::from_png_bytes(include_bytes!("../assets/downloadcraft.png")).ok()?;
+        let data = eframe::icon_data::from_png_bytes(include_bytes!("../assets/webcraft.png")).ok()?;
         let icon = tray_icon::Icon::from_rgba(data.rgba, data.width, data.height).ok()?;
         let menu = tray_icon::menu::Menu::new();
         let show = tray_icon::menu::MenuItem::new(tray_toggle_label(visible), true, None);
@@ -213,7 +232,7 @@ impl DownloadApp {
         let (show_id, add_id, quit_id) = (show.id().clone(), add.id().clone(), quit.id().clone());
         let _ = menu.append_items(&[&show, &add, &quit]);
         // Menu on right click only: left click reserved for double-click toggle.
-        let tray = tray_icon::TrayIconBuilder::new().with_icon(icon).with_menu(Box::new(menu.clone())).with_tooltip("downloadcraft").with_menu_on_left_click(false).build().ok()?;
+        let tray = tray_icon::TrayIconBuilder::new().with_icon(icon).with_menu(Box::new(menu.clone())).with_tooltip("webcraft").with_menu_on_left_click(false).build().ok()?;
         Some(TrayNav { _tray: tray, _menu: menu, show_item: show, show_id, add_id, quit_id })
     }
 
@@ -242,6 +261,8 @@ impl DownloadApp {
     }
 
     fn start_task(&mut self, id: &str) {
+        // Re-download of completed task may notify again when it finishes.
+        self.seen_completed.remove(id);
         // Never spawn a second worker for same task: it replaces Controls entry,
         // and Stop would then cancel only newest worker while old one keeps downloading.
         if self.handles.get(id).is_some_and(|h| !h.is_finished()) { return; }
@@ -377,6 +398,22 @@ impl DownloadApp {
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
+        if !self.ytdlp_checked {
+            self.ytdlp_checked = true;
+            let auto = self.rt.lock().unwrap().state.settings.ytdlp_auto_update;
+            let rt_b = self.tokio_rt.clone();
+            std::thread::spawn(move || {
+                rt_b.block_on(async move {
+                    // ponytail: silent best-effort; manual Update button surfaces errors.
+                    if let Ok(p) = ytdlp::ensure_ytdlp().await {
+                        if auto {
+                            let stale = std::fs::metadata(&p).and_then(|m| m.modified()).map(|t| t.elapsed().map(|e| e.as_secs() > 30 * 86400).unwrap_or(false)).unwrap_or(false);
+                            if stale { let _ = tokio::task::spawn_blocking(move || ytdlp::ytdlp_update(&p)).await; }
+                        }
+                    }
+                });
+            });
+        }
         self.handles.retain(|_, h| !h.is_finished());
         // Purge Controls with no live handle (worker panicked before cleanup
         // ran). Live workers keep theirs: start_task inserts Controls then
@@ -398,10 +435,9 @@ impl DownloadApp {
             "quit" => { self.allow_close = true; self.rt.lock().unwrap().save(); ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
             _ => {}
         }
-        let show_request = crate::platform::config_dir().join("show.request");
-        if show_request.exists() {
-            let content = std::fs::read_to_string(&show_request).unwrap_or_default();
-            let _ = std::fs::remove_file(&show_request);
+        // Claim atomically: watcher may claim "toggle" first (instant native
+        // hide while egui idles); then no file here and window sync applies.
+        if let Some(content) = crate::platform::claim_show_request() {
             match content.trim() {
                 "toggle" => self.toggle_window(ctx),
                 "add" => { self.show_window(ctx); self.tab = Tab::Downloads; self.show_add = true; }
@@ -456,8 +492,10 @@ impl DownloadApp {
             let totals: Vec<(String, u64)> = g.controls.iter().map(|(k, c)| (k.clone(), c.total.load(Ordering::Relaxed))).collect();
             for (id, tot) in totals { if tot > 0 { if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) { t.total = Some(tot); } } }
             if self.completed_notice.is_none() {
-                let done_name = g.state.tasks.iter().find(|t| t.status == TaskStatus::Complete).map(|t| t.filename.clone());
-                if let Some(n) = done_name { if self.last_notified.as_deref() != Some(n.as_str()) { self.completed_notice = Some(n.clone()); self.last_notified = Some(n); } }
+                // Notify once per task id, only for tasks not already
+                // Complete at startup (seeded in new()).
+                let done = g.state.tasks.iter().find(|t| t.status == TaskStatus::Complete && !self.seen_completed.contains(&t.id)).map(|t| (t.id.clone(), t.filename.clone()));
+                if let Some((id, n)) = done { self.seen_completed.insert(id); self.completed_notice = Some(n); }
             }
             // clipboard monitor
             if g.state.settings.clipboard_monitor {
@@ -639,7 +677,7 @@ impl eframe::App for DownloadApp {
                         if ui.button("Options").clicked() { self.tab = Tab::Options; ui.close_menu(); }
                     });
                     ui.menu_button("Help", |ui| {
-                        if ui.button(format!("About downloadcraft v{}", env!("CARGO_PKG_VERSION"))).clicked() { self.show_about = true; ui.close_menu(); }
+                        if ui.button(format!("About webcraft v{}", env!("CARGO_PKG_VERSION"))).clicked() { self.show_about = true; ui.close_menu(); }
                     });
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -707,7 +745,7 @@ impl eframe::App for DownloadApp {
                 let _ = id;
                 ui.label(egui::RichText::new(fmt_rate(self.speed_hist.last().copied().unwrap_or(0.0))).color(theme::TEAL_500).small());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(format!("downloadcraft v{}", env!("CARGO_PKG_VERSION"))).color(theme::TEXT_FAINT).small());
+                    ui.label(egui::RichText::new(format!("webcraft v{}", env!("CARGO_PKG_VERSION"))).color(theme::TEXT_FAINT).small());
                 ui.separator();
                 ui.label(egui::RichText::new("Ready").color(theme::TEXT_FAINT).small());
                 });
@@ -734,8 +772,8 @@ impl eframe::App for DownloadApp {
         });
 
         if self.show_about {
-            egui::Window::new("About downloadcraft").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-                ui.label("downloadcraft 0.2.0 — clean-room cross-platform download manager.");
+            egui::Window::new("About webcraft").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                ui.label(format!("webcraft {} — clean-room cross-platform download manager.", env!("CARGO_PKG_VERSION")));
                 ui.label("Rust + egui. Segmented downloads, DASH/HLS, queues, scheduler, Site Grabber.");
                 ui.label("No proprietary code, binaries, icons, or activation logic.");
                 if ui.button("Close").clicked() { self.show_about = false; }
@@ -821,7 +859,7 @@ fn resume_all(app: &mut DownloadApp) { let ids: Vec<String> = { let g = app.rt.l
 fn stop_all(app: &mut DownloadApp) { let ids: Vec<String> = { let g = app.rt.lock().unwrap(); g.state.tasks.iter().filter(|t| t.status == TaskStatus::Downloading).map(|t| t.id.clone()).collect() }; for id in ids { stop_task(app, &id); } }
 fn delete_completed(app: &mut DownloadApp) { let mut g = app.rt.lock().unwrap(); g.state.tasks.retain(|t| t.status != TaskStatus::Complete); g.save(); }
 fn toggle_limiter(app: &mut DownloadApp) { let mut g = app.rt.lock().unwrap(); g.state.settings.speed_limit_kbps = if g.state.settings.speed_limit_kbps == 0 { 512 } else { 0 }; let lim = g.state.settings.speed_limit_kbps; for c in g.controls.values() { c.limit_kbps.store(lim, Ordering::Relaxed); } g.save(); }
-fn export_json(app: &mut DownloadApp) { let g = app.rt.lock().unwrap(); let txt = serde_json::to_string_pretty(&g.state.tasks.iter().map(|t| serde_json::json!({"url":t.url,"filename":t.filename,"queue":t.queue_id})).collect::<Vec<_>>()).unwrap_or_default(); let path = g.state.settings.download_dir.join("downloadcraft-export.json"); let _ = std::fs::write(path, txt); }
+fn export_json(app: &mut DownloadApp) { let g = app.rt.lock().unwrap(); let txt = serde_json::to_string_pretty(&g.state.tasks.iter().map(|t| serde_json::json!({"url":t.url,"filename":t.filename,"queue":t.queue_id})).collect::<Vec<_>>()).unwrap_or_default(); let path = g.state.settings.download_dir.join("webcraft-export.json"); let _ = std::fs::write(path, txt); }
 fn add_batch_clipboard(app: &mut DownloadApp) {
     if let Ok(mut cb) = arboard::Clipboard::new() { if let Ok(txt) = cb.get_text() { for line in txt.lines() { let u = line.trim(); if u.starts_with("http://") || u.starts_with("https://") { add_url_task(app, u); } } } }
 }
@@ -898,7 +936,7 @@ fn icon_btn_enabled(ui: &mut egui::Ui, ic: Icon, label: &str, primary: bool, min
 /// Download-table column widths shared by header and rows (separate Grids auto-sized
 /// independently, so header and row columns never lined up). Name column takes remainder.
 /// Fixed widths follow live IDM ListSettings (File Name|Q 30|Size 75|Status 65|
-/// Time left 73|Transfer rate 82); Progress/Actions are DownloadCraft extras.
+/// Time left 73|Transfer rate 82); Progress/Actions are webcraft extras.
 const COL_GAP: f32 = 10.0; // header/rows use item_spacing.x = 10; leading cell at row_origin_x
 const COL_MIN: f32 = 36.0;
 const NAME_MIN: f32 = 120.0;
@@ -1283,14 +1321,18 @@ impl DownloadApp {
                 ui.label("Login:"); ui.add(egui::TextEdit::singleline(&mut self.add_user).desired_width(130.0));
                 ui.label("Password:"); ui.add(egui::TextEdit::singleline(&mut self.add_pass).password(true).desired_width(130.0));
             });
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("SSH key (SFTP)").color(theme::TEXT_MUTED).small().strong());
+                ui.add(egui::TextEdit::singleline(&mut self.add_key).hint_text("path to private key, empty = ~/.ssh/id_*").desired_width(300.0));
+            });
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui.add_enabled_ui(!self.add_url.trim().is_empty(), |ui| theme::primary_btn(ui, "Start download")).inner.clicked() {
-                    let url = self.add_url.trim().to_string();
+                    let url = normalize_webdav(&self.add_url);
                     if !url.is_empty() {
                         let (referrer, cookies, queue) = (self.add_referrer.clone(), self.add_cookies.clone(), if self.add_queue.is_empty() { "main".into() } else { self.add_queue.clone() });
-                        let (user, pass, mirrors, desc) = (self.add_user.clone(), self.add_pass.clone(), self.add_mirrors.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>(), self.add_desc.clone());
-                        let id = { let mut g = self.rt.lock().unwrap(); let id = g.add_url(&url, &queue, &referrer, &cookies); let segs = g.state.settings.max_connections; if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) { t.segments = segs; t.username = user; t.password = pass; t.mirrors = mirrors; t.description = desc; } g.save(); id };
+                        let (user, pass, key, mirrors, desc) = (self.add_user.clone(), self.add_pass.clone(), self.add_key.clone(), self.add_mirrors.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>(), self.add_desc.clone());
+                        let id = { let mut g = self.rt.lock().unwrap(); let id = g.add_url(&url, &queue, &referrer, &cookies); let segs = g.state.settings.max_connections; if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) { t.segments = segs; t.username = user; t.password = pass; t.ssh_key_path = key; t.mirrors = mirrors; t.description = desc; } g.save(); id };
                         self.start_task(&id);
                         self.add_url.clear(); self.show_add = false;
                     }
@@ -1716,6 +1758,7 @@ impl DownloadApp {
         let before_autostart = settings.autostart;
         let mut repair_hosts = false;
         let mut remove_hosts = false;
+        let mut update_ytdlp = false;
 
         theme::panel().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1787,7 +1830,7 @@ impl DownloadApp {
                         });
                     });
                     ui.label(egui::RichText::new(format!("Chromium extension ID: {}", downloadcraft_lib::platform::CHROME_EXT_ID)).color(theme::TEXT_FAINT).small().monospace());
-                    ui.label(egui::RichText::new("Load extensions/chromium in Chromium browsers or extensions/firefox in Firefox. Native host: downloadcraft-host.").color(theme::TEXT_FAINT).small());
+                    ui.label(egui::RichText::new("Load extensions/chromium in Chromium browsers or extensions/firefox in Firefox. Native host: webcraft-host.").color(theme::TEXT_FAINT).small());
                     ui.add_space(10.0);
                     ui.label(egui::RichText::new("Browser capture filter").strong());
                     ui.separator();
@@ -1796,17 +1839,40 @@ impl DownloadApp {
                         ui.label("Minimum size MB"); ui.add(egui::DragValue::new(&mut settings.capture_min_mb).range(0..=100_000)); ui.end_row();
                     });
                     ui.label(egui::RichText::new("Empty extensions = all types. Size filter only skips files with known size below limit; unknown size still captured. Explicit browser sends (context menu, video panel) bypass filter.").color(theme::TEXT_FAINT).small());
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("yt-dlp (video pages)").strong());
+                    ui.separator();
+                    ui.checkbox(&mut settings.ytdlp_auto_update, "Auto-update yt-dlp");
+                    if ui.button("Update yt-dlp now").clicked() { update_ytdlp = true; }
+                    ui.label(egui::RichText::new("Downloads video-page URLs (YouTube, Vimeo, ...). Binary: bundled next to exe, config bin/, or PATH; fetched on first use.").color(theme::TEXT_FAINT).small());
                 }
                 _ => {
                     ui.label(egui::RichText::new("About").strong());
                     ui.separator();
-                    ui.label(format!("downloadcraft v{}", env!("CARGO_PKG_VERSION")));
+                    ui.label(format!("webcraft v{}", env!("CARGO_PKG_VERSION")));
                     ui.label("Cross-platform download manager written in Rust with egui.");
                     ui.label(egui::RichText::new("No proprietary code, binaries, icons, or licensing logic.").color(theme::TEXT_FAINT).small());
                 }
             }
         });
 
+        if update_ytdlp {
+            self.options_notice = "Updating yt-dlp...".into();
+            let rt = self.rt.clone();
+            let rt_b = self.tokio_rt.clone();
+            std::thread::spawn(move || {
+                let res = rt_b.block_on(async move {
+                    match ytdlp::ensure_ytdlp().await {
+                        Ok(p) => tokio::task::spawn_blocking(move || ytdlp::ytdlp_update(&p)).await.map_err(|e| e.to_string()).and_then(|r| r),
+                        Err(e) => Err(e),
+                    }
+                });
+                let msg = match res { Ok(t) => format!("yt-dlp update: {}", t.lines().last().unwrap_or("ok")), Err(e) => format!("yt-dlp update failed: {e}") };
+                let mut g = rt.lock().unwrap();
+                g.messages.push(msg);
+                if g.messages.len() > 200 { g.messages.drain(..50); }
+            });
+        }
         if repair_hosts {
             let mut g = self.rt.lock().unwrap();
             match platform::register_native_hosts(&crate::sibling_host_path()) {
@@ -1869,8 +1935,8 @@ mod progress_tests {
 
     #[test]
     fn tray_toggle_label_follows_visibility() {
-        assert_eq!(tray_toggle_label(true), "Hide downloadcraft");
-        assert_eq!(tray_toggle_label(false), "Show downloadcraft");
+        assert_eq!(tray_toggle_label(true), "Hide webcraft");
+        assert_eq!(tray_toggle_label(false), "Show webcraft");
     }
 
     fn task(total: Option<u64>, downloaded: u64) -> DownloadTask {
@@ -1888,6 +1954,14 @@ mod progress_tests {
     fn manifest_segment_count_supplies_fraction_when_bytes_unknown() {
         let view = SegView { parts: vec![(3, 12)], manifest: true };
         assert_eq!(display_fraction(&task(None, 999), Some(&view)), Some(0.25));
+    }
+
+    #[test]
+    fn webdav_schemes_map_to_http() {
+        assert_eq!(normalize_webdav("webdav://example.com/a.bin"), "http://example.com/a.bin");
+        assert_eq!(normalize_webdav("webdavs://example.com/a.bin"), "https://example.com/a.bin");
+        assert_eq!(normalize_webdav("  webdavs://example.com/a.bin  "), "https://example.com/a.bin");
+        assert_eq!(normalize_webdav("https://example.com/a.bin"), "https://example.com/a.bin");
     }
 
     #[test]

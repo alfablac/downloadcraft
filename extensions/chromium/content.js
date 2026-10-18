@@ -1,4 +1,4 @@
-// downloadcraft content script (Chromium MV3): video button + panel.
+// webcraft content script (Chromium MV3): video button + panel.
 // IDM-observed behavior, clean-room: button appears on first playable/sized
 // frame (readyState>=2 or a poster), anchored top-right of the media frame,
 // even when src is blob:/MSE (Reddit, YouTube...). Stream URLs come from the
@@ -43,7 +43,7 @@
     panel = document.createElement("div");
     panel.id = "downloadcraft-panel";
     panel.style.cssText = "position:absolute;z-index:2147483647;background:#111;color:#fff;font:12px sans-serif;border-radius:6px;padding:6px;box-shadow:0 2px 10px rgba(0,0,0,.5);max-width:420px;min-width:260px;";
-    panel.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;"><b>Download with downloadcraft</b><button class="dc-close" style="cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #555;padding:0 6px;">×</button></div><div class="downloadcraft-items"></div>';
+    panel.innerHTML = '<div style="display:flex;justify-content:flex-end;align-items:center;margin-bottom:4px;"><button class="dc-close" style="cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #555;padding:0 6px;">×</button></div><div class="downloadcraft-items"></div>';
     panel.querySelector(".dc-close").addEventListener("click", () => panel.remove());
     document.documentElement.appendChild(panel);
     return panel;
@@ -66,7 +66,7 @@
     urlEl.style.cssText = "color:#bbb;word-break:break-all;margin:4px 0;";
     const reply = (accept) => { panel.remove(); try { api.runtime.sendMessage({ type: "downloadcraft-confirm-result", id: msg.id, accept }); } catch (e) {} };
     const ok = document.createElement("button");
-    ok.textContent = "Download with downloadcraft";
+    ok.textContent = "Download";
     ok.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;";
     ok.addEventListener("click", () => reply(true));
     const nat = document.createElement("button");
@@ -77,6 +77,24 @@
     box.appendChild(close); box.appendChild(name); box.appendChild(urlEl); box.appendChild(ok); box.appendChild(nat);
   }
 
+  // Page-declared media invisible to <video> scan: og:/twitter: meta,
+  // JSON-LD VideoObject, embed/object URLs. Blob:/data: excluded.
+  function pageMediaUrls() {
+    const out = [];
+    const push = (v) => {
+      if (!v || typeof v !== "string") return;
+      try { const u = new URL(v.trim().replace(/\\\//g, "/"), location.href).href; if (/^https?:$/.test(new URL(u).protocol)) out.push(u); } catch (e) {}
+    };
+    document.querySelectorAll('meta[property="og:video"],meta[property="og:video:url"],meta[property="og:video:secure_url"],meta[name="twitter:player:stream"]').forEach((m) => push(m.getAttribute("content")));
+    document.querySelectorAll('script[type="application/ld+json"]').forEach((s) => {
+      try {
+        const walk = (n) => { if (!n || typeof n !== "object") return; if (Array.isArray(n)) { n.forEach(walk); return; } push(n.contentUrl); push(n.embedUrl); Object.values(n).forEach(walk); };
+        walk(JSON.parse(s.textContent || "null"));
+      } catch (e) {}
+    });
+    document.querySelectorAll("iframe[src], embed[src], object[data]").forEach((e) => push(e.getAttribute("src") || e.getAttribute("data")));
+    return [...new Set(out)];
+  }
   function directUrls(video) {
     const urls = [];
     if (video.currentSrc) urls.push(video.currentSrc);
@@ -86,7 +104,9 @@
   }
 
   function pickStream(video) {
-    const direct = directUrls(video);
+    // Rescan at click time: manifests/page media declared after load.
+    scanManifests();
+    const direct = [...new Set([...directUrls(video), ...manifestUrls, ...pageMediaUrls()])];
     fetchCandidates((candidates) => {
       const mans = [], medias = [];
       candidates.forEach((c) => { if (c && c.url) (/mpd|m3u8|dash|mpegurl/i.test(c.type || c.url) ? mans : medias).push(c); });
@@ -142,11 +162,11 @@
     let btn = btnFor.get(video);
     if (btn) { positionBtn(video); return btn; }
     btn = document.createElement("button");
-    btn.title = "Download with downloadcraft (drag to move)";
-    btn.setAttribute("aria-label", "Download with downloadcraft");
+    btn.title = "Download video";
+    btn.setAttribute("aria-label", "Download video");
     btn.setAttribute("data-downloadcraft-btn", "1");
-    btn.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:7px auto;pointer-events:none"><path d="M12 3v11"/><path d="m7 10 5 5 5-5"/><path d="M4 20h16"/></svg>';
-    btn.style.cssText = "position:absolute;z-index:2147483646;width:30px;height:30px;border-radius:50%;background:rgba(17,17,17,.62);color:#fff;border:1px solid rgba(255,255,255,.28);padding:0;cursor:grab;font:14px/30px sans-serif;text-align:center;opacity:.55;display:none;touch-action:none;user-select:none;-webkit-user-select:none;";
+    btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:5px auto;pointer-events:none"><path d="M12 3v11"/><path d="m7 10 5 5 5-5"/><path d="M4 20h16"/></svg>';
+    btn.style.cssText = "position:absolute;z-index:2147483646;width:24px;height:24px;border-radius:50%;background:rgba(17,17,17,.45);color:#fff;border:1px solid rgba(255,255,255,.15);padding:0;cursor:grab;text-align:center;opacity:0;pointer-events:none;display:none;touch-action:none;user-select:none;-webkit-user-select:none;";
     btn.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); if (btn.dataset.suppressClick) { delete btn.dataset.suppressClick; return; } pickStream(video); });
 
     // Draggable: press-move >4px drags (persisted offset per video via dataset),
@@ -174,8 +194,16 @@
       btn.style.cursor = "grab"; if (wasDrag) { btn.dataset.suppressClick = "1"; setTimeout(() => delete btn.dataset.suppressClick, 50); }
       if (wasDrag) { e.preventDefault(); e.stopPropagation(); }
     });
-    btn.addEventListener("mouseenter", () => { btn.style.opacity = "1"; });
-    btn.addEventListener("mouseleave", () => { btn.style.opacity = ".55"; });
+    // Discreet: invisible until pointer over video or button itself;
+    // hidden state must not swallow clicks meant for video controls.
+    const showBtn = () => { btn.style.opacity = ".9"; btn.style.pointerEvents = "auto"; };
+    const hideBtn = () => { btn.style.opacity = "0"; btn.style.pointerEvents = "none"; };
+    video.addEventListener("mouseenter", showBtn);
+    video.addEventListener("mouseleave", hideBtn);
+    btn.addEventListener("mouseenter", showBtn);
+    btn.addEventListener("mouseleave", hideBtn);
+    btn.addEventListener("focus", showBtn);
+    btn.addEventListener("blur", hideBtn);
 
     btnFor.set(video, btn);
     (document.body || document.documentElement).appendChild(btn);
@@ -195,9 +223,14 @@
   }
   let manifestUrls = [];
   function scanManifests() {
-    const html = document.documentElement.innerHTML;
-    const re = /https?:\/\/[^\s"'<>]+\.(?:mpd|m3u8)(?:\?[^\s"'<>]*)?/gi;
-    manifestUrls = [...new Set(html.match(re) || [])];
+    // Escaped (https:\/\/, &amp;) and relative manifest refs in inline
+    // player config were missed by absolute-URL-only regex.
+    const html = document.documentElement.innerHTML.replace(/\\\//g, "/").replace(/&amp;/g, "&");
+    const abs = html.match(/https?:\/\/[^\s"'<>\\]+\.(?:mpd|m3u8)(?:\?[^\s"'<>\\]*)?/gi) || [];
+    const rel = html.match(/["'(=]\s*([^\s"'<>\\]+\.(?:mpd|m3u8)(?:\?[^\s"'<>\\]*)?)/gi) || [];
+    const out = [...abs];
+    rel.forEach((m) => { try { out.push(new URL(m.replace(/^["'(=]\s*/, ""), location.href).href); } catch (e) {} });
+    manifestUrls = [...new Set(out)];
   }
   function scan() { document.querySelectorAll("video, audio").forEach(scanVideo); scanManifests(); }
   let pending = null;
@@ -218,7 +251,17 @@
     if (msg.type === "downloadcraft-navigate") { scan(); return; }
     if (msg.type === "downloadcraft-scan") {
       const anchor = document.querySelector("video, audio");
-      if (anchor) { attachBtn(anchor); pickStream(anchor); }
+      if (anchor) { attachBtn(anchor); pickStream(anchor); return; }
+      // No media element (embed/meta-only page): panel vs page media +
+      // sniffed candidates, anchored to body.
+      scanManifests();
+      fetchCandidates((candidates) => {
+        const byUrl = new Map();
+        [...manifestUrls, ...pageMediaUrls()].forEach((u) => byUrl.set(u, { url: u, label: filenameFromUrl(u), filename: filenameFromUrl(u), type: "" }));
+        candidates.forEach((c) => { if (c && c.url && !c.url.startsWith("blob:")) byUrl.set(c.url, { url: c.url, label: `${filenameFromUrl(c.url)} (${c.type || "media"})`, filename: filenameFromUrl(c.url), type: c.type }); });
+        const items = [...byUrl.values()];
+        if (items.length) showPanel(document.body, items);
+      });
       return;
     }
     if (msg.type === "downloadcraft-grab-all") {

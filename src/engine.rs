@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 pub fn build_client(proxy: &str) -> reqwest::Client {
-    let mut b = reqwest::Client::builder().user_agent("downloadcraft/0.1").connect_timeout(std::time::Duration::from_secs(15)).read_timeout(std::time::Duration::from_secs(60)).pool_idle_timeout(std::time::Duration::from_secs(20)).pool_max_idle_per_host(8);
+    let mut b = reqwest::Client::builder().user_agent(concat!("webcraft/", env!("CARGO_PKG_VERSION"))).connect_timeout(std::time::Duration::from_secs(15)).read_timeout(std::time::Duration::from_secs(60)).pool_idle_timeout(std::time::Duration::from_secs(20)).pool_max_idle_per_host(8);
     if !proxy.trim().is_empty() { if let Ok(p) = reqwest::Proxy::all(proxy.trim()) { b = b.proxy(p); } }
     b.build().unwrap_or_default()
 }
@@ -99,7 +99,7 @@ where S: futures_util::Stream + Unpin {
     }
 }
 
-async fn wait_not_paused(ctrl: &Controls) -> Result<(), String> {
+pub async fn wait_not_paused(ctrl: &Controls) -> Result<(), String> {
     while ctrl.paused.load(Ordering::Relaxed) {
         if ctrl.cancelled.load(Ordering::Relaxed) { return Err("cancelled".into()); }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;

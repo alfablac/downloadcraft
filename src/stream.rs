@@ -4,7 +4,23 @@ use crate::model::*;
 use crate::mpd::*;
 use std::sync::Arc;
 
-enum Manifest { Dash, Hls, File }
+enum Manifest { Dash, Hls, Metalink, File }
+
+fn is_metalink_url(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
+    path.ends_with(".meta4") || path.ends_with(".metalink")
+}
+
+/// `.nzb` URL/local path, `nzb://` wrapper, or explicit `x-nzb` header marker.
+fn is_nzb_url(task: &DownloadTask) -> bool {
+    if task.headers.contains_key("x-nzb") { return true; }
+    let url = task.url.trim();
+    if url.starts_with("nzb://") { return true; }
+    if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://")) && std::path::Path::new(url).is_file() {
+        return url.to_ascii_lowercase().ends_with(".nzb");
+    }
+    url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase().ends_with(".nzb")
+}
 
 /// Probe Content-Type only (headers, body dropped). On any error/non-success -> File.
 /// ponytail: header-only probe misses manifests served as octet-stream/text; body-peek + reuse would need passing fetched text into download_dash/download_hls — add when such servers matter.
@@ -18,20 +34,61 @@ async fn probe_manifest(client: &reqwest::Client, task: &DownloadTask) -> Manife
     let ct = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
     let ct = ct.split(';').next().unwrap_or("").trim();
     // IDM MIME map (REA round 6): video/vnd.mpeg.dash.mpd, application/vnd.apple.mpegurl.
-    if ct.contains("dash") || ct.contains("mpd") { Manifest::Dash } else if ct.contains("mpegurl") || ct.contains("m3u") { Manifest::Hls } else { Manifest::File }
+    if ct.contains("application/metalink+xml") { Manifest::Metalink } else if ct.contains("dash") || ct.contains("mpd") { Manifest::Dash } else if ct.contains("mpegurl") || ct.contains("m3u") { Manifest::Hls } else { Manifest::File }
 }
 
 /// Resolve URL to download task(s): URL .mpd/.m3u8 hint first, else probe Content-Type, else plain HTTP.
 pub async fn download_url(client: reqwest::Client, task: DownloadTask, ctrl: Arc<engine::Controls>) -> Result<DownloadTask, String> {
+    download_url_with_settings(client, task, ctrl, &Settings::default()).await
+}
+
+/// Same dispatch with live app `Settings` (NNTP server config lives there).
+pub async fn download_url_with_settings(client: reqwest::Client, task: DownloadTask, ctrl: Arc<engine::Controls>, settings: &Settings) -> Result<DownloadTask, String> {
     let lower = task.url.to_ascii_lowercase();
     if lower.starts_with("ftp://") { return crate::ftp::download_ftp(task, ctrl).await; }
+    if lower.starts_with("sftp://") || lower.starts_with("ssh://") { return crate::sftp::download_sftp(task, ctrl).await; }
+    if is_nzb_url(&task) {
+        let mut task = task;
+        // nzb://<real-url> wrapper: strip scheme so fetch sees the NZB URL/path.
+        if let Some(rest) = task.url.trim().strip_prefix("nzb://") { task.url = rest.to_string(); }
+        let cfg = crate::nntp::NntpConfig::from_settings(settings, &task);
+        return crate::nntp::download_nzb(client, task, ctrl, &cfg).await;
+    }
+    if is_metalink_url(&task.url) { return download_metalink(client, task, ctrl).await; }
     if lower.contains(".mpd") { return download_dash(client, task, ctrl, false).await; }
     if lower.contains(".m3u8") { return download_hls(client, task, ctrl).await; }
+    // Video-page URLs (YouTube etc): yt-dlp extracts formats; native probe would
+    // download HTML page. Fall through to native flow on any yt-dlp failure.
+    if task.headers.contains_key("x-ytdlp") || crate::ytdlp::is_video_page(&task.url) {
+        match crate::ytdlp::download_with_ytdlp(task.clone(), ctrl.clone()).await {
+            Ok(done) => return Ok(done),
+            Err(e) => eprintln!("yt-dlp failed, falling back to native: {e}"),
+        }
+    }
     match probe_manifest(&client, &task).await {
+        Manifest::Metalink => download_metalink(client, task, ctrl).await,
         Manifest::Dash => download_dash(client, task, ctrl, false).await,
         Manifest::Hls => download_hls(client, task, ctrl).await,
         Manifest::File => engine::download_http(client, task, ctrl).await,
     }
+}
+
+/// Fetch + parse .meta4/.metalink, take first <file>: primary url[0], rest
+/// are mirrors (existing engine probe failover), sha256 feeds finish_check.
+/// ponytail: first file only; multi-file .metalink would need task fan-out.
+async fn download_metalink(client: reqwest::Client, mut task: DownloadTask, ctrl: Arc<engine::Controls>) -> Result<DownloadTask, String> {
+    // No silent fallback: bad fetch/parse/empty-url-list must error the task.
+    let xml = fetch_text(&client, &task, &task.url).await.map_err(|e| format!("metalink fetch failed: {e}"))?;
+    let files = crate::metalink::parse_metalink(&xml)?;
+    let f = files.into_iter().next().ok_or("metalink has no <file> entries")?;
+    let mut urls = f.urls.into_iter();
+    let Some(primary) = urls.next() else { return Err(format!("metalink file '{}' has no <url>", f.name)); };
+    task.url = primary;
+    task.mirrors = urls.collect();
+    if !f.name.is_empty() { task.filename = sanitize_filename(&f.name); }
+    // Hash wins; keep caller-supplied sha256 when manifest has none.
+    if f.sha256.is_some() { task.sha256 = f.sha256; }
+    engine::download_http(client, task, ctrl).await
 }
 
 async fn fetch_text(client: &reqwest::Client, task: &DownloadTask, url: &str) -> Result<String, String> {

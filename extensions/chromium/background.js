@@ -1,5 +1,5 @@
-// downloadcraft Chromium MV3 background. Native host: com.downloadcraft.host
-const HOST = "com.downloadcraft.host";
+// webcraft Chromium MV3 background. Native host: com.webcraft.host
+const HOST = "com.webcraft.host";
 // Native messaging: single in-flight queue. Host originally replied without
 // an id, so sends are serialized and the first reply settles the in-flight
 // send. New host echoes `id`; a mismatched id is ignored. 4s timeout rejects.
@@ -62,7 +62,9 @@ function isSniff(details, type) {
   if (!type) return false;
   if (SNIFF_TYPES.has(type)) return true;
   if (type.startsWith("video/") || type.startsWith("audio/")) {
-    try { const seg = new URL(details.url).pathname.split("/").pop() || ""; if (/^seg|^chunk|\.m4s($|\?)/i.test(seg)) return false; } catch (e) {}
+    // Segments (seg-1.ts, chunk_00001.m4s, -0002.ts) pollute panel; only
+    // manifests/full media belong there.
+    try { const seg = new URL(details.url).pathname.split("/").pop() || ""; if (/^(seg|segment|chunk|frag)[-_]?\d|\.m4s$|[-_]\d+\.(ts|m4s)$/i.test(seg)) return false; } catch (e) {}
     return true;
   }
   try { const path = new URL(details.url).pathname.toLowerCase(); return path.endsWith(".mpd") || path.endsWith(".m3u8"); } catch (e) { return false; }
@@ -73,6 +75,7 @@ function pruneCandidates(now = Date.now()) {
 }
 if (chrome.webRequest && chrome.webRequest.onHeadersReceived) {
   chrome.webRequest.onHeadersReceived.addListener((details) => {
+    if (details.statusCode && ![200, 206].includes(details.statusCode)) return; // 404/redirect bodies poison panel
     const header = (details.responseHeaders || []).find((h) => h.name.toLowerCase() === "content-type");
     if (!header || !header.value) return;
     const type = header.value.split(";")[0].trim().toLowerCase();
@@ -105,17 +108,18 @@ function filenameFromUrl(u) {
 }
 const MEDIA_EXT = /\.(mp4|webm|mkv|mp3|mp4|zip|rar|7z|gz|pdf|exe|msi|dmg|deb|iso|tar|mpd|m3u8)(\?|#|$)/i;
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.contextMenus.create({ id: "downloadcraft-link", title: "Download with downloadcraft", contexts: ["link"] });
-  chrome.contextMenus.create({ id: "downloadcraft-media", title: "Download media with downloadcraft", contexts: ["video", "audio", "image"] });
-  chrome.contextMenus.create({ id: "downloadcraft-page", title: "Download all links with downloadcraft", contexts: ["page"] });
+  chrome.contextMenus.create({ id: "downloadcraft-link", title: "Download with webcraft", contexts: ["link"] });
+  chrome.contextMenus.create({ id: "downloadcraft-media", title: "Download media with webcraft", contexts: ["video", "audio", "image"] });
+  chrome.contextMenus.create({ id: "downloadcraft-page", title: "Download all links with webcraft", contexts: ["page"] });
 });
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === "downloadcraft-link" && info.linkUrl) sendDownload(info.linkUrl, tab);
-  else if (info.menuItemId === "downloadcraft-media" && info.srcUrl) sendDownload(info.srcUrl, tab);
+  // blob:/data: srcUrl dies in native host; MSE video needs panel manifests.
+  else if (info.menuItemId === "downloadcraft-media" && info.srcUrl && !/^(blob|data):/.test(info.srcUrl)) sendDownload(info.srcUrl, tab);
   else if (info.menuItemId === "downloadcraft-page" && tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "downloadcraft-grab-all" });
 });
 // Ask-first intercept: stash pending, confirm in originating tab, then
-// send to downloadcraft or resume browser-native download.
+// send to webcraft or resume browser-native download.
 const pending = new Map(); // download id -> {id, url, filename, mime, referrer}
 const bypass = new Map(); // url -> timestamp, one-shot for resumed native downloads
 const BYPASS_TTL_MS = 30 * 1000;
@@ -125,7 +129,7 @@ function takeBypass(url) {
   bypass.delete(url);
   return Date.now() - t < BYPASS_TTL_MS;
 }
-// Intercept browser downloads and ask before redirecting to downloadcraft
+// Intercept browser downloads and ask before redirecting to webcraft
 chrome.downloads.onCreated.addListener(async (item) => {
   if (!item.url || item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
   const url = item.finalUrl || item.url;
@@ -176,3 +180,5 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === "downloadcraft-video-panel") { sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer }).then(sendResponse, (e) => sendResponse({ type: "error", error: String((e && e.message) || e) })); return true; }
 });
 chrome.action.onClicked.addListener((tab) => { if (tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "downloadcraft-scan" }); });
+// SPA/new-page navigation: drop tab's stale sniffed streams.
+if (chrome.tabs && chrome.tabs.onUpdated) chrome.tabs.onUpdated.addListener((tabId, info) => { if (info.status === "loading" && info.url) { for (const [u, c] of [...candidates]) if (c.tabId === tabId) candidates.delete(u); } });

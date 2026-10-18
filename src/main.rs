@@ -74,7 +74,7 @@ fn parse_kv_file(path: &std::path::Path) -> Option<DownloadTask> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--version" || a == "-V") { println!("downloadcraft {}", env!("CARGO_PKG_VERSION")); return; }
+    if args.iter().any(|a| a == "--version" || a == "-V") { println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")); return; }
     if args.iter().any(|a| a == "--smoke-test") {
         if let Err(e) = platform::ensure_dirs() { eprintln!("smoke: ensure_dirs failed: {e}"); std::process::exit(1); }
         // native-host handshake against self
@@ -105,7 +105,7 @@ fn main() {
                 if pid != std::process::id() && process_alive(pid) {
                     let _ = std::fs::write(platform::config_dir().join("show.request"), "show");
                     for a in &args[1..] {
-                        if a.starts_with("http://") || a.starts_with("https://") || a.starts_with("downloadcraft://") {
+                        if a.starts_with("http://") || a.starts_with("https://") || (a.starts_with("webcraft://") || a.starts_with("downloadcraft://")) {
                             let f = platform::inbox_dir().join(format!("fwd-{}.txt", model::new_id()));
                             let _ = std::fs::write(f, format!("url={a}\n"));
                         }
@@ -120,15 +120,15 @@ fn main() {
     let autostart = args.iter().any(|a| a == "--autostart");
     // Inbox: files dropped by native host
     let mut initial_urls: Vec<String> = Vec::new();
-    for a in &args[1..] { if a.starts_with("http://") || a.starts_with("https://") || a.starts_with("downloadcraft://") { initial_urls.push(a.clone()); } }
+    for a in &args[1..] { if a.starts_with("http://") || a.starts_with("https://") || (a.starts_with("webcraft://") || a.starts_with("downloadcraft://")) { initial_urls.push(a.clone()); } }
     let hidden = autostart || load_state().settings.start_minimized;
     run_gui(initial_urls, hidden);
 }
 
 pub fn sibling_host_path() -> std::path::PathBuf {
-    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("downloadcraft"));
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("webcraft"));
     let dir = exe.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    dir.join(if cfg!(windows) { "downloadcraft-host.exe" } else { "downloadcraft-host" })
+    dir.join(if cfg!(windows) { "webcraft-host.exe" } else { "webcraft-host" })
 }
 
 pub fn run_host_handshake(host: &std::path::Path) -> Result<(), String> {
@@ -162,17 +162,17 @@ fn run_gui(initial_urls: Vec<String>, hidden: bool) {
     let _ = platform::register_protocol();
     let rt = Arc::new(Mutex::new(Runtime::load()));
     for u in &initial_urls {
-        let clean = u.strip_prefix("downloadcraft://add?url=").map(url_decode).unwrap_or_else(|| u.clone());
+        let clean = u.strip_prefix("webcraft://add?url=").or_else(|| u.strip_prefix("downloadcraft://add?url=")).map(url_decode).unwrap_or_else(|| u.clone());
         rt.lock().unwrap().add_url(&clean, "main", "", "");
     }
     // drain inbox into pending captures (confirm dialog shows on first frame)
     rt.lock().unwrap().pending_captures = take_inbox_tasks(&rt);
     let rt_clone = rt.clone();
-    // Window/taskbar icon: same artwork as .exe resource (assets/downloadcraft.png -> .ico).
+    // Window/taskbar icon: same artwork as .exe resource (assets/webcraft.png -> .ico).
     // Without this eframe/winit falls back to a default blue square.
-    let win_icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/downloadcraft.png")).unwrap_or_default();
-    let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_icon(std::sync::Arc::new(win_icon)).with_inner_size([1180.0, 720.0]).with_min_inner_size([760.0, 520.0]).with_title(format!("downloadcraft v{}", env!("CARGO_PKG_VERSION"))).with_visible(!hidden), ..Default::default() };
-    let _ = eframe::run_native("downloadcraft", options, Box::new(move |cc| Ok(Box::new(app::DownloadApp::new(cc, rt_clone, hidden)))));
+    let win_icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/webcraft.png")).unwrap_or_default();
+    let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_icon(std::sync::Arc::new(win_icon)).with_inner_size([1180.0, 720.0]).with_min_inner_size([760.0, 520.0]).with_title(format!("webcraft v{}", env!("CARGO_PKG_VERSION"))).with_visible(!hidden), ..Default::default() };
+    let _ = eframe::run_native("webcraft", options, Box::new(move |cc| Ok(Box::new(app::DownloadApp::new(cc, rt_clone, hidden)))));
 }
 
 fn process_alive(pid: u32) -> bool {
@@ -204,8 +204,8 @@ pub fn take_inbox_tasks(rt: &Arc<Mutex<Runtime>>) -> Vec<DownloadTask> {
         for e in rd.flatten() {
             let p = e.path();
             if let Some(mut t) = parse_kv_file(&p) {
-                if let Some(enc) = t.url.strip_prefix("downloadcraft://grab?url=") { let _ = std::fs::write(platform::config_dir().join("pending-grab.txt"), url_decode(enc)); let _ = std::fs::remove_file(&p); continue; }
-                if let Some(enc) = t.url.strip_prefix("downloadcraft://add?url=") { t.url = url_decode(enc); }
+                if let Some(enc) = t.url.strip_prefix("webcraft://grab?url=").or_else(|| t.url.strip_prefix("downloadcraft://grab?url=")) { let _ = std::fs::write(platform::config_dir().join("pending-grab.txt"), url_decode(enc)); let _ = std::fs::remove_file(&p); continue; }
+                if let Some(enc) = t.url.strip_prefix("webcraft://add?url=").or_else(|| t.url.strip_prefix("downloadcraft://add?url=")) { t.url = url_decode(enc); }
                 let mut g = rt.lock().unwrap();
                 if t.id.is_empty() { t.id = new_id(); }
                 if t.filename.is_empty() { t.filename = filename_from_url(&t.url); }

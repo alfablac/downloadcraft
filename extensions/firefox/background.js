@@ -1,8 +1,8 @@
-// downloadcraft Firefox background. Native host: com.downloadcraft.host
+// webcraft Firefox background. Native host: com.webcraft.host
 // IDM-parity capture (from shipped IDM Firefox ext evidence): blocking
 // webRequest.onHeadersReceived decides takeover by status, Content-Disposition,
 // Content-Type (MIME->ext map), URL extension; media requests feed video panel.
-const HOST = "com.downloadcraft.host";
+const HOST = "com.webcraft.host";
 // Native messaging: single in-flight queue (see Chromium background.js).
 let nativePort = null;
 let nativeNextId = 1;
@@ -56,7 +56,7 @@ function notify(title, message) {
 }
 async function safeSend(url, tab, extra = {}) {
   try { return await sendDownload(url, tab, extra); }
-  catch (e) { notify("downloadcraft: download not sent", "Native host unreachable. Start downloadcraft desktop app once, then retry. (" + (e && e.message || e) + ")"); throw e; }
+  catch (e) { notify("webcraft: download not sent", "Native host unreachable. Start webcraft desktop app once, then retry. (" + (e && e.message || e) + ")"); throw e; }
 }
 // --- Ask-first capture: stash, prompt tab, act on answer. Fallback: safeSend. ---
 const pendingCaptures = new Map(); // id -> {id,url,filename,mime,size,referrer,tabId,time}
@@ -118,7 +118,7 @@ function basename(name) { return name ? String(name).split(/[\\/]/).pop() || "" 
 function captureDecision(details) {
   if (isBypassed(details.url)) return null;
   if (![200, 206].includes(details.statusCode)) return null;
-  if (/^Seg\d|^ts\d/i.test(filenameFromUrl(details.url))) return null; // stream segments: panel lists manifest, not fragments
+  if (/^(seg|segment|chunk|frag)[-_]?\d|\.m4s$|[-_]\d+\.(ts|m4s)$/i.test(filenameFromUrl(details.url))) return null; // stream segments: panel lists manifest, not fragments
   const type = headerOf(details.responseHeaders, "content-type").split(";")[0].trim().toLowerCase();
   const disp = headerOf(details.responseHeaders, "content-disposition").toLowerCase();
   const ext = extOfUrl(details.url);
@@ -174,19 +174,19 @@ async function sendDownload(url, tab, extra = {}) {
 // Menus: create on startup too (event-page restarts lose onInstalled-only menus).
 function createMenus() {
   try {
-    browser.contextMenus.create({ id: "downloadcraft-link", title: "Download with downloadcraft", contexts: ["link"] }, () => void browser.runtime.lastError);
-    browser.contextMenus.create({ id: "downloadcraft-media", title: "Download media with downloadcraft", contexts: ["video", "audio", "image"] }, () => void browser.runtime.lastError);
-    browser.contextMenus.create({ id: "downloadcraft-page", title: "Download all links with downloadcraft", contexts: ["page"] }, () => void browser.runtime.lastError);
-    browser.contextMenus.create({ id: "downloadcraft-grab", title: "Grab site with downloadcraft", contexts: ["page"] }, () => void browser.runtime.lastError);
+    browser.contextMenus.create({ id: "downloadcraft-link", title: "Download with webcraft", contexts: ["link"] }, () => void browser.runtime.lastError);
+    browser.contextMenus.create({ id: "downloadcraft-media", title: "Download media with webcraft", contexts: ["video", "audio", "image"] }, () => void browser.runtime.lastError);
+    browser.contextMenus.create({ id: "downloadcraft-page", title: "Download all links with webcraft", contexts: ["page"] }, () => void browser.runtime.lastError);
+    browser.contextMenus.create({ id: "downloadcraft-grab", title: "Grab site with webcraft", contexts: ["page"] }, () => void browser.runtime.lastError);
   } catch (e) {}
 }
 browser.runtime.onInstalled.addListener(createMenus);
 createMenus();
 browser.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === "downloadcraft-link" && info.linkUrl) safeSend(info.linkUrl, tab).catch(() => {});
-  else if (info.menuItemId === "downloadcraft-media" && info.srcUrl) safeSend(info.srcUrl, tab).catch(() => {});
+  else if (info.menuItemId === "downloadcraft-media" && info.srcUrl && !/^(blob|data):/.test(info.srcUrl)) safeSend(info.srcUrl, tab).catch(() => {});
   else if (info.menuItemId === "downloadcraft-page" && tab && tab.id) browser.tabs.sendMessage(tab.id, { type: "downloadcraft-grab-all" });
-  else if (info.menuItemId === "downloadcraft-grab" && tab && tab.url) safeSend("downloadcraft://grab?url=" + encodeURIComponent(tab.url), tab, { referrer: tab.url }).catch(() => {});
+  else if (info.menuItemId === "downloadcraft-grab" && tab && tab.url) safeSend("webcraft://grab?url=" + encodeURIComponent(tab.url), tab, { referrer: tab.url }).catch(() => {});
 });
 browser.downloads.onCreated.addListener(async (item) => {
   if (!item.url || isBypassed(item.url) || item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
@@ -210,7 +210,7 @@ browser.runtime.onMessage.addListener((msg, sender) => {
           try { await safeSend(p.url, tab, { filename: p.filename, mime: p.mime, referrer: p.referrer, size: p.size, captured: true }); }
           catch (e) { try { await browserDownload(p); } catch (e2) {} } // host died: file must not vanish
         } else if (msg.action === "browser") {
-          try { await browserDownload(p); } catch (e) { notify("downloadcraft: browser download failed", (e && e.message) || String(e)); }
+          try { await browserDownload(p); } catch (e) { notify("webcraft: browser download failed", (e && e.message) || String(e)); }
         }
       })();
     }
@@ -227,3 +227,5 @@ browser.runtime.onMessage.addListener((msg, sender) => {
 // Ask-first leftovers: tab closed mid-prompt must not lose file (no candidates map here).
 if (browser.tabs && browser.tabs.onRemoved) browser.tabs.onRemoved.addListener((tid) => { for (const [pid, p] of [...pendingCaptures]) if (p.tabId === tid) { pendingCaptures.delete(pid); browserDownload(p).catch(() => {}); } });
 browser.browserAction.onClicked.addListener((tab) => { if (tab && tab.id) browser.tabs.sendMessage(tab.id, { type: "downloadcraft-scan" }); });
+// SPA/new-page navigation: drop tab's stale sniffed streams.
+if (browser.tabs && browser.tabs.onUpdated) browser.tabs.onUpdated.addListener((tabId, info) => { if (info.status === "loading" && info.url) { for (const [u, c] of [...candidatesByUrl]) if (c.tabId === tabId) candidatesByUrl.delete(u); } });

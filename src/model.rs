@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -42,6 +43,8 @@ pub struct DownloadTask {
     #[serde(default)] pub password: String,
     #[serde(default)] pub last_try_at: u64,
     #[serde(default)] pub description: String,
+    /// SFTP private-key file (empty = password auth, else ~/.ssh/id_* probe).
+    #[serde(default)] pub ssh_key_path: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,12 +125,21 @@ pub struct Settings {
     /// Browser-capture minimum size in MB. 0 = no minimum. Files with unknown
     /// size (missing Content-Length) still captured: cannot prove small.
     #[serde(default)] pub capture_min_mb: u64,
+    #[serde(default = "def_true")] pub ytdlp_auto_update: bool,
+    /// NNTP (Usenet/NZB) server. Host empty = unconfigured. Creds stored
+    /// plain like proxy creds — ponytail: no OS keychain; add keyring when needed.
+    #[serde(default)] pub nntp_host: String,
+    #[serde(default = "def_nntp_port")] pub nntp_port: u16,
+    #[serde(default = "def_true")] pub nntp_tls: bool,
+    #[serde(default)] pub nntp_user: String,
+    #[serde(default)] pub nntp_pass: String,
 }
+fn def_nntp_port() -> u16 { 563 }
 fn def_conn() -> u32 { 8 }
 fn def_global() -> usize { 3 }
 impl Default for Settings {
     fn default() -> Self {
-        Self { download_dir: crate::platform::default_download_dir(), max_connections: 8, global_max_concurrent: 3, speed_limit_kbps: 0, autostart: false, start_minimized: false, close_to_tray: true, clipboard_monitor: false, proxy_url: String::new(), scheduler_enabled: true, capture_exts: String::new(), capture_min_mb: 0 }
+        Self { download_dir: crate::platform::default_download_dir(), max_connections: 8, global_max_concurrent: 3, speed_limit_kbps: 0, autostart: false, start_minimized: false, close_to_tray: true, clipboard_monitor: false, proxy_url: String::new(), scheduler_enabled: true, capture_exts: String::new(), capture_min_mb: 0, ytdlp_auto_update: true, nntp_host: String::new(), nntp_port: 563, nntp_tls: true, nntp_user: String::new(), nntp_pass: String::new() }
     }
 }
 
