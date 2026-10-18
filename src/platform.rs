@@ -38,6 +38,51 @@ pub fn state_path() -> PathBuf {
     config_dir().join("state.json")
 }
 
+pub fn crash_log_path() -> PathBuf {
+    config_dir().join("crash.log")
+}
+
+/// Append one record to crash.log. Never panics; safe inside panic hook.
+pub fn log_crash(record: &str) {
+    let _ = std::fs::create_dir_all(config_dir());
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(crash_log_path())
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{record}");
+    }
+}
+
+/// GUI-subsystem builds have no stderr: record every panic (GUI + workers)
+/// to %APPDATA%/webcraft/crash.log with location + forced backtrace.
+pub fn install_crash_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Box<dyn Any>".into()
+        };
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "?".into());
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        log_crash(&format!(
+            "--- panic ts={ts} pid={} ver={}\n  at {loc}\n  msg: {msg}\n{}",
+            std::process::id(),
+            env!("CARGO_PKG_VERSION"),
+            std::backtrace::Backtrace::force_capture()
+        ));
+    }));
+}
+
 /// Real main-window visibility (visible && !minimized), maintained by watcher
 /// on Windows from HWND state; app writes it on egui-driven show/hide. Tray
 /// label + hidden flag sync from this when native side changes state alone.

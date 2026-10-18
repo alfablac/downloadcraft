@@ -41,6 +41,94 @@ fn is_nzb_url(task: &DownloadTask) -> bool {
         .ends_with(".nzb")
 }
 
+/// Download protocol, derived from task URL/headers. Label source for list UI:
+/// mirrors dispatch order in `download_url_with_settings`.
+/// ponytail: derived, not persisted — metalink primary-mirror rewrite and
+/// Content-Type-only streams lose exact kind after run; persist field if needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProtoKind {
+    Torrent,
+    Ftp,
+    Ftps,
+    Sftp,
+    Nntp,
+    Metalink,
+    Dash,
+    Hls,
+    YtDlp,
+    #[default]
+    Http,
+    File,
+}
+
+impl ProtoKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProtoKind::Torrent => "TORRENT",
+            ProtoKind::Ftp => "FTP",
+            ProtoKind::Ftps => "FTPS",
+            ProtoKind::Sftp => "SFTP",
+            ProtoKind::Nntp => "NNTP",
+            ProtoKind::Metalink => "METALINK",
+            ProtoKind::Dash => "DASH",
+            ProtoKind::Hls => "HLS",
+            ProtoKind::YtDlp => "YT-DLP",
+            ProtoKind::Http => "HTTP",
+            ProtoKind::File => "FILE",
+        }
+    }
+    pub fn full_name(self) -> &'static str {
+        match self {
+            ProtoKind::Torrent => "BitTorrent",
+            ProtoKind::Ftp => "FTP",
+            ProtoKind::Ftps => "FTPS",
+            ProtoKind::Sftp => "SFTP/SSH",
+            ProtoKind::Nntp => "NNTP (NZB)",
+            ProtoKind::Metalink => "Metalink",
+            ProtoKind::Dash => "DASH stream",
+            ProtoKind::Hls => "HLS stream",
+            ProtoKind::YtDlp => "Video page (yt-dlp)",
+            ProtoKind::Http => "HTTP/HTTPS",
+            ProtoKind::File => "Local file",
+        }
+    }
+}
+
+pub fn proto_kind(task: &DownloadTask) -> ProtoKind {
+    let lower = task.url.trim().to_ascii_lowercase();
+    if crate::torrent::is_torrent_task(task) {
+        return ProtoKind::Torrent;
+    }
+    if lower.starts_with("ftps://") || lower.starts_with("ftpsi://") {
+        return ProtoKind::Ftps;
+    }
+    if lower.starts_with("ftp://") {
+        return ProtoKind::Ftp;
+    }
+    if lower.starts_with("sftp://") || lower.starts_with("ssh://") {
+        return ProtoKind::Sftp;
+    }
+    if is_nzb_url(task) {
+        return ProtoKind::Nntp;
+    }
+    if is_metalink_url(&task.url) {
+        return ProtoKind::Metalink;
+    }
+    if lower.contains(".mpd") {
+        return ProtoKind::Dash;
+    }
+    if lower.contains(".m3u8") {
+        return ProtoKind::Hls;
+    }
+    if task.headers.contains_key("x-ytdlp") || crate::ytdlp::is_video_page(&task.url) {
+        return ProtoKind::YtDlp;
+    }
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return ProtoKind::Http;
+    }
+    ProtoKind::File
+}
+
 /// Probe Content-Type only (headers, body dropped). On any error/non-success -> File.
 /// ponytail: header-only probe misses manifests served as octet-stream/text; body-peek + reuse would need passing fetched text into download_dash/download_hls — add when such servers matter.
 async fn probe_manifest(client: &reqwest::Client, task: &DownloadTask) -> Manifest {
@@ -120,6 +208,12 @@ pub async fn download_url_with_settings(
     if is_metalink_url(&task.url) {
         return download_metalink(client, task, ctrl).await;
     }
+    // Explicit yt-dlp choice (x-ytdlp header from dialog) beats manifest dispatch:
+    // without this, manifest URLs never reach yt-dlp. Explicit choice fails loud
+    // (no silent native fallback: user picked engine deliberately).
+    if task.headers.contains_key("x-ytdlp") {
+        return crate::ytdlp::download_with_ytdlp(task, ctrl).await;
+    }
     if lower.contains(".mpd") {
         return download_dash(client, task, ctrl, false).await;
     }
@@ -128,11 +222,11 @@ pub async fn download_url_with_settings(
     }
     // Video-page URLs (YouTube etc): yt-dlp extracts formats; native probe would
     // download HTML page. Fall through to native flow on any yt-dlp failure.
-    if task.headers.contains_key("x-ytdlp") || crate::ytdlp::is_video_page(&task.url) {
-        match crate::ytdlp::download_with_ytdlp(task.clone(), ctrl.clone()).await {
-            Ok(done) => return Ok(done),
-            Err(e) => eprintln!("yt-dlp failed, falling back to native: {e}"),
-        }
+    if crate::ytdlp::is_video_page(&task.url) {
+        // No native fallback: probe would download page HTML as fake file.
+        return crate::ytdlp::download_with_ytdlp(task, ctrl)
+            .await
+            .map_err(|e| format!("yt-dlp failed: {e}"));
     }
     match probe_manifest(&client, &task).await {
         Manifest::Metalink => download_metalink(client, task, ctrl).await,
@@ -535,7 +629,7 @@ async fn download_hls_media(
         std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
         ctrl.parts_are_segments
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        *ctrl.parts.lock().unwrap() = vec![(0, media.segments.len() as u64)];
+        *ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()) = vec![(0, media.segments.len() as u64)];
         let mut parts: Vec<std::path::PathBuf> = Vec::new();
         if let Some(init) = &media.init_uri {
             let p = work.join("init.bin");
@@ -565,7 +659,7 @@ async fn download_hls_media(
             .await?;
             ctrl.downloaded
                 .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-            if let Some(part) = ctrl.parts.lock().unwrap().first_mut() {
+            if let Some(part) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
                 part.0 = (i + 1) as u64;
             }
             if let Some(Some(ki)) = media.key_infos.get(i) {
@@ -618,4 +712,38 @@ async fn download_hls_media(
         .map(|u| (media.init_uri.clone(), u.clone()))
         .collect();
     engine::download_media(client, task, ctrl, vec![("video".into(), segs)]).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::DownloadTask;
+
+    fn kind_of(url: &str) -> ProtoKind {
+        proto_kind(&DownloadTask {
+            url: url.to_string(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn proto_kind_labels() {
+        assert_eq!(
+            kind_of("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"),
+            ProtoKind::Torrent
+        );
+        assert_eq!(kind_of("https://x.org/a.torrent"), ProtoKind::Torrent);
+        assert_eq!(kind_of("ftp://x.org/a.zip"), ProtoKind::Ftp);
+        assert_eq!(kind_of("ftps://x.org/a.zip"), ProtoKind::Ftps);
+        assert_eq!(kind_of("ftpsi://x.org/a.zip"), ProtoKind::Ftps);
+        assert_eq!(kind_of("sftp://x.org/a.zip"), ProtoKind::Sftp);
+        assert_eq!(kind_of("ssh://x.org/a.zip"), ProtoKind::Sftp);
+        assert_eq!(kind_of("nzb://x.org/a.nzb"), ProtoKind::Nntp);
+        assert_eq!(kind_of("https://x.org/a.meta4"), ProtoKind::Metalink);
+        assert_eq!(kind_of("https://x.org/m.mpd?token=1"), ProtoKind::Dash);
+        assert_eq!(kind_of("https://x.org/m.m3u8"), ProtoKind::Hls);
+        assert_eq!(kind_of("https://x.org/a.zip"), ProtoKind::Http);
+        assert_eq!(kind_of("file.zip"), ProtoKind::File);
+        assert_eq!(ProtoKind::Torrent.label(), "TORRENT");
+    }
 }

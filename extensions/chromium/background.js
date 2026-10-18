@@ -61,6 +61,7 @@ const candidates = new Map(); // url -> {url, type, tabId, time}
 const SNIFF_TYPES = new Set(["application/dash+xml", "application/x-mpegurl", "application/vnd.apple.mpegurl", "application/x-mpegurl", "video/vnd.mpeg.dash.mpd", "video/mpegurl", "video/x-mpegurl", "application/mpegurl"]);
 function isSniff(details, type) {
   if (!type) return false;
+  if (/\.(json|js|mjs|css|html?|map)($|[?#])/i.test(details.url || "")) return false; // page assets, whatever MIME claims
   if (SNIFF_TYPES.has(type)) return true;
   if (type.startsWith("video/") || type.startsWith("audio/")) {
     // Segments (seg-1.ts, chunk_00001.m4s, -0002.ts) pollute panel; only
@@ -81,7 +82,8 @@ if (chrome.webRequest && chrome.webRequest.onHeadersReceived) {
     if (!header || !header.value) return;
     const type = header.value.split(";")[0].trim().toLowerCase();
     if (!isSniff(details, type)) return;
-    candidates.set(details.url, { url: details.url, type, tabId: details.tabId, time: Date.now() });
+    const lenH = (details.responseHeaders || []).find((h) => h.name.toLowerCase() === "content-length");
+    candidates.set(details.url, { url: details.url, type, tabId: details.tabId, time: Date.now(), size: lenH ? parseInt(lenH.value, 10) || 0 : 0 });
     pruneCandidates();
   }, { urls: ["<all_urls>"], types: ["main_frame", "sub_frame", "media", "object", "xmlhttprequest", "other"] }, ["responseHeaders"]);
 }
@@ -131,7 +133,15 @@ function takeBypass(url) {
   return Date.now() - t < BYPASS_TTL_MS;
 }
 // Intercept browser downloads and ask before redirecting to webcraft
+// Never intercept page-asset downloads (json/js/css) even with download attr.
+function isAssetDownload(item) {
+  const m = String((item && item.mime) || "").toLowerCase();
+  if (/json|javascript|ecmascript|css/.test(m)) return true;
+  const f = String((item && item.filename) || (item && item.url) || "").split(/[?#]/)[0];
+  return /\.(json|js|mjs|css)$/i.test(f);
+}
 chrome.downloads.onCreated.addListener(async (item) => {
+  if (isAssetDownload(item)) return;
   if (!item.url || item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
   const url = item.finalUrl || item.url;
   if (takeBypass(url) || takeBypass(item.url)) return;

@@ -18,6 +18,14 @@
       || /\/chunklist|\/seg-|sequence/i.test(base);
   }
 
+  function isJunkUrl(u) {
+    if (/^(blob|data):/i.test(String(u || ""))) return true;
+    if (/(^|[/&?=._-])(license|widevine|drm)([/&?=._-]|$)/i.test(String(u || ""))) return true;
+    // Page assets never downloads, whatever MIME claims: json/js/css/html etc.
+    var base = String(u || "").split(/[?#]/)[0];
+    return /\.(json|js|mjs|css|html?|xhtml|xml|txt|map)$/i.test(base);
+  }
+
   // Slice selectors (bytestart/byteend) address same file: collapse them.
   function canonicalUrl(u) {
     try {
@@ -65,6 +73,7 @@
     (list || []).forEach(function (raw, idx) {
       var item = typeof raw === "string" ? { url: raw } : raw;
       if (!item || !item.url) return;
+      if (isJunkUrl(item.url)) return;
       var key = canonicalUrl(item.url);
       var size = sizeOf(item);
       var hit = byCanon.get(key);
@@ -73,6 +82,9 @@
     });
     var rows = Array.from(byCanon.values());
     var hasPlaylist = rows.some(function (r) { return kindOf(r.item) === "playlist"; });
+    // Filter, don't demote: segments/init pieces under known playlist are parts
+    // engine fetches itself. Kept bare when no playlist (only lead user has).
+    if (hasPlaylist) rows = rows.filter(function (r) { return kindOf(r.item) !== "segment"; });
     return rows
       .map(function (r) {
         return { item: r.item, index: r.index, size: r.size, dur: durationOf(r.item), score: scoreOf(kindOf(r.item), hasPlaylist) };

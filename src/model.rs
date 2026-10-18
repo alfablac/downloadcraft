@@ -190,6 +190,8 @@ pub struct Schedule {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
+    // No default here broke whole-state parse (data loss) when absent in old state files.
+    #[serde(default)]
     pub download_dir: PathBuf,
     #[serde(default = "def_conn")]
     pub max_connections: u32,
@@ -321,12 +323,54 @@ pub fn sanitize_filename(name: &str) -> String {
             }
         })
         .collect();
-    let t = cleaned.trim().trim_end_matches('.').trim();
+    let t = cleaned.trim().trim_end_matches(['.', ' ']).trim();
     if t.is_empty() {
-        "download.bin".into()
+        return "download.bin".into();
+    }
+    // Windows reserved device names fail file creation; prefix stem.
+    let stem = t.split('.').next().unwrap_or(t);
+    let reserved = matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    let mut out = if reserved {
+        format!("_{t}")
     } else {
         t.to_string()
+    };
+    // Cap name length: hostile 10k names / >260-char full paths fail on Windows.
+    if out.len() > 120 {
+        let (ext, stem_part) = match out.rfind('.') {
+            Some(i) if i > 0 && out.len() - i <= 10 => {
+                (out[i..].to_string(), out[..i].to_string())
+            }
+            _ => (String::new(), out.clone()),
+        };
+        let keep = 120usize.saturating_sub(ext.len());
+        out = format!("{}{}", stem_part.chars().take(keep).collect::<String>(), ext);
     }
+    out
 }
 
 pub fn filename_from_url(url: &str) -> String {

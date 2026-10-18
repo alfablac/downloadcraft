@@ -279,7 +279,7 @@ pub async fn download_ftp(
         task.total = Some(t);
         ctrl.total.store(t, Ordering::Relaxed);
         ctrl.parts_are_segments.store(false, Ordering::Relaxed);
-        *ctrl.parts.lock().unwrap() = vec![(offset.min(t), t)];
+        *ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()) = vec![(offset.min(t), t)];
         if t > 0 && offset == t {
             if dest.exists() {
                 tokio::fs::remove_file(&dest)
@@ -302,7 +302,7 @@ pub async fn download_ftp(
     ctrl.downloaded.store(offset, Ordering::Relaxed);
     if total.is_none() {
         ctrl.parts_are_segments.store(false, Ordering::Relaxed);
-        *ctrl.parts.lock().unwrap() = vec![(offset, 0)];
+        *ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()) = vec![(offset, 0)];
     }
     task.downloaded = offset;
     task.status = TaskStatus::Downloading;
@@ -327,7 +327,7 @@ pub async fn download_ftp(
         if code != 350 {
             offset = 0;
             ctrl.downloaded.store(0, Ordering::Relaxed);
-            if let Some(part) = ctrl.parts.lock().unwrap().first_mut() {
+            if let Some(part) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
                 part.0 = 0;
             }
         } // server cannot resume: restart below via truncate
@@ -382,7 +382,7 @@ pub async fn download_ftp(
         file.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
         downloaded += n as u64;
         ctrl.downloaded.store(downloaded, Ordering::Relaxed);
-        if let Some(part) = ctrl.parts.lock().unwrap().first_mut() {
+        if let Some(part) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
             part.0 = downloaded;
         }
         task.downloaded = downloaded;
@@ -411,7 +411,7 @@ pub async fn download_ftp(
     if task.total.is_none() {
         task.total = Some(downloaded);
         ctrl.total.store(downloaded, Ordering::Relaxed);
-        if let Some(part) = ctrl.parts.lock().unwrap().first_mut() {
+        if let Some(part) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
             *part = (downloaded, downloaded);
         }
     }
@@ -438,7 +438,7 @@ mod tests {
         let mut offset = 0u64;
         wr.write_all(b"220 fake\r\n").await.unwrap();
         while let Ok(Some(line)) = lines.next_line().await {
-            st.cmds.lock().unwrap().push(line.clone());
+            st.cmds.lock().unwrap_or_else(|e| e.into_inner()).push(line.clone());
             let mut it = line.splitn(2, ' ');
             let cmd = it.next().unwrap_or("").to_ascii_uppercase();
             let arg = it.next().unwrap_or("");
@@ -474,7 +474,7 @@ mod tests {
                 }
                 "REST" => {
                     offset = arg.parse().unwrap_or(0);
-                    *st.rest.lock().unwrap() = offset;
+                    *st.rest.lock().unwrap_or_else(|e| e.into_inner()) = offset;
                     wr.write_all(b"350 ok\r\n").await.unwrap();
                 }
                 "RETR" => {
@@ -534,7 +534,7 @@ mod tests {
         assert_eq!(ctrl.total.load(Ordering::Relaxed), payload_len as u64);
         assert!(!ctrl.parts_are_segments.load(Ordering::Relaxed));
         assert_eq!(
-            ctrl.parts.lock().unwrap().clone(),
+            ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             vec![(payload_len as u64, payload_len as u64)]
         );
         (done, dir, st)
@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(done.total, Some(50_000));
         assert_eq!(std::fs::read(dir.join("file.bin")).unwrap(), payload);
         assert!(!dir.join("file.bin.part").exists());
-        let cmds = st.cmds.lock().unwrap().clone();
+        let cmds = st.cmds.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert!(cmds.iter().any(|c| c == "USER alice"), "{cmds:?}");
         assert!(cmds.iter().any(|c| c == "PASS secret"), "{cmds:?}");
         assert!(
@@ -580,7 +580,7 @@ mod tests {
         let payload: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
         let (done, dir, st) = run(50_000, 4_000, "anonymous", "anonymous@").await;
         assert_eq!(done.status, TaskStatus::Complete);
-        assert_eq!(*st.rest.lock().unwrap(), 4_000);
+        assert_eq!(*st.rest.lock().unwrap_or_else(|e| e.into_inner()), 4_000);
         assert_eq!(std::fs::read(dir.join("file.bin")).unwrap(), payload);
         let _ = std::fs::remove_dir_all(&dir);
     }

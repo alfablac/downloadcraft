@@ -395,7 +395,7 @@ impl Crawler {
         current: &str,
     ) {
         if let Some(p) = &self.progress {
-            let mut g = p.lock().unwrap();
+            let mut g = p.lock().unwrap_or_else(|e| e.into_inner());
             g.pages_done = pages.len();
             g.pages_queued = queue_len;
             g.depth = depth;

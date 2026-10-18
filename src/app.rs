@@ -29,12 +29,19 @@ enum Tab {
 pub struct SegView {
     pub parts: Vec<(u64, u64)>,
     pub manifest: bool,
+    /// Download type: NNTP multi-file parts are files, torrent part is whole torrent.
+    pub kind: crate::stream::ProtoKind,
+    /// Torrent swarm snapshot (torrent kind only).
+    pub torrent: Option<crate::engine::TorrentSnap>,
 }
 impl SegView {
     fn label(&self) -> String {
         if self.manifest {
             let (d, t) = self.parts.first().copied().unwrap_or((0, 0));
             format!("{d} / {t} segments")
+        } else if self.kind == crate::stream::ProtoKind::Nntp {
+            let done = self.parts.iter().filter(|(d, e)| e > &0 && d >= e).count();
+            format!("{done} / {} files done", self.parts.len())
         } else {
             let done = self.parts.iter().filter(|(d, e)| e > &0 && d >= e).count();
             format!("{done} / {} parts done", self.parts.len())
@@ -238,6 +245,8 @@ pub struct DownloadApp {
     add_mirrors: String,
     add_desc: String,
     add_queue: String,
+    add_start_now: bool,
+    add_just_opened: bool,
     new_queue_name: String,
     grab_url: String,
     grab_depth: usize,
@@ -263,12 +272,14 @@ pub struct DownloadApp {
     search: String,
     minutes_today: (i64, u32),
     category: String,
+    type_filter: Option<TypeSel>,
     sort_col: u8,
     sort_asc: bool,
     options_tab: u8,
     options_notice: String,
     show_add: bool,
     show_progress_for: Option<String>,
+    progress_raise: bool,
     selected: Option<String>,
     selected_schedule: Option<String>,
     completed_notice: Option<String>,
@@ -303,6 +314,8 @@ pub struct DownloadApp {
     /// IDM-style pre-download capture dialog state: task being confirmed +
     /// editable filename buffer (None = no capture dialog open).
     capture_task: Option<DownloadTask>,
+    /// Edge guard: reveal window once per capture burst, not every poll while minimized.
+    capture_revealed: bool,
     capture_name: String,
     /// True only for first frame after capture dialog opens: focus filename field.
     capture_just_opened: bool,
@@ -372,12 +385,10 @@ impl DownloadApp {
         // show.request -> platform watcher shows/hides HWND, poll then syncs UI.
         {
             let rt_ev = rt.clone();
-            // MenuItem is !Send but handlers + menu live on UI thread; share
-            // via raw pointer. SAFETY: item outlives handlers (process exit).
-            let show_ptr = tray
-                .as_ref()
-                .map(|t| &t.show_item as *const tray_icon::menu::MenuItem as usize)
-                .unwrap_or(0);
+            // No raw MenuItem pointer: TrayNav moves into DownloadApp (then heap),
+            // captured stack address goes stale -> native AV in muda set_text.
+            // Handlers only write show.request + flip WINDOW_VISIBLE; GUI thread
+            // refreshes label via valid self.tray in sync_tray_label().
             let ids = tray
                 .as_ref()
                 .map(|t| (t.show_id.clone(), t.add_id.clone(), t.quit_id.clone()));
@@ -403,13 +414,10 @@ impl DownloadApp {
                             crate::platform::config_dir().join("show.request"),
                             "toggle",
                         );
-                        // Flip label here too: egui poll may not run while hidden.
-                        let visible = !crate::platform::WINDOW_VISIBLE
+                        // Flip shared flag; GUI updates label via self.tray
+                        // (no raw MenuItem pointer: TrayNav moves after capture).
+                        crate::platform::WINDOW_VISIBLE
                             .fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
-                        if show_ptr != 0 {
-                            unsafe { &*(show_ptr as *const tray_icon::menu::MenuItem) }
-                                .set_text(tray_toggle_label(visible));
-                        }
                     } else if ev.id == add_id {
                         let _ = std::fs::write(
                             crate::platform::config_dir().join("show.request"),
@@ -422,23 +430,14 @@ impl DownloadApp {
             // before menu shows (catches close-to-tray/taskbar changes).
             tray_icon::TrayIconEvent::set_event_handler(Some(
                 move |ev: tray_icon::TrayIconEvent| {
-                    let item = if show_ptr == 0 {
-                        None
-                    } else {
-                        Some(unsafe { &*(show_ptr as *const tray_icon::menu::MenuItem) })
-                    };
                     match ev {
                         tray_icon::TrayIconEvent::DoubleClick {
                             button: tray_icon::MouseButton::Left,
                             ..
                         } => {
-                            // New state known here: flip shared flag + label now,
-                            // next menu open must not wait for egui poll sync.
-                            let visible = !crate::platform::WINDOW_VISIBLE
+                            // Flip shared flag; GUI syncs label via self.tray.
+                            crate::platform::WINDOW_VISIBLE
                                 .fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
-                            if let Some(item) = item {
-                                item.set_text(tray_toggle_label(visible));
-                            }
                             let _ = std::fs::write(
                                 crate::platform::config_dir().join("show.request"),
                                 "toggle",
@@ -451,12 +450,7 @@ impl DownloadApp {
                             button_state: tray_icon::MouseButtonState::Down,
                             ..
                         } => {
-                            if let Some(item) = item {
-                                item.set_text(tray_toggle_label(
-                                    crate::platform::WINDOW_VISIBLE
-                                        .load(std::sync::atomic::Ordering::Relaxed),
-                                ));
-                            }
+                            // Label refreshed by GUI poll (sync_tray_label).
                         }
                         _ => {}
                     }
@@ -476,6 +470,8 @@ impl DownloadApp {
             add_mirrors: String::new(),
             add_desc: String::new(),
             add_queue: "main".into(),
+            add_start_now: true,
+            add_just_opened: false,
             new_queue_name: String::new(),
             grab_url: String::new(),
             grab_depth: 2,
@@ -500,12 +496,14 @@ impl DownloadApp {
             search: String::new(),
             minutes_today: today_parts(),
             category: "All Downloads".into(),
+            type_filter: None,
             sort_col: 0,
             sort_asc: true,
             options_tab: 0,
             options_notice: "Changes save automatically.".into(),
             show_add: false,
             show_progress_for: None,
+            progress_raise: false,
             selected: None,
             selected_schedule: None,
             completed_notice: None,
@@ -524,6 +522,7 @@ impl DownloadApp {
             dl_widths: None,
             grab_widths: None,
             capture_task: None,
+            capture_revealed: false,
             capture_name: String::new(),
             capture_just_opened: false,
         }
@@ -599,9 +598,9 @@ impl DownloadApp {
         }
         // Heal leaked Controls (worker panicked before cleanup ran): no
         // unfinished handle above => any entry stale, drop it and proceed.
-        self.rt.lock().unwrap().controls.remove(id);
+        crate::lock_unpoison(&self.rt).controls.remove(id);
         let (task_opt, settings) = {
-            let g = self.rt.lock().unwrap();
+            let g = crate::lock_unpoison(&self.rt);
             (
                 g.state.tasks.iter().find(|t| t.id == id).cloned(),
                 g.state.settings.clone(),
@@ -611,7 +610,7 @@ impl DownloadApp {
             return;
         };
         {
-            let mut g = self.rt.lock().unwrap();
+            let mut g = crate::lock_unpoison(&self.rt);
             if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) {
                 t.status = TaskStatus::Downloading;
                 t.error.clear();
@@ -623,9 +622,7 @@ impl DownloadApp {
         } else {
             settings.speed_limit_kbps
         }));
-        self.rt
-            .lock()
-            .unwrap()
+        crate::lock_unpoison(&self.rt)
             .controls
             .insert(id.to_string(), ctrl.clone());
         let rt = self.rt.clone();
@@ -633,9 +630,18 @@ impl DownloadApp {
         let client = engine::build_client(&settings.proxy_url);
         let ctrl2 = ctrl.clone();
         let handle = self.tokio_rt.spawn(async move {
-            let result =
-                crate::stream::download_url_with_settings(client, task, ctrl, &settings).await;
-            let mut g = rt.lock().unwrap();
+            // Inner spawn: downloader panic (e.g. librqbit internals) surfaces as
+            // JoinError -> task Error below, not stuck "Downloading" forever.
+            let settings2 = settings.clone();
+            let result = match tokio::spawn(async move {
+                crate::stream::download_url_with_settings(client, task, ctrl, &settings2).await
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => Err(format!("download worker panicked: {e}")),
+            };
+            let mut g = crate::lock_unpoison(&rt);
             // Only this worker may unregister its own Controls. A stopped worker
             // racing a fresh Resume must not remove the new worker's entry.
             if g.controls.get(&tid).is_some_and(|c| Arc::ptr_eq(c, &ctrl2)) {
@@ -684,7 +690,7 @@ impl DownloadApp {
                                 s.quota_window_start = now;
                                 s.quota_used_bytes = 0;
                             }
-                            s.quota_used_bytes += bytes;
+                            s.quota_used_bytes = s.quota_used_bytes.saturating_add(bytes);
                             if s.quota_used_bytes >= s.quota_mb * 1024 * 1024 {
                                 quota_hit = true;
                             }
@@ -752,9 +758,16 @@ impl DownloadApp {
     fn sample_rates(&mut self) {
         let now = std::time::Instant::now();
         // Snapshot controls: (id, downloaded, total, parts)
-        type Snap = (String, u64, u64, Vec<(u64, u64)>, bool);
+        type Snap = (
+            String,
+            u64,
+            u64,
+            Vec<(u64, u64)>,
+            bool,
+            Option<crate::engine::TorrentSnap>,
+        );
         let snap: Vec<Snap> = {
-            let g = self.rt.lock().unwrap();
+            let g = crate::lock_unpoison(&self.rt);
             g.controls
                 .iter()
                 .map(|(k, c)| {
@@ -762,13 +775,15 @@ impl DownloadApp {
                         k.clone(),
                         c.downloaded.load(Ordering::Relaxed),
                         c.total.load(Ordering::Relaxed),
-                        c.parts.lock().unwrap().clone(),
+                        // Poison-tolerant: see torrent publish() — no cascade to GUI.
+                        c.parts.lock().unwrap_or_else(|e| e.into_inner()).clone(),
                         c.parts_are_segments.load(Ordering::Relaxed),
+                        c.torrent.lock().unwrap_or_else(|e| e.into_inner()).clone(),
                     )
                 })
                 .collect()
         };
-        for (id, n, _total, parts, manifest) in &snap {
+        for (id, n, _total, parts, manifest, torrent_snap) in &snap {
             let v = self.rate_map.entry(id.clone()).or_default();
             if v.last()
                 .map(|(t, b)| now.duration_since(*t).as_millis() >= 100 && *b != *n)
@@ -783,33 +798,41 @@ impl DownloadApp {
                     SegView {
                         parts: parts.clone(),
                         manifest: *manifest,
+                        torrent: torrent_snap.clone(),
+                        kind: crate::lock_unpoison(&self.rt)
+                            .state
+                            .tasks
+                            .iter()
+                            .find(|t| &t.id == id)
+                            .map(crate::stream::proto_kind)
+                            .unwrap_or_default(),
                     },
                 );
             }
         }
         self.rate_map.retain(|id, _| {
-            let g = self.rt.lock().unwrap();
+            let g = crate::lock_unpoison(&self.rt);
             g.controls.contains_key(id)
                 || g.state.tasks.iter().any(|t| {
                     &t.id == id && matches!(t.status, TaskStatus::Downloading | TaskStatus::Paused)
                 })
         });
         self.seg_info.retain(|id, _| {
-            let g = self.rt.lock().unwrap();
+            let g = crate::lock_unpoison(&self.rt);
             g.controls.contains_key(id)
                 || g.state.tasks.iter().any(|t| {
                     &t.id == id && matches!(t.status, TaskStatus::Downloading | TaskStatus::Paused)
                 })
         });
         self.rate_smooth.retain(|id, _| {
-            let g = self.rt.lock().unwrap();
+            let g = crate::lock_unpoison(&self.rt);
             g.state.tasks.iter().any(|t| {
                 &t.id == id && matches!(t.status, TaskStatus::Downloading | TaskStatus::Paused)
             })
         });
         // Fallback for tasks without controls yet (probe/queue): part files on disk vs known total.
         let tasks: Vec<(String, std::path::PathBuf, u64)> = {
-            let g = self.rt.lock().unwrap();
+            let g = crate::lock_unpoison(&self.rt);
             g.state
                 .tasks
                 .iter()
@@ -867,6 +890,8 @@ impl DownloadApp {
                         SegView {
                             parts,
                             manifest: false,
+                            kind: crate::stream::ProtoKind::Http,
+                            torrent: None,
                         },
                     );
                 }
@@ -922,7 +947,7 @@ impl DownloadApp {
     /// Execute runs it, Cancel drops it. Shown every frame until resolved.
     fn show_pending_power(&mut self, ctx: &egui::Context) {
         if self.pending_power_confirm.is_none() {
-            self.pending_power_confirm = self.rt.lock().unwrap().pending_power.take();
+            self.pending_power_confirm = crate::lock_unpoison(&self.rt).pending_power.take();
         }
         let Some(action) = self.pending_power_confirm else {
             return;
@@ -953,9 +978,7 @@ impl DownloadApp {
             let _ = crate::platform::execute_power(action);
         } else if cancel {
             self.pending_power_confirm = None;
-            self.rt
-                .lock()
-                .unwrap()
+            crate::lock_unpoison(&self.rt)
                 .log(format!("Power action {action:?} cancelled by user"));
         }
     }
@@ -963,7 +986,7 @@ impl DownloadApp {
     fn poll(&mut self, ctx: &egui::Context) {
         if !self.ytdlp_checked {
             self.ytdlp_checked = true;
-            let auto = self.rt.lock().unwrap().state.settings.ytdlp_auto_update;
+            let auto = crate::lock_unpoison(&self.rt).state.settings.ytdlp_auto_update;
             let rt_b = self.tokio_rt.clone();
             std::thread::spawn(move || {
                 rt_b.block_on(async move {
@@ -994,9 +1017,7 @@ impl DownloadApp {
         // handle synchronously on this thread, so live worker has handle here.
         {
             let handles = &self.handles;
-            self.rt
-                .lock()
-                .unwrap()
+            crate::lock_unpoison(&self.rt)
                 .controls
                 .retain(|id, _| handles.get(id).is_some_and(|h| !h.is_finished()));
         }
@@ -1026,11 +1047,11 @@ impl DownloadApp {
             "add" => {
                 self.show_window(ctx);
                 self.tab = Tab::Downloads;
-                self.show_add = true;
+                { self.show_add = true; self.add_just_opened = true; }
             }
             "quit" => {
                 self.allow_close = true;
-                self.rt.lock().unwrap().save();
+                crate::lock_unpoison(&self.rt).save();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             _ => {}
@@ -1043,7 +1064,7 @@ impl DownloadApp {
                 "add" => {
                     self.show_window(ctx);
                     self.tab = Tab::Downloads;
-                    self.show_add = true;
+                    { self.show_add = true; self.add_just_opened = true; }
                 }
                 _ => self.show_window(ctx),
             }
@@ -1078,10 +1099,13 @@ impl DownloadApp {
         // Downloaded already-running pages fire no task.start guard — captures
         // sit in rt.pending_captures until confirmed, so no auto-start here.
         let has_capture =
-            self.capture_task.is_some() || !self.rt.lock().unwrap().pending_captures.is_empty();
-        if has_capture && (self.hidden || ctx.input(|i| i.viewport().minimized.unwrap_or(false))) {
+            self.capture_task.is_some() || !crate::lock_unpoison(&self.rt).pending_captures.is_empty();
+        if has_capture && !self.capture_revealed
+            && (self.hidden || ctx.input(|i| i.viewport().minimized.unwrap_or(false)))
+        {
             self.show_window(ctx);
         }
+        self.capture_revealed = has_capture;
         if self.grab_busy {
             GRAB_SLOT.with(|s| {
                 if let Some(slot) = &*s.borrow() {
@@ -1106,7 +1130,7 @@ impl DownloadApp {
         self.update_smooth_rates();
         // progress sync
         {
-            let mut g = self.rt.lock().unwrap();
+            let mut g = crate::lock_unpoison(&self.rt);
             // Re-apply limits each poll: global split tracks active count,
             // per-task edits live-apply without restart. Covers settings
             // slider / schedule stores that write controls directly.
@@ -1250,7 +1274,7 @@ impl DownloadApp {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let ready: Vec<String> = {
-                let g = self.rt.lock().unwrap();
+                let g = crate::lock_unpoison(&self.rt);
                 if !g.state.queues.iter().any(|q| q.auto_start) {
                     Vec::new()
                 } else {
@@ -1304,12 +1328,12 @@ impl DownloadApp {
         {
             let (day, secs) = today_parts();
             self.minutes_today = (day, secs);
-            let master = self.rt.lock().unwrap().state.settings.scheduler_enabled;
+            let master = crate::lock_unpoison(&self.rt).state.settings.scheduler_enabled;
             let mut to_start: Vec<String> = Vec::new();
             let mut to_stop: Vec<String> = Vec::new();
             let mut latched_stop = false;
             {
-                let mut g = self.rt.lock().unwrap();
+                let mut g = crate::lock_unpoison(&self.rt);
                 for s in if master {
                     g.state.schedules.clone()
                 } else {
@@ -1350,7 +1374,7 @@ impl DownloadApp {
                 // limit via global mechanism (settings.speed_limit_kbps + controls
                 // atomic, same as Settings apply at save).
                 {
-                    let mut g = self.rt.lock().unwrap();
+                    let mut g = crate::lock_unpoison(&self.rt);
                     let sch = g
                         .state
                         .schedules
@@ -1373,7 +1397,7 @@ impl DownloadApp {
                 }
                 // route through planner so global/per-queue caps hold (was: direct start, caps bypassed)
                 let ids: Vec<String> = {
-                    let g = self.rt.lock().unwrap();
+                    let g = crate::lock_unpoison(&self.rt);
                     let active: Vec<(String, String)> = g
                         .controls
                         .keys()
@@ -1406,10 +1430,7 @@ impl DownloadApp {
                     })
                     .collect()
                 };
-                let limit = self
-                    .rt
-                    .lock()
-                    .unwrap()
+                let limit = crate::lock_unpoison(&self.rt)
                     .state
                     .schedules
                     .iter()
@@ -1425,7 +1446,7 @@ impl DownloadApp {
             }
             for qid in to_stop {
                 let ids: Vec<String> = {
-                    let g = self.rt.lock().unwrap();
+                    let g = crate::lock_unpoison(&self.rt);
                     g.state
                         .tasks
                         .iter()
@@ -1459,25 +1480,31 @@ impl DownloadApp {
                         .map(|w| w.to_string())
                 });
             if let Some(url) = text {
-                let mut g = self.rt.lock().unwrap();
+                let mut g = crate::lock_unpoison(&self.rt);
                 g.add_url(&url, "main", "", "");
                 g.log(format!("Dropped URL added: {url}"));
             }
         }
         // Idle cost: fast wake only while work runs; egui still repaints on input.
         let busy = self.grab_busy || {
-            let g = self.rt.lock().unwrap();
+            let g = crate::lock_unpoison(&self.rt);
             g.state
                 .tasks
                 .iter()
                 .any(|t| t.status == TaskStatus::Downloading)
         };
         let minimized = ctx.input(|i| i.viewport().minimized == Some(true));
+        // Dialog viewports run inside root pass: keep frames live while open
+        // so child clicks/buttons don't wait 500ms-5s cadence.
+        let dialog_open =
+            self.show_add || self.show_progress_for.is_some() || self.capture_task.is_some();
         let ms = if self.hidden || minimized {
             5_000
+        } else if dialog_open {
+            50
         } else if busy {
             500
-        } else if self.rt.lock().unwrap().state.settings.clipboard_monitor {
+        } else if crate::lock_unpoison(&self.rt).state.settings.clipboard_monitor {
             1_000
         } else {
             5_000
@@ -1635,7 +1662,7 @@ impl eframe::App for DownloadApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Stop workers first so Runtime drop does not wait on blocking pool.
         {
-            let g = self.rt.lock().unwrap();
+            let g = crate::lock_unpoison(&self.rt);
             for c in g.controls.values() {
                 c.cancelled
                     .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1645,7 +1672,7 @@ impl eframe::App for DownloadApp {
         for (_, h) in self.handles.drain() {
             h.abort();
         }
-        self.rt.lock().unwrap().save();
+        crate::lock_unpoison(&self.rt).save();
         // Release single-instance lock only if it still holds our pid.
         let lock = crate::platform::config_dir().join("instance.lock");
         if let Ok(txt) = std::fs::read_to_string(&lock) {
@@ -1668,7 +1695,7 @@ impl eframe::App for DownloadApp {
         // Close-to-tray: window X hides to tray (setting existed but was never wired).
         if !self.allow_close && ctx.input(|i| i.viewport().close_requested()) {
             let to_tray = {
-                let g = self.rt.lock().unwrap();
+                let g = crate::lock_unpoison(&self.rt);
                 g.state.settings.close_to_tray
             } && self.tray.as_ref().and_then(|t| t._nav.as_ref()).is_some();
             if to_tray {
@@ -1710,7 +1737,7 @@ impl eframe::App for DownloadApp {
                     egui::menu::bar(ui, |ui| {
                         ui.menu_button("Tasks", |ui| {
                             if ui.button("Add new download…").clicked() {
-                                self.show_add = true;
+                                { self.show_add = true; self.add_just_opened = true; }
                                 ui.close_menu();
                             }
                             if ui.button("Add batch from clipboard").clicked() {
@@ -1737,7 +1764,7 @@ impl eframe::App for DownloadApp {
                         ui.menu_button("File", |ui| {
                             let sel = self.selected.clone();
                             let sel_status = sel.as_ref().and_then(|id| {
-                                let g = self.rt.lock().unwrap();
+                                let g = crate::lock_unpoison(&self.rt);
                                 g.state.tasks.iter().find(|t| &t.id == id).map(|t| t.status)
                             });
                             if ui
@@ -1851,24 +1878,23 @@ impl eframe::App for DownloadApp {
                             }
                         });
                     });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // In right-to-left layout space allocates at far right first: chip sits inset, not flush to window edge.
-                        ui.add_space(4.0);
-                        let active = {
-                            let g = self.rt.lock().unwrap();
-                            g.state
-                                .tasks
-                                .iter()
-                                .filter(|t| t.status == TaskStatus::Downloading)
-                                .count()
-                        };
-                        let speed = self.speed_hist.last().copied().unwrap_or(0.0);
-                        theme::chip(
-                            ui,
-                            &format!("{active} active · {}", fmt_rate(speed)),
-                            theme::TEXT_MUTED,
-                        );
-                    });
+                    // Inline after menus, not pinned to right edge: chip moves with
+                    // menu bar content instead of sticking to window edge on resize.
+                    ui.add_space(12.0);
+                    let active = {
+                        let g = crate::lock_unpoison(&self.rt);
+                        g.state
+                            .tasks
+                            .iter()
+                            .filter(|t| t.status == TaskStatus::Downloading)
+                            .count()
+                    };
+                    let speed = self.speed_hist.last().copied().unwrap_or(0.0);
+                    theme::chip(
+                        ui,
+                        &format!("{active} active · {}", fmt_rate(speed)),
+                        theme::TEXT_MUTED,
+                    );
                 });
             });
 
@@ -1936,7 +1962,7 @@ impl eframe::App for DownloadApp {
                 ];
                 // Per-category counts, same membership rule as downloads table filter (below).
                 let counts: Vec<usize> = {
-                    let g = self.rt.lock().unwrap();
+                    let g = crate::lock_unpoison(&self.rt);
                     cats.iter()
                         .map(|(c, _)| match *c {
                             "All Downloads" => g.state.tasks.len(),
@@ -1972,6 +1998,45 @@ impl eframe::App for DownloadApp {
                 }
                 ui.add_space(8.0);
                 ui.separator();
+                ui.horizontal(|ui| {
+                    let (irect, _) =
+                        ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                    icon(ui.painter(), &Icon::Link, irect, theme::TEXT_FAINT);
+                    ui.label(
+                        egui::RichText::new("TYPE")
+                            .color(theme::TEXT_FAINT)
+                            .small()
+                            .strong(),
+                    );
+                });
+                ui.add_space(4.0);
+                // Single pass over tasks (proto_kind may stat local files).
+                let type_counts: [usize; 8] = {
+                    let g = crate::lock_unpoison(&self.rt);
+                    let mut tc = [0usize; 8];
+                    for t in &g.state.tasks {
+                        let k = crate::stream::proto_kind(t);
+                        for sel in TypeSel::ALL {
+                            if sel.matches(k) {
+                                tc[sel.index()] += 1;
+                                break;
+                            }
+                        }
+                    }
+                    tc
+                };
+                if nav_row(ui, Icon::Download, "All types", self.type_filter.is_none(), None).clicked() {
+                    self.type_filter = None;
+                    self.tab = Tab::Downloads;
+                }
+                for sel in TypeSel::ALL {
+                    if nav_row(ui, sel.icon(), sel.label(), self.type_filter == Some(sel), Some(type_counts[sel.index()])).clicked() {
+                        self.type_filter = Some(sel);
+                        self.tab = Tab::Downloads;
+                    }
+                }
+                ui.add_space(8.0);
+                ui.separator();
                 ui.label(
                     egui::RichText::new("ffmpeg: PATH/beside exe only")
                         .color(theme::TEXT_FAINT)
@@ -1995,7 +2060,7 @@ impl eframe::App for DownloadApp {
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     let (total, done, active) = {
-                        let g = self.rt.lock().unwrap();
+                        let g = crate::lock_unpoison(&self.rt);
                         (
                             g.state.tasks.len(),
                             g.state
@@ -2114,10 +2179,7 @@ impl eframe::App for DownloadApp {
                     ui.label(format!("{name} finished."));
                     ui.horizontal(|ui| {
                         if theme::primary_btn(ui, "Open file").clicked() {
-                            if let Some(t) = self
-                                .rt
-                                .lock()
-                                .unwrap()
+                            if let Some(t) = crate::lock_unpoison(&self.rt)
                                 .state
                                 .tasks
                                 .iter()
@@ -2142,7 +2204,7 @@ impl eframe::App for DownloadApp {
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0);
             let downloading: Vec<String> = {
-                let g = self.rt.lock().unwrap();
+                let g = crate::lock_unpoison(&self.rt);
                 g.state
                     .tasks
                     .iter()
@@ -2169,7 +2231,7 @@ impl eframe::App for DownloadApp {
         // Global sparkline uses same smoothed per-task rates shown in rows.
         // End-of-frame aggregate byte deltas jump with chunk bursts and repaint cadence.
         let ids: Vec<String> = {
-            let g = self.rt.lock().unwrap();
+            let g = crate::lock_unpoison(&self.rt);
             g.state
                 .tasks
                 .iter()
@@ -2210,6 +2272,88 @@ fn quota_exhausted(g: &Runtime, queue_id: &str, now: u64) -> bool {
 }
 
 /// Category icon by extension (sidebar + row glyphs).
+/// Protocol label color. Short text carries meaning; color secondary (only
+/// ~5 text-safe hues in theme). Avoid ERR: already means Error status.
+fn proto_color(k: crate::stream::ProtoKind) -> egui::Color32 {
+    use crate::stream::ProtoKind::*;
+    match k {
+        Torrent => theme::WARN,
+        Ftp | Ftps | Dash | Hls => theme::STEEL_TEXT,
+        Sftp => theme::OK,
+        YtDlp => theme::STEEL_TEXT,
+        Nntp | Metalink => theme::TEXT_MUTED,
+        Http | File => theme::TEXT_FAINT,
+    }
+}
+
+/// Rail "TYPE" filter buckets over derived ProtoKind. Orthogonal to extension
+/// category: AND semantics in downloads table filter.
+#[derive(Clone, Copy, PartialEq)]
+enum TypeSel {
+    Torrent,
+    Nntp,
+    Ftp,
+    Stream,
+    YtDlp,
+    Metalink,
+    Http,
+    File,
+}
+
+impl TypeSel {
+    const ALL: [TypeSel; 8] = [
+        TypeSel::Torrent,
+        TypeSel::Nntp,
+        TypeSel::Ftp,
+        TypeSel::Stream,
+        TypeSel::YtDlp,
+        TypeSel::Metalink,
+        TypeSel::Http,
+        TypeSel::File,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            TypeSel::Torrent => "Torrents",
+            TypeSel::Nntp => "NNTP / NZB",
+            TypeSel::Ftp => "FTP / SFTP",
+            TypeSel::Stream => "Streams",
+            TypeSel::YtDlp => "YT-DLP",
+            TypeSel::Metalink => "Metalink",
+            TypeSel::Http => "HTTP",
+            TypeSel::File => "Local files",
+        }
+    }
+    fn icon(self) -> Icon {
+        match self {
+            TypeSel::Torrent => Icon::Down,
+            TypeSel::Nntp => Icon::Queue,
+            TypeSel::Ftp => Icon::Globe,
+            TypeSel::Stream => Icon::Play,
+            TypeSel::YtDlp => Icon::Video,
+            TypeSel::Metalink => Icon::Link,
+            TypeSel::Http => Icon::Download,
+            TypeSel::File => Icon::File,
+        }
+    }
+    fn matches(self, k: crate::stream::ProtoKind) -> bool {
+        use crate::stream::ProtoKind::*;
+        matches!(
+            (self, k),
+            (TypeSel::Torrent, Torrent)
+                | (TypeSel::Nntp, Nntp)
+                | (TypeSel::Ftp, Ftp | Ftps | Sftp)
+                | (TypeSel::Stream, Dash | Hls)
+                | (TypeSel::YtDlp, YtDlp)
+                | (TypeSel::Metalink, Metalink)
+                | (TypeSel::Http, Http)
+                | (TypeSel::File, File)
+        )
+    }
+    fn index(self) -> usize {
+        TypeSel::ALL.iter().position(|x| *x == self).unwrap_or(0)
+    }
+}
+
 fn cat_icon(filename: &str) -> Icon {
     let e = filename
         .rsplit('.')
@@ -2235,7 +2379,7 @@ fn stop_task(app: &mut DownloadApp, id: &str) {
     if let Some(h) = app.handles.remove(id) {
         h.abort();
     }
-    let mut g = app.rt.lock().unwrap();
+    let mut g = crate::lock_unpoison(&app.rt);
     let downloaded = if let Some(c) = g.controls.remove(id) {
         c.cancelled.store(true, Ordering::Relaxed);
         c.paused.store(false, Ordering::Relaxed);
@@ -2256,7 +2400,7 @@ fn remove_task(app: &mut DownloadApp, id: &str) {
     if let Some(h) = app.handles.remove(id) {
         h.abort();
     }
-    let mut g = app.rt.lock().unwrap();
+    let mut g = crate::lock_unpoison(&app.rt);
     if let Some(c) = g.controls.get(id) {
         c.cancelled.store(true, Ordering::Relaxed);
         c.paused.store(false, Ordering::Relaxed);
@@ -2274,7 +2418,7 @@ fn resume_all(app: &mut DownloadApp) {
     // re-enters worker, but first error re-increments past budget -> no real
     // retry. Reset attempts + retry gate so Retry-all actually retries.
     {
-        let mut g = app.rt.lock().unwrap();
+        let mut g = crate::lock_unpoison(&app.rt);
         let mut changed = false;
         for t in g.state.tasks.iter_mut() {
             if t.status == TaskStatus::Error {
@@ -2289,7 +2433,7 @@ fn resume_all(app: &mut DownloadApp) {
         }
     }
     let ids: Vec<String> = {
-        let g = app.rt.lock().unwrap();
+        let g = crate::lock_unpoison(&app.rt);
         g.state
             .tasks
             .iter()
@@ -2308,7 +2452,7 @@ fn resume_all(app: &mut DownloadApp) {
 }
 fn stop_all(app: &mut DownloadApp) {
     let ids: Vec<String> = {
-        let g = app.rt.lock().unwrap();
+        let g = crate::lock_unpoison(&app.rt);
         g.state
             .tasks
             .iter()
@@ -2321,12 +2465,12 @@ fn stop_all(app: &mut DownloadApp) {
     }
 }
 fn delete_completed(app: &mut DownloadApp) {
-    let mut g = app.rt.lock().unwrap();
+    let mut g = crate::lock_unpoison(&app.rt);
     g.state.tasks.retain(|t| t.status != TaskStatus::Complete);
     g.save();
 }
 fn toggle_limiter(app: &mut DownloadApp) {
-    let mut g = app.rt.lock().unwrap();
+    let mut g = crate::lock_unpoison(&app.rt);
     g.state.settings.speed_limit_kbps = if g.state.settings.speed_limit_kbps == 0 {
         512
     } else {
@@ -2339,7 +2483,7 @@ fn toggle_limiter(app: &mut DownloadApp) {
     g.save();
 }
 fn export_json(app: &mut DownloadApp) {
-    let g = app.rt.lock().unwrap();
+    let g = crate::lock_unpoison(&app.rt);
     let txt = serde_json::to_string_pretty(
         &g.state
             .tasks
@@ -2363,7 +2507,7 @@ fn import_urls_file(app: &mut DownloadApp) {
     };
     // Dedupe vs existing tasks + within file. Mirror add_batch_clipboard.
     let existing: std::collections::HashSet<String> = {
-        let g = app.rt.lock().unwrap();
+        let g = crate::lock_unpoison(&app.rt);
         g.state.tasks.iter().map(|t| t.url.clone()).collect()
     };
     let mut seen = existing;
@@ -2377,9 +2521,7 @@ fn import_urls_file(app: &mut DownloadApp) {
             added += 1;
         }
     }
-    app.rt
-        .lock()
-        .unwrap()
+    crate::lock_unpoison(&app.rt)
         .log(format!("Imported {added} URLs from {}", path.display()));
 }
 
@@ -2397,7 +2539,7 @@ fn add_batch_clipboard(app: &mut DownloadApp) {
 }
 fn add_url_task(app: &mut DownloadApp, url: &str) {
     let id = {
-        let mut g = app.rt.lock().unwrap();
+        let mut g = crate::lock_unpoison(&app.rt);
         g.add_url(url, "main", "", "")
     };
     app.start_task(&id);
@@ -2409,8 +2551,10 @@ fn fmt_rate(bps: f32) -> String {
         format!("{bps:.0} B/s")
     } else if bps < 1024.0 * 1024.0 {
         format!("{:.1} KB/s", bps / 1024.0)
-    } else {
+    } else if bps < 1024.0 * 1024.0 * 1024.0 {
         format!("{:.2} MB/s", bps / 1048576.0)
+    } else {
+        format!("{:.2} GB/s", bps / (1024.0 * 1024.0 * 1024.0))
     }
 }
 fn eta(secs: f64) -> String {
@@ -2515,6 +2659,19 @@ fn icon_btn_enabled(
     min_w: f32,
     enabled: bool,
 ) -> egui::Response {
+    paint_btn(ui, Some(ic), label, primary, min_w, enabled)
+}
+
+/// Shared painted button (toolbar + dialogs): same fill/stroke per state everywhere.
+fn paint_btn(
+    ui: &mut egui::Ui,
+    ic: Option<Icon>,
+    label: &str,
+    primary: bool,
+    min_w: f32,
+    enabled: bool,
+) -> egui::Response {
+    let enabled = enabled && ui.is_enabled();
     // Allocate first, paint after state known: previous Frame-then-interact painted
     // one flat box regardless of hover/press (buttons looked dead, clicks unreliable).
     let sense = if enabled {
@@ -2532,7 +2689,11 @@ fn icon_btn_enabled(
         )
         .size()
         .x;
-    let w = min_w.max(8.0 + 16.0 + 6.0 + text_w + 8.0);
+    let w = if ic.is_some() {
+        min_w.max(8.0 + 16.0 + 6.0 + text_w + 8.0)
+    } else {
+        min_w.max(12.0 + text_w + 12.0)
+    };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, theme::BTN_H), sense);
     let (fill, stroke, fg) = if !enabled {
         (theme::SURFACE, theme::BORDER, theme::TEXT_FAINT)
@@ -2567,6 +2728,16 @@ fn icon_btn_enabled(
     if enabled && resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+    let Some(ic) = ic else {
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::TextStyle::Body.resolve(ui.style()),
+            fg,
+        );
+        return resp;
+    };
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(rect.shrink2(egui::vec2(8.0, 0.0)))
@@ -2591,26 +2762,37 @@ const COL_GAP: f32 = 10.0; // header/rows use item_spacing.x = 10; leading cell 
 const COL_MIN: f32 = 36.0;
 const NAME_MIN: f32 = 120.0;
 
-fn clamp_min(w: f32, idx: usize) -> f32 {
+/// Per-column non-Name minima (full mode idx: 1=Q, 2=Size, 3=Status, 4=ETA, 5=Rate,
+/// 6=Progress, 7=Actions; compact: 1=Size, 2=Status, 3=Progress, 4=Actions).
+/// Blanket COL_MIN let drags shrink columns below own content = clipped text.
+fn col_min(idx: usize, compact: bool) -> f32 {
     if idx == 0 {
-        w.max(NAME_MIN)
-    } else {
-        w.max(COL_MIN)
+        return NAME_MIN;
+    }
+    match (compact, idx) {
+        (false, 1) => 44.0,  // Q: "main"
+        (false, 3) => 76.0,  // Status: "Downloading"
+        (false, 6) => 132.0, // Progress: bar + %
+        (false, 7) => 58.0,  // Actions: 2 buttons
+        (true, 2) => 76.0,
+        (true, 3) => 132.0,
+        (true, 4) => 58.0,
+        _ => COL_MIN,
     }
 }
 
 fn dl_cols(avail: f32, compact: bool, stored: Option<&[f32]>) -> Vec<f32> {
     let fixed: &[f32] = if compact {
-        &[75.0, 76.0, 132.0, 48.0]
+        &[75.0, 76.0, 132.0, 58.0]
     } else {
-        &[30.0, 75.0, 76.0, 73.0, 82.0, 132.0, 48.0]
+        &[44.0, 75.0, 76.0, 73.0, 82.0, 132.0, 58.0]
     };
     if let Some(s) = stored.filter(|s| s.len() == fixed.len() + 1) {
-        // User widths: clamp each; Name = remainder only when total fits avail, else keep user width (h-scroll handles overflow).
+        // User widths: clamp per-column; Name = remainder only when total fits avail, else keep user width (h-scroll handles overflow).
         let mut v: Vec<f32> = s
             .iter()
             .enumerate()
-            .map(|(i, w)| clamp_min(*w, i))
+            .map(|(i, w)| (*w).max(col_min(i, compact)))
             .collect();
         let total: f32 = v.iter().sum::<f32>() + COL_GAP * fixed.len() as f32;
         if total <= avail {
@@ -2672,8 +2854,9 @@ fn col_resize_handles(ui: &mut egui::Ui, header: egui::Rect, cols: &mut [f32]) -
             let d = resp.drag_delta().x;
             if d != 0.0 {
                 let (a, b) = (cols[i], cols[i + 1]);
-                let na = clamp_min(a + d, i);
-                let nb = clamp_min(b - (na - a), i + 1);
+                // Header separators only exist in dl table: full-mode index map.
+                let na = (a + d).max(col_min(i, false));
+                let nb = (b - (na - a)).max(col_min(i + 1, false));
                 cols[i] = na;
                 cols[i + 1] = nb;
                 changed = true;
@@ -2782,19 +2965,27 @@ const LABEL_W: f32 = 120.0;
 const DRAG_W: f32 = 90.0;
 
 /// 2-col form grid: label col fixed 120 (right-aligned via col layout), field fills.
+/// ponytail: max_col_width() is global in egui 0.29 (clamps ALL cols incl. field
+/// col to 120px, shrinking every input); 1024 cap keeps cell wrap for long labels.
 fn form_grid(id: &str) -> egui::Grid {
     egui::Grid::new(id)
         .num_columns(2)
         .spacing([12.0, 6.0])
         .min_col_width(LABEL_W)
-        .max_col_width(LABEL_W)
+        .max_col_width(1024.0)
 }
 
 /// Right-aligned muted form label (use inside `form_grid` col 0).
 fn form_label(ui: &mut egui::Ui, text: &str) {
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.label(egui::RichText::new(text).color(theme::TEXT_MUTED));
-    });
+    // Fixed LABEL_W cell: RTL in a non-last Grid col got max_col_width (1024) and
+    // painted label off-screen, widening the parent (right-aligned footers vanished).
+    ui.allocate_ui_with_layout(
+        egui::vec2(LABEL_W, theme::BTN_H),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            ui.label(egui::RichText::new(text).color(theme::TEXT_MUTED));
+        },
+    );
 }
 
 /// Section header: label + 6px + separator (Options / editor groups).
@@ -2802,6 +2993,18 @@ fn section(ui: &mut egui::Ui, title: &str) {
     ui.label(egui::RichText::new(title).color(theme::TEXT).strong());
     ui.add_space(6.0);
     ui.separator();
+}
+
+fn vp_id(name: &str) -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(name)
+}
+
+/// Compact stat tile: faint label above strong value (progress dialog).
+fn stat_tile(ui: &mut egui::Ui, label: &str, value: String) {
+    ui.vertical(|ui| {
+        ui.label(egui::RichText::new(label).color(theme::TEXT_FAINT).small());
+        ui.add(egui::Label::new(egui::RichText::new(value).strong()).truncate());
+    });
 }
 
 /// TextEdit filling grid field col.
@@ -2817,28 +3020,31 @@ fn drag<'a, T: egui::emath::Numeric>(val: &'a mut T) -> egui::DragValue<'a> {
 /// Right-aligned button row. RTL: first added = rightmost, so primary first.
 /// Buttons: BTN_H height (theme), min width 72.
 fn btn_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add);
+    // One BTN_H row (was: whole remaining height, buttons floated mid-window).
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), theme::BTN_H),
+        egui::Layout::right_to_left(egui::Align::Center),
+        add,
+    );
 }
 
+/// Native dialog viewport frame: window fill + margin (Frame::none left black bg, edge-to-edge content).
+fn dialog_frame() -> egui::Frame {
+    egui::Frame::none()
+        .fill(theme::SURFACE)
+        .inner_margin(egui::Margin::same(theme::SP_LG))
+}
+
+/// Pinned dialog footer height: separator + button row.
+const FOOTER_H: f32 = theme::BTN_H + theme::SP_SM + 12.0;
+
 /// Primary/ghost button with min width 72 (height = BTN_H via theme).
+/// Painted like toolbar icon_btn (fixed .fill() had no hover/pressed/disabled state).
 fn primary_btn_w(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(
-            egui::RichText::new(label)
-                .color(egui::Color32::WHITE)
-                .strong(),
-        )
-        .fill(theme::STEEL)
-        .rounding(theme::R_CTRL)
-        .min_size(egui::vec2(72.0, theme::BTN_H)),
-    )
+    paint_btn(ui, None, label, true, 72.0, true)
 }
 fn ghost_btn_w(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(egui::RichText::new(label).color(theme::TEXT))
-            .rounding(theme::R_CTRL)
-            .min_size(egui::vec2(72.0, theme::BTN_H)),
-    )
+    paint_btn(ui, None, label, false, 72.0, true)
 }
 
 /// Bordered action group: related controls stay together and wrap as one unit.
@@ -2864,18 +3070,18 @@ impl DownloadApp {
         });
         ui.add_space(4.0);
         let selected_task = self.selected.as_ref().and_then(|id| {
-            let g = self.rt.lock().unwrap();
+            let g = crate::lock_unpoison(&self.rt);
             g.state.tasks.iter().find(|t| &t.id == id).cloned()
         });
         let has_active = {
-            let g = self.rt.lock().unwrap();
+            let g = crate::lock_unpoison(&self.rt);
             g.state
                 .tasks
                 .iter()
                 .any(|t| t.status == TaskStatus::Downloading)
         };
         let has_completed = {
-            let g = self.rt.lock().unwrap();
+            let g = crate::lock_unpoison(&self.rt);
             g.state
                 .tasks
                 .iter()
@@ -2884,7 +3090,7 @@ impl DownloadApp {
         ui.horizontal_wrapped(|ui| {
             action_group(ui, "Add", |ui| {
                 if icon_btn(ui, Icon::Plus, "Add URL", true, 86.0).clicked() {
-                    self.show_add = true;
+                    { self.show_add = true; self.add_just_opened = true; }
                 }
             });
             action_group(ui, "Selected download", |ui| {
@@ -2907,6 +3113,7 @@ impl DownloadApp {
                 if let Some(t) = &selected_task {
                     if icon_btn(ui, Icon::Info, "Progress", false, 82.0).clicked() {
                         self.show_progress_for = Some(t.id.clone());
+                        self.progress_raise = true;
                     }
                 } else {
                     let _ = icon_btn_enabled(ui, Icon::Info, "Progress", false, 82.0, false);
@@ -2969,7 +3176,7 @@ impl DownloadApp {
 
         // snapshot + filter + sort
         let mut tasks: Vec<DownloadTask> = {
-            let g = self.rt.lock().unwrap();
+            let g = crate::lock_unpoison(&self.rt);
             g.state.tasks.clone()
         };
         let cat = self.category.clone();
@@ -2982,6 +3189,9 @@ impl DownloadApp {
             };
             let q = self.search.to_ascii_lowercase();
             cat_ok
+                && self
+                    .type_filter
+                    .is_none_or(|f| f.matches(crate::stream::proto_kind(t)))
                 && (q.is_empty()
                     || t.filename.to_ascii_lowercase().contains(&q)
                     || t.url.to_ascii_lowercase().contains(&q))
@@ -3018,7 +3228,7 @@ impl DownloadApp {
             let ui = &mut c;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = COL_GAP;
-                for (i, (h, sc)) in if compact_table { vec![("File Name", Some(0u8)), ("Size", Some(2u8)), ("Status", Some(3u8)), ("Progress", None), ("", None)] } else { vec![("File Name", Some(0u8)), ("Q", Some(1u8)), ("Size", Some(2u8)), ("Status", Some(3u8)), ("Time left", None), ("Transfer rate", None), ("Progress", None), ("", None)] }.iter().enumerate() {
+                for (i, (h, sc)) in if compact_table { vec![("File Name", Some(0u8)), ("Size", Some(2u8)), ("Status", Some(3u8)), ("Progress", None), ("", None)] } else { vec![("File Name", Some(0u8)), ("Q", Some(1u8)), ("Size", Some(2u8)), ("Status", Some(3u8)), ("Time left", None), ("Rate", None), ("Progress", None), ("", None)] }.iter().enumerate() {
                     let arrow = if Some(self.sort_col) == *sc { if self.sort_asc { " ▲" } else { " ▼" } } else { "" };
                     let hdr = |ui: &mut egui::Ui, f: &dyn Fn(&mut egui::Ui) -> bool| -> bool {
                         if matches!(i, 2 | 4 | 5) { cell_r(ui, cols[i], |ui| f(ui)) } else { cell(ui, cols[i], |ui| f(ui)) }
@@ -3041,7 +3251,7 @@ impl DownloadApp {
                 ui.add_space(24.0);
                 ui.label(egui::RichText::new("No downloads here").color(theme::TEXT_MUTED).size(14.0));
                 ui.label(egui::RichText::new("Add a URL, paste from clipboard (Tasks → Add batch), or send from browser extension.").color(theme::TEXT_MUTED));
-                if theme::primary_btn(ui, "+ Add URL").clicked() { self.show_add = true; }
+                if theme::primary_btn(ui, "+ Add URL").clicked() { { self.show_add = true; self.add_just_opened = true; } }
                 ui.add_space(24.0);
             });
             return;
@@ -3062,25 +3272,25 @@ impl DownloadApp {
 
                     ui.horizontal(|ui| { ui.spacing_mut().item_spacing.x = COL_GAP; let mut ci = 0usize; let mut nw = || { ci += 1; cols[ci - 1] };
                         let task_rate = self.task_rate(&t.id);
-                        cell(ui, nw(), |ui| { let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover()); icon(ui.painter(), &cat_icon(&t.filename), irect, theme::TEXT_MUTED); ui.add(egui::Label::new(egui::RichText::new(&t.filename).color(theme::TEXT).small()).truncate().selectable(false)).on_hover_text(if t.error.is_empty() { t.filename.clone() } else { format!("{}\nError: {}", t.filename, t.error) }); });
-                        if !compact_table { let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(if t.queue_id.is_empty() { "main" } else { &t.queue_id }).color(theme::TEXT_MUTED).small()).truncate().selectable(false))); }
-                        let w = nw(); cell_r(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(match t.total { Some(n) => fmt_bytes(n), None => "—".into() }).color(theme::TEXT_MUTED).small()).truncate().selectable(false)));
+                        cell(ui, nw(), |ui| { let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover()); icon(ui.painter(), &cat_icon(&t.filename), irect, theme::TEXT_MUTED); let kind = crate::stream::proto_kind(&t); ui.add(egui::Label::new(egui::RichText::new(kind.label()).color(proto_color(kind)).small().strong()).truncate().selectable(false)).on_hover_text(format!("{} - {}", kind.full_name(), t.url)); ui.add(egui::Label::new(egui::RichText::new(&t.filename).color(theme::TEXT).small()).truncate().selectable(false)).on_hover_text(if t.error.is_empty() { t.filename.clone() } else { format!("{}\nError: {}", t.filename, t.error) }); });
+                        if !compact_table { let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(if t.queue_id.is_empty() { "main" } else { &t.queue_id }).color(theme::TEXT_MUTED).small()).truncate().selectable(false)).on_hover_text(if t.queue_id.is_empty() { "main".to_string() } else { t.queue_id.clone() })); }
+                        let w = nw(); cell_r(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(match t.total { Some(n) => fmt_bytes(n), None => "—".into() }).color(theme::TEXT_MUTED).small()).truncate().selectable(false)).on_hover_text(match t.total { Some(n) => fmt_bytes(n), None => "unknown size".to_string() }));
                         let sc = theme::status_color(t.status);
-                        let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(format!("{:?}", t.status)).color(sc).small().strong()).truncate().selectable(false)));
+                        let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(format!("{:?}", t.status)).color(sc).small().strong()).truncate().selectable(false)).on_hover_text(format!("{:?}", t.status)));
                         if !compact_table {
                             // ETA from THIS task's own rate (was global rate for all rows)
                             let eta_txt = if t.status == TaskStatus::Downloading { if let Some(total) = t.total { if task_rate > 1.0 && total > t.downloaded { eta((total - t.downloaded) as f64 / task_rate) } else { "—".into() } } else { "—".into() } } else { "—".into() };
-                            let w = nw(); cell_r(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(eta_txt).color(theme::TEXT_MUTED).small()).truncate().selectable(false)));
-                            let w = nw(); cell_r(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(if t.status == TaskStatus::Downloading { fmt_rate(task_rate as f32) } else { "—".into() }).color(theme::TEXT_MUTED).small()).truncate().selectable(false)));
+                            let w = nw(); cell_r(ui, w, |ui| { let eta_hover = eta_txt.clone(); ui.add(egui::Label::new(egui::RichText::new(eta_txt).color(theme::TEXT_MUTED).small()).truncate().selectable(false)).on_hover_text(eta_hover); });
+                            let w = nw(); cell_r(ui, w, |ui| { let rate_txt = if t.status == TaskStatus::Downloading { fmt_rate(task_rate as f32) } else { "—".into() }; ui.add(egui::Label::new(egui::RichText::new(&rate_txt).color(theme::TEXT_MUTED).small()).truncate().selectable(false)).on_hover_text(rate_txt); });
                         }
                         let seg_view = self.seg_info.get(&t.id);
                         let frac_opt = display_fraction(&t, seg_view);
                         let frac = frac_opt.unwrap_or(0.0);
                         let hover = format!("{}{}", if frac_opt.is_some() { format!("{:.1}% · ", frac * 100.0) } else { String::new() }, if t.total.is_some() { format!("{} of {}", fmt_bytes(t.downloaded), t.total.map(fmt_bytes).unwrap_or_else(|| "?".into())) } else if let Some(v) = seg_view.filter(|v| v.manifest) { format!("{} | {}", fmt_bytes(t.downloaded), v.label()) } else { format!("{} of ?", fmt_bytes(t.downloaded)) });
                         let w = nw(); cell(ui, w, |ui| {
-                            let bar = egui::ProgressBar::new(frac).desired_width(88.0).desired_height(6.0).rounding(egui::Rounding::same(3.0)).fill(theme::PRIMARY);
+                            let bar = egui::ProgressBar::new(frac).desired_width(72.0).desired_height(6.0).rounding(egui::Rounding::same(3.0)).fill(theme::PRIMARY);
                             ui.add(bar).on_hover_text(&hover);
-                            ui.add(egui::Label::new(egui::RichText::new(if frac_opt.is_some() { format!("{:.1}%", frac * 100.0) } else { "?".into() }).color(theme::TEXT_MUTED).small()).truncate().selectable(false));
+                            ui.add(egui::Label::new(egui::RichText::new(if frac_opt.is_some() { format!("{:.1}%", frac * 100.0) } else { "?".into() }).color(theme::TEXT_MUTED).small()).truncate().selectable(false)).on_hover_text(&hover);
                         });
                         let w = nw(); cell(ui, w, |ui| {
                             if t.status == TaskStatus::Downloading {
@@ -3126,6 +3336,7 @@ impl DownloadApp {
         }
         if let Some(id) = to_progress {
             self.show_progress_for = Some(id);
+            self.progress_raise = true;
         }
     }
 
@@ -3135,7 +3346,7 @@ impl DownloadApp {
         // Pull next pending capture into editor state.
         if self.capture_task.is_none() {
             let next = {
-                let mut g = self.rt.lock().unwrap();
+                let mut g = crate::lock_unpoison(&self.rt);
                 if g.pending_captures.is_empty() {
                     None
                 } else {
@@ -3154,23 +3365,21 @@ impl DownloadApp {
         }
         let task = self.capture_task.clone().unwrap();
         let queues: Vec<(String, String)> = {
-            let g = self.rt.lock().unwrap();
+            let g = crate::lock_unpoison(&self.rt);
             g.state
                 .queues
                 .iter()
                 .map(|q| (q.id.clone(), q.name.clone()))
                 .collect()
         };
-        let mut open = true;
         let mut action: Option<&'static str> = None; // "start" | "later" | "cancel"
-        egui::Window::new("Download file")
-            .open(&mut open)
-            .resizable(false)
-            .collapsible(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .default_size([484.0, 0.0])
-            .show(ctx, |ui| {
-                ui.set_min_width(460.0);
+        // Independent native window: no main-rect clip / shrink-wrap.
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Download file")
+            .with_inner_size([520.0, 480.0])
+            .with_min_inner_size([440.0, 360.0])
+            .with_resizable(true);
+        let cap_body = |ui: &mut egui::Ui, app: &mut DownloadApp| {
                 ui.label(
                     egui::RichText::new("URL")
                         .color(theme::TEXT_MUTED)
@@ -3189,11 +3398,11 @@ impl DownloadApp {
                 form_grid("cap-grid").show(ui, |ui| {
                     form_label(ui, "Save as");
                     let name_resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.capture_name)
+                        egui::TextEdit::singleline(&mut app.capture_name)
                             .id(egui::Id::new("capture-name"))
                             .desired_width(f32::INFINITY),
                     );
-                    if self.capture_just_opened {
+                    if app.capture_just_opened {
                         name_resp.request_focus();
                         focus_name = true;
                     }
@@ -3220,7 +3429,7 @@ impl DownloadApp {
                     form_label(ui, "Category");
                     egui::ComboBox::from_id_salt("cap-cat")
                         .selected_text(t.category.clone())
-                        .width(f32::INFINITY)
+                        .width(ui.available_width())
                         .show_ui(ui, |ui| {
                             for c in [
                                 "General",
@@ -3242,7 +3451,7 @@ impl DownloadApp {
                         .unwrap_or_else(|| t.queue_id.clone());
                     egui::ComboBox::from_id_salt("cap-queue")
                         .selected_text(cur)
-                        .width(f32::INFINITY)
+                        .width(ui.available_width())
                         .show_ui(ui, |ui| {
                             for (id, name) in &queues {
                                 if ui.selectable_label(t.queue_id == *id, name).clicked() {
@@ -3252,9 +3461,27 @@ impl DownloadApp {
                         });
                     ui.end_row();
                 });
+                // Engine choice for streams/video pages: native (default) vs yt-dlp.
+                // Stored as x-ytdlp header, honored before manifest dispatch.
+                {
+                    use crate::stream::ProtoKind as K;
+                    let kind = crate::stream::proto_kind(&t);
+                    if matches!(kind, K::Dash | K::Hls | K::YtDlp) {
+                        let mut use_ytdlp = t.headers.contains_key("x-ytdlp");
+                        if ui.checkbox(&mut use_ytdlp, "Use yt-dlp for this stream (else built-in)").changed() {
+                            if use_ytdlp {
+                                t.headers.insert("x-ytdlp".into(), "1".into());
+                            } else {
+                                t.headers.remove("x-ytdlp");
+                            }
+                        }
+                    }
+                }
+                // Write back every edit (Browse/Category/Queue were dropped unless stream kind).
+                app.capture_task = Some(t.clone());
                 if focus_name {
-                    ctx.memory_mut(|m| m.request_focus(egui::Id::new("capture-name")));
-                    self.capture_just_opened = false;
+                    ui.ctx().memory_mut(|m| m.request_focus(egui::Id::new("capture-name")));
+                    app.capture_just_opened = false;
                 }
                 if !t.referrer.is_empty() {
                     ui.add_space(6.0);
@@ -3264,23 +3491,46 @@ impl DownloadApp {
                             .small(),
                     );
                 }
-                ui.add_space(12.0);
+        };
+        let mut cap_body = Some(cap_body);
+        ctx.show_viewport_immediate(vp_id("webcraft-capture"), builder, |ctx, class| {
+            if ctx.input(|i| i.viewport().close_requested()) {
+                action = Some("cancel");
+            }
+            let bb = cap_body.as_mut().unwrap();
+            let footer = |ui: &mut egui::Ui, action: &mut Option<&'static str>| {
+                ui.separator();
                 btn_row(ui, |ui| {
                     if primary_btn_w(ui, "Start download").clicked() {
-                        action = Some("start");
+                        *action = Some("start");
                     }
                     if ghost_btn_w(ui, "Download later").clicked() {
-                        action = Some("later");
+                        *action = Some("later");
                     }
                     if ghost_btn_w(ui, "Cancel").clicked() {
-                        action = Some("cancel");
+                        *action = Some("cancel");
                     }
                 });
-                self.capture_task = Some(t);
-            });
-        if !open {
-            action = Some("cancel");
-        }
+            };
+            if matches!(class, egui::ViewportClass::Embedded) {
+                egui::Window::new("Download file")
+                    .collapsible(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        bb(ui, self);
+                        footer(ui, &mut action);
+                    });
+            } else {
+                egui::CentralPanel::default().frame(dialog_frame()).show(ctx, |ui| {
+                    let avail = ui.available_height();
+                    egui::ScrollArea::vertical()
+                        .id_salt("cap-main")
+                        .max_height((avail - FOOTER_H).max(120.0))
+                        .show(ui, |ui| bb(ui, self));
+                    footer(ui, &mut action);
+                });
+            }
+        });
         let Some(act) = action else { return };
         let mut t = self.capture_task.take().unwrap();
         let name_input = std::mem::take(&mut self.capture_name);
@@ -3298,7 +3548,7 @@ impl DownloadApp {
                 };
                 let start_id = (act == "start").then(|| t.id.clone());
                 {
-                    let mut g = self.rt.lock().unwrap();
+                    let mut g = crate::lock_unpoison(&self.rt);
                     if t.queue_id.is_empty() || !g.state.queues.iter().any(|q| q.id == t.queue_id) {
                         t.queue_id = "main".into();
                     }
@@ -3315,332 +3565,560 @@ impl DownloadApp {
     }
 
     fn ui_add_dialog(&mut self, ctx: &egui::Context) {
-        egui::Window::new("Add download")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_size([484.0, 0.0])
-            .show(ctx, |ui| {
-                ui.set_min_width(460.0);
-                form_grid("add-url-grid").show(ui, |ui| {
-                    form_label(ui, "URL");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.add_url)
-                            .hint_text("https://example.com/file.zip, .mpd/.m3u8, magnet:?xt=..., or .torrent URL")
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.end_row();
-                });
-                ui.horizontal(|ui| {
-                    if ui.button("Paste").clicked() {
-                        if let Ok(mut cb) = arboard::Clipboard::new() {
-                            if let Ok(t) = cb.get_text() {
-                                self.add_url = t.trim().to_string();
+        // Independent native window: no main-rect clip / shrink-wrap weirdness.
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Add download")
+            .with_inner_size([560.0, 560.0])
+            .with_min_inner_size([460.0, 420.0])
+            .with_resizable(true);
+        let mut start: Option<bool> = None; // Some(true)=now, Some(false)=later
+        let mut cancel = false;
+        ctx.show_viewport_immediate(vp_id("webcraft-add"), builder, |ctx, class| {
+            if ctx.input(|i| i.viewport().close_requested()) {
+                cancel = true;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                cancel = true;
+            }
+            let body = |ui: &mut egui::Ui, app: &mut Self, start: &mut Option<bool>, cancel: &mut bool| {
+                egui::ScrollArea::vertical()
+                    .id_salt("add-main")
+                    .auto_shrink([false, false])
+                    .max_height((ui.available_height() - FOOTER_H).max(120.0))
+                    .show(ui, |ui| {
+                    section(ui, "Link");
+                    ui.horizontal(|ui| {
+                        let w = (ui.available_width() - 80.0).max(120.0);
+                        let resp = ui.add_sized(
+                            [w, theme::BTN_H],
+                            egui::TextEdit::singleline(&mut app.add_url)
+                                .id(egui::Id::new("add-url"))
+                                .hint_text("https://… or magnet:?xt=urn:btih:…"),
+                        );
+                        if app.add_just_opened {
+                            resp.request_focus();
+                            app.add_just_opened = false;
+                        }
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            *start = Some(app.add_start_now);
+                        }
+                        if ghost_btn_w(ui, "Paste").clicked() {
+                            if let Ok(mut cb) = arboard::Clipboard::new() {
+                                if let Ok(text) = cb.get_text() {
+                                    app.add_url = text.trim().to_string();
+                                }
                             }
                         }
-                    }
+                    });
                     ui.label(
-                        egui::RichText::new("Supports segmented HTTP, DASH, HLS")
+                        egui::RichText::new("Supports HTTP(S), FTP/SFTP, NNTP/NZB, torrents, DASH/HLS manifests, metalink.")
                             .color(theme::TEXT_FAINT)
                             .small(),
                     );
-                });
-                ui.add_space(6.0);
-                form_grid("add-grid").show(ui, |ui| {
+                    ui.add_space(theme::SP_SM);
+                    section(ui, "Destination");
+                    form_grid("add-grid").show(ui, |ui| {
                         form_label(ui, "Queue");
-                        ui.add(fill_edit(&mut self.add_queue));
+                        {
+                            let queues: Vec<(String, String)> = {
+                                let g = crate::lock_unpoison(&app.rt);
+                                g.state.queues.iter().map(|q| (q.id.clone(), q.name.clone())).collect()
+                            };
+                            let cur = queues
+                                .iter()
+                                .find(|(id, _)| *id == app.add_queue)
+                                .map(|(_, n)| n.clone())
+                                .unwrap_or_else(|| app.add_queue.clone());
+                            egui::ComboBox::from_id_salt("add-queue")
+                                .selected_text(cur)
+                                .width(ui.available_width())
+                                .show_ui(ui, |ui| {
+                                    for (id, name) in &queues {
+                                        ui.selectable_value(&mut app.add_queue, id.clone(), name);
+                                    }
+                                });
+                        }
                         ui.end_row();
                         form_label(ui, "Save to");
-                        ui.label(
-                            egui::RichText::new(
-                                self.rt
-                                    .lock()
-                                    .unwrap()
-                                    .state
-                                    .settings
-                                    .download_dir
-                                    .display()
-                                    .to_string(),
+                        {
+                            let dir = crate::lock_unpoison(&app.rt).state.settings.download_dir.display().to_string();
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&dir).color(theme::TEXT_FAINT).monospace().small()).truncate(),
                             )
-                            .monospace()
-                            .small(),
-                        );
+                            .on_hover_text(dir);
+                        }
                         ui.end_row();
                         form_label(ui, "Referrer");
-                        ui.add(fill_edit(&mut self.add_referrer));
+                        ui.add(fill_edit(&mut app.add_referrer));
                         ui.end_row();
                         form_label(ui, "Cookies");
-                        ui.add(fill_edit(&mut self.add_cookies));
+                        ui.add(fill_edit(&mut app.add_cookies));
                         ui.end_row();
+                    });
+                    ui.add_space(theme::SP_SM);
+                    section(ui, "Transfer");
+                    form_grid("add-transfer").show(ui, |ui| {
                         form_label(ui, "Mirrors");
                         ui.add(
-                            egui::TextEdit::singleline(&mut self.add_mirrors)
+                            egui::TextEdit::singleline(&mut app.add_mirrors)
                                 .hint_text("mirror URLs, comma separated (failover)")
-                                .desired_width(f32::INFINITY),
+                                .desired_width(ui.available_width()),
                         );
                         ui.end_row();
                         form_label(ui, "Description");
-                        ui.add(fill_edit(&mut self.add_desc));
+                        ui.add(fill_edit(&mut app.add_desc));
                         ui.end_row();
-                        form_label(ui, "Login");
-                        ui.add(fill_edit(&mut self.add_user));
-                        ui.end_row();
-                        form_label(ui, "Password");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.add_pass)
-                                .password(true)
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.end_row();
-                        form_label(ui, "SSH key");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.add_key)
-                                .hint_text("path to private key, empty = ~/.ssh/id_*")
-                                .desired_width(f32::INFINITY),
-                        );
+                        form_label(ui, "When");
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut app.add_start_now, true, "Start now");
+                            ui.radio_value(&mut app.add_start_now, false, "Later");
+                        });
                         ui.end_row();
                     });
-                ui.add_space(10.0);
+                    ui.add_space(theme::SP_SM);
+                    egui::CollapsingHeader::new("Auth (advanced)")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            form_grid("add-auth").show(ui, |ui| {
+                                form_label(ui, "Login");
+                                ui.add(fill_edit(&mut app.add_user));
+                                ui.end_row();
+                                form_label(ui, "Password");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut app.add_pass)
+                                        .password(true)
+                                        .desired_width(ui.available_width()),
+                                );
+                                ui.end_row();
+                                form_label(ui, "SSH key");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut app.add_key)
+                                        .hint_text("path to private key, empty = ~/.ssh/id_*")
+                                        .desired_width(ui.available_width()),
+                                );
+                                ui.end_row();
+                            });
+                        });
+                });
+                ui.separator();
                 btn_row(ui, |ui| {
                     if ui
-                        .add_enabled_ui(!self.add_url.trim().is_empty(), |ui| {
+                        .add_enabled_ui(!app.add_url.trim().is_empty(), |ui| {
                             primary_btn_w(ui, "Start download")
                         })
                         .inner
                         .clicked()
                     {
-                        let url = normalize_webdav(&self.add_url);
-                        if !url.is_empty() {
-                            let (referrer, cookies, queue) = (
-                                self.add_referrer.clone(),
-                                self.add_cookies.clone(),
-                                if self.add_queue.is_empty() {
-                                    "main".into()
-                                } else {
-                                    self.add_queue.clone()
-                                },
-                            );
-                            let (user, pass, key, mirrors, desc) = (
-                                self.add_user.clone(),
-                                self.add_pass.clone(),
-                                self.add_key.clone(),
-                                self.add_mirrors
-                                    .split(',')
-                                    .map(|s| s.trim().to_string())
-                                    .filter(|s| !s.is_empty())
-                                    .collect::<Vec<_>>(),
-                                self.add_desc.clone(),
-                            );
-                            let id = {
-                                let mut g = self.rt.lock().unwrap();
-                                let id = g.add_url(&url, &queue, &referrer, &cookies);
-                                let segs = g.state.settings.max_connections;
-                                if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) {
-                                    t.segments = segs;
-                                    t.username = user;
-                                    t.password = pass;
-                                    t.ssh_key_path = key;
-                                    t.mirrors = mirrors;
-                                    t.description = desc;
-                                }
-                                g.save();
-                                id
-                            };
-                            self.start_task(&id);
-                            self.add_url.clear();
-                            self.show_add = false;
-                        }
+                        *start = Some(app.add_start_now);
                     }
                     if ghost_btn_w(ui, "Cancel").clicked() {
-                        self.show_add = false;
+                        *cancel = true;
                     }
                 });
-            });
+            };
+            let mut body = Some(body);
+            let bb = body.as_mut().unwrap();
+            if matches!(class, egui::ViewportClass::Embedded) {
+                egui::Window::new("Add download")
+                    .collapsible(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| bb(ui, self, &mut start, &mut cancel));
+            } else {
+                egui::CentralPanel::default().frame(dialog_frame()).show(ctx, |ui| {
+                    bb(ui, self, &mut start, &mut cancel)
+                });
+            }
+        });
+        if cancel {
+            self.show_add = false;
+            return;
+        }
+        if let Some(start_now) = start {
+            let url = normalize_webdav(&self.add_url);
+            if !url.is_empty() {
+                let (referrer, cookies, queue) = (
+                    self.add_referrer.clone(),
+                    self.add_cookies.clone(),
+                    if self.add_queue.is_empty() { "main".into() } else { self.add_queue.clone() },
+                );
+                let (user, pass, key, mirrors, desc) = (
+                    self.add_user.clone(),
+                    self.add_pass.clone(),
+                    self.add_key.clone(),
+                    self.add_mirrors.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>(),
+                    self.add_desc.clone(),
+                );
+                let id = {
+                    let mut g = crate::lock_unpoison(&self.rt);
+                    let id = g.add_url(&url, &queue, &referrer, &cookies);
+                    let segs = g.state.settings.max_connections;
+                    if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) {
+                        t.segments = segs;
+                        t.username = user;
+                        t.password = pass;
+                        t.ssh_key_path = key;
+                        t.mirrors = mirrors;
+                        t.description = desc;
+                        if !start_now {
+                            t.status = TaskStatus::Paused;
+                        }
+                    }
+                    g.save();
+                    id
+                };
+                if start_now {
+                    self.start_task(&id);
+                }
+                // Clear draft incl. password: no stale secrets next open.
+                self.add_url.clear();
+                self.add_referrer.clear();
+                self.add_cookies.clear();
+                self.add_user.clear();
+                self.add_pass.clear();
+                self.add_key.clear();
+                self.add_mirrors.clear();
+                self.add_desc.clear();
+                self.show_add = false;
+            }
+        }
     }
 
     fn ui_progress_dialog(&mut self, ctx: &egui::Context, id: &str) {
         let task = {
-            let g = self.rt.lock().unwrap();
+            let g = crate::lock_unpoison(&self.rt);
             g.state.tasks.iter().find(|t| t.id == id).cloned()
         };
         let Some(t) = task else {
             self.show_progress_for = None;
             return;
         };
+        let kind = crate::stream::proto_kind(&t);
         let mut close = false;
         let mut toggle_pause = false;
-        egui::Window::new("Download progress")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_size([484.0, 0.0])
-            .show(ctx, |ui| {
-                ui.set_min_width(460.0);
-                ui.label(egui::RichText::new(&t.filename).strong().size(16.0));
-                ui.label(egui::RichText::new(&t.url).color(theme::TEXT_FAINT).small());
-                ui.add_space(8.0);
-                let frac_opt = display_fraction(&t, self.seg_info.get(&t.id));
-                let frac = frac_opt.unwrap_or(0.0);
-                if frac_opt.is_some() {
+        let mut copy_link = false;
+        // Independent native window: content outgrows main window rect.
+        let builder = egui::ViewportBuilder::default()
+            .with_title(format!("Progress - {}", t.filename))
+            .with_inner_size([600.0, 640.0])
+            .with_min_inner_size([440.0, 380.0])
+            .with_resizable(true);
+        if self.progress_raise {
+            self.progress_raise = false;
+            ctx.send_viewport_cmd_to(vp_id("webcraft-progress"), egui::ViewportCommand::Focus);
+        }
+        let task_rate = self.task_rate(&t.id);
+        let eta_txt = match t.total {
+            Some(total)
+                if t.status == TaskStatus::Downloading
+                    && task_rate > 1.0
+                    && total > t.downloaded =>
+            {
+                eta((total - t.downloaded) as f64 / task_rate)
+            }
+            _ => "—".into(),
+        };
+        let samples: Vec<(f64, u64)> = self
+            .task_hist
+            .get(&t.id)
+            .map(|d| d.iter().copied().collect())
+            .unwrap_or_default();
+        let series = task_speed_series(&samples);
+        let peak = series.iter().copied().fold(task_rate, f64::max);
+        let frac_opt = display_fraction(&t, self.seg_info.get(&t.id));
+        let frac = frac_opt.unwrap_or(0.0);
+        let seg_view = self.seg_info.get(&t.id).cloned();
+        let body = |ui: &mut egui::Ui, app: &mut Self| -> (bool, bool, bool) {
+            let (mut b_close, mut b_toggle, mut b_copy) = (false, false, false);
+            // HEADER: icon + filename + chips; URL truncated, hover full.
+            ui.horizontal(|ui| {
+                let (irect, _) =
+                    ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
+                ui.painter()
+                    .rect_filled(irect, theme::R_CTRL, theme::SURFACE_RAISED);
+                icon(ui.painter(), &cat_icon(&t.filename), irect.shrink(6.0), theme::TEXT_MUTED);
+                ui.vertical(|ui| {
                     ui.add(
-                        egui::ProgressBar::new(frac)
-                            .desired_width(f32::INFINITY)
-                            .fill(theme::PRIMARY)
-                            .text(format!("{:.1}%", frac * 100.0)),
-                    );
-                } else if t.status == TaskStatus::Downloading {
+                        egui::Label::new(
+                            egui::RichText::new(&t.filename).strong().size(13.0),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&t.filename);
                     ui.add(
-                        egui::ProgressBar::new(0.0)
-                            .desired_width(f32::INFINITY)
-                            .fill(theme::PRIMARY)
-                            .text("receiving".to_string()),
-                    );
+                        egui::Label::new(
+                            egui::RichText::new(&t.url).color(theme::TEXT_FAINT).small(),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&t.url);
+                });
+            });
+            ui.horizontal(|ui| {
+                // Raw STEEL as text fails contrast: use STEEL_TEXT for Downloading.
+                let sc = if t.status == TaskStatus::Downloading {
+                    theme::STEEL_TEXT
                 } else {
-                    ui.add(
-                        egui::ProgressBar::new(frac)
-                            .desired_width(f32::INFINITY)
-                            .fill(theme::PRIMARY)
-                            .text(format!("{:.1}%", frac * 100.0)),
-                    );
-                }
-                ui.add_space(6.0);
-                let task_rate = self.task_rate(&t.id);
-                let eta_txt = match t.total {
-                    Some(total)
-                        if t.status == TaskStatus::Downloading
-                            && task_rate > 1.0
-                            && total > t.downloaded =>
-                    {
-                        eta((total - t.downloaded) as f64 / task_rate)
-                    }
-                    _ => "—".into(),
+                    theme::status_color(t.status)
                 };
-                let samples: Vec<(f64, u64)> = self
-                    .task_hist
-                    .get(&t.id)
-                    .map(|d| d.iter().copied().collect())
-                    .unwrap_or_default();
-                let series = task_speed_series(&samples);
-                let peak = series.iter().copied().fold(task_rate, f64::max);
-                form_grid("prog-grid").show(ui, |ui| {
-                    form_label(ui, "Status");
-                    ui.label(format!("{:?}", t.status));
-                    ui.end_row();
-                    form_label(ui, "Transfer rate");
-                    ui.label(if t.status == TaskStatus::Downloading {
-                        fmt_rate(task_rate as f32)
+                theme::chip(ui, &format!("{:?}", t.status), sc);
+                theme::chip(ui, kind.label(), theme::TEXT_MUTED);
+                theme::chip(
+                    ui,
+                    if t.category.is_empty() {
+                        crate::model::category_for(&t.filename)
+                    } else {
+                        &t.category
+                    },
+                    theme::TEXT_MUTED,
+                );
+            });
+            ui.add_space(theme::SP_SM);
+            // PROGRESS: % + finite bar + 4 stat tiles + collapsible graph.
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(if frac_opt.is_some() {
+                        format!("{:.1}%", frac * 100.0)
+                    } else if t.status == TaskStatus::Downloading {
+                        "receiving".into()
                     } else {
                         "—".into()
-                    });
-                    ui.end_row();
-                    form_label(ui, "Peak rate");
-                    ui.label(if samples.is_empty() {
-                        "—".into()
-                    } else {
-                        fmt_rate(peak as f32)
-                    });
-                    ui.end_row();
-                    // Per-task speed graph: rates from task_hist samples
-                    // (rate_map history). Painter polyline, same pattern as
-                    // global sparkline — no egui_plot dep.
-                    form_label(ui, "Speed graph");
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new(if samples.is_empty() {
-                                "—".into()
-                            } else {
-                                format!(
-                                    "Now {} · Peak {}",
-                                    fmt_rate(task_rate as f32),
-                                    fmt_rate(peak as f32)
+                    })
+                    .strong()
+                    .size(18.0),
+                );
+                ui.label(
+                    egui::RichText::new(format!("{:?}", t.status))
+                        .color(theme::TEXT_FAINT)
+                        .small(),
+                );
+            });
+            let bar_w = ui.available_width();
+            ui.add(
+                egui::ProgressBar::new(frac)
+                    .desired_width(bar_w)
+                    .desired_height(8.0)
+                    .fill(theme::PRIMARY),
+            );
+            ui.add_space(theme::SP_XS);
+            ui.columns(4, |c| {
+                    let ui = &mut c[0];
+                    stat_tile(
+                        ui,
+                        "RATE",
+                        if t.status == TaskStatus::Downloading {
+                            fmt_rate(task_rate as f32)
+                        } else {
+                            "—".into()
+                        },
+                    );
+                    stat_tile(&mut c[1], "ETA", eta_txt.clone());
+                    stat_tile(
+                        &mut c[2],
+                        "DOWNLOADED",
+                        format!(
+                            "{} / {}",
+                            fmt_bytes(t.downloaded),
+                            t.total.map(fmt_bytes).unwrap_or_else(|| "—".into())
+                        ),
+                    );
+                    stat_tile(
+                        &mut c[3],
+                        "PEAK",
+                        if samples.is_empty() {
+                            "—".into()
+                        } else {
+                            fmt_rate(peak as f32)
+                        },
+                    );
+                });
+            egui::CollapsingHeader::new("Speed graph")
+                .default_open(t.status == TaskStatus::Downloading && series.len() > 1)
+                .show(ui, |ui| {
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 40.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect_filled(rect, theme::R_CHIP, theme::G_950);
+                    ui.painter().rect_stroke(
+                        rect,
+                        theme::R_CHIP,
+                        egui::Stroke::new(1.0_f32, theme::BORDER),
+                    );
+                    if series.len() > 1 {
+                        let peak = peak.max(1.0);
+                        let n = series.len();
+                        let pts: Vec<egui::Pos2> = series
+                            .iter()
+                            .enumerate()
+                            .map(|(i, v)| {
+                                egui::pos2(
+                                    rect.left() + rect.width() * (i as f32 / (n - 1).max(1) as f32),
+                                    rect.bottom()
+                                        - 2.0
+                                        - (*v as f32 / peak as f32) * (rect.height() - 5.0),
                                 )
                             })
-                            .color(theme::TEXT_FAINT)
-                            .small(),
-                        );
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width(), 48.0),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter().rect_filled(rect, 2.0, theme::G_950);
-                        ui.painter().rect_stroke(
-                            rect,
-                            2.0,
-                            egui::Stroke::new(1.0f32, theme::BORDER),
-                        );
-                        if series.len() > 1 {
-                            let max = peak.max(1.0) as f32;
-                            let n = series.len();
-                            for i in 1..n {
-                                let x0 = rect.left()
-                                    + rect.width() * (i - 1) as f32 / (n - 1).max(1) as f32;
-                                let x1 = rect.left()
-                                    + rect.width() * i as f32 / (n - 1).max(1) as f32;
-                                let y0 = rect.bottom()
-                                    - (series[i - 1] as f32 / max) * rect.height();
-                                let y1 = rect.bottom()
-                                    - (series[i] as f32 / max) * rect.height();
-                                ui.painter().line_segment(
-                                    [egui::pos2(x0, y0), egui::pos2(x1, y1)],
-                                    egui::Stroke::new(1.5f32, theme::TEAL_500),
-                                );
-                            }
-                            if let Some(last) = series.last() {
-                                let y =
-                                    rect.bottom() - (*last as f32 / max) * rect.height();
-                                ui.painter().circle_filled(
-                                    egui::pos2(rect.right() - 1.5, y),
-                                    2.0,
-                                    theme::TEAL_500,
-                                );
-                            }
-                        } else {
-                            ui.painter().text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "Collecting…",
-                                egui::FontId::proportional(10.0),
-                                theme::TEXT_FAINT,
-                            );
+                            .collect();
+                        for w in pts.windows(2) {
+                            ui.painter()
+                                .line_segment([w[0], w[1]], egui::Stroke::new(1.5_f32, theme::TEAL_500));
                         }
-                    });
-                    ui.end_row();
-                    form_label(ui, "Time left");
-                    ui.label(eta_txt);
-                    ui.end_row();
-                    form_label(ui, "Segments");
-                    ui.label(
-                        self.seg_info
-                            .get(&t.id)
-                            .map(|v| v.label())
-                            .unwrap_or_else(|| format!("{} connections", t.segments)),
-                    );
-                    ui.end_row();
-                    form_label(ui, "Downloaded");
-                    ui.label(format!(
-                        "{} / {}",
-                        fmt_bytes(t.downloaded),
-                        t.total.map(fmt_bytes).unwrap_or_else(|| "—".into())
-                    ));
-                    ui.end_row();
-                    form_label(ui, "Resume");
-                    ui.label(if resume_supported(&t) { "Yes" } else { "No" });
-                    ui.end_row();
-                    form_label(ui, "Save to");
-                    ui.label(t.dest_dir.display().to_string());
-                    ui.end_row();
-                    form_label(ui, "Limit (KB/s, 0=off)");
+                        if let Some(last) = pts.last() {
+                            ui.painter().circle_filled(*last, 2.0, theme::TEAL_500);
+                        }
+                    } else {
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "—",
+                            egui::FontId::proportional(10.0),
+                            theme::TEXT_FAINT,
+                        );
+                    }
+                });
+            if !t.error.is_empty() {
+                ui.add_space(theme::SP_XS);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Error").color(theme::ERR).strong());
+                    ui.add(egui::Label::new(egui::RichText::new(&t.error).color(theme::ERR)).wrap());
+                });
+            }
+            // Scrollable middle: sections never widen window; footer pinned below.
+            egui::ScrollArea::vertical()
+                .id_salt("prog-main")
+                .auto_shrink([false, false])
+                .max_height((ui.available_height() - FOOTER_H).max(120.0))
+                .show(ui, |ui| {
+                    section(ui, "Connection");
                     {
+                        use crate::stream::ProtoKind as K;
+                        let mut pairs: Vec<(&str, String)> = vec![
+                            ("Type", kind.full_name().to_string()),
+                            (
+                                "Queue",
+                                if t.queue_id.is_empty() {
+                                    "main".into()
+                                } else {
+                                    t.queue_id.clone()
+                                },
+                            ),
+                        ];
+                        match kind {
+                            K::Nntp => {
+                                let st = {
+                                    let g = crate::lock_unpoison(&app.rt);
+                                    g.state.settings.clone()
+                                };
+                                pairs.push((
+                                    "Server",
+                                    format!(
+                                        "{}:{} {}",
+                                        st.nntp_host,
+                                        st.nntp_port,
+                                        if st.nntp_tls { "(TLS)" } else { "(plain)" }
+                                    ),
+                                ));
+                            }
+                            K::Ftp | K::Ftps | K::Sftp => {
+                                if let Ok(u) = url::Url::parse(&t.url) {
+                                    let host = u.host_str().unwrap_or("");
+                                    pairs.push((
+                                        "Server",
+                                        match u.port() {
+                                            Some(p) => format!("{host}:{p}"),
+                                            None => host.to_string(),
+                                        },
+                                    ));
+                                    pairs.push((
+                                        "Security",
+                                        match kind {
+                                            K::Sftp => {
+                                                if t.ssh_key_path.is_empty() {
+                                                    "Password auth".into()
+                                                } else {
+                                                    format!("Key: {}", t.ssh_key_path)
+                                                }
+                                            }
+                                            K::Ftps
+                                                if t.url
+                                                    .to_ascii_lowercase()
+                                                    .starts_with("ftpsi://") =>
+                                            {
+                                                "FTPS implicit".into()
+                                            }
+                                            K::Ftps => "FTPS (AUTH TLS)".into(),
+                                            _ => "Plain".into(),
+                                        },
+                                    ));
+                                }
+                            }
+                            _ => {}
+                        }
+                        if !matches!(kind, K::Torrent | K::Ftp | K::Ftps | K::Sftp | K::File | K::YtDlp) {
+                            pairs.push((
+                                "Segments",
+                                seg_view
+                                    .as_ref()
+                                    .map(|v| v.label())
+                                    .unwrap_or_else(|| format!("{} connections", t.segments)),
+                            ));
+                        }
+                        if !matches!(kind, K::Nntp | K::YtDlp) {
+                            pairs.push((
+                                "Resume",
+                                if resume_supported(&t) { "Yes" } else { "No" }.into(),
+                            ));
+                        }
+                        // Equal halves, fixed key col (4-col Grid squeezed values to "HTT…").
+                        for chunk in pairs.chunks(2) {
+                            ui.columns(2, |c| {
+                                for (i, (k, v)) in chunk.iter().enumerate() {
+                                    c[i].horizontal(|ui| {
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(64.0, 16.0),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(*k)
+                                                        .color(theme::TEXT_FAINT)
+                                                        .small(),
+                                                );
+                                            },
+                                        );
+                                        ui.add(
+                                            egui::Label::new(egui::RichText::new(v).small())
+                                                .truncate(),
+                                        )
+                                        .on_hover_text(v);
+                                    });
+                                }
+                            });
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Save to").color(theme::TEXT_FAINT).small());
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(t.dest_dir.display().to_string()).small(),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(t.dest_dir.display().to_string());
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Limit").color(theme::TEXT_FAINT).small());
                         let mut lim = t.speed_limit_kbps;
                         if ui
-                            .add_sized([DRAG_W, theme::BTN_H], drag(&mut lim).range(0..=1_000_000))
+                            .add_sized(
+                                [DRAG_W, theme::BTN_H],
+                                drag(&mut lim).range(0..=1_000_000),
+                            )
                             .changed()
                         {
-                            let mut g = self.rt.lock().unwrap();
+                            let mut g = crate::lock_unpoison(&app.rt);
                             if let Some(x) = g.state.tasks.iter_mut().find(|x| x.id == t.id) {
                                 x.speed_limit_kbps = lim;
                             }
-                            // Live-apply; poll re-derives every tick anyway.
                             if let Some(c) = g.controls.get(&t.id) {
                                 let n = g.controls.len();
                                 let eff = effective_limit_kbps(
@@ -3652,91 +4130,47 @@ impl DownloadApp {
                             }
                             g.save();
                         }
-                    }
-                    ui.end_row();
-                    form_label(ui, "Queue");
-                    ui.label(if t.queue_id.is_empty() {
-                        "main".into()
-                    } else {
-                        t.queue_id.clone()
+                        ui.label(
+                            egui::RichText::new("KB/s · 0 = off")
+                                .color(theme::TEXT_FAINT)
+                                .small(),
+                        );
                     });
-                    ui.end_row();
-                    if !t.error.is_empty() {
-                        ui.label(egui::RichText::new("Error").color(theme::RED_600));
-                        ui.label(egui::RichText::new(&t.error).color(theme::RED_600));
-                        ui.end_row();
-                    }
-                });
-                if let Some(view) = self.seg_info.get(&t.id).cloned() {
-                    if !view.parts.is_empty() {
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("Parts")
-                                .color(theme::TEXT_MUTED)
-                                .small()
-                                .strong(),
-                        );
-                        ui.label(
-                            egui::RichText::new(
-                                "Finished: done \u{2265} expected · Receiving: >0 · Pending: 0 (word skipped if size unknown)",
-                            )
-                            .color(theme::TEXT_FAINT)
-                            .small(),
-                        );
-                        parts_strip(ui, &view, ui.available_width());
-                        if view.manifest {
-                            let (d, tot) = view.parts.first().copied().unwrap_or((0, 0));
-                            ui.label(
-                                egui::RichText::new(format!("{d} of {tot} segments downloaded"))
-                                    .color(theme::TEXT_FAINT)
-                                    .small(),
-                            );
-                        } else {
-                            egui::Grid::new("prog-parts")
-                                .num_columns(4)
-                                .spacing([12.0, 6.0])
-                                .show(ui, |ui| {
-                                    for (i, (done, exp)) in view.parts.iter().enumerate().take(32) {
-                                        let pct = if *exp > 0 {
-                                            *done as f32 / *exp as f32 * 100.0
+                    // SWARM (torrent snapshot; hidden when absent)
+                    if kind == crate::stream::ProtoKind::Torrent {
+                        if let Some(snap) = seg_view.as_ref().and_then(|v| v.torrent.clone()) {
+                            ui.add_space(theme::SP_SM);
+                            section(ui, "Swarm");
+                            ui.columns(3, |c| {
+                                                    stat_tile(
+                                        &mut c[0],
+                                        "PEERS",
+                                        if snap.live {
+                                            format!("{}", snap.peers_live)
                                         } else {
-                                            0.0
-                                        };
-                                        ui.label(
-                                            egui::RichText::new(format!("Part {}", i + 1))
-                                                .color(theme::TEXT_FAINT)
-                                                .small(),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(format!("{:.0}%", pct))
-                                                .color(theme::TEXT)
-                                                .small(),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "{} / {}",
-                                                fmt_bytes(*done),
-                                                fmt_bytes(*exp)
-                                            ))
-                                            .color(theme::TEXT_FAINT)
-                                            .small(),
-                                        );
-                                        // Status word; unknown length (exp==0): % only, no word.
-                                        ui.label(
-                                            egui::RichText::new(
-                                                part_status_word(*done, *exp).unwrap_or(""),
-                                            )
-                                            .color(theme::TEXT_FAINT)
-                                            .small(),
-                                        );
-                                        ui.end_row();
-                                    }
+                                            "—".into()
+                                        },
+                                    );
+                                    stat_tile(
+                                        &mut c[1],
+                                        "PIECES",
+                                        if snap.pieces_total > 0 {
+                                            format!("{} / {}", snap.pieces_done, snap.pieces_total)
+                                        } else {
+                                            "—".into()
+                                        },
+                                    );
+                                    stat_tile(
+                                        &mut c[2],
+                                        "UPLOADED",
+                                        format!("{} (run)", fmt_bytes(snap.uploaded)),
+                                    );
                                 });
-                            if view.parts.len() > 32 {
+                            if snap.live {
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "... and {} more parts",
-                                        view.parts.len() - 32
+                                        "{} connecting · {} seen",
+                                        snap.peers_connecting, snap.peers_seen
                                     ))
                                     .color(theme::TEXT_FAINT)
                                     .small(),
@@ -3744,44 +4178,221 @@ impl DownloadApp {
                             }
                             ui.horizontal(|ui| {
                                 ui.label(
-                                    egui::RichText::new("Finished")
-                                        .color(theme::OK)
-                                        .small(),
-                                );
-                                ui.label(
-                                    egui::RichText::new("Receiving")
-                                        .color(theme::STEEL_TEXT)
-                                        .small(),
-                                );
-                                ui.label(
-                                    egui::RichText::new("Pending")
+                                    egui::RichText::new("Info hash")
                                         .color(theme::TEXT_FAINT)
                                         .small(),
                                 );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&snap.info_hash).small().monospace(),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(&snap.info_hash);
                             });
+                            ui.label(
+                                egui::RichText::new(format!("Trackers ({})", snap.trackers.len()))
+                                    .color(theme::TEXT_FAINT)
+                                    .small(),
+                            );
+                            egui::ScrollArea::vertical()
+                                .id_salt("prog-trackers")
+                                .max_height(88.0)
+                                .show(ui, |ui| {
+                                    if snap.trackers.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new("— (DHT/PEX only or none yet)")
+                                                .color(theme::TEXT_FAINT)
+                                                .small(),
+                                        );
+                                    }
+                                    for tr in &snap.trackers {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(tr)
+                                                    .color(theme::TEXT_FAINT)
+                                                    .small(),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(tr);
+                                    }
+                                });
                         }
                     }
-                }
-                ui.add_space(10.0);
-                btn_row(ui, |ui| {
-                    // RTL: first = rightmost = primary action.
-                    if t.status == TaskStatus::Downloading {
-                        if ghost_btn_w(ui, "Pause").clicked() {
-                            toggle_pause = true;
+                    // PARTS / FILES
+                    if let Some(view) = &seg_view {
+                        let suppress_single = matches!(
+                            view.kind,
+                            crate::stream::ProtoKind::Torrent
+                                | crate::stream::ProtoKind::Ftp
+                                | crate::stream::ProtoKind::Ftps
+                                | crate::stream::ProtoKind::Sftp
+                                | crate::stream::ProtoKind::File
+                        ) && view.parts.len() <= 1;
+                        if !view.parts.is_empty() && !suppress_single {
+                            ui.add_space(theme::SP_SM);
+                            section(
+                                ui,
+                                if matches!(
+                                    view.kind,
+                                    crate::stream::ProtoKind::Nntp
+                                        | crate::stream::ProtoKind::Torrent
+                                ) {
+                                    "Files"
+                                } else {
+                                    "Parts"
+                                },
+                            );
+                            if view.manifest {
+                                let (d, tot) = view.parts.first().copied().unwrap_or((0, 0));
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{d} of {tot} segments downloaded"
+                                    ))
+                                    .color(theme::TEXT_MUTED)
+                                    .small(),
+                                );
+                            } else {
+                                parts_strip(ui, view, ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Finished").color(theme::OK).small());
+                                    ui.label(
+                                        egui::RichText::new("Receiving")
+                                            .color(theme::STEEL_TEXT)
+                                            .small(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("Pending")
+                                            .color(theme::TEXT_FAINT)
+                                            .small(),
+                                    );
+                                });
+                                egui::ScrollArea::vertical()
+                                    .id_salt("prog-parts")
+                                    .max_height(128.0)
+                                    .show(ui, |ui| {
+                                        egui::Grid::new("prog-parts")
+                                            .num_columns(4)
+                                            .spacing([theme::SP_MD, theme::SP_XS])
+                                            .show(ui, |ui| {
+                                                for (i, (done, exp)) in view.parts.iter().enumerate() {
+                                                    let pct = if *exp > 0 {
+                                                        *done as f32 / *exp as f32 * 100.0
+                                                    } else {
+                                                        0.0
+                                                    };
+                                                    ui.label(
+                                                        egui::RichText::new(match view.kind {
+                                                            crate::stream::ProtoKind::Nntp
+                                                            | crate::stream::ProtoKind::Torrent => {
+                                                                format!("File {}", i + 1)
+                                                            }
+                                                            _ => format!("Part {}", i + 1),
+                                                        })
+                                                        .color(theme::TEXT_FAINT)
+                                                        .small(),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(format!("{:.0}%", pct))
+                                                            .color(theme::TEXT)
+                                                            .small(),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(if *exp == 0 {
+                                                            format!("{} / —", fmt_bytes(*done))
+                                                        } else {
+                                                            format!(
+                                                                "{} / {}",
+                                                                fmt_bytes(*done),
+                                                                fmt_bytes(*exp)
+                                                            )
+                                                        })
+                                                        .color(theme::TEXT_FAINT)
+                                                        .small(),
+                                                    );
+                                                    let word = part_status_word(*done, *exp).unwrap_or("");
+                                                    ui.label(
+                                                        egui::RichText::new(word)
+                                                            .color(match word {
+                                                                "Finished" => theme::OK,
+                                                                "Receiving" => theme::STEEL_TEXT,
+                                                                _ => theme::TEXT_FAINT,
+                                                            })
+                                                            .small(),
+                                                    );
+                                                    ui.end_row();
+                                                }
+                                            });
+                                    });
+                            }
                         }
-                    } else if t.status != TaskStatus::Complete
-                        && primary_btn_w(ui, "Resume").clicked()
-                    {
-                        toggle_pause = true;
-                    }
-                    if ghost_btn_w(ui, "Open folder").clicked() {
-                        let _ = crate::platform::reveal_path(&t.dest_dir.join(&t.filename));
-                    }
-                    if ghost_btn_w(ui, "Close").clicked() {
-                        close = true;
                     }
                 });
+            ui.separator();
+            btn_row(ui, |ui| {
+                if t.status == TaskStatus::Downloading {
+                    if icon_btn(ui, Icon::Pause, "Pause", true, 72.0).clicked() {
+                        b_toggle = true;
+                    }
+                } else if t.status != TaskStatus::Complete
+                    && icon_btn(ui, Icon::Play, "Resume", true, 72.0).clicked()
+                {
+                    b_toggle = true;
+                }
+                if icon_btn(ui, Icon::FolderOpen, "Open folder", false, 72.0).clicked() {
+                    let _ = crate::platform::reveal_path(&t.dest_dir.join(&t.filename));
+                }
+                if icon_btn(
+                    ui,
+                    Icon::Link,
+                    if crate::torrent::is_magnet(&t.url) {
+                        "Copy magnet"
+                    } else {
+                        "Copy link"
+                    },
+                    false,
+                    72.0,
+                )
+                .clicked()
+                {
+                    b_copy = true;
+                }
+                if ghost_btn_w(ui, "Close").clicked() {
+                    b_close = true;
+                }
             });
+            (b_close, b_toggle, b_copy)
+        };
+        let mut body = Some(body);
+        ctx.show_viewport_immediate(vp_id("webcraft-progress"), builder, |ctx, class| {
+            if ctx.input(|i| i.viewport().close_requested()) {
+                close = true;
+            }
+            let bb = body.as_mut().unwrap();
+            let out = if matches!(class, egui::ViewportClass::Embedded) {
+                egui::Window::new("Download progress")
+                    .collapsible(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| bb(ui, self))
+                    .and_then(|r| r.inner)
+                    .unwrap_or((false, false, false))
+            } else {
+                egui::CentralPanel::default()
+                    .frame(dialog_frame())
+                    .show(ctx, |ui| bb(ui, self))
+                    .inner
+            };
+            // Accumulate: discarded extra pass must not erase click flags.
+            close |= out.0;
+            toggle_pause |= out.1;
+            copy_link |= out.2;
+        });
+        if copy_link {
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                let _ = cb.set_text(t.url.clone());
+            }
+        }
         if toggle_pause {
             if t.status == TaskStatus::Downloading {
                 stop_task(self, id);
@@ -3814,7 +4425,7 @@ impl DownloadApp {
                         .clicked()
                         && !self.new_queue_name.trim().is_empty()
                     {
-                        let mut g = self.rt.lock().unwrap();
+                        let mut g = crate::lock_unpoison(&self.rt);
                         let id = crate::model::new_id();
                         g.state.queues.push(Queue {
                             id,
@@ -3831,7 +4442,7 @@ impl DownloadApp {
                 });
             });
             ui.add_space(6.0);
-            let queues = self.rt.lock().unwrap().state.queues.clone();
+            let queues = crate::lock_unpoison(&self.rt).state.queues.clone();
             for q in queues {
                 theme::panel().show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -3853,7 +4464,7 @@ impl DownloadApp {
                     });
                     ui.separator();
                     let tasks: Vec<DownloadTask> = {
-                        let g = self.rt.lock().unwrap();
+                        let g = crate::lock_unpoison(&self.rt);
                         let mut v: Vec<_> = g
                             .state
                             .tasks
@@ -3893,12 +4504,12 @@ impl DownloadApp {
                                         self.start_task(&t.id.clone());
                                     }
                                     if icon_btn(ui, Icon::Down, "Down", false, 62.0).clicked() {
-                                        let mut g = self.rt.lock().unwrap();
+                                        let mut g = crate::lock_unpoison(&self.rt);
                                         move_task(&mut g.state.tasks, &t.id, 1);
                                         g.save();
                                     }
                                     if icon_btn(ui, Icon::Up, "Up", false, 48.0).clicked() {
-                                        let mut g = self.rt.lock().unwrap();
+                                        let mut g = crate::lock_unpoison(&self.rt);
                                         move_task(&mut g.state.tasks, &t.id, -1);
                                         g.save();
                                     }
@@ -3908,7 +4519,7 @@ impl DownloadApp {
                                         ("High", Priority::High),
                                     ] {
                                         if ui.small_button(label).clicked() {
-                                            let mut g = self.rt.lock().unwrap();
+                                            let mut g = crate::lock_unpoison(&self.rt);
                                             if let Some(x) =
                                                 g.state.tasks.iter_mut().find(|x| x.id == t.id)
                                             {
@@ -3948,7 +4559,7 @@ impl DownloadApp {
                             || retry != q.retry_count
                             || interval != q.retry_interval_secs
                         {
-                            let mut g = self.rt.lock().unwrap();
+                            let mut g = crate::lock_unpoison(&self.rt);
                             if let Some(x) = g.state.queues.iter_mut().find(|x| x.id == q.id) {
                                 x.max_concurrent = maxc.max(1);
                                 x.auto_start = auto;
@@ -3966,17 +4577,17 @@ impl DownloadApp {
             ui.horizontal(|ui| {
                 ui.heading("Scheduler");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut master = self.rt.lock().unwrap().state.settings.scheduler_enabled;
+                    let mut master = crate::lock_unpoison(&self.rt).state.settings.scheduler_enabled;
                     if ui.checkbox(&mut master, "Turn on scheduler").changed() {
-                        let mut g = self.rt.lock().unwrap();
+                        let mut g = crate::lock_unpoison(&self.rt);
                         g.state.settings.scheduler_enabled = master;
                         g.save();
                     }
                 });
             });
             ui.add_space(8.0);
-            let schedules = self.rt.lock().unwrap().state.schedules.clone();
-            let queues = self.rt.lock().unwrap().state.queues.clone();
+            let schedules = crate::lock_unpoison(&self.rt).state.schedules.clone();
+            let queues = crate::lock_unpoison(&self.rt).state.queues.clone();
             let (day, secs) = self.minutes_today;
             if self.selected_schedule.is_none()
                 || !schedules
@@ -4023,7 +4634,7 @@ impl DownloadApp {
                     ui.horizontal(|ui| {
                         if theme::primary_btn(ui, "New").clicked() {
                             let id = crate::model::new_id();
-                            let mut g = self.rt.lock().unwrap();
+                            let mut g = crate::lock_unpoison(&self.rt);
                             g.state.schedules.push(Schedule {
                                 id: id.clone(),
                                 queue_id: "main".into(),
@@ -4040,7 +4651,7 @@ impl DownloadApp {
                         ui.add_enabled_ui(self.selected_schedule.is_some(), |ui| {
                             if theme::ghost_btn(ui, "Delete").clicked() {
                                 if let Some(id) = self.selected_schedule.take() {
-                                    let mut g = self.rt.lock().unwrap();
+                                    let mut g = crate::lock_unpoison(&self.rt);
                                     g.state.schedules.retain(|x| x.id != id);
                                     g.save();
                                 }
@@ -4062,7 +4673,7 @@ impl DownloadApp {
                         return;
                     };
                     let edit = |app: &DownloadApp, f: &dyn Fn(&mut Schedule)| {
-                        let mut g = app.rt.lock().unwrap();
+                        let mut g = crate::lock_unpoison(&app.rt);
                         if let Some(x) = g.state.schedules.iter_mut().find(|x| x.id == sel) {
                             f(x);
                         }
@@ -4316,7 +4927,7 @@ impl DownloadApp {
                                     )
                                     .changed()
                                 {
-                                    let mut g = self.rt.lock().unwrap();
+                                    let mut g = crate::lock_unpoison(&self.rt);
                                     if let Some(q) =
                                         g.state.queues.iter_mut().find(|q| q.id == sch.queue_id)
                                     {
@@ -4380,10 +4991,7 @@ impl DownloadApp {
                     });
                     ui.horizontal(|ui| {
                         if icon_btn(ui, Icon::Play, "Start now", false, 96.0).clicked() {
-                            let ids: Vec<String> = self
-                                .rt
-                                .lock()
-                                .unwrap()
+                            let ids: Vec<String> = crate::lock_unpoison(&self.rt)
                                 .state
                                 .tasks
                                 .iter()
@@ -4478,7 +5086,7 @@ impl DownloadApp {
                     std::thread::spawn(move || {
                         let res = rt2.block_on(async move { crawler.crawl(&client).await });
                         let mut out = slot2.lock().unwrap(); out.done = true; out.apply_files = true;
-                        match res { Ok((pages, files)) => { out.message = format!("Done. {} pages explored, {} files found.", pages.len(), files.len()); out.files = files; rt.lock().unwrap().log("Grabber explore done"); } Err(e) => { out.message = format!("Explore failed: {e}"); rt.lock().unwrap().log(format!("Grabber error: {e}")); } }
+                        match res { Ok((pages, files)) => { out.message = format!("Done. {} pages explored, {} files found.", pages.len(), files.len()); out.files = files; crate::lock_unpoison(&rt).log("Grabber explore done"); } Err(e) => { out.message = format!("Explore failed: {e}"); crate::lock_unpoison(&rt).log(format!("Grabber error: {e}")); } }
                     });
                     self.grab_files = Vec::new();
                     GRAB_SLOT.with(|s| *s.borrow_mut() = Some(files_slot));
@@ -4493,7 +5101,7 @@ impl DownloadApp {
                         let slot2 = slot.clone();
                         GRAB_SLOT.with(|s| *s.borrow_mut() = Some(slot));
                         let rt = self.rt.clone(); let rt2 = self.tokio_rt.clone();
-                        std::thread::spawn(move || { let res = rt2.block_on(async move { crate::grabber::mirror_site(&engine::build_client(""), &proj, &dir).await }); let mut out = slot2.lock().unwrap(); out.done = true; out.apply_files = false; match res { Ok(v) => { out.message = format!("Mirror done: {} files written.", v.len()); rt.lock().unwrap().log(format!("Mirror done: {} files", v.len())); }, Err(e) => { out.message = format!("Mirror failed: {e}"); rt.lock().unwrap().log(format!("Mirror error: {e}")); } } });
+                        std::thread::spawn(move || { let res = rt2.block_on(async move { crate::grabber::mirror_site(&engine::build_client(""), &proj, &dir).await }); let mut out = slot2.lock().unwrap(); out.done = true; out.apply_files = false; match res { Ok(v) => { out.message = format!("Mirror done: {} files written.", v.len()); crate::lock_unpoison(&rt).log(format!("Mirror done: {} files", v.len())); }, Err(e) => { out.message = format!("Mirror failed: {e}"); crate::lock_unpoison(&rt).log(format!("Mirror error: {e}")); } } });
                     }
                 }
                 ui.label(egui::RichText::new("Explore crawls pages; Enqueue adds selected files as downloads with page referrer.").color(theme::TEXT_FAINT).small());
@@ -4526,7 +5134,7 @@ impl DownloadApp {
                     .clicked()
                     {
                         for f in self.grab_files.iter().filter(|f| f.selected) {
-                            let id = self.rt.lock().unwrap().add_url(
+                            let id = crate::lock_unpoison(&self.rt).add_url(
                                 &f.url.clone(),
                                 "main",
                                 &f.page_url.clone(),
@@ -4681,7 +5289,7 @@ impl DownloadApp {
                             // Grab cols are [check, URL, Size, Type]; stored vec uses URL at idx 0 for helpers (clamped NAME_MIN).
                             let grab_defaults = [28.0f32, 76.0, 90.0];
                             let mut gcols: Vec<f32> =
-                                match self.grab_widths.as_deref().filter(|s| s.len() == 4) {
+                                match self.grab_widths.as_deref().filter(|s| s.len() == 3) {
                                     Some(s) => {
                                         let mut v: Vec<f32> = s
                                             .iter()
@@ -4879,7 +5487,7 @@ impl DownloadApp {
         ui.add_space(8.0);
 
         let mut settings = {
-            let g = self.rt.lock().unwrap();
+            let g = crate::lock_unpoison(&self.rt);
             g.state.settings.clone()
         };
         let before = serde_json::to_string(&settings).unwrap_or_default();
@@ -5119,16 +5727,11 @@ impl DownloadApp {
                                 Some((name, url)) => {
                                     ui.label(format!("Asset: {name}"));
                                     if ui.button("Download update").clicked() {
-                                        let id = self
-                                            .rt
-                                            .lock()
-                                            .unwrap()
+                                        let id = crate::lock_unpoison(&self.rt)
                                             .add_url(&url, "main", "", "");
                                         // Never self-replace: plain download task.
                                         self.start_task(&id);
-                                        self.rt
-                                            .lock()
-                                            .unwrap()
+                                        crate::lock_unpoison(&self.rt)
                                             .log(format!("Update download queued: {name}"));
                                     }
                                 }
@@ -5164,7 +5767,7 @@ impl DownloadApp {
                     Ok(t) => format!("yt-dlp update: {}", t.lines().last().unwrap_or("ok")),
                     Err(e) => format!("yt-dlp update failed: {e}"),
                 };
-                let mut g = rt.lock().unwrap();
+                let mut g = crate::lock_unpoison(&rt);
                 g.messages.push(msg);
                 if g.messages.len() > 200 {
                     g.messages.drain(..50);
@@ -5172,7 +5775,7 @@ impl DownloadApp {
             });
         }
         if repair_hosts {
-            let mut g = self.rt.lock().unwrap();
+            let mut g = crate::lock_unpoison(&self.rt);
             match platform::register_native_hosts(&crate::sibling_host_path()) {
                 Ok(paths) => {
                     self.options_notice = format!(
@@ -5193,7 +5796,7 @@ impl DownloadApp {
             let _ = platform::set_autostart(false);
             settings.autostart = false;
             self.options_notice = "Browser integration and autostart removed.".into();
-            self.rt.lock().unwrap().log(self.options_notice.clone());
+            crate::lock_unpoison(&self.rt).log(self.options_notice.clone());
         }
 
         // Apply immediately. Options previously looked inert because edits only
@@ -5213,7 +5816,7 @@ impl DownloadApp {
                 .collect();
             let _ = std::fs::write(crate::platform::config_dir().join("capture-filter.json"), serde_json::json!({"exts": exts, "minBytes": settings.capture_min_mb.saturating_mul(1024 * 1024)}).to_string());
             let limits: Vec<_> = {
-                let mut g = self.rt.lock().unwrap();
+                let mut g = crate::lock_unpoison(&self.rt);
                 g.state.settings = settings;
                 g.save();
                 g.controls.values().cloned().collect::<Vec<_>>()
@@ -5289,6 +5892,7 @@ mod progress_tests {
         let view = SegView {
             parts: vec![(25, 100)],
             manifest: false,
+            ..Default::default()
         };
         assert_eq!(
             display_fraction(&task(Some(200), 50), Some(&view)),
@@ -5302,6 +5906,7 @@ mod progress_tests {
         let view = SegView {
             parts: vec![(3, 12)],
             manifest: true,
+            ..Default::default()
         };
         assert_eq!(display_fraction(&task(None, 999), Some(&view)), Some(0.25));
     }
@@ -5331,6 +5936,7 @@ mod progress_tests {
         let view = SegView {
             parts: vec![(10, 0)],
             manifest: false,
+            ..Default::default()
         };
         assert_eq!(display_fraction(&task(None, 10), Some(&view)), None);
     }

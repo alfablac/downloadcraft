@@ -538,7 +538,7 @@ pub async fn download_nzb(
     // segment-count convention (parts_are_segments).
     let multi = nzb.files.len() > 1;
     ctrl.parts_are_segments.store(!multi, Ordering::Relaxed);
-    *ctrl.parts.lock().unwrap() = if multi {
+    *ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()) = if multi {
         nzb.files.iter().map(|f| (0, f.total_bytes)).collect()
     } else {
         vec![(0, total_segs)]
@@ -571,10 +571,10 @@ pub async fn download_nzb(
             task.downloaded = downloaded;
             segs_done += file.segments.len() as u64;
             if multi {
-                if let Some(p) = ctrl.parts.lock().unwrap().get_mut(file_idx) {
+                if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).get_mut(file_idx) {
                     *p = (file.total_bytes, file.total_bytes);
                 }
-            } else if let Some(p) = ctrl.parts.lock().unwrap().first_mut() {
+            } else if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
                 p.0 = segs_done;
             }
             continue;
@@ -648,10 +648,10 @@ pub async fn download_nzb(
             segs_done += 1;
             ctrl.downloaded.store(downloaded, Ordering::Relaxed);
             if multi {
-                if let Some(p) = ctrl.parts.lock().unwrap().get_mut(file_idx) {
+                if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).get_mut(file_idx) {
                     p.0 = written.min(p.1);
                 }
-            } else if let Some(p) = ctrl.parts.lock().unwrap().first_mut() {
+            } else if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
                 p.0 = segs_done;
             }
             task.downloaded = downloaded;
@@ -665,7 +665,7 @@ pub async fn download_nzb(
             ctrl.downloaded.store(downloaded, Ordering::Relaxed);
             task.downloaded = downloaded;
             if multi {
-                if let Some(p) = ctrl.parts.lock().unwrap().get_mut(file_idx) {
+                if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).get_mut(file_idx) {
                     p.0 = 0;
                 }
             }
@@ -679,7 +679,7 @@ pub async fn download_nzb(
             return Err(format!("NZB file '{}' assembled empty", file.name));
         }
         if multi {
-            if let Some(p) = ctrl.parts.lock().unwrap().get_mut(file_idx) {
+            if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).get_mut(file_idx) {
                 *p = (file.total_bytes, file.total_bytes);
             }
         }

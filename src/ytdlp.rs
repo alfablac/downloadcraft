@@ -151,7 +151,11 @@ impl YtFormat {
         self.filesize.or(self.filesize_approx)
     }
     fn has_video(&self) -> bool {
-        self.vcodec.as_deref().is_some_and(|c| c != "none")
+        // vcodec null = progressive format with unknown codec (X http-*): treat as video.
+        match self.vcodec.as_deref() {
+            None => true,
+            Some(c) => c != "none",
+        }
     }
     fn has_audio(&self) -> bool {
         self.acodec.as_deref().is_some_and(|c| c != "none")
@@ -190,12 +194,14 @@ fn base_args(url: &str, task: &DownloadTask) -> Vec<String> {
 }
 
 #[derive(Deserialize)]
-struct YtDump {
+pub struct YtDump {
     #[serde(default)]
-    formats: Vec<YtFormat>,
+    pub formats: Vec<YtFormat>,
+    #[serde(default)]
+    pub title: String,
 }
 
-pub async fn fetch_formats(url: &str, task: &DownloadTask) -> Result<Vec<YtFormat>, String> {
+pub async fn fetch_formats(url: &str, task: &DownloadTask) -> Result<YtDump, String> {
     let path = ytdlp_path().ok_or("yt-dlp not found")?;
     let mut args = vec!["-J".to_string()];
     args.extend(base_args(url, task));
@@ -212,7 +218,7 @@ pub async fn fetch_formats(url: &str, task: &DownloadTask) -> Result<Vec<YtForma
     .await
     .map_err(|e| e.to_string())??;
     let dump: YtDump = serde_json::from_slice(&out).map_err(|e| e.to_string())?;
-    Ok(dump.formats)
+    Ok(dump)
 }
 
 fn parse_progress(
@@ -248,10 +254,15 @@ pub async fn download_with_ytdlp(
     std::fs::create_dir_all(&task.dest_dir).map_err(|e| e.to_string())?;
     let dest = task.dest_dir.join(&task.filename);
     // Format choice: -J first; fallback selector lets yt-dlp decide.
-    let chosen = fetch_formats(&task.url, &task)
-        .await
-        .ok()
-        .and_then(|fs| pick_best(&fs));
+    // Also adopt video title as filename when seeded name is extensionless ID.
+    let dump = fetch_formats(&task.url, &task).await.ok();
+    let mut task = task;
+    if let Some(d) = &dump {
+        if !d.title.trim().is_empty() && !task.filename.contains('.') {
+            task.filename = crate::model::sanitize_filename(&format!("{}.mp4", d.title));
+        }
+    }
+    let chosen = dump.and_then(|d| pick_best(&d.formats));
     let fmt_arg = match &chosen {
         Some(f) if f.has_audio() => f.format_id.clone(),
         // Fallbacks mandatory: chosen id can vanish between -J and download (client/format rotation).
@@ -435,7 +446,7 @@ fn run_ytdlp_download(
     let err_tail2 = err_tail.clone();
     let _err_thread = std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            let mut g = err_tail2.lock().unwrap();
+            let mut g = err_tail2.lock().unwrap_or_else(|e| e.into_inner());
             g.push(line);
             if g.len() > 20 {
                 g.remove(0);
@@ -483,7 +494,7 @@ fn run_ytdlp_download(
                 if status.success() {
                     return Ok(());
                 }
-                let t = err_tail.lock().unwrap().join("\n");
+                let t = err_tail.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
                 return Err(if t.trim().is_empty() {
                     "yt-dlp exited with error".into()
                 } else {

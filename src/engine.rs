@@ -90,6 +90,24 @@ pub struct Controls {
     /// NZB keeps segment-count convention (flag true).
     pub parts: std::sync::Mutex<Vec<(u64, u64)>>,
     pub parts_are_segments: AtomicBool,
+    /// Torrent swarm snapshot (only torrent worker writes). Live-only:
+    /// never persisted, GUI renders last known for Complete tasks.
+    pub torrent: std::sync::Mutex<Option<TorrentSnap>>,
+}
+
+/// Plain-data torrent swarm snapshot for Info dialog. No seeds/leecher split
+/// exists in librqbit: peers_live = connected peers (seeds+leechers mixed).
+#[derive(Clone, Default)]
+pub struct TorrentSnap {
+    pub trackers: Vec<String>,
+    pub peers_live: u32,
+    pub peers_connecting: u32,
+    pub peers_seen: u32,
+    pub uploaded: u64,
+    pub pieces_done: u64,
+    pub pieces_total: u32,
+    pub info_hash: String,
+    pub live: bool,
 }
 impl Controls {
     pub fn new(limit: u64) -> Self {
@@ -102,6 +120,7 @@ impl Controls {
             total: AtomicU64::new(0),
             parts: std::sync::Mutex::new(Vec::new()),
             parts_are_segments: AtomicBool::new(false),
+            torrent: std::sync::Mutex::new(None),
         }
     }
 }
@@ -119,7 +138,7 @@ fn compute_rate(prev_bytes: u64, cur_bytes: u64, dt_secs: f64) -> f64 {
 pub fn rate_bps(ctrl: &Controls) -> f64 {
     let cur = ctrl.downloaded.load(Ordering::Relaxed);
     let now = std::time::Instant::now();
-    let mut g = ctrl.rate.lock().unwrap();
+    let mut g = ctrl.rate.lock().unwrap_or_else(|e| e.into_inner());
     let Some(prev_t) = g.2 else {
         g.2 = Some(now);
         g.3 = cur;
@@ -148,7 +167,7 @@ async fn throttle(ctrl: &Controls, bytes: u64) {
     // Global 1s window gate shared across workers.
     loop {
         let wait = {
-            let mut g = ctrl.rate.lock().unwrap();
+            let mut g = ctrl.rate.lock().unwrap_or_else(|e| e.into_inner());
             if g.0.elapsed() >= std::time::Duration::from_secs(1) {
                 g.0 = std::time::Instant::now();
                 g.1 = 0;
@@ -604,7 +623,7 @@ pub async fn download_http(
         if let Some(t) = task.total {
             ctrl.total.store(t, Ordering::Relaxed);
             ctrl.parts_are_segments.store(false, Ordering::Relaxed);
-            *ctrl.parts.lock().unwrap() = vec![(0, t)];
+            *ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()) = vec![(0, t)];
         }
         // Plain path: response headers carry CD/MIME too.
         if let Some(name) = adopt_server_filename(
@@ -636,7 +655,7 @@ pub async fn download_http(
             ctrl.downloaded.store(n, Ordering::Relaxed);
             task.downloaded = n;
             if let Some(t) = task.total {
-                if let Some(part) = ctrl.parts.lock().unwrap().first_mut() {
+                if let Some(part) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
                     part.0 = n.min(t);
                 }
             }
@@ -736,8 +755,8 @@ pub async fn download_http(
     ctrl.total.store(total, Ordering::Relaxed);
     ctrl.parts_are_segments.store(false, Ordering::Relaxed);
     {
-        let mut pg = ctrl.parts.lock().unwrap();
-        *pg = segs.iter().map(|x| (x.done, x.end + 1 - x.start)).collect();
+        let mut pg = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner());
+        *pg = segs.iter().map(|x| (x.done, x.end.saturating_add(1).saturating_sub(x.start))).collect();
     }
     // Work-stealing pool: fixed worker count (= initial segment count). Idle
     // worker splits largest remaining in-flight segment, steals its tail.
@@ -898,10 +917,10 @@ async fn claim_or_split(
         })
         .collect();
     {
-        let mut pg = ctrl.parts.lock().unwrap();
+        let mut pg = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner());
         *pg = snapshot
             .iter()
-            .map(|x| (x.done, x.end + 1 - x.start))
+            .map(|x| (x.done, x.end.saturating_add(1).saturating_sub(x.start)))
             .collect();
     }
     drop(act);
@@ -976,10 +995,10 @@ async fn run_segment(
                         .collect::<Vec<_>>()
                 };
                 {
-                    let mut pg = ctrl.parts.lock().unwrap();
+                    let mut pg = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner());
                     *pg = snapshot
                         .iter()
-                        .map(|x| (x.done, x.end + 1 - x.start))
+                        .map(|x| (x.done, x.end.saturating_add(1).saturating_sub(x.start)))
                         .collect();
                 }
                 let et_opt = if etag.is_empty() {
@@ -1064,7 +1083,7 @@ async fn download_range(
                         ctrl.downloaded
                             .fetch_add(chunk.len() as u64, Ordering::Relaxed);
                         if let Some(pi) = part_index {
-                            let mut pg = ctrl.parts.lock().unwrap();
+                            let mut pg = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some(part) = pg.get_mut(pi) {
                                 part.0 = (prior + n).min(part.1);
                             }
@@ -1091,7 +1110,7 @@ async fn download_range(
     if let Some(e) = err {
         ctrl.downloaded.fetch_sub(n, Ordering::Relaxed);
         if let Some(pi) = part_index {
-            if let Some(part) = ctrl.parts.lock().unwrap().get_mut(pi) {
+            if let Some(part) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).get_mut(pi) {
                 part.0 = prior.min(part.1);
             }
         }
@@ -1172,7 +1191,7 @@ pub async fn download_media(
     {
         let total_segs: u64 = tracks.iter().map(|(_, sg)| sg.len() as u64).sum();
         ctrl.parts_are_segments.store(true, Ordering::Relaxed);
-        *ctrl.parts.lock().unwrap() = vec![(0, total_segs)];
+        *ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()) = vec![(0, total_segs)];
     }
     for (kind, segs) in tracks.iter() {
         let out = work.join(format!("track-{kind}.bin"));
@@ -1212,7 +1231,7 @@ pub async fn download_media(
                 }
                 .await;
                 if seg_result.is_ok() {
-                    let mut pg = ctrl.parts.lock().unwrap();
+                    let mut pg = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(first) = pg.first_mut() {
                         first.0 += 1;
                     }
@@ -1409,7 +1428,12 @@ pub async fn fetch_bytes_counted(
     let mut req = client.get(url).headers(headers_for(task));
     if let Some((len, off)) = range {
         let start = off.unwrap_or(0);
-        req = req.header("Range", format!("bytes={start}-{}", start + len - 1));
+        // len==0 (hostile/garbled HLS byterange) underflows start+len-1: debug panic, release wrap.
+        let end = start
+            .checked_add(len)
+            .and_then(|e| e.checked_sub(1))
+            .ok_or("invalid byte range length 0")?;
+        req = req.header("Range", format!("bytes={start}-{end}"));
     }
     let resp = req.send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() && resp.status().as_u16() != 206 {

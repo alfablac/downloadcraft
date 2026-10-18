@@ -50,6 +50,7 @@
   }
   function showConfirm(msg) {
     const panel = ensurePanel();
+    panel.dataset.confirmId = String(msg.id);
     panel.style.left = Math.max(8, window.scrollX + Math.round((window.innerWidth - 420) / 2)) + "px";
     panel.style.top = (window.scrollY + 16) + "px";
     const box = panel.querySelector(".downloadcraft-items");
@@ -64,7 +65,8 @@
     const urlEl = document.createElement("div");
     urlEl.textContent = msg.url || "";
     urlEl.style.cssText = "color:#bbb;word-break:break-all;margin:4px 0;";
-    const reply = (accept) => { panel.remove(); try { api.runtime.sendMessage({ type: "downloadcraft-confirm-result", id: msg.id, accept }); } catch (e) {} };
+    const reply = (accept) => { clearTimeout(timer); delete panel.dataset.confirmId; panel.remove(); try { api.runtime.sendMessage({ type: "downloadcraft-confirm-result", id: msg.id, accept }); } catch (e) {} };
+    const timer = setTimeout(() => reply(false), 120000); // no answer -> browser download, file not lost
     const ok = document.createElement("button");
     ok.textContent = "Download";
     ok.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;";
@@ -83,16 +85,17 @@
     const out = [];
     const push = (v) => {
       if (!v || typeof v !== "string") return;
-      try { const u = new URL(v.trim().replace(/\\\//g, "/"), location.href).href; if (/^https?:$/.test(new URL(u).protocol)) out.push(u); } catch (e) {}
+      try { const u = new URL(v.trim().replace(/\\\//g, "/"), location.href).href; if (/^https?:$/.test(new URL(u).protocol) && !/\.(json|js|mjs|css|html?|map)($|[?#])/i.test(u)) out.push(u); } catch (e) {}
     };
     document.querySelectorAll('meta[property="og:video"],meta[property="og:video:url"],meta[property="og:video:secure_url"],meta[name="twitter:player:stream"]').forEach((m) => push(m.getAttribute("content")));
     document.querySelectorAll('script[type="application/ld+json"]').forEach((s) => {
       try {
-        const walk = (n) => { if (!n || typeof n !== "object") return; if (Array.isArray(n)) { n.forEach(walk); return; } push(n.contentUrl); push(n.embedUrl); Object.values(n).forEach(walk); };
+        const walk = (n) => { if (!n || typeof n !== "object") return; if (Array.isArray(n)) { n.forEach(walk); return; } const t = n["@type"]; if (t === "VideoObject" || (Array.isArray(t) && t.includes("VideoObject"))) push(n.contentUrl); Object.values(n).forEach(walk); };
         walk(JSON.parse(s.textContent || "null"));
       } catch (e) {}
     });
-    document.querySelectorAll("iframe[src], embed[src], object[data]").forEach((e) => push(e.getAttribute("src") || e.getAttribute("data")));
+    // No iframe/embed/object: every frame runs own content script; those srcs
+    // are player pages/ads/captcha, not downloadable media.
     return [...new Set(out)];
   }
   function directUrls(video) {
@@ -119,13 +122,14 @@
         showPanel(video, [], "No stream captured yet. Press play on the video, then click again.");
         return;
       }
-      if (items.length === 1) { sendStream({ url: items[0].url, filename: filenameFromUrl(items[0].url), type: items[0].type, mime: items[0].type }); return; }
+      // Always show panel (even 1 item): single sniffed ad/preview must not auto-download.
       showPanel(video, items.map((c) => ({ url: c.url, label: c.label || candidateLabel(c), filename: filenameFromUrl(c.url), type: c.type })));
     });
   }
 
   function showPanel(anchor, items, note) {
     const panel = ensurePanel();
+    if (panel.dataset.confirmId) return; // confirm pending: picker must not overwrite it
     const box = panel.querySelector(".downloadcraft-items");
     box.innerHTML = "";
     if (note) {
@@ -211,11 +215,13 @@
     return btn;
   }
   function scanVideo(video) {
+    // Decorative hero/background loops: muted+loop+autoplay short clips get no button.
+    if (video.loop && video.muted && video.autoplay) return;
     if (wired.has(video)) { attachBtn(video); return; }
     wired.add(video);
     const show = () => { if (isBigEnough(video)) attachBtn(video); };
     if (isBigEnough(video)) attachBtn(video);
-    ["loadedmetadata", "canplay", "playing", "loadeddata"].forEach((ev) => video.addEventListener(ev, show));
+    video.addEventListener("playing", show); // play-latch: button exists only once video actually plays (discreet)
   }
   function isBigEnough(video) {
     const r = video.getBoundingClientRect();
@@ -232,7 +238,7 @@
     rel.forEach((m) => { try { out.push(new URL(m.replace(/^["'(=]\s*/, ""), location.href).href); } catch (e) {} });
     manifestUrls = [...new Set(out)];
   }
-  function scan() { document.querySelectorAll("video, audio").forEach(scanVideo); scanManifests(); }
+  function scan() { document.querySelectorAll("video").forEach(scanVideo); } // video only: audio via context menu // scanManifests only at click: full innerHTML regex per observer scan = biggest page cost
   let pending = null;
   const mo = new MutationObserver(() => {
     if (pending) return;
@@ -241,7 +247,7 @@
       document.querySelectorAll("video, audio").forEach(positionBtn);
     }, 400);
   });
-  mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "style", "class"] });
+  mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["src"] });
   window.addEventListener("resize", () => document.querySelectorAll("video, audio").forEach(positionBtn), { passive: true });
   scan();
 

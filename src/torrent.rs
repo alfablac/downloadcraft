@@ -76,10 +76,43 @@ fn publish(ctrl: &Controls, handle: &ManagedTorrent) -> librqbit::TorrentStats {
     }
     ctrl.downloaded.store(s.progress_bytes, Ordering::Relaxed);
     ctrl.parts_are_segments.store(false, Ordering::Relaxed);
-    // Single (done,total) part: GUI strip + rate work; per-file parts need metadata file lengths — add if UI wants file-level view.
+    // Per-file parts when metadata gives file lengths; else single whole-torrent part.
     if !s.file_progress.is_empty() {
-        let total = s.total_bytes.max(1);
-        *ctrl.parts.lock().unwrap() = vec![(s.progress_bytes.min(total), total)];
+        let lens: Vec<u64> = handle
+            .with_metadata(|m| m.file_infos.iter().map(|f| f.len).collect())
+            .unwrap_or_default();
+        let set_parts = |v: Vec<(u64, u64)>| {
+            // Poison-tolerant: worker panic elsewhere must not cascade into GUI thread.
+            *ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()) = v;
+        };
+        if lens.len() == s.file_progress.len() && lens.len() > 1 {
+            set_parts(s.file_progress.iter().copied().zip(lens).collect());
+        } else {
+            let total = s.total_bytes.max(1);
+            set_parts(vec![(s.progress_bytes.min(total), total)]);
+        }
+    }
+    // Swarm snapshot for Info dialog. Cheap stats only; trackers/hash static per handle.
+    {
+        let peer = s.live.as_ref().map(|l| &l.snapshot.peer_stats);
+        let snap = crate::engine::TorrentSnap {
+            trackers: handle.shared().trackers.iter().map(|u| u.to_string()).collect(),
+            peers_live: peer.map(|p| p.live).unwrap_or(0),
+            peers_connecting: peer.map(|p| p.connecting).unwrap_or(0),
+            peers_seen: peer.map(|p| p.seen).unwrap_or(0),
+            uploaded: s.uploaded_bytes,
+            pieces_done: s
+                .live
+                .as_ref()
+                .map(|l| l.snapshot.downloaded_and_checked_pieces)
+                .unwrap_or(0),
+            pieces_total: handle
+                .with_metadata(|m| m.lengths().total_pieces())
+                .unwrap_or(0),
+            info_hash: handle.info_hash().as_string(),
+            live: s.live.is_some(),
+        };
+        *ctrl.torrent.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
     }
     s
 }
@@ -235,7 +268,10 @@ pub async fn download_torrent(
     result?;
     let s = publish(&ctrl, &handle);
     task.downloaded = s.progress_bytes;
-    task.total = Some(s.total_bytes);
+    // Zero-byte/error torrents: Some(0) made dialog show 0/1 parts + "1/1 done" nonsense.
+    if s.total_bytes > 0 {
+        task.total = Some(s.total_bytes);
+    }
     // ponytail: v1 stops seeding on complete unless seed_after_complete; persistent seeding across app restarts needs session-restore ownership in app.rs — add when seeding is a feature.
     if !settings.torrent_seed_after_complete {
         let _ = session.pause(&handle).await;

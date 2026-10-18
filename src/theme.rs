@@ -38,6 +38,7 @@ pub const PRIMARY: Color32 = STEEL;
 #[allow(dead_code)]
 pub const ACCENT: Color32 = STEEL;
 pub const TEAL_500: Color32 = STEEL; // legacy alias (app.rs sparkline/status)
+#[allow(dead_code)]
 pub const RED_600: Color32 = ERR;
 
 pub const SP_XS: f32 = 4.0;
@@ -163,7 +164,8 @@ pub fn apply(ctx: &egui::Context) {
         dormant_background_opacity: 0.0,
         active_background_opacity: 0.0,
         interact_background_opacity: 0.0,
-        dormant_handle_opacity: 0.0,
+        // 0.35 not 0: invisible dormant handle hides h-scroll overflow (reads as clipped text).
+        dormant_handle_opacity: 0.35,
         active_handle_opacity: 0.6,
         interact_handle_opacity: 1.0,
     };

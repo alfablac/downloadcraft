@@ -6,10 +6,17 @@ mod app;
 #[allow(dead_code)]
 mod icons;
 mod theme;
-use downloadcraft_lib::{engine, grabber, model, platform, queue, scheduler, stream};
+use downloadcraft_lib::{engine, grabber, model, platform, queue, scheduler, stream, torrent};
 use model::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+/// Poison-tolerant lock: a panic while a thread held the mutex must not
+/// cascade into every later lock (GUI thread death, invisible on Windows
+/// GUI-subsystem builds). Data may be mid-update; callers tolerate that.
+pub fn lock_unpoison<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 pub struct Runtime {
     pub state: AppState,
@@ -60,6 +67,11 @@ impl Runtime {
         }
     }
     pub fn add_url(&mut self, url: &str, queue_id: &str, referrer: &str, cookies: &str) -> String {
+        // Dedup exact URL: duplicate magnet = same librqbit handle shared by two
+        // app tasks; removing one detaches other into never-finishing zombie.
+        if let Some(t) = self.state.tasks.iter().find(|t| t.url == url) {
+            return t.id.clone();
+        }
         // NZB tasks produce NZB file names at download time; don't seed
         // `something.nzb` as the final filename (overwritten anyway).
         let filename = if url
@@ -188,6 +200,7 @@ fn parse_kv_file(path: &std::path::Path) -> Option<DownloadTask> {
 }
 
 fn main() {
+    platform::install_crash_hook();
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
@@ -338,10 +351,10 @@ fn run_gui(initial_urls: Vec<String>, hidden: bool) {
             .or_else(|| u.strip_prefix("downloadcraft://add?url="))
             .map(url_decode)
             .unwrap_or_else(|| u.clone());
-        rt.lock().unwrap().add_url(&clean, "main", "", "");
+        crate::lock_unpoison(&rt).add_url(&clean, "main", "", "");
     }
     // drain inbox into pending captures (confirm dialog shows on first frame)
-    rt.lock().unwrap().pending_captures = take_inbox_tasks(&rt);
+    crate::lock_unpoison(&rt).pending_captures = take_inbox_tasks(&rt);
     let rt_clone = rt.clone();
     // Window/taskbar icon: same artwork as .exe resource (assets/webcraft.png -> .ico).
     // Without this eframe/winit falls back to a default blue square.
@@ -356,11 +369,13 @@ fn run_gui(initial_urls: Vec<String>, hidden: bool) {
             .with_visible(!hidden),
         ..Default::default()
     };
-    let _ = eframe::run_native(
+    if let Err(e) = eframe::run_native(
         "webcraft",
         options,
         Box::new(move |cc| Ok(Box::new(app::DownloadApp::new(cc, rt_clone, hidden)))),
-    );
+    ) {
+        platform::log_crash(&format!("eframe::run_native failed: {e}"));
+    }
 }
 
 fn process_alive(pid: u32) -> bool {
@@ -451,7 +466,7 @@ pub fn take_inbox_tasks(rt: &Arc<Mutex<Runtime>>) -> Vec<DownloadTask> {
                 {
                     t.url = url_decode(enc);
                 }
-                let mut g = rt.lock().unwrap();
+                let mut g = crate::lock_unpoison(rt);
                 if t.id.is_empty() {
                     t.id = new_id();
                 }
@@ -486,7 +501,7 @@ pub fn take_inbox_tasks(rt: &Arc<Mutex<Runtime>>) -> Vec<DownloadTask> {
 pub fn drain_inbox(rt: &Arc<Mutex<Runtime>>) {
     let caps = take_inbox_tasks(rt);
     if !caps.is_empty() {
-        rt.lock().unwrap().pending_captures.extend(caps);
+        crate::lock_unpoison(rt).pending_captures.extend(caps);
     }
 }
 

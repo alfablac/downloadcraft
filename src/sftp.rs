@@ -148,7 +148,7 @@ impl client::Handler for Handler {
         match verify_or_store_at(&known_hosts_path(), &self.hostport, &fp) {
             Ok(_) => Ok(true),
             Err(e) => {
-                *self.err.lock().unwrap() = Some(e);
+                *self.err.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
                 Ok(false)
             }
         }
@@ -202,13 +202,13 @@ pub async fn download_sftp(
     let mut session = match client::connect(config, (u.host.as_str(), u.port), handler).await {
         Ok(s) => s,
         Err(e) => {
-            if let Some(m) = err.lock().unwrap().take() {
+            if let Some(m) = err.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 return Err(m);
             }
             return Err(format!("SSH connect {hostport}: {e}"));
         }
     };
-    if let Some(m) = err.lock().unwrap().take() {
+    if let Some(m) = err.lock().unwrap_or_else(|e| e.into_inner()).take() {
         return Err(m);
     }
 
@@ -285,7 +285,7 @@ pub async fn download_sftp(
             .await
             .map_err(|e| e.to_string())?;
         ctrl.downloaded.store(total, Ordering::Relaxed);
-        *ctrl.parts.lock().unwrap() = vec![(total, total)];
+        *ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()) = vec![(total, total)];
         task.downloaded = total;
         task.status = TaskStatus::Complete;
         return Ok(task);
@@ -295,7 +295,7 @@ pub async fn download_sftp(
         offset = 0;
     }
     ctrl.downloaded.store(offset, Ordering::Relaxed);
-    *ctrl.parts.lock().unwrap() = vec![(offset, total)];
+    *ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()) = vec![(offset, total)];
     task.downloaded = offset;
     task.status = TaskStatus::Downloading;
 
@@ -358,7 +358,7 @@ pub async fn download_sftp(
         file.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
         downloaded += n as u64;
         ctrl.downloaded.store(downloaded, Ordering::Relaxed);
-        if let Some(p) = ctrl.parts.lock().unwrap().first_mut() {
+        if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
             p.0 = downloaded;
         }
         task.downloaded = downloaded;

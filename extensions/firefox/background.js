@@ -117,6 +117,7 @@ function basename(name) { return name ? String(name).split(/[\\/]/).pop() || "" 
 // IDM takeover rules: status ok, attachment, binary/media type, or known file extension.
 function captureDecision(details) {
   if (isBypassed(details.url)) return null;
+  if (/\.(json|js|mjs|css|html?|map)($|[?#])/i.test(details.url || "")) return null; // page assets, whatever MIME claims
   if (![200, 206].includes(details.statusCode)) return null;
   if (/^(seg|segment|chunk|frag)[-_]?\d|\.m4s$|[-_]\d+\.(ts|m4s)$/i.test(filenameFromUrl(details.url))) return null; // stream segments: panel lists manifest, not fragments
   const type = headerOf(details.responseHeaders, "content-type").split(";")[0].trim().toLowerCase();
@@ -127,8 +128,14 @@ function captureDecision(details) {
   const isMedia = type.startsWith("video/") || type.startsWith("audio/") || PANEL_EXTS.has(ext);
   if (isStream || isMedia) return { url: details.url, type: type || (ext === "mpd" ? "application/dash+xml" : "application/x-mpegurl"), tabId: details.tabId, kind: "panel" };
   const isAttach = disp.startsWith("attachment");
-  const isBinary = type === "application/octet-stream" || type === "application/x-download" || type.startsWith("application/") && type !== "application/xhtml+xml";
-  if (isAttach || (isBinary && (FILE_EXTS.has(ext) || fname)) || FILE_EXTS.has(ext) && type !== "text/html") {
+  // NB: nearly all application/* is JSON/JS API traffic. Requiring real file
+  // ext (no fname fallback) stops drive-by capture of site XHR.
+  const isBinary = type === "application/octet-stream" || type === "application/x-download"
+    || (type.startsWith("application/") && !/json|javascript|ecmascript|xhtml/.test(type));
+  // Attachment is user intent, but json/js/css payloads are page assets, not downloads.
+  var fnameExt = (String(fname || "").split(".").pop() || "").toLowerCase();
+  if (/^(json|js|mjs|css|html?)$/.test(fnameExt) || /^(json|js|mjs|css|html?)$/.test(ext)) return null;
+  if (isAttach || (isBinary && FILE_EXTS.has(ext))) {
     if (type === "text/html" && !isAttach) return null;
     return { url: details.url, type, tabId: details.tabId, kind: "download", filename: fname, mime: type };
   }
@@ -140,10 +147,11 @@ if (browser.webRequest && browser.webRequest.onHeadersReceived) {
   browser.webRequest.onHeadersReceived.addListener(async (details) => {
     const d = captureDecision(details);
     if (!d) return {};
+    // XHR/other: observe-only. Cancelling them kills site API calls.
+    if (d.kind === "download" && (details.type === "xmlhttprequest" || details.type === "other")) return {};
     if (d.kind === "panel") {
-      candidates.set(d.url, { url: d.url, type: d.type, tabId: d.tabId, time: Date.now() });
+      candidates.set(d.url, { url: d.url, type: d.type, tabId: d.tabId, frameId: details.frameId, time: Date.now(), size: parseInt(headerOf(details.responseHeaders, "content-length"), 10) || 0 });
       pruneCandidates();
-      if (details.tabId >= 0) { try { browser.tabs.sendMessage(details.tabId, { type: "downloadcraft-candidates" }); } catch (e) {} }
       return {};
     }
     // File takeover: only main/sub frame navigations + explicit other downloads.
@@ -188,7 +196,15 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
   else if (info.menuItemId === "downloadcraft-page" && tab && tab.id) browser.tabs.sendMessage(tab.id, { type: "downloadcraft-grab-all" });
   else if (info.menuItemId === "downloadcraft-grab" && tab && tab.url) safeSend("webcraft://grab?url=" + encodeURIComponent(tab.url), tab, { referrer: tab.url }).catch(() => {});
 });
+// Never intercept page-asset downloads (json/js/css) even with download attr.
+function isAssetDownload(item) {
+  const m = String((item && item.mime) || "").toLowerCase();
+  if (/json|javascript|ecmascript|css/.test(m)) return true;
+  const f = String((item && item.filename) || (item && item.url) || "").split(/[?#]/)[0];
+  return /\.(json|js|mjs|css)$/i.test(f);
+}
 browser.downloads.onCreated.addListener(async (item) => {
+  if (isAssetDownload(item)) return;
   if (!item.url || isBypassed(item.url) || item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
   try {
     if (!(await interceptOn())) return;
@@ -219,13 +235,14 @@ browser.runtime.onMessage.addListener((msg, sender) => {
   if (msg && msg.type === "getCandidates") {
     pruneCandidates();
     const tabId = sender.tab && sender.tab.id;
-    const list = (typeof rankCandidates === "function" ? rankCandidates : (x) => x)([...candidates.values()].filter((c) => tabId == null || c.tabId === tabId || c.tabId === -1));
+    const frameId = sender.frameId;
+    const list = (typeof rankCandidates === "function" ? rankCandidates : (x) => x)([...candidates.values()].filter((c) => (tabId == null || c.tabId === tabId) && (frameId == null || c.frameId === frameId)));
     return Promise.resolve({ type: "candidates", candidates: list });
   }
   if (msg && (msg.type === "downloadcraft-download" || msg.type === "downloadcraft-video-panel")) return safeSend(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer });
 });
 // Ask-first leftovers: tab closed mid-prompt must not lose file (no candidates map here).
 if (browser.tabs && browser.tabs.onRemoved) browser.tabs.onRemoved.addListener((tid) => { for (const [pid, p] of [...pendingCaptures]) if (p.tabId === tid) { pendingCaptures.delete(pid); browserDownload(p).catch(() => {}); } });
-browser.browserAction.onClicked.addListener((tab) => { if (tab && tab.id) browser.tabs.sendMessage(tab.id, { type: "downloadcraft-scan" }); });
+// No toolbar popup: discreet video buttons only (content scan handler removed).
 // SPA/new-page navigation: drop tab's stale sniffed streams.
-if (browser.tabs && browser.tabs.onUpdated) browser.tabs.onUpdated.addListener((tabId, info) => { if (info.status === "loading" && info.url) { for (const [u, c] of [...candidatesByUrl]) if (c.tabId === tabId) candidatesByUrl.delete(u); } });
+if (browser.tabs && browser.tabs.onUpdated) browser.tabs.onUpdated.addListener((tabId, info) => { if (info.status === "loading" && info.url) { for (const [u, c] of [...candidates]) if (c.tabId === tabId) candidates.delete(u); } });
