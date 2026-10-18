@@ -1,6 +1,6 @@
 [package]
 name = "webcraft"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Clean-room cross-platform download manager (IDM feature clone)"
 license = "MIT"
@@ -23,6 +23,8 @@ directories = "5"
 futures-util = "0.3"
 russh = "0.64"
 russh-sftp = "3"
+# BitTorrent. default-features off: drops default-tls (native-tls) + http-api-client; rust-tls reuses ring/rustls stack already in tree. No http-api/postgres/prometheus.
+librqbit = { version = "9", default-features = false, features = ["rust-tls"] }
 eframe = { version = "0.29", default-features = false, features = ["glow", "wayland", "x11"] }
 egui = "0.29"
 rfd = "0.15"

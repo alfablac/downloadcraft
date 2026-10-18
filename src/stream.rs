@@ -96,7 +96,13 @@ pub async fn download_url_with_settings(
     settings: &Settings,
 ) -> Result<DownloadTask, String> {
     let lower = task.url.to_ascii_lowercase();
-    if lower.starts_with("ftp://") {
+    // BitTorrent before HTTP probe: magnet has no HTTP form, .torrent probe would download metadata as file.
+    if crate::torrent::is_torrent_task(&task) {
+        return crate::torrent::download_torrent(client, task, ctrl, settings).await;
+    }
+    if lower.starts_with("ftp://")
+        || lower.starts_with("ftps://")
+        || lower.starts_with("ftpsi://") {
         return crate::ftp::download_ftp(task, ctrl).await;
     }
     if lower.starts_with("sftp://") || lower.starts_with("ssh://") {

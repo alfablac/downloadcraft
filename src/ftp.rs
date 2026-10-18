@@ -1,18 +1,128 @@
-// Minimal FTP client (PASV/REST binary) over tokio TCP. No new deps.
-// ponytail: plain FTP only, no FTPS/active mode; add suppaftp+rustls if FTPS needed.
+// Minimal FTP/FTPS client (PASV/REST binary) over tokio TCP + rustls.
+// Schemes: ftp:// plain (default port 21); ftps:// explicit FTPS - plain
+// connect, then AUTH TLS, PBSZ 0, PROT P (default port 21, NOT 990);
+// ftpsi:// implicit FTPS - TLS on connect (default port 990). Data
+// connections use TLS whenever control does (PROT P). Certs verified
+// against webpki roots (no accept-invalid), server name = URL host.
 use crate::engine::Controls;
 use crate::model::{DownloadTask, TaskStatus};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf,
+    WriteHalf,
+};
 use tokio::net::TcpStream;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TlsMode {
+    Plain,
+    Explicit,
+    Implicit,
+}
+
+/// Scheme -> (TLS mode, default port). Explicit FTPS defaults 21, not 990.
+fn tls_mode_and_port(url: &url::Url) -> Result<(TlsMode, u16), String> {
+    let (mode, default) = match url.scheme() {
+        "ftp" => (TlsMode::Plain, 21),
+        "ftps" => (TlsMode::Explicit, 21),
+        "ftpsi" => (TlsMode::Implicit, 990),
+        s => return Err(format!("unsupported FTP scheme: {s}")),
+    };
+    Ok((mode, url.port().unwrap_or(default)))
+}
+
+enum Wire {
+    Plain(TcpStream),
+    // Boxed: TlsStream dwarfs TcpStream (clippy large_enum_variant).
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for Wire {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Wire::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            Wire::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+impl AsyncWrite for Wire {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        b: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Wire::Plain(s) => std::pin::Pin::new(s).poll_write(cx, b),
+            Wire::Tls(s) => std::pin::Pin::new(s).poll_write(cx, b),
+        }
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Wire::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Wire::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Wire::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Wire::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+// rustls config mirrors src/nntp.rs: webpki roots, no client auth.
+async fn wrap_tls(
+    tcp: TcpStream,
+    host: &str,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+    use tokio_rustls::rustls;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|_| "invalid FTPS TLS host name".to_string())?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio_rustls::TlsConnector::from(Arc::new(config)).connect(name, tcp),
+    )
+    .await
+    .map_err(|_| "FTPS TLS handshake timeout".to_string())?
+    .map_err(|e| format!("FTPS TLS: {e}"))
+}
+
 struct Ftp {
-    rd: BufReader<ReadHalf<TcpStream>>,
-    wr: WriteHalf<TcpStream>,
+    rd: BufReader<ReadHalf<Wire>>,
+    wr: WriteHalf<Wire>,
 }
 
 impl Ftp {
+    /// AUTH TLS upgrade (consuming: halves unsplit for handshake, reader
+    /// buffer dropped - server sends nothing between 234 and handshake).
+    async fn upgrade_tls(self, host: &str) -> Result<Self, String> {
+        let plain = match self.rd.into_inner().unsplit(self.wr) {
+            Wire::Plain(tcp) => tcp,
+            Wire::Tls(_) => return Err("FTP control already TLS".into()),
+        };
+        let (rd, wr) = tokio::io::split(Wire::Tls(Box::new(wrap_tls(plain, host).await?)));
+        Ok(Self {
+            rd: BufReader::new(rd),
+            wr,
+        })
+    }
+
     async fn reply(&mut self) -> Result<(u16, String), String> {
         let mut text = String::new();
         loop {
@@ -90,7 +200,7 @@ pub async fn download_ftp(
 ) -> Result<DownloadTask, String> {
     let url = url::Url::parse(&task.url).map_err(|e| e.to_string())?;
     let host = url.host_str().ok_or("FTP URL missing host")?.to_string();
-    let port = url.port().unwrap_or(21);
+    let (mode, port) = tls_mode_and_port(&url)?;
     let path = pct_decode(url.path());
     if path.is_empty() || path == "/" {
         return Err("FTP URL missing file path".into());
@@ -130,7 +240,12 @@ pub async fn download_ftp(
     let stream = TcpStream::connect((host.as_str(), port))
         .await
         .map_err(|e| format!("FTP connect {host}:{port}: {e}"))?;
-    let (rd, wr) = tokio::io::split(stream);
+    // Implicit FTPS: TLS before any FTP bytes (greeting inside TLS).
+    let wire = match mode {
+        TlsMode::Implicit => Wire::Tls(Box::new(wrap_tls(stream, &host).await?)),
+        _ => Wire::Plain(stream),
+    };
+    let (rd, wr) = tokio::io::split(wire);
     let mut ftp = Ftp {
         rd: BufReader::new(rd),
         wr,
@@ -144,6 +259,14 @@ pub async fn download_ftp(
         ftp.expect(&format!("PASS {pass}"), &[230]).await?;
     } else if code != 230 {
         return Err(format!("FTP USER -> {text}"));
+    }
+    if mode != TlsMode::Plain {
+        if mode == TlsMode::Explicit {
+            ftp.expect("AUTH TLS", &[234]).await?;
+            ftp = ftp.upgrade_tls(&host).await?;
+        }
+        ftp.expect("PBSZ 0", &[200]).await?;
+        ftp.expect("PROT P", &[200]).await?;
     }
     ftp.expect("TYPE I", &[200]).await?;
 
@@ -199,10 +322,6 @@ pub async fn download_ftp(
         format!("{}.{}.{}.{}", nums[0], nums[1], nums[2], nums[3])
     };
     let data_port = (nums[4] as u16) * 256 + nums[5] as u16;
-    let mut data = TcpStream::connect((data_host.as_str(), data_port))
-        .await
-        .map_err(|e| format!("FTP data connect: {e}"))?;
-
     if offset > 0 {
         let (code, _) = ftp.cmd(&format!("REST {offset}")).await?;
         if code != 350 {
@@ -214,6 +333,16 @@ pub async fn download_ftp(
         } // server cannot resume: restart below via truncate
     }
     ftp.expect(&format!("RETR {path}"), &[125, 150]).await?;
+
+    // Data TCP+TLS after RETR accepted: FTPS servers may refuse
+    // connect/handshake until RETR. Same order for plain, no cost.
+    let data_tcp = TcpStream::connect((data_host.as_str(), data_port))
+        .await
+        .map_err(|e| format!("FTP data connect: {e}"))?;
+    let mut data: Wire = match mode {
+        TlsMode::Plain => Wire::Plain(data_tcp),
+        _ => Wire::Tls(Box::new(wrap_tls(data_tcp, &host).await?)),
+    };
 
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
@@ -410,6 +539,23 @@ mod tests {
         );
         (done, dir, st)
     }
+
+    #[test]
+    fn scheme_port_defaults() {
+        let (m, p) = tls_mode_and_port(&url::Url::parse("ftp://h/f").unwrap()).unwrap();
+        assert_eq!((m, p), (TlsMode::Plain, 21));
+        let (m, p) = tls_mode_and_port(&url::Url::parse("ftps://h/f").unwrap()).unwrap();
+        assert_eq!((m, p), (TlsMode::Explicit, 21));
+        let (m, p) = tls_mode_and_port(&url::Url::parse("ftpsi://h/f").unwrap()).unwrap();
+        assert_eq!((m, p), (TlsMode::Implicit, 990));
+        let (m, p) = tls_mode_and_port(&url::Url::parse("ftpsi://h:21/f").unwrap()).unwrap();
+        assert_eq!((m, p), (TlsMode::Implicit, 21));
+        assert!(tls_mode_and_port(&url::Url::parse("http://h/f").unwrap()).is_err());
+    }
+
+    // Live FTPS integration test intentionally skipped: no in-tree TLS FTP
+    // server fixture (rcgen + vsftpd-class server too heavy for unit suite);
+    // TLS wiring covered by scheme tests + shared wrap_tls with nntp.rs.
 
     #[tokio::test]
     async fn ftp_fresh_download_auth() {

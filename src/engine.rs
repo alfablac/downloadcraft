@@ -243,6 +243,219 @@ pub struct Probe {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub final_url: String,
+    pub content_disposition: Option<String>,
+    pub content_type: Option<String>,
+}
+
+/// Percent-decode to bytes (no '+' handling: CD filenames are not form-encoded).
+fn pct_decode_bytes(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16)
+            {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Sanitize a server-supplied filename: strip path separators + control
+/// chars, reject empty/dot-only results. Reuses model::sanitize_filename
+/// (which already strips dirs and maps <>:"/\|?* and controls).
+pub fn sanitize_cd_filename(name: &str) -> Option<String> {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    if base.is_empty() || base.chars().all(|c| c == '.') {
+        return None;
+    }
+    let cleaned: String = base.chars().filter(|c| (*c as u32) >= 32).collect();
+    if cleaned.trim().is_empty() {
+        return None;
+    }
+    let s = crate::model::sanitize_filename(&cleaned);
+    if s == "download.bin" && !cleaned.eq_ignore_ascii_case("download.bin") {
+        None // sanitizer fallback means nothing usable survived
+    } else {
+        Some(s)
+    }
+}
+
+/// Parse Content-Disposition filename. RFC 5987 `filename*` (charset'lang'%XX)
+/// wins over plain `filename=`. Returns sanitized name.
+pub fn parse_content_disposition(header: &str) -> Option<String> {
+    // filename* first
+    for part in header.split(';') {
+        let part = part.trim();
+        let Some(eq) = part.find('=') else { continue };
+        if !part[..eq].trim().eq_ignore_ascii_case("filename*") {
+            continue;
+        }
+        let v = part[eq + 1..].trim().trim_matches('"');
+        // charset'lang'value
+        let mut it = v.splitn(3, '\'');
+        let charset = it.next().unwrap_or("utf-8").to_ascii_lowercase();
+        let _lang = it.next();
+        let Some(encoded) = it.next() else { continue };
+        let bytes = pct_decode_bytes(encoded);
+        let text = if charset.contains("utf-8") || charset.contains("utf8") {
+            String::from_utf8_lossy(&bytes).into_owned()
+        } else if charset.contains("iso-8859-1") || charset.contains("latin1") {
+            bytes.iter().map(|&b| b as char).collect()
+        } else {
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        if let Some(s) = sanitize_cd_filename(&text) {
+            return Some(s);
+        }
+    }
+    for part in header.split(';') {
+        let part = part.trim();
+        let Some(eq) = part.find('=') else { continue };
+        if !part[..eq].trim().eq_ignore_ascii_case("filename") {
+            continue;
+        }
+        let raw = part[eq + 1..].trim();
+        let unq = if raw.len() >= 2 && raw.starts_with('"') {
+            // Quoted-string: unescape \" and \\, stop at closing quote.
+            let mut out = String::new();
+            let mut chars = raw[1..].chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => {
+                        if let Some(n) = chars.next() {
+                            out.push(n);
+                        }
+                    }
+                    '"' => break,
+                    _ => out.push(c),
+                }
+            }
+            out
+        } else {
+            raw.trim_matches('"').to_string()
+        };
+        // Plain filename= may still be percent-encoded by broken servers.
+        let decoded = String::from_utf8_lossy(&pct_decode_bytes(&unq)).into_owned();
+        if let Some(s) = sanitize_cd_filename(&decoded) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Generic placeholder names eligible for server-name adoption. Protects
+/// user-renamed tasks: capture dialog sets filename via sanitize_filename,
+/// so any specific name (with extension, not in this set) is left alone.
+pub fn is_generic_filename(name: &str) -> bool {
+    let n = name.trim();
+    if n.is_empty() {
+        return true;
+    }
+    let stem = n.rsplit_once('.').map(|(s, _)| s).unwrap_or(n);
+    stem.eq_ignore_ascii_case("download")
+        || stem.eq_ignore_ascii_case("index")
+        || Path::new(n).extension().is_none()
+}
+
+fn mime_ext(content_type: &str) -> Option<&'static str> {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    Some(match ct.as_str() {
+        "application/zip" => "zip",
+        "application/x-7z-compressed" => "7z",
+        "application/x-rar-compressed" | "application/vnd.rar" => "rar",
+        "application/gzip" | "application/x-gzip" => "gz",
+        "application/pdf" => "pdf",
+        "application/octet-stream" => "bin",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "video/x-matroska" => "mkv",
+        "audio/mpeg" => "mp3",
+        "audio/flac" => "flac",
+        "audio/ogg" => "ogg",
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "text/plain" => "txt",
+        "application/json" => "json",
+        "application/x-iso9660-image" => "iso",
+        "application/x-msdownload" | "application/vnd.microsoft.portable-executable" => "exe",
+        "application/x-msi" => "msi",
+        "application/vnd.android.package-archive" => "apk",
+        _ => return None,
+    })
+}
+
+/// Adopt server filename when current name is generic. CD name wins; else
+/// append MIME extension when current name lacks one.
+pub fn adopt_server_filename(
+    current: &str,
+    content_disposition: Option<&str>,
+    content_type: Option<&str>,
+) -> Option<String> {
+    if !is_generic_filename(current) {
+        return None;
+    }
+    if let Some(cd) = content_disposition.and_then(parse_content_disposition) {
+        if !cd.eq_ignore_ascii_case(current) {
+            return Some(cd);
+        }
+    }
+    if Path::new(current).extension().is_none() {
+        if let Some(ext) = content_type.and_then(mime_ext) {
+            let stem = if current.trim().is_empty() {
+                "download"
+            } else {
+                current.trim()
+            };
+            return Some(format!("{stem}.{ext}"));
+        }
+    }
+    None
+}
+
+/// Same-destination guard for final rename: dest exists with different
+/// size than incoming file -> pick `name (1).ext`, `name (2).ext`, ...
+/// Same size (likely own redownload) or absent dest: keep dest (rename replaces).
+pub fn dedup_dest(dest: &Path, incoming_size: Option<u64>) -> PathBuf {
+    let occupied_diff = |p: &Path| -> bool {
+        match (std::fs::metadata(p).map(|m| m.len()).ok(), incoming_size) {
+            (Some(existing), Some(inc)) => existing != inc,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    };
+    if !occupied_diff(dest) {
+        return dest.to_path_buf();
+    }
+    let stem = dest
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".into());
+    let ext = dest.extension().map(|s| s.to_string_lossy().into_owned());
+    let parent = dest.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    for n in 1..1000 {
+        let cand = match &ext {
+            Some(e) => parent.join(format!("{stem} ({n}).{e}")),
+            None => parent.join(format!("{stem} ({n})")),
+        };
+        if !occupied_diff(&cand) && !cand.exists() {
+            return cand;
+        }
+    }
+    dest.to_path_buf()
 }
 
 pub async fn probe(client: &reqwest::Client, task: &DownloadTask) -> Result<Probe, String> {
@@ -265,6 +478,16 @@ pub async fn probe(client: &reqwest::Client, task: &DownloadTask) -> Result<Prob
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
     let final_url = resp.url().to_string();
+    let content_disposition = resp
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     if status.as_u16() == 206 {
         let cr = resp
             .headers()
@@ -280,6 +503,8 @@ pub async fn probe(client: &reqwest::Client, task: &DownloadTask) -> Result<Prob
             etag,
             last_modified: lm,
             final_url,
+            content_disposition: content_disposition.clone(),
+            content_type: content_type.clone(),
         })
     } else if status.is_success() {
         let total = resp.content_length();
@@ -290,6 +515,8 @@ pub async fn probe(client: &reqwest::Client, task: &DownloadTask) -> Result<Prob
             etag,
             last_modified: lm,
             final_url,
+            content_disposition,
+            content_type,
         })
     } else {
         Err(format!("HTTP {status}"))
@@ -348,6 +575,15 @@ pub async fn download_http(
     };
     task.url = used_url;
     task.total = probe.total;
+    // Filename repair: adopt CD/MIME name only for generic placeholders,
+    // never overriding user-renamed (specific) filenames.
+    if let Some(name) = adopt_server_filename(
+        &task.filename,
+        probe.content_disposition.as_deref(),
+        probe.content_type.as_deref(),
+    ) {
+        task.filename = name;
+    }
     std::fs::create_dir_all(&task.dest_dir).map_err(|e| e.to_string())?;
     let dest = task.dest_dir.join(&task.filename);
     let part_dir = task.dest_dir.join(format!(".downloadcraft-{}", task.id));
@@ -368,6 +604,19 @@ pub async fn download_http(
             ctrl.parts_are_segments.store(false, Ordering::Relaxed);
             *ctrl.parts.lock().unwrap() = vec![(0, t)];
         }
+        // Plain path: response headers carry CD/MIME too.
+        if let Some(name) = adopt_server_filename(
+            &task.filename,
+            resp.headers()
+                .get(reqwest::header::CONTENT_DISPOSITION)
+                .and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+        ) {
+            task.filename = name;
+        }
+        let dest = task.dest_dir.join(&task.filename);
         let tmp = task.dest_dir.join(format!(".partial-{}", task.filename));
         let mut file = tokio::fs::File::create(&tmp)
             .await
@@ -392,6 +641,12 @@ pub async fn download_http(
         }
         file.flush().await.map_err(|e| e.to_string())?;
         drop(file);
+        let dest = dedup_dest(&dest, Some(n));
+        if let Some(name) = dest.file_name().map(|s| s.to_string_lossy().into_owned()) {
+            if name != task.filename {
+                task.filename = name;
+            }
+        }
         tokio::fs::rename(&tmp, &dest)
             .await
             .map_err(|e| e.to_string())?;
@@ -572,6 +827,12 @@ pub async fn download_http(
         return Err(format!(
             "size mismatch: assembled {assembled} != total {total}"
         ));
+    }
+    let dest = dedup_dest(&dest, Some(total));
+    if let Some(name) = dest.file_name().map(|s| s.to_string_lossy().into_owned()) {
+        if name != task.filename {
+            task.filename = name;
+        }
     }
     tokio::fs::rename(&tmp, &dest)
         .await
@@ -857,7 +1118,17 @@ async fn finish_check(dest: &Path, task: &DownloadTask) -> Result<(), String> {
         }
         let got = format!("{:x}", hasher.finalize());
         if !got.eq_ignore_ascii_case(want) {
-            return Err(format!("sha256 mismatch: got {got} want {want}"));
+            // Checksum auto-repair: quarantine corrupt output as `<name>.bad`
+            // (overwrite prior .bad) so retry re-downloads instead of
+            // resuming/verifying same corrupt bytes. Error still propagates:
+            // app retry policy requeues, parts already cleaned by caller.
+            let bad = PathBuf::from(format!("{}.bad", dest.display()));
+            let _ = tokio::fs::remove_file(&bad).await;
+            let _ = tokio::fs::rename(dest, &bad).await;
+            return Err(format!(
+                "sha256 mismatch: got {got} want {want} (quarantined as {})",
+                bad.display()
+            ));
         }
     }
     Ok(())
@@ -965,7 +1236,16 @@ pub async fn download_media(
     }
     // Subtitle tracks land as sidecar next to final file (ffmpeg stream mapping for
     // arbitrary subtitle segment bytes is unreliable; sidecar is what players pick up).
-    let dest = task.dest_dir.join(&task.filename);
+    let incoming = track_files
+        .first()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len());
+    let dest = dedup_dest(&task.dest_dir.join(&task.filename), incoming);
+    if let Some(name) = dest.file_name().map(|s| s.to_string_lossy().into_owned()) {
+        if name != task.filename {
+            task.filename = name;
+        }
+    }
     let text_url_ext = tracks
         .iter()
         .find(|(k, _)| k == "text")
@@ -1226,5 +1506,118 @@ mod tests {
         assert_eq!(split_point(0, 10, 20), None);
         // both halves >= MIN_SPLIT at exact threshold
         assert_eq!(split_point(0, 2 * MIN_SPLIT - 1, 0), Some(MIN_SPLIT - 1));
+    }
+    #[test]
+    fn cd_rfc5987_utf8() {
+        assert_eq!(
+            parse_content_disposition(
+                "attachment; filename*=UTF-8''%E2%82%AC%20rates.pdf"
+            )
+            .as_deref(),
+            Some("€ rates.pdf")
+        );
+    }
+    #[test]
+    fn cd_star_wins_over_plain() {
+        assert_eq!(
+            parse_content_disposition(
+                "attachment; filename=\"plain.zip\"; filename*=UTF-8''star%20name.zip"
+            )
+            .as_deref(),
+            Some("star name.zip")
+        );
+    }
+    #[test]
+    fn cd_plain_quoted_and_unquoted() {
+        assert_eq!(
+            parse_content_disposition("attachment; filename=\"my file.zip\"").as_deref(),
+            Some("my file.zip")
+        );
+        assert_eq!(
+            parse_content_disposition("attachment; filename=report.pdf").as_deref(),
+            Some("report.pdf")
+        );
+    }
+    #[test]
+    fn cd_sanitizes_traversal_and_controls() {
+        assert_eq!(
+            parse_content_disposition("attachment; filename=\"../../evil.exe\"").as_deref(),
+            Some("evil.exe")
+        );
+        assert_eq!(
+            parse_content_disposition("attachment; filename*=UTF-8''..%2F..%2Fevil.exe")
+                .as_deref(),
+            Some("evil.exe")
+        );
+        assert_eq!(parse_content_disposition("attachment"), None);
+        assert_eq!(parse_content_disposition("attachment; filename=\"\""), None);
+    }
+    #[test]
+    fn cd_latin1_star() {
+        // 0xE9 = é in ISO-8859-1
+        assert_eq!(
+            parse_content_disposition("attachment; filename*=ISO-8859-1''caf%E9.txt")
+                .as_deref(),
+            Some("café.txt")
+        );
+    }
+    #[test]
+    fn adopt_only_generic_names() {
+        let cd = Some("attachment; filename=\"real-name.zip\"");
+        assert_eq!(
+            adopt_server_filename("download", cd, None).as_deref(),
+            Some("real-name.zip")
+        );
+        assert_eq!(
+            adopt_server_filename("", cd, None).as_deref(),
+            Some("real-name.zip")
+        );
+        assert_eq!(
+            adopt_server_filename("index", cd, None).as_deref(),
+            Some("real-name.zip")
+        );
+        // User-renamed specific name never overridden.
+        assert_eq!(adopt_server_filename("my-rename.zip", cd, None), None);
+        assert_eq!(adopt_server_filename("holiday.mp4", cd, None), None);
+        // Generic without extension + no CD: MIME fallback.
+        assert_eq!(
+            adopt_server_filename("download", None, Some("video/mp4")).as_deref(),
+            Some("download.mp4")
+        );
+        assert_eq!(
+            adopt_server_filename("download.bin", None, Some("video/mp4")),
+            None,
+            "has extension already"
+        );
+        assert_eq!(adopt_server_filename("download", None, None), None);
+    }
+    #[test]
+    fn generic_detection() {
+        assert!(is_generic_filename(""));
+        assert!(is_generic_filename("download"));
+        assert!(is_generic_filename("download.bin"));
+        assert!(is_generic_filename("index.html"));
+        assert!(is_generic_filename("noext"));
+        assert!(!is_generic_filename("report.pdf"));
+    }
+    #[test]
+    fn dedup_picks_suffix_on_size_conflict() {
+        let dir = std::env::temp_dir().join(format!("wc-dedup-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let dest = dir.join("file.zip");
+        std::fs::write(&dest, b"12345").unwrap(); // 5 bytes
+        assert_eq!(dedup_dest(&dest, Some(5)), dest, "same size keeps dest");
+        assert_eq!(
+            dedup_dest(&dest, Some(99)),
+            dir.join("file (1).zip"),
+            "different size dedups"
+        );
+        std::fs::write(dir.join("file (1).zip"), b"x").unwrap();
+        assert_eq!(dedup_dest(&dest, Some(99)), dir.join("file (2).zip"));
+        assert_eq!(
+            dedup_dest(&dir.join("absent.zip"), Some(1)),
+            dir.join("absent.zip")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

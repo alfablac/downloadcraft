@@ -232,6 +232,12 @@ pub struct Settings {
     pub nntp_user: String,
     #[serde(default)]
     pub nntp_pass: String,
+    /// BitTorrent listen port. 0 = librqbit default (random).
+    #[serde(default)]
+    pub torrent_listen_port: u16,
+    /// Keep seeding after download completes instead of pausing torrent.
+    #[serde(default)]
+    pub torrent_seed_after_complete: bool,
 }
 fn def_nntp_port() -> u16 {
     563
@@ -263,6 +269,8 @@ impl Default for Settings {
             nntp_tls: true,
             nntp_user: String::new(),
             nntp_pass: String::new(),
+            torrent_listen_port: 0,
+            torrent_seed_after_complete: false,
         }
     }
 }

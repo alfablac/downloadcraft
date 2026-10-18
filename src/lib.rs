@@ -11,4 +11,5 @@ pub mod queue;
 pub mod scheduler;
 pub mod sftp;
 pub mod stream;
+pub mod torrent;
 pub mod ytdlp;

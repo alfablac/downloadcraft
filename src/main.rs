@@ -95,10 +95,22 @@ impl Runtime {
     }
 }
 
+/// Pure parse: None on any corruption (never panics).
+pub fn parse_state(txt: &str) -> Option<AppState> {
+    serde_json::from_str(txt).ok()
+}
+
 pub fn load_state() -> AppState {
     let p = platform::state_path();
     if let Ok(txt) = std::fs::read_to_string(&p) {
-        if let Ok(s) = serde_json::from_str(&txt) {
+        if let Some(s) = parse_state(&txt) {
+            return s;
+        }
+    }
+    // Corrupt/truncated primary: fall back to last-known-good backup.
+    let bak = p.with_extension("json.bak");
+    if let Ok(txt) = std::fs::read_to_string(&bak) {
+        if let Some(s) = parse_state(&txt) {
             return s;
         }
     }
@@ -106,8 +118,28 @@ pub fn load_state() -> AppState {
 }
 pub fn save_state(state: &AppState) {
     let _ = platform::ensure_dirs();
-    if let Ok(txt) = serde_json::to_string_pretty(state) {
-        let _ = std::fs::write(platform::state_path(), txt);
+    let Ok(txt) = serde_json::to_string_pretty(state) else {
+        return;
+    };
+    let p = platform::state_path();
+    // Preserve previous good state as .bak before replacing it.
+    if std::fs::read_to_string(&p)
+        .map(|old| parse_state(&old).is_some())
+        .unwrap_or(false)
+    {
+        let _ = std::fs::copy(&p, p.with_extension("json.bak"));
+    }
+    // Atomic-ish replace: write tmp in same dir, rename over dest.
+    // Windows rename fails when dest exists, so remove dest first;
+    // on any failure fall back to direct write.
+    let tmp = p.with_extension("json.tmp");
+    let replaced = std::fs::write(&tmp, &txt).is_ok() && {
+        let _ = std::fs::remove_file(&p);
+        std::fs::rename(&tmp, &p).is_ok()
+    };
+    if !replaced {
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::write(&p, txt);
     }
 }
 
@@ -420,5 +452,35 @@ pub fn drain_inbox(rt: &Arc<Mutex<Runtime>>) {
     let caps = take_inbox_tasks(rt);
     if !caps.is_empty() {
         rt.lock().unwrap().pending_captures.extend(caps);
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn parse_state_accepts_valid_rejects_corrupt() {
+        let good = serde_json::to_string(&AppState::default()).unwrap();
+        assert!(parse_state(&good).is_some());
+        assert!(parse_state("").is_none());
+        assert!(parse_state("{not json").is_none());
+        assert!(parse_state("{\"tasks\":[").is_none(), "truncated write");
+        assert!(parse_state("null").is_none());
+    }
+
+    #[test]
+    fn bak_holds_previous_good_state() {
+        let dir = std::env::temp_dir().join(format!("wc-state-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("state.json");
+        std::fs::write(&p, "{\"tasks\":[]}").unwrap();
+        if parse_state(&std::fs::read_to_string(&p).unwrap()).is_some() {
+            std::fs::copy(&p, p.with_extension("json.bak")).unwrap();
+        }
+        std::fs::write(&p, "CORRUPT").unwrap();
+        let bak_txt = std::fs::read_to_string(p.with_extension("json.bak")).unwrap();
+        assert!(parse_state(&bak_txt).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
