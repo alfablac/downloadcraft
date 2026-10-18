@@ -17,24 +17,40 @@ pub fn parse_metalink(xml: &str) -> Result<Vec<MetalinkFile>, String> {
     }
     let mut files = Vec::new();
     for file in doc.descendants().filter(|n| n.has_tag_name("file")) {
-        let mut f = MetalinkFile { name: file.attribute("name").unwrap_or("").trim().to_string(), ..Default::default() };
+        let mut f = MetalinkFile {
+            name: file.attribute("name").unwrap_or("").trim().to_string(),
+            ..Default::default()
+        };
         // Descendants (not just children): v3 nests <hash> under
         // <verification> and <url> under <resources>.
         for n in file.descendants() {
             if n.has_tag_name("size") {
-                if f.size.is_none() { f.size = n.text().and_then(|t| t.trim().parse().ok()); }
+                if f.size.is_none() {
+                    f.size = n.text().and_then(|t| t.trim().parse().ok());
+                }
             } else if n.has_tag_name("hash") {
-                let ty = n.attribute("type").unwrap_or("").to_ascii_lowercase().replace(['-', '_'], "");
+                let ty = n
+                    .attribute("type")
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .replace(['-', '_'], "");
                 if ty == "sha256" && f.sha256.is_none() {
-                    f.sha256 = n.text().map(|t| t.trim().to_ascii_lowercase()).filter(|t| !t.is_empty());
+                    f.sha256 = n
+                        .text()
+                        .map(|t| t.trim().to_ascii_lowercase())
+                        .filter(|t| !t.is_empty());
                 }
             } else if n.has_tag_name("url") {
-                if let Some(t) = n.text().map(|t| t.trim()).filter(|t| !t.is_empty()) { f.urls.push(t.to_string()); }
+                if let Some(t) = n.text().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+                    f.urls.push(t.to_string());
+                }
             }
         }
         files.push(f);
     }
-    if files.is_empty() { return Err("metalink has no <file> entries".into()); }
+    if files.is_empty() {
+        return Err("metalink has no <file> entries".into());
+    }
     Ok(files)
 }
 
@@ -61,7 +77,13 @@ mod tests {
         assert_eq!(files[0].name, "example.iso");
         assert_eq!(files[0].size, Some(12345));
         assert_eq!(files[0].sha256.as_deref(), Some("abcdef0123"));
-        assert_eq!(files[0].urls, vec!["https://cdn1.example.com/example.iso", "https://cdn2.example.com/example.iso"]);
+        assert_eq!(
+            files[0].urls,
+            vec![
+                "https://cdn1.example.com/example.iso",
+                "https://cdn2.example.com/example.iso"
+            ]
+        );
         assert_eq!(files[1].size, None);
         assert_eq!(files[1].sha256, None);
     }
@@ -93,7 +115,10 @@ mod tests {
     fn rejects_non_metalink_and_broken_xml() {
         assert!(parse_metalink("<MPD/>").is_err());
         assert!(parse_metalink("<metalink").is_err());
-        assert!(parse_metalink("<metalink xmlns=\"urn:ietf:params:xml:ns:metalink\"/>").is_err(), "no files");
+        assert!(
+            parse_metalink("<metalink xmlns=\"urn:ietf:params:xml:ns:metalink\"/>").is_err(),
+            "no files"
+        );
         // Non-SHA256 hashes ignored.
         let xml = r#"<metalink xmlns="urn:ietf:params:xml:ns:metalink"><file name="x"><hash type="md5">abc</hash><url>http://e/x</url></file></metalink>"#;
         assert_eq!(parse_metalink(xml).unwrap()[0].sha256, None);

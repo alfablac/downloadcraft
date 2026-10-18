@@ -23,9 +23,9 @@ pub const WARN: Color32 = Color32::from_rgb(0xB8, 0x8A, 0x3D);
 pub const ERR: Color32 = Color32::from_rgb(0xD9, 0x7A, 0x6E); // lightened: #B04A44 was 2.7-3.2:1 as small text
 
 // Semantic
-pub const BG: Color32 = G_900;              // central list background
-pub const SURFACE: Color32 = G_850;         // panels (menubar, rail, statusbar)
-pub const SURFACE_RAISED: Color32 = G_800;  // toolbars, headers, inputs
+pub const BG: Color32 = G_900; // central list background
+pub const SURFACE: Color32 = G_850; // panels (menubar, rail, statusbar)
+pub const SURFACE_RAISED: Color32 = G_800; // toolbars, headers, inputs
 pub const SURFACE_HOVER: Color32 = G_750;
 pub const BORDER: Color32 = G_700;
 pub const BORDER_STRONG: Color32 = G_600;
@@ -57,7 +57,14 @@ pub const STEEL_TEXT: Color32 = Color32::from_rgb(0x7F, 0xB3, 0xAA);
 
 pub fn status_color(s: crate::model::TaskStatus) -> Color32 {
     use crate::model::TaskStatus::*;
-    match s { Complete => OK, Downloading => STEEL, Error => ERR, Protected => WARN, Paused => WARN, Queued => TEXT_FAINT }
+    match s {
+        Complete => OK,
+        Downloading => STEEL,
+        Error => ERR,
+        Protected => WARN,
+        Paused => WARN,
+        Queued => TEXT_FAINT,
+    }
 }
 
 /// Table header text: 11px semibold. Named body size, so call sites drop `.small()`.
@@ -97,7 +104,16 @@ pub fn apply(ctx: &egui::Context) {
     v.window_rounding = r_panel;
     v.menu_rounding = r_ctrl;
     v.window_stroke = egui::Stroke::new(1.0f32, BORDER);
-    for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] { w.rounding = r_ctrl; w.expansion = 0.0; }
+    for w in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.rounding = r_ctrl;
+        w.expansion = 0.0;
+    }
     v.widgets.noninteractive.bg_fill = SURFACE;
     v.widgets.noninteractive.weak_bg_fill = SURFACE;
     v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0f32, BORDER);
@@ -140,30 +156,54 @@ pub fn apply(ctx: &egui::Context) {
         (TextStyle::Button, FontId::proportional(11.0)),
         (TextStyle::Small, FontId::proportional(10.5)),
         (TextStyle::Monospace, FontId::monospace(11.0)),
-    ].into();
+    ]
+    .into();
     ctx.set_style(style);
 }
 
 /// Primary action button: STEEL fill (white text 9.3:1 on it), global hover/pressed.
 pub fn primary_btn(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add(egui::Button::new(egui::RichText::new(label).color(Color32::WHITE).strong()).fill(STEEL).rounding(R_CTRL).min_size(egui::vec2(0.0, BTN_H)))
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).color(Color32::WHITE).strong())
+            .fill(STEEL)
+            .rounding(R_CTRL)
+            .min_size(egui::vec2(0.0, BTN_H)),
+    )
 }
 /// Secondary button: no .fill() — global inactive/hovered/active visuals paint it.
 pub fn ghost_btn(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add(egui::Button::new(egui::RichText::new(label).color(TEXT)).rounding(R_CTRL).min_size(egui::vec2(0.0, BTN_H)))
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).color(TEXT))
+            .rounding(R_CTRL)
+            .min_size(egui::vec2(0.0, BTN_H)),
+    )
 }
 /// Small status label — bordered box, 4px radius.
 pub fn chip(ui: &mut egui::Ui, label: &str, color: Color32) {
-    egui::Frame::none().fill(SURFACE_RAISED).stroke(egui::Stroke::new(1.0f32, BORDER)).rounding(R_CHIP).inner_margin(egui::Margin::symmetric(6.0, 2.0))
-        .show(ui, |ui| { ui.label(egui::RichText::new(label).color(color).small()); });
+    egui::Frame::none()
+        .fill(SURFACE_RAISED)
+        .stroke(egui::Stroke::new(1.0f32, BORDER))
+        .rounding(R_CHIP)
+        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).color(color).small());
+        });
 }
 /// Panel frame (desktop group box), 8px radius.
 #[allow(dead_code)]
 pub fn panel() -> egui::Frame {
-    egui::Frame::none().fill(SURFACE).stroke(egui::Stroke::new(1.0f32, BORDER)).rounding(R_PANEL).inner_margin(egui::Margin::same(12.0))
+    egui::Frame::none()
+        .fill(SURFACE)
+        .stroke(egui::Stroke::new(1.0f32, BORDER))
+        .rounding(R_PANEL)
+        .inner_margin(egui::Margin::same(12.0))
 }
 /// Sunken list/table frame.
 #[allow(dead_code)]
 pub fn list_frame() -> egui::Frame {
-    egui::Frame::none().fill(BG).stroke(egui::Stroke::new(1.0f32, BORDER_STRONG)).rounding(R_PANEL).inner_margin(egui::Margin::same(0.0))
+    egui::Frame::none()
+        .fill(BG)
+        .stroke(egui::Stroke::new(1.0f32, BORDER_STRONG))
+        .rounding(R_PANEL)
+        .inner_margin(egui::Margin::same(0.0))
 }

@@ -7,8 +7,17 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 pub fn build_client(proxy: &str) -> reqwest::Client {
-    let mut b = reqwest::Client::builder().user_agent(concat!("webcraft/", env!("CARGO_PKG_VERSION"))).connect_timeout(std::time::Duration::from_secs(15)).read_timeout(std::time::Duration::from_secs(60)).pool_idle_timeout(std::time::Duration::from_secs(20)).pool_max_idle_per_host(8);
-    if !proxy.trim().is_empty() { if let Ok(p) = reqwest::Proxy::all(proxy.trim()) { b = b.proxy(p); } }
+    let mut b = reqwest::Client::builder()
+        .user_agent(concat!("webcraft/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(60))
+        .pool_idle_timeout(std::time::Duration::from_secs(20))
+        .pool_max_idle_per_host(8);
+    if !proxy.trim().is_empty() {
+        if let Ok(p) = reqwest::Proxy::all(proxy.trim()) {
+            b = b.proxy(p);
+        }
+    }
     b.build().unwrap_or_default()
 }
 
@@ -19,36 +28,88 @@ fn b64(data: &[u8]) -> String {
     for c in data.chunks(3) {
         let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(T[(n >> 18) as usize & 63] as char); out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
 
 fn headers_for(task: &DownloadTask) -> reqwest::header::HeaderMap {
     let mut h = reqwest::header::HeaderMap::new();
-    if !task.referrer.is_empty() { if let Ok(v) = task.referrer.parse() { h.insert(reqwest::header::REFERER, v); } }
-    if !task.cookies.is_empty() { if let Ok(v) = task.cookies.parse() { h.insert(reqwest::header::COOKIE, v); } }
-    for (k, v) in &task.headers { if let (Ok(n), Ok(vv)) = (k.parse::<reqwest::header::HeaderName>(), v.parse()) { h.insert(n, vv); } }
+    if !task.referrer.is_empty() {
+        if let Ok(v) = task.referrer.parse() {
+            h.insert(reqwest::header::REFERER, v);
+        }
+    }
+    if !task.cookies.is_empty() {
+        if let Ok(v) = task.cookies.parse() {
+            h.insert(reqwest::header::COOKIE, v);
+        }
+    }
+    for (k, v) in &task.headers {
+        if let (Ok(n), Ok(vv)) = (k.parse::<reqwest::header::HeaderName>(), v.parse()) {
+            h.insert(n, vv);
+        }
+    }
     if !task.username.is_empty() && !h.contains_key(reqwest::header::AUTHORIZATION) {
         let raw = format!("{}:{}", task.username, task.password);
-        if let Ok(v) = format!("Basic {}", b64(raw.as_bytes())).parse() { h.insert(reqwest::header::AUTHORIZATION, v); }
+        if let Ok(v) = format!("Basic {}", b64(raw.as_bytes())).parse() {
+            h.insert(reqwest::header::AUTHORIZATION, v);
+        }
     }
     h
 }
 
-pub struct Controls { pub paused: AtomicBool, pub cancelled: AtomicBool, pub downloaded: AtomicU64, pub limit_kbps: AtomicU64, pub rate: std::sync::Mutex<(std::time::Instant, u64, Option<std::time::Instant>, u64, f64)>,
+pub struct Controls {
+    pub paused: AtomicBool,
+    pub cancelled: AtomicBool,
+    pub downloaded: AtomicU64,
+    pub limit_kbps: AtomicU64,
+    pub rate: std::sync::Mutex<(
+        std::time::Instant,
+        u64,
+        Option<std::time::Instant>,
+        u64,
+        f64,
+    )>,
     /// Total bytes when known (0 = unknown). GUI needs this live; task.total only lands at finish.
     pub total: AtomicU64,
     /// Per-part (done, expected). Segmented HTTP/FTP/single-file use bytes;
     /// manifest downloads use segment counts and set `parts_are_segments`.
     pub parts: std::sync::Mutex<Vec<(u64, u64)>>,
-    pub parts_are_segments: AtomicBool }
-impl Controls { pub fn new(limit: u64) -> Self { Self { paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), downloaded: AtomicU64::new(0), limit_kbps: AtomicU64::new(limit), rate: std::sync::Mutex::new((std::time::Instant::now(), 0, None, 0, 0.0)), total: AtomicU64::new(0), parts: std::sync::Mutex::new(Vec::new()), parts_are_segments: AtomicBool::new(false) } } }
+    pub parts_are_segments: AtomicBool,
+}
+impl Controls {
+    pub fn new(limit: u64) -> Self {
+        Self {
+            paused: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            downloaded: AtomicU64::new(0),
+            limit_kbps: AtomicU64::new(limit),
+            rate: std::sync::Mutex::new((std::time::Instant::now(), 0, None, 0, 0.0)),
+            total: AtomicU64::new(0),
+            parts: std::sync::Mutex::new(Vec::new()),
+            parts_are_segments: AtomicBool::new(false),
+        }
+    }
+}
 
 fn compute_rate(prev_bytes: u64, cur_bytes: u64, dt_secs: f64) -> f64 {
-    if dt_secs <= 0.0 || cur_bytes <= prev_bytes { 0.0 } else { (cur_bytes - prev_bytes) as f64 / dt_secs }
+    if dt_secs <= 0.0 || cur_bytes <= prev_bytes {
+        0.0
+    } else {
+        (cur_bytes - prev_bytes) as f64 / dt_secs
+    }
 }
 
 /// Per-task smoothed rate (bytes/s) from `ctrl.downloaded`. First call only
@@ -57,63 +118,103 @@ pub fn rate_bps(ctrl: &Controls) -> f64 {
     let cur = ctrl.downloaded.load(Ordering::Relaxed);
     let now = std::time::Instant::now();
     let mut g = ctrl.rate.lock().unwrap();
-    let Some(prev_t) = g.2 else { g.2 = Some(now); g.3 = cur; return 0.0; };
+    let Some(prev_t) = g.2 else {
+        g.2 = Some(now);
+        g.3 = cur;
+        return 0.0;
+    };
     let dt = now.duration_since(prev_t).as_secs_f64();
-    if dt <= 0.0 { return g.4; }
+    if dt <= 0.0 {
+        return g.4;
+    }
     let inst = compute_rate(g.3, cur, dt);
-    g.4 = if g.4 == 0.0 { inst } else { 0.25 * inst + 0.75 * g.4 };
-    g.2 = Some(now); g.3 = cur;
+    g.4 = if g.4 == 0.0 {
+        inst
+    } else {
+        0.25 * inst + 0.75 * g.4
+    };
+    g.2 = Some(now);
+    g.3 = cur;
     g.4
 }
 
 async fn throttle(ctrl: &Controls, bytes: u64) {
     let limit = ctrl.limit_kbps.load(Ordering::Relaxed);
-    if limit == 0 { return; }
+    if limit == 0 {
+        return;
+    }
     // Global 1s window gate shared across workers.
     loop {
         let wait = {
             let mut g = ctrl.rate.lock().unwrap();
-            if g.0.elapsed() >= std::time::Duration::from_secs(1) { g.0 = std::time::Instant::now(); g.1 = 0; }
+            if g.0.elapsed() >= std::time::Duration::from_secs(1) {
+                g.0 = std::time::Instant::now();
+                g.1 = 0;
+            }
             let budget = limit.saturating_mul(1024);
             if bytes > budget {
-                if g.1 == 0 { g.1 = bytes; return; }
+                if g.1 == 0 {
+                    g.1 = bytes;
+                    return;
+                }
                 std::time::Duration::from_secs(1).saturating_sub(g.0.elapsed())
-            } else if g.1 + bytes <= budget { g.1 += bytes; return; }
-            else { std::time::Duration::from_secs(1).saturating_sub(g.0.elapsed()) }
+            } else if g.1 + bytes <= budget {
+                g.1 += bytes;
+                return;
+            } else {
+                std::time::Duration::from_secs(1).saturating_sub(g.0.elapsed())
+            }
         };
         tokio::time::sleep(wait).await;
     }
 }
 
-
 /// Next stream chunk, but wake every 200ms to honour cancel/pause while socket idle.
 /// Without this, cancel only lands when next chunk arrives (stalled server = never).
 async fn next_chunk<S>(stream: &mut S, ctrl: &Controls) -> Result<Option<S::Item>, String>
-where S: futures_util::Stream + Unpin {
+where
+    S: futures_util::Stream + Unpin,
+{
     loop {
         wait_not_paused(ctrl).await?;
         match tokio::time::timeout(std::time::Duration::from_millis(200), stream.next()).await {
             Ok(v) => return Ok(v),
-            Err(_) => { if ctrl.cancelled.load(Ordering::Relaxed) { return Err("cancelled".into()); } }
+            Err(_) => {
+                if ctrl.cancelled.load(Ordering::Relaxed) {
+                    return Err("cancelled".into());
+                }
+            }
         }
     }
 }
 
 pub async fn wait_not_paused(ctrl: &Controls) -> Result<(), String> {
     while ctrl.paused.load(Ordering::Relaxed) {
-        if ctrl.cancelled.load(Ordering::Relaxed) { return Err("cancelled".into()); }
+        if ctrl.cancelled.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    if ctrl.cancelled.load(Ordering::Relaxed) { return Err("cancelled".into()); }
+    if ctrl.cancelled.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
     Ok(())
 }
 
 /// Split total into segment ranges.
 pub fn plan_segments(total: u64, wanted: u32) -> Vec<(u64, u64)> {
-    if total == 0 { return vec![]; }
+    if total == 0 {
+        return vec![];
+    }
     let n = (wanted.max(1) as u64).min(total.max(1));
-    let chunk = total / n; let mut v = Vec::new(); let mut s = 0;
-    for i in 0..n { let e = if i == n - 1 { total - 1 } else { s + chunk - 1 }; v.push((s, e)); s = e + 1; }
+    let chunk = total / n;
+    let mut v = Vec::new();
+    let mut s = 0;
+    for i in 0..n {
+        let e = if i == n - 1 { total - 1 } else { s + chunk - 1 };
+        v.push((s, e));
+        s = e + 1;
+    }
     v
 }
 
@@ -125,49 +226,126 @@ pub const MIN_SPLIT: u64 = 256 * 1024;
 /// by thief. Upgrade: track per-segment in-flight offset if waste matters.
 fn split_point(start: u64, end: u64, done: u64) -> Option<u64> {
     let cur = start.checked_add(done)?;
-    if cur > end { return None; }
+    if cur > end {
+        return None;
+    }
     let remaining = end - cur + 1;
-    if remaining < 2 * MIN_SPLIT { None } else { Some(cur + remaining / 2 - 1) }
+    if remaining < 2 * MIN_SPLIT {
+        None
+    } else {
+        Some(cur + remaining / 2 - 1)
+    }
 }
 
-pub struct Probe { pub total: Option<u64>, pub accept_ranges: bool, pub etag: Option<String>, pub last_modified: Option<String>, pub final_url: String }
+pub struct Probe {
+    pub total: Option<u64>,
+    pub accept_ranges: bool,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub final_url: String,
+}
 
 pub async fn probe(client: &reqwest::Client, task: &DownloadTask) -> Result<Probe, String> {
-    let resp = client.get(&task.url).headers(headers_for(task)).header("Range", "bytes=0-0").send().await.map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&task.url)
+        .headers(headers_for(task))
+        .header("Range", "bytes=0-0")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     let status = resp.status();
-    let etag = resp.headers().get(reqwest::header::ETAG).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-    let lm = resp.headers().get(reqwest::header::LAST_MODIFIED).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let etag = resp
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let lm = resp
+        .headers()
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     let final_url = resp.url().to_string();
     if status.as_u16() == 206 {
-        let cr = resp.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let cr = resp
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         let total = cr.rsplit('/').next().and_then(|v| v.parse().ok());
         let _ = resp.bytes().await;
-        Ok(Probe { total, accept_ranges: true, etag, last_modified: lm, final_url })
+        Ok(Probe {
+            total,
+            accept_ranges: true,
+            etag,
+            last_modified: lm,
+            final_url,
+        })
     } else if status.is_success() {
         let total = resp.content_length();
         let _ = resp.bytes().await;
-        Ok(Probe { total, accept_ranges: false, etag, last_modified: lm, final_url })
-    } else { Err(format!("HTTP {status}")) }
+        Ok(Probe {
+            total,
+            accept_ranges: false,
+            etag,
+            last_modified: lm,
+            final_url,
+        })
+    } else {
+        Err(format!("HTTP {status}"))
+    }
 }
 
-struct SegmentState { start: u64, end: u64, done: u64 }
-fn state_path_for(part_dir: &Path) -> PathBuf { part_dir.join("state.json") }
-fn save_state(part_dir: &Path, url: &str, etag: &Option<String>, total: u64, segs: &[SegmentState]) {
-    let v: Vec<_> = segs.iter().map(|s| serde_json::json!({"start":s.start,"end":s.end,"done":s.done})).collect();
+struct SegmentState {
+    start: u64,
+    end: u64,
+    done: u64,
+}
+fn state_path_for(part_dir: &Path) -> PathBuf {
+    part_dir.join("state.json")
+}
+fn save_state(
+    part_dir: &Path,
+    url: &str,
+    etag: &Option<String>,
+    total: u64,
+    segs: &[SegmentState],
+) {
+    let v: Vec<_> = segs
+        .iter()
+        .map(|s| serde_json::json!({"start":s.start,"end":s.end,"done":s.done}))
+        .collect();
     let j = serde_json::json!({"url":url,"etag":etag,"total":total,"segments":v});
     let _ = std::fs::write(state_path_for(part_dir), j.to_string());
 }
 
 /// Segmented HTTP download with resume. Segment files: part{i} in dest_dir/.downloadcraft-{id}/
-pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl: Arc<Controls>) -> Result<DownloadTask, String> {
+pub async fn download_http(
+    client: reqwest::Client,
+    mut task: DownloadTask,
+    ctrl: Arc<Controls>,
+) -> Result<DownloadTask, String> {
     // Mirror failover (IDM Url0..UrlN): first URL whose probe succeeds wins; task.url rewritten to it.
-    let mut urls = vec![task.url.clone()]; urls.extend(task.mirrors.iter().cloned());
-    let mut found: Option<(String, Probe)> = None; let mut last_err = String::new();
+    let mut urls = vec![task.url.clone()];
+    urls.extend(task.mirrors.iter().cloned());
+    let mut found: Option<(String, Probe)> = None;
+    let mut last_err = String::new();
     for u in urls {
-        let cand = DownloadTask { url: u.clone(), ..task.clone() };
-        match probe(&client, &cand).await { Ok(p) => { found = Some((u, p)); break; } Err(e) => last_err = e }
+        let cand = DownloadTask {
+            url: u.clone(),
+            ..task.clone()
+        };
+        match probe(&client, &cand).await {
+            Ok(p) => {
+                found = Some((u, p));
+                break;
+            }
+            Err(e) => last_err = e,
+        }
     }
-    let Some((used_url, probe)) = found else { return Err(format!("all mirrors failed (last: {last_err})")); };
+    let Some((used_url, probe)) = found else {
+        return Err(format!("all mirrors failed (last: {last_err})"));
+    };
     task.url = used_url;
     task.total = probe.total;
     std::fs::create_dir_all(&task.dest_dir).map_err(|e| e.to_string())?;
@@ -175,8 +353,15 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
     let part_dir = task.dest_dir.join(format!(".downloadcraft-{}", task.id));
     // Server ignored Range: plain streaming download with throttle.
     if !probe.accept_ranges || probe.total.is_none() {
-        let resp = client.get(&task.url).headers(headers_for(&task)).send().await.map_err(|e| e.to_string())?;
-        if !resp.status().is_success() { return Err(format!("HTTP {}", resp.status())); }
+        let resp = client
+            .get(&task.url)
+            .headers(headers_for(&task))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status()));
+        }
         task.total = resp.content_length().or(task.total);
         if let Some(t) = task.total {
             ctrl.total.store(t, Ordering::Relaxed);
@@ -184,21 +369,35 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
             *ctrl.parts.lock().unwrap() = vec![(0, t)];
         }
         let tmp = task.dest_dir.join(format!(".partial-{}", task.filename));
-        let mut file = tokio::fs::File::create(&tmp).await.map_err(|e| e.to_string())?;
-        let mut stream = resp.bytes_stream(); let mut n: u64 = 0;
+        let mut file = tokio::fs::File::create(&tmp)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut stream = resp.bytes_stream();
+        let mut n: u64 = 0;
         loop {
-            let Some(chunk) = next_chunk(&mut stream, &ctrl).await? else { break };
+            let Some(chunk) = next_chunk(&mut stream, &ctrl).await? else {
+                break;
+            };
             let chunk = chunk.map_err(|e| e.to_string())?;
             throttle(&ctrl, chunk.len() as u64).await;
             file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-            n += chunk.len() as u64; ctrl.downloaded.store(n, Ordering::Relaxed); task.downloaded = n;
-            if let Some(t) = task.total { if let Some(part) = ctrl.parts.lock().unwrap().first_mut() { part.0 = n.min(t); } }
+            n += chunk.len() as u64;
+            ctrl.downloaded.store(n, Ordering::Relaxed);
+            task.downloaded = n;
+            if let Some(t) = task.total {
+                if let Some(part) = ctrl.parts.lock().unwrap().first_mut() {
+                    part.0 = n.min(t);
+                }
+            }
         }
         file.flush().await.map_err(|e| e.to_string())?;
         drop(file);
-        tokio::fs::rename(&tmp, &dest).await.map_err(|e| e.to_string())?;
+        tokio::fs::rename(&tmp, &dest)
+            .await
+            .map_err(|e| e.to_string())?;
         finish_check(&dest, &task).await?;
-        task.status = TaskStatus::Complete; task.downloaded = n;
+        task.status = TaskStatus::Complete;
+        task.downloaded = n;
         return Ok(task);
     }
     let total = probe.total.unwrap();
@@ -211,51 +410,111 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
     if state_file.exists() {
         if let Ok(txt) = std::fs::read_to_string(&state_file) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                let etag_ok = v.get("etag").and_then(|e| e.as_str()).map(|s| s.to_string()) == probe.etag || probe.etag.is_none();
-                if v.get("url").and_then(|u| u.as_str()) == Some(task.url.as_str()) && v.get("total").and_then(|t| t.as_u64()) == Some(total) && etag_ok {
+                let etag_ok = v
+                    .get("etag")
+                    .and_then(|e| e.as_str())
+                    .map(|s| s.to_string())
+                    == probe.etag
+                    || probe.etag.is_none();
+                if v.get("url").and_then(|u| u.as_str()) == Some(task.url.as_str())
+                    && v.get("total").and_then(|t| t.as_u64()) == Some(total)
+                    && etag_ok
+                {
                     if let Some(arr) = v.get("segments").and_then(|s| s.as_array()) {
                         let mut loaded: Vec<SegmentState> = Vec::new();
                         for s in arr {
-                            let (start, end, done) = (s["start"].as_u64().unwrap_or(0), s["end"].as_u64().unwrap_or(0), s["done"].as_u64().unwrap_or(0));
+                            let (start, end, done) = (
+                                s["start"].as_u64().unwrap_or(0),
+                                s["end"].as_u64().unwrap_or(0),
+                                s["done"].as_u64().unwrap_or(0),
+                            );
                             // verify part file size matches done (index = position in saved array)
                             let pf = part_dir.join(format!("part{}", loaded.len()));
                             let actual = std::fs::metadata(&pf).map(|m| m.len()).unwrap_or(0);
-                            loaded.push(SegmentState { start, end, done: done.min(actual) });
+                            loaded.push(SegmentState {
+                                start,
+                                end,
+                                done: done.min(actual),
+                            });
                         }
                         // Split tails appended out of order: intervals must tile [0,total) exactly, else discard corrupt state.
                         let mut sorted: Vec<&SegmentState> = loaded.iter().collect();
                         sorted.sort_by_key(|s| s.start);
-                        let mut expect = 0u64; let mut ok = total > 0;
-                        for s in &sorted { if s.start != expect || s.end < s.start || s.done > s.end - s.start + 1 { ok = false; break; } expect = s.end + 1; }
-                        if ok && expect == total { resumed = loaded.iter().map(|s| s.done).sum(); segs = loaded; }
+                        let mut expect = 0u64;
+                        let mut ok = total > 0;
+                        for s in &sorted {
+                            if s.start != expect || s.end < s.start || s.done > s.end - s.start + 1
+                            {
+                                ok = false;
+                                break;
+                            }
+                            expect = s.end + 1;
+                        }
+                        if ok && expect == total {
+                            resumed = loaded.iter().map(|s| s.done).sum();
+                            segs = loaded;
+                        }
                     }
                 }
             }
         }
     }
     if segs.is_empty() {
-        let wanted = if task.segments == 0 { crate::model::Settings::default().max_connections } else { task.segments };
-        segs = plan_segments(total, wanted).into_iter().map(|(start, end)| SegmentState { start, end, done: 0 }).collect();
+        let wanted = if task.segments == 0 {
+            crate::model::Settings::default().max_connections
+        } else {
+            task.segments
+        };
+        segs = plan_segments(total, wanted)
+            .into_iter()
+            .map(|(start, end)| SegmentState {
+                start,
+                end,
+                done: 0,
+            })
+            .collect();
     }
-    ctrl.downloaded.store(resumed, Ordering::Relaxed); task.downloaded = resumed;
+    ctrl.downloaded.store(resumed, Ordering::Relaxed);
+    task.downloaded = resumed;
     ctrl.total.store(total, Ordering::Relaxed);
     ctrl.parts_are_segments.store(false, Ordering::Relaxed);
-    { let mut pg = ctrl.parts.lock().unwrap(); *pg = segs.iter().map(|x| (x.done, x.end + 1 - x.start)).collect(); }
+    {
+        let mut pg = ctrl.parts.lock().unwrap();
+        *pg = segs.iter().map(|x| (x.done, x.end + 1 - x.start)).collect();
+    }
     // Work-stealing pool: fixed worker count (= initial segment count). Idle
     // worker splits largest remaining in-flight segment, steals its tail.
     let etag: Arc<str> = probe.etag.clone().unwrap_or_default().into();
     let segs = Arc::new(tokio::sync::Mutex::new(segs));
-    let active = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::<usize>::new()));
+    let active = Arc::new(tokio::sync::Mutex::new(
+        std::collections::HashSet::<usize>::new(),
+    ));
     let mut handles = Vec::new();
     let count = segs.lock().await.len();
     for _ in 0..count.max(1) {
-        let (client, task_c, ctrl, segs, active, part_dir, etag) = (client.clone(), task.clone(), ctrl.clone(), segs.clone(), active.clone(), part_dir.clone(), etag.clone());
+        let (client, task_c, ctrl, segs, active, part_dir, etag) = (
+            client.clone(),
+            task.clone(),
+            ctrl.clone(),
+            segs.clone(),
+            active.clone(),
+            part_dir.clone(),
+            etag.clone(),
+        );
         handles.push(tokio::spawn(async move {
             loop {
-                let Some(i) = claim_or_split(&segs, &active, &part_dir, &task_c.url, &etag, total, &ctrl).await else { return Ok::<(), String>(()) };
-                let r = run_segment(i, &segs, &client, &task_c, &part_dir, &etag, total, &ctrl).await;
+                let Some(i) =
+                    claim_or_split(&segs, &active, &part_dir, &task_c.url, &etag, total, &ctrl)
+                        .await
+                else {
+                    return Ok::<(), String>(());
+                };
+                let r =
+                    run_segment(i, &segs, &client, &task_c, &part_dir, &etag, total, &ctrl).await;
                 active.lock().await.remove(&i);
-                if ctrl.cancelled.load(Ordering::Relaxed) { return Err("cancelled".to_string()); }
+                if ctrl.cancelled.load(Ordering::Relaxed) {
+                    return Err("cancelled".to_string());
+                }
                 r?;
             }
         }));
@@ -268,46 +527,91 @@ pub async fn download_http(client: reqwest::Client, mut task: DownloadTask, ctrl
             Err(e) => return Err(e.to_string()),
         }
     }
-    if ctrl.cancelled.load(Ordering::Relaxed) { task.status = TaskStatus::Paused; task.downloaded = ctrl.downloaded.load(Ordering::Relaxed); return Ok(task); }
+    if ctrl.cancelled.load(Ordering::Relaxed) {
+        task.status = TaskStatus::Paused;
+        task.downloaded = ctrl.downloaded.load(Ordering::Relaxed);
+        return Ok(task);
+    }
     // Assemble in byte order: split tails appended (index != byte order).
-    let order: Vec<usize> = { let s = segs.lock().await; let mut v: Vec<usize> = (0..s.len()).collect(); v.sort_by_key(|&i| s[i].start); v };
+    let order: Vec<usize> = {
+        let s = segs.lock().await;
+        let mut v: Vec<usize> = (0..s.len()).collect();
+        v.sort_by_key(|&i| s[i].start);
+        v
+    };
     let tmp = task.dest_dir.join(format!(".assemble-{}", task.filename));
     {
-        let mut out = tokio::fs::File::create(&tmp).await.map_err(|e| e.to_string())?;
+        let mut out = tokio::fs::File::create(&tmp)
+            .await
+            .map_err(|e| e.to_string())?;
         for i in order {
-            let meta_len = tokio::fs::metadata(part_dir.join(format!("part{i}"))).await.map(|m| m.len()).unwrap_or(0);
+            let meta_len = tokio::fs::metadata(part_dir.join(format!("part{i}")))
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
             // Part may hold discarded in-flight bytes past a split point; copy only full segment length clamped to file size.
-            let want = { let s = segs.lock().await; let sg = &s[i]; (sg.end - sg.start + 1).min(meta_len) };
-            let f = tokio::fs::File::open(part_dir.join(format!("part{i}"))).await.map_err(|e| e.to_string())?;
-            tokio::io::copy(&mut f.take(want), &mut out).await.map_err(|e| e.to_string())?;
+            let want = {
+                let s = segs.lock().await;
+                let sg = &s[i];
+                (sg.end - sg.start + 1).min(meta_len)
+            };
+            let f = tokio::fs::File::open(part_dir.join(format!("part{i}")))
+                .await
+                .map_err(|e| e.to_string())?;
+            tokio::io::copy(&mut f.take(want), &mut out)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         out.flush().await.map_err(|e| e.to_string())?;
     }
-    let assembled = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
-    if assembled != total { return Err(format!("size mismatch: assembled {assembled} != total {total}")); }
-    tokio::fs::rename(&tmp, &dest).await.map_err(|e| e.to_string())?;
+    let assembled = tokio::fs::metadata(&tmp)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if assembled != total {
+        return Err(format!(
+            "size mismatch: assembled {assembled} != total {total}"
+        ));
+    }
+    tokio::fs::rename(&tmp, &dest)
+        .await
+        .map_err(|e| e.to_string())?;
     let _ = tokio::fs::remove_dir_all(&part_dir).await;
     finish_check(&dest, &task).await?;
-    task.status = TaskStatus::Complete; task.downloaded = total;
+    task.status = TaskStatus::Complete;
+    task.downloaded = total;
     Ok(task)
 }
 
 /// Claim work: prefer unclaimed unfinished segment; else split largest
 /// remaining active segment (tail half >= MIN_SPLIT) and claim new tail.
 /// None when all segments done.
-async fn claim_or_split(segs: &Arc<tokio::sync::Mutex<Vec<SegmentState>>>, active: &Arc<tokio::sync::Mutex<std::collections::HashSet<usize>>>, part_dir: &Path, url: &str, etag: &Arc<str>, total: u64, ctrl: &Controls) -> Option<usize> {
+async fn claim_or_split(
+    segs: &Arc<tokio::sync::Mutex<Vec<SegmentState>>>,
+    active: &Arc<tokio::sync::Mutex<std::collections::HashSet<usize>>>,
+    part_dir: &Path,
+    url: &str,
+    etag: &Arc<str>,
+    total: u64,
+    ctrl: &Controls,
+) -> Option<usize> {
     let mut s = segs.lock().await;
     let mut act = active.lock().await;
     let remaining = |sg: &SegmentState| (sg.end + 1).saturating_sub(sg.start + sg.done);
     for (i, sg) in s.iter().enumerate() {
-        if remaining(sg) > 0 && !act.contains(&i) { act.insert(i); return Some(i); }
+        if remaining(sg) > 0 && !act.contains(&i) {
+            act.insert(i);
+            return Some(i);
+        }
     }
     let mut victim: Option<(usize, u64)> = None;
     for (i, sg) in s.iter().enumerate() {
         if act.contains(&i) {
             if let Some(np) = split_point(sg.start, sg.end, sg.done) {
                 let tail = sg.end - np;
-                if victim.is_none_or(|(_, b)| tail > b) { victim = Some((i, tail)); }
+                if victim.is_none_or(|(_, b)| tail > b) {
+                    victim = Some((i, tail));
+                }
             }
         }
     }
@@ -316,12 +620,34 @@ async fn claim_or_split(segs: &Arc<tokio::sync::Mutex<Vec<SegmentState>>>, activ
     let np = split_point(s[vi].start, old_end, s[vi].done)?;
     s[vi].end = np;
     let new_idx = s.len();
-    s.push(SegmentState { start: np + 1, end: old_end, done: 0 });
+    s.push(SegmentState {
+        start: np + 1,
+        end: old_end,
+        done: 0,
+    });
     act.insert(new_idx);
-    let snapshot: Vec<SegmentState> = s.iter().map(|x| SegmentState { start: x.start, end: x.end, done: x.done }).collect();
-    { let mut pg = ctrl.parts.lock().unwrap(); *pg = snapshot.iter().map(|x| (x.done, x.end + 1 - x.start)).collect(); }
-    drop(act); drop(s);
-    let et_opt = if etag.is_empty() { None } else { Some(etag.to_string()) };
+    let snapshot: Vec<SegmentState> = s
+        .iter()
+        .map(|x| SegmentState {
+            start: x.start,
+            end: x.end,
+            done: x.done,
+        })
+        .collect();
+    {
+        let mut pg = ctrl.parts.lock().unwrap();
+        *pg = snapshot
+            .iter()
+            .map(|x| (x.done, x.end + 1 - x.start))
+            .collect();
+    }
+    drop(act);
+    drop(s);
+    let et_opt = if etag.is_empty() {
+        None
+    } else {
+        Some(etag.to_string())
+    };
     save_state(part_dir, url, &et_opt, total, &snapshot);
     Some(new_idx)
 }
@@ -330,114 +656,274 @@ async fn claim_or_split(segs: &Arc<tokio::sync::Mutex<Vec<SegmentState>>>, activ
 /// On split-shrink: only bytes up to current end counted/committed; tail
 /// bytes in part file discarded at assemble, re-downloaded by thief.
 #[allow(clippy::too_many_arguments)]
-async fn run_segment(i: usize, segs: &Arc<tokio::sync::Mutex<Vec<SegmentState>>>, client: &reqwest::Client, task: &DownloadTask, part_dir: &Path, etag: &Arc<str>, total: u64, ctrl: &Arc<Controls>) -> Result<(), String> {
+async fn run_segment(
+    i: usize,
+    segs: &Arc<tokio::sync::Mutex<Vec<SegmentState>>>,
+    client: &reqwest::Client,
+    task: &DownloadTask,
+    part_dir: &Path,
+    etag: &Arc<str>,
+    total: u64,
+    ctrl: &Arc<Controls>,
+) -> Result<(), String> {
     let mut attempt = 0;
     loop {
-        let (start, end, done) = { let s = segs.lock().await; let sg = &s[i]; (sg.start, sg.end, sg.done) };
-        if done > end - start { return Ok(()); }
+        let (start, end, done) = {
+            let s = segs.lock().await;
+            let sg = &s[i];
+            (sg.start, sg.end, sg.done)
+        };
+        if done > end - start {
+            return Ok(());
+        }
         let range_start = start + done;
-        if range_start > end { return Ok(()); }
-        match download_range(client, task, range_start, end, part_dir.join(format!("part{i}")).as_path(), ctrl, done, Some(i)).await {
+        if range_start > end {
+            return Ok(());
+        }
+        match download_range(
+            client,
+            task,
+            range_start,
+            end,
+            part_dir.join(format!("part{i}")).as_path(),
+            ctrl,
+            done,
+            Some(i),
+        )
+        .await
+        {
             Ok(written) => {
-                let keep = { let s = segs.lock().await; let sg = &s[i]; (sg.end + 1).saturating_sub(start + done).min(written) };
-                { let mut s = segs.lock().await; s[i].done = (s[i].done + keep).min(s[i].end + 1 - s[i].start); }
-                let snapshot = { let s = segs.lock().await; s.iter().map(|x| SegmentState { start: x.start, end: x.end, done: x.done }).collect::<Vec<_>>() };
-                    { let mut pg = ctrl.parts.lock().unwrap(); *pg = snapshot.iter().map(|x| (x.done, x.end + 1 - x.start)).collect(); }
-                let et_opt = if etag.is_empty() { None } else { Some(etag.to_string()) }; save_state(part_dir, &task.url, &et_opt, total, &snapshot);
-                if keep < written { continue; }
+                let keep = {
+                    let s = segs.lock().await;
+                    let sg = &s[i];
+                    (sg.end + 1).saturating_sub(start + done).min(written)
+                };
+                {
+                    let mut s = segs.lock().await;
+                    s[i].done = (s[i].done + keep).min(s[i].end + 1 - s[i].start);
+                }
+                let snapshot = {
+                    let s = segs.lock().await;
+                    s.iter()
+                        .map(|x| SegmentState {
+                            start: x.start,
+                            end: x.end,
+                            done: x.done,
+                        })
+                        .collect::<Vec<_>>()
+                };
+                {
+                    let mut pg = ctrl.parts.lock().unwrap();
+                    *pg = snapshot
+                        .iter()
+                        .map(|x| (x.done, x.end + 1 - x.start))
+                        .collect();
+                }
+                let et_opt = if etag.is_empty() {
+                    None
+                } else {
+                    Some(etag.to_string())
+                };
+                save_state(part_dir, &task.url, &et_opt, total, &snapshot);
+                if keep < written {
+                    continue;
+                }
                 return Ok(());
             }
             Err(e) => {
-                if ctrl.cancelled.load(Ordering::Relaxed) { return Err(e); }
+                if ctrl.cancelled.load(Ordering::Relaxed) {
+                    return Err(e);
+                }
                 attempt += 1;
-                if attempt > 5 { return Err(e); }
-                tokio::time::sleep(std::time::Duration::from_millis(500 * (1 << attempt.min(4)))).await;
+                if attempt > 5 {
+                    return Err(e);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    500 * (1 << attempt.min(4)),
+                ))
+                .await;
             }
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn download_range(client: &reqwest::Client, task: &DownloadTask, start: u64, end: u64, dest: &Path, ctrl: &Controls, prior: u64, part_index: Option<usize>) -> Result<u64, String> {
-    let resp = client.get(&task.url).headers(headers_for(task)).header("Range", format!("bytes={start}-{end}")).send().await.map_err(|e| e.to_string())?;
-    if resp.status().as_u16() != 206 { return Err(format!("expected 206 got {}", resp.status())); }
+async fn download_range(
+    client: &reqwest::Client,
+    task: &DownloadTask,
+    start: u64,
+    end: u64,
+    dest: &Path,
+    ctrl: &Controls,
+    prior: u64,
+    part_index: Option<usize>,
+) -> Result<u64, String> {
+    let resp = client
+        .get(&task.url)
+        .headers(headers_for(task))
+        .header("Range", format!("bytes={start}-{end}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status().as_u16() != 206 {
+        return Err(format!("expected 206 got {}", resp.status()));
+    }
     // Truncate to caller-known done: drops bytes from interrupted attempt.
-    let mut file = tokio::fs::OpenOptions::new().create(true).write(true).truncate(false).open(dest).await.map_err(|e| e.to_string())?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dest)
+        .await
+        .map_err(|e| e.to_string())?;
     file.set_len(prior).await.map_err(|e| e.to_string())?;
-    file.seek(std::io::SeekFrom::Start(prior)).await.map_err(|e| e.to_string())?;
-    let mut stream = resp.bytes_stream(); let mut n: u64 = 0;
+    file.seek(std::io::SeekFrom::Start(prior))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut stream = resp.bytes_stream();
+    let mut n: u64 = 0;
     let mut err: Option<String> = None;
     loop {
-        let chunk = match next_chunk(&mut stream, ctrl).await { Ok(Some(c)) => c, Ok(None) => break, Err(e) => { err = Some(e); break; } };
+        let chunk = match next_chunk(&mut stream, ctrl).await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        };
         match chunk {
             Ok(chunk) => {
                 throttle(ctrl, chunk.len() as u64).await;
                 match file.write_all(&chunk).await {
                     Ok(()) => {
                         n += chunk.len() as u64;
-                        ctrl.downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                        ctrl.downloaded
+                            .fetch_add(chunk.len() as u64, Ordering::Relaxed);
                         if let Some(pi) = part_index {
                             let mut pg = ctrl.parts.lock().unwrap();
-                            if let Some(part) = pg.get_mut(pi) { part.0 = (prior + n).min(part.1); }
+                            if let Some(part) = pg.get_mut(pi) {
+                                part.0 = (prior + n).min(part.1);
+                            }
                         }
                     }
-                    Err(e) => { err = Some(e.to_string()); break; }
+                    Err(e) => {
+                        err = Some(e.to_string());
+                        break;
+                    }
                 }
             }
-            Err(e) => { err = Some(e.to_string()); break; }
+            Err(e) => {
+                err = Some(e.to_string());
+                break;
+            }
         }
     }
-    if err.is_none() { if let Err(e) = file.flush().await { err = Some(e.to_string()); } }
+    if err.is_none() {
+        if let Err(e) = file.flush().await {
+            err = Some(e.to_string());
+        }
+    }
     // Live-counted bytes roll back on failure: retry truncates part to `prior` and recounts.
     if let Some(e) = err {
         ctrl.downloaded.fetch_sub(n, Ordering::Relaxed);
-        if let Some(pi) = part_index { if let Some(part) = ctrl.parts.lock().unwrap().get_mut(pi) { part.0 = prior.min(part.1); } }
+        if let Some(pi) = part_index {
+            if let Some(part) = ctrl.parts.lock().unwrap().get_mut(pi) {
+                part.0 = prior.min(part.1);
+            }
+        }
         return Err(e);
     }
     let expected = end - start + 1;
-    if n != expected { return Err(format!("short range: got {n} expected {expected}")); }
+    if n != expected {
+        return Err(format!("short range: got {n} expected {expected}"));
+    }
     Ok(n)
 }
 
 async fn finish_check(dest: &Path, task: &DownloadTask) -> Result<(), String> {
     if let Some(want) = &task.sha256 {
-        let mut f = tokio::fs::File::open(dest).await.map_err(|e| e.to_string())?;
-        let mut hasher = Sha256::new(); let mut buf = vec![0u8; 65536];
-        loop { let n = f.read(&mut buf).await.map_err(|e| e.to_string())?; if n == 0 { break; } hasher.update(&buf[..n]); }
+        let mut f = tokio::fs::File::open(dest)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = f.read(&mut buf).await.map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
         let got = format!("{:x}", hasher.finalize());
-        if !got.eq_ignore_ascii_case(want) { return Err(format!("sha256 mismatch: got {got} want {want}")); }
+        if !got.eq_ignore_ascii_case(want) {
+            return Err(format!("sha256 mismatch: got {got} want {want}"));
+        }
     }
     Ok(())
 }
 
 pub type MediaTracks = Vec<(String, Vec<(Option<String>, String)>)>;
 /// Download list of media segments (DASH/HLS) and concatenate. Separate tracks muxed via ffmpeg if available.
-pub async fn download_media(client: reqwest::Client, task: DownloadTask, ctrl: Arc<Controls>, tracks: MediaTracks) -> Result<DownloadTask, String> {
+pub async fn download_media(
+    client: reqwest::Client,
+    task: DownloadTask,
+    ctrl: Arc<Controls>,
+    tracks: MediaTracks,
+) -> Result<DownloadTask, String> {
     // tracks: (kind, [(init, segment_url)...]) — one segment list per track, init repeated per entry ignored except first
     std::fs::create_dir_all(&task.dest_dir).map_err(|e| e.to_string())?;
     let mut task = task;
-    let work = task.dest_dir.join(format!(".downloadcraft-media-{}", task.id));
+    let work = task
+        .dest_dir
+        .join(format!(".downloadcraft-media-{}", task.id));
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     // Manifest snapshot BEFORE fetch: kill-resume reuses seg caches below.
-    let _ = std::fs::write(work.join("tracks.json"), serde_json::to_string(&tracks.iter().map(|(k, s)| (k.clone(), s.len())).collect::<Vec<_>>()).unwrap_or_default());
+    let _ = std::fs::write(
+        work.join("tracks.json"),
+        serde_json::to_string(
+            &tracks
+                .iter()
+                .map(|(k, s)| (k.clone(), s.len()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_default(),
+    );
     let mut track_files: Vec<PathBuf> = Vec::new();
     let mut subtitle_files: Vec<PathBuf> = Vec::new();
     // Segment sizes unknown upfront: progress in bytes, task.total stays None.
-    let mut done_bytes: u64 = 0; task.total = None; task.downloaded = 0; ctrl.downloaded.store(0, Ordering::Relaxed);
-    { let total_segs: u64 = tracks.iter().map(|(_, sg)| sg.len() as u64).sum(); ctrl.parts_are_segments.store(true, Ordering::Relaxed); *ctrl.parts.lock().unwrap() = vec![(0, total_segs)]; }
+    let mut done_bytes: u64 = 0;
+    task.total = None;
+    task.downloaded = 0;
+    ctrl.downloaded.store(0, Ordering::Relaxed);
+    {
+        let total_segs: u64 = tracks.iter().map(|(_, sg)| sg.len() as u64).sum();
+        ctrl.parts_are_segments.store(true, Ordering::Relaxed);
+        *ctrl.parts.lock().unwrap() = vec![(0, total_segs)];
+    }
     for (kind, segs) in tracks.iter() {
         let out = work.join(format!("track-{kind}.bin"));
         {
-            let mut file = tokio::fs::File::create(&out).await.map_err(|e| e.to_string())?;
+            let mut file = tokio::fs::File::create(&out)
+                .await
+                .map_err(|e| e.to_string())?;
             let mut seen_init: Option<String> = None;
             for (i, (init, seg_url)) in segs.iter().enumerate() {
                 wait_not_paused(&ctrl).await?;
                 // Kill-resume: cached segment file from prior run is replayed, not refetched.
                 let cache = work.join(format!("seg-{kind}-{i}.bin"));
                 let seg_result = async {
-                    if let Some(init) = init { if seen_init.as_deref() != Some(init.as_str()) { seen_init = Some(init.clone()); done_bytes += fetch_into_inner(&client, &task, init, &mut file, &ctrl).await?; } }
+                    if let Some(init) = init {
+                        if seen_init.as_deref() != Some(init.as_str()) {
+                            seen_init = Some(init.clone());
+                            done_bytes +=
+                                fetch_into_inner(&client, &task, init, &mut file, &ctrl).await?;
+                        }
+                    }
                     if !cache.exists() {
-                        let mut cf = tokio::fs::File::create(&cache).await.map_err(|e| e.to_string())?;
+                        let mut cf = tokio::fs::File::create(&cache)
+                            .await
+                            .map_err(|e| e.to_string())?;
                         // Streaming fetch counts live progress; undo that count here —
                         // append below counts segment exactly once (fetch or replay).
                         let n = fetch_into_inner(&client, &task, seg_url, &mut cf, &ctrl).await?;
@@ -445,48 +931,91 @@ pub async fn download_media(client: reqwest::Client, task: DownloadTask, ctrl: A
                         cf.flush().await.map_err(|e| e.to_string())?;
                     }
                     let bytes = tokio::fs::read(&cache).await.map_err(|e| e.to_string())?;
-                    done_bytes += bytes.len() as u64; ctrl.downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    done_bytes += bytes.len() as u64;
+                    ctrl.downloaded
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     file.write_all(&bytes).await.map_err(|e| e.to_string())?;
                     Ok::<(), String>(())
-                }.await;
-                if seg_result.is_ok() { let mut pg = ctrl.parts.lock().unwrap(); if let Some(first) = pg.first_mut() { first.0 += 1; } }
+                }
+                .await;
+                if seg_result.is_ok() {
+                    let mut pg = ctrl.parts.lock().unwrap();
+                    if let Some(first) = pg.first_mut() {
+                        first.0 += 1;
+                    }
+                }
                 if let Err(e) = seg_result {
                     if ctrl.cancelled.load(Ordering::Relaxed) || e == "cancelled" {
-                        task.status = TaskStatus::Paused; task.downloaded = ctrl.downloaded.load(Ordering::Relaxed);
+                        task.status = TaskStatus::Paused;
+                        task.downloaded = ctrl.downloaded.load(Ordering::Relaxed);
                         return Ok(task);
                     }
                     return Err(e);
                 }
-                task.downloaded = done_bytes; task.total = None;
+                task.downloaded = done_bytes;
+                task.total = None;
             }
             file.flush().await.map_err(|e| e.to_string())?;
         }
-        if kind == "text" { subtitle_files.push(out); } else { track_files.push(out); }
+        if kind == "text" {
+            subtitle_files.push(out);
+        } else {
+            track_files.push(out);
+        }
     }
     // Subtitle tracks land as sidecar next to final file (ffmpeg stream mapping for
     // arbitrary subtitle segment bytes is unreliable; sidecar is what players pick up).
     let dest = task.dest_dir.join(&task.filename);
-    let text_url_ext = tracks.iter().find(|(k, _)| k == "text").and_then(|(_, s)| s.first()).map(|(_, u)| u.rsplit('.').next().unwrap_or("vtt").split(['?', '#']).next().unwrap_or("vtt").to_string());
+    let text_url_ext = tracks
+        .iter()
+        .find(|(k, _)| k == "text")
+        .and_then(|(_, s)| s.first())
+        .map(|(_, u)| {
+            u.rsplit('.')
+                .next()
+                .unwrap_or("vtt")
+                .split(['?', '#'])
+                .next()
+                .unwrap_or("vtt")
+                .to_string()
+        });
     for (i, sub) in subtitle_files.iter().enumerate() {
-        let stem = task.filename.rsplit_once('.').map(|(s, _)| s).unwrap_or(&task.filename);
+        let stem = task
+            .filename
+            .rsplit_once('.')
+            .map(|(s, _)| s)
+            .unwrap_or(&task.filename);
         let ext = text_url_ext.clone().unwrap_or_else(|| "vtt".into());
-        let suffix = if subtitle_files.len() > 1 { format!(".{i}") } else { String::new() };
+        let suffix = if subtitle_files.len() > 1 {
+            format!(".{i}")
+        } else {
+            String::new()
+        };
         let _ = tokio::fs::copy(sub, task.dest_dir.join(format!("{stem}{suffix}.{ext}"))).await;
     }
     if track_files.is_empty() && !subtitle_files.is_empty() {
         // Subtitle-only download: sidecar IS the product.
-        tokio::fs::copy(&subtitle_files[0], &dest).await.map_err(|e| e.to_string())?;
+        tokio::fs::copy(&subtitle_files[0], &dest)
+            .await
+            .map_err(|e| e.to_string())?;
     } else if track_files.len() == 1 {
-        tokio::fs::rename(&track_files[0], &dest).await.map_err(|e| e.to_string())?;
+        tokio::fs::rename(&track_files[0], &dest)
+            .await
+            .map_err(|e| e.to_string())?;
     } else {
         // Try ffmpeg mux; fallback: keep first track and note error (muxer missing handled by caller docs)
         match mux_tracks(&track_files, &dest).await {
             Ok(()) => {}
             Err(e) => {
                 // Fallback: rename video/first track so file exists, record error
-                tokio::fs::copy(&track_files[0], &dest).await.map_err(|e| e.to_string())?;
+                tokio::fs::copy(&track_files[0], &dest)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let _ = tokio::fs::remove_dir_all(&work).await;
-                task.status = TaskStatus::Error; task.error = format!("mux failed ({e}); kept first track only"); task.downloaded = done_bytes; task.total = None;
+                task.status = TaskStatus::Error;
+                task.error = format!("mux failed ({e}); kept first track only");
+                task.downloaded = done_bytes;
+                task.total = None;
                 return Ok(task);
             }
         }
@@ -499,71 +1028,153 @@ pub async fn download_media(client: reqwest::Client, task: DownloadTask, ctrl: A
     Ok(task)
 }
 
-async fn fetch_into_inner(client: &reqwest::Client, task: &DownloadTask, url: &str, file: &mut tokio::fs::File, ctrl: &Controls) -> Result<u64, String> {
+async fn fetch_into_inner(
+    client: &reqwest::Client,
+    task: &DownloadTask,
+    url: &str,
+    file: &mut tokio::fs::File,
+    ctrl: &Controls,
+) -> Result<u64, String> {
     let mut attempt = 0;
-    let start = file.seek(std::io::SeekFrom::Current(0)).await.map_err(|e| e.to_string())?;
+    let start = file
+        .seek(std::io::SeekFrom::Current(0))
+        .await
+        .map_err(|e| e.to_string())?;
     loop {
         match fetch_once_counted_impl(client, task, url, file, ctrl).await {
             Ok(n) => return Ok(n),
             Err(e) => {
-                if ctrl.cancelled.load(Ordering::Relaxed) { return Err(e); }
-                attempt += 1; if attempt > 4 { return Err(e); }
+                if ctrl.cancelled.load(Ordering::Relaxed) {
+                    return Err(e);
+                }
+                attempt += 1;
+                if attempt > 4 {
+                    return Err(e);
+                }
                 // Roll back partial bytes so retry does not duplicate/count twice.
                 file.set_len(start).await.map_err(|x| x.to_string())?;
-                file.seek(std::io::SeekFrom::Start(start)).await.map_err(|x| x.to_string())?;
+                file.seek(std::io::SeekFrom::Start(start))
+                    .await
+                    .map_err(|x| x.to_string())?;
                 tokio::time::sleep(std::time::Duration::from_millis(400 * attempt)).await;
             }
         }
     }
 }
-async fn fetch_once_counted_impl(client: &reqwest::Client, task: &DownloadTask, url: &str, file: &mut tokio::fs::File, ctrl: &Controls) -> Result<u64, String> {
+async fn fetch_once_counted_impl(
+    client: &reqwest::Client,
+    task: &DownloadTask,
+    url: &str,
+    file: &mut tokio::fs::File,
+    ctrl: &Controls,
+) -> Result<u64, String> {
     let req = client.get(url).headers(headers_for(task));
     // byte-range segment stored in headers via special marker? HLS BYTERANGE passed through task headers Range by caller when needed.
     let resp = req.send().await.map_err(|e| e.to_string())?;
-    if !resp.status().is_success() { return Err(format!("HTTP {} for {url}", resp.status())); }
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {} for {url}", resp.status()));
+    }
     let mut stream = resp.bytes_stream();
     let mut n = 0u64;
     loop {
-        let Some(chunk) = (match next_chunk(&mut stream, ctrl).await { Ok(v) => v, Err(e) => { ctrl.downloaded.fetch_sub(n, Ordering::Relaxed); return Err(e); } }) else { break };
-        let chunk = match chunk { Ok(c) => c, Err(e) => { ctrl.downloaded.fetch_sub(n, Ordering::Relaxed); return Err(e.to_string()); } };
+        let Some(chunk) = (match next_chunk(&mut stream, ctrl).await {
+            Ok(v) => v,
+            Err(e) => {
+                ctrl.downloaded.fetch_sub(n, Ordering::Relaxed);
+                return Err(e);
+            }
+        }) else {
+            break;
+        };
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                ctrl.downloaded.fetch_sub(n, Ordering::Relaxed);
+                return Err(e.to_string());
+            }
+        };
         throttle(ctrl, chunk.len() as u64).await;
-        if let Err(e) = file.write_all(&chunk).await { ctrl.downloaded.fetch_sub(n, Ordering::Relaxed); return Err(e.to_string()); }
+        if let Err(e) = file.write_all(&chunk).await {
+            ctrl.downloaded.fetch_sub(n, Ordering::Relaxed);
+            return Err(e.to_string());
+        }
         n += chunk.len() as u64;
-        ctrl.downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        ctrl.downloaded
+            .fetch_add(chunk.len() as u64, Ordering::Relaxed);
     }
     Ok(n)
 }
 
 /// Fetch segment honoring optional byte range (HLS EXT-X-BYTERANGE).
-pub async fn fetch_bytes(client: &reqwest::Client, task: &DownloadTask, url: &str, range: Option<(u64, Option<u64>)>, dest: &Path) -> Result<(), String> {
-    fetch_bytes_counted(client, task, url, range, dest).await.map(|_| ())
+pub async fn fetch_bytes(
+    client: &reqwest::Client,
+    task: &DownloadTask,
+    url: &str,
+    range: Option<(u64, Option<u64>)>,
+    dest: &Path,
+) -> Result<(), String> {
+    fetch_bytes_counted(client, task, url, range, dest)
+        .await
+        .map(|_| ())
 }
-pub async fn fetch_bytes_counted(client: &reqwest::Client, task: &DownloadTask, url: &str, range: Option<(u64, Option<u64>)>, dest: &Path) -> Result<u64, String> {
+pub async fn fetch_bytes_counted(
+    client: &reqwest::Client,
+    task: &DownloadTask,
+    url: &str,
+    range: Option<(u64, Option<u64>)>,
+    dest: &Path,
+) -> Result<u64, String> {
     let mut req = client.get(url).headers(headers_for(task));
-    if let Some((len, off)) = range { let start = off.unwrap_or(0); req = req.header("Range", format!("bytes={start}-{}", start + len - 1)); }
+    if let Some((len, off)) = range {
+        let start = off.unwrap_or(0);
+        req = req.header("Range", format!("bytes={start}-{}", start + len - 1));
+    }
     let resp = req.send().await.map_err(|e| e.to_string())?;
-    if !resp.status().is_success() && resp.status().as_u16() != 206 { return Err(format!("HTTP {}", resp.status())); }
+    if !resp.status().is_success() && resp.status().as_u16() != 206 {
+        return Err(format!("HTTP {}", resp.status()));
+    }
     let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
     let n = bytes.len() as u64;
-    tokio::fs::write(dest, &bytes).await.map_err(|e| e.to_string())?;
+    tokio::fs::write(dest, &bytes)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(n)
 }
 
 pub async fn mux_tracks(tracks: &[PathBuf], dest: &Path) -> Result<(), String> {
     // ffmpeg sidecar: PATH lookup (bundled ffmpeg next to exe preferred)
     let mut candidates = vec![PathBuf::from("ffmpeg")];
-    if let Ok(exe) = std::env::current_exe() { if let Some(d) = exe.parent() { candidates.insert(0, d.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" })); } }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            candidates.insert(
+                0,
+                d.join(if cfg!(windows) {
+                    "ffmpeg.exe"
+                } else {
+                    "ffmpeg"
+                }),
+            );
+        }
+    }
     let mut last_err = String::new();
     for cand in &candidates {
         let mut cmd = tokio::process::Command::new(cand);
         cmd.arg("-y");
-        for t in tracks { cmd.args(["-i"]).arg(t); }
+        for t in tracks {
+            cmd.args(["-i"]).arg(t);
+        }
         cmd.args(["-c", "copy"]);
         cmd.arg(dest);
-        cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
         match cmd.output().await {
             Ok(o) if o.status.success() => return Ok(()),
-            Ok(o) => last_err = String::from_utf8_lossy(&o.stderr).chars().take(300).collect(),
+            Ok(o) => {
+                last_err = String::from_utf8_lossy(&o.stderr)
+                    .chars()
+                    .take(300)
+                    .collect()
+            }
             Err(e) => last_err = e.to_string(),
         }
     }
@@ -594,12 +1205,24 @@ mod tests {
         c.downloaded.store(1234, Ordering::Relaxed);
         assert_eq!(rate_bps(&c), 0.0);
     }
-    #[test]    fn split_point_halves_remaining() {
+    #[test]
+    fn split_point_halves_remaining() {
         let kb = 1024u64;
         assert_eq!(split_point(0, 1024 * kb - 1, 0), Some(512 * kb - 1));
-        assert_eq!(split_point(0, 512 * kb - 2, 0), None, "remaining < 512KB never splits");
-        assert_eq!(split_point(0, 600 * kb - 1, 200 * kb), None, "done counts toward remaining");
-        assert_eq!(split_point(100, 100 + 1024 * kb - 1, 512 * kb), Some(100 + 768 * kb - 1));
+        assert_eq!(
+            split_point(0, 512 * kb - 2, 0),
+            None,
+            "remaining < 512KB never splits"
+        );
+        assert_eq!(
+            split_point(0, 600 * kb - 1, 200 * kb),
+            None,
+            "done counts toward remaining"
+        );
+        assert_eq!(
+            split_point(100, 100 + 1024 * kb - 1, 512 * kb),
+            Some(100 + 768 * kb - 1)
+        );
         assert_eq!(split_point(0, 10, 20), None);
         // both halves >= MIN_SPLIT at exact threshold
         assert_eq!(split_point(0, 2 * MIN_SPLIT - 1, 0), Some(MIN_SPLIT - 1));

@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=downloadcraft
+Name=webcraft
 Comment=Cross-platform download manager
-Exec=downloadcraft %u
-Icon=downloadcraft
+Exec=webcraft %u
+Icon=webcraft
 Categories=Network;FileTransfer;
-MimeType=x-scheme-handler/downloadcraft;
+MimeType=x-scheme-handler/webcraft;x-scheme-handler/downloadcraft;
 Terminal=false

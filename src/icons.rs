@@ -117,7 +117,10 @@ fn poly_shape(pts: Vec<Pos2>, fill: Color32, stroke: Stroke) -> Shape {
 }
 
 fn stroke_for(rect: Rect, color: Color32) -> Stroke {
-    Stroke::new((rect.width().min(rect.height()) * 0.08).clamp(1.0, 2.5), color)
+    Stroke::new(
+        (rect.width().min(rect.height()) * 0.08).clamp(1.0, 2.5),
+        color,
+    )
 }
 
 /// Draw `kind` inside `rect` in `color`. Nothing outside `rect`.
@@ -260,10 +263,24 @@ pub fn icon(p: &Painter, kind: &Icon, rect: Rect, color: Color32) {
         }
         Icon::Pause => {
             let w = rect.width() * 0.14;
-            let (x0, x1) = (rect.left() + rect.width() * 0.30, rect.left() + rect.width() * 0.56);
-            let (t, b) = (rect.top() + rect.height() * 0.20, rect.top() + rect.height() * 0.80);
-            p.rect_filled(Rect::from_min_max(Pos2::new(x0, t), Pos2::new(x0 + w, b)), 0.0, color);
-            p.rect_filled(Rect::from_min_max(Pos2::new(x1, t), Pos2::new(x1 + w, b)), 0.0, color);
+            let (x0, x1) = (
+                rect.left() + rect.width() * 0.30,
+                rect.left() + rect.width() * 0.56,
+            );
+            let (t, b) = (
+                rect.top() + rect.height() * 0.20,
+                rect.top() + rect.height() * 0.80,
+            );
+            p.rect_filled(
+                Rect::from_min_max(Pos2::new(x0, t), Pos2::new(x0 + w, b)),
+                0.0,
+                color,
+            );
+            p.rect_filled(
+                Rect::from_min_max(Pos2::new(x1, t), Pos2::new(x1 + w, b)),
+                0.0,
+                color,
+            );
         }
         Icon::Plus => {
             seg(p, pt(rect, 0.50, 0.18), pt(rect, 0.50, 0.82), s);
@@ -319,12 +336,7 @@ pub fn icon(p: &Painter, kind: &Icon, rect: Rect, color: Color32) {
                 }
                 prev = Some(q);
             }
-            seg(
-                p,
-                Pos2::new(c.x - r, c.y),
-                Pos2::new(c.x + r, c.y),
-                s,
-            );
+            seg(p, Pos2::new(c.x - r, c.y), Pos2::new(c.x + r, c.y), s);
             // parallels
             for dy in [-0.45f32, 0.45] {
                 let yy = c.y + dy * r;
@@ -354,14 +366,7 @@ pub fn icon(p: &Painter, kind: &Icon, rect: Rect, color: Color32) {
         }
         Icon::Link => {
             // two chain links: diagonal bars + end arcs approximated by polylines
-            poly(
-                p,
-                &[
-                    pt(rect, 0.36, 0.64),
-                    pt(rect, 0.58, 0.42),
-                ],
-                s,
-            );
+            poly(p, &[pt(rect, 0.36, 0.64), pt(rect, 0.58, 0.42)], s);
             // lower-left link
             poly(
                 p,
@@ -496,7 +501,10 @@ mod tests {
         // stroke width bounded
         let s = stroke_for(rect, Color32::WHITE);
         assert!((1.0..=2.5).contains(&s.width));
-        let tiny = stroke_for(Rect::from_min_size(Pos2::ZERO, egui::vec2(4.0, 4.0)), Color32::WHITE);
+        let tiny = stroke_for(
+            Rect::from_min_size(Pos2::ZERO, egui::vec2(4.0, 4.0)),
+            Color32::WHITE,
+        );
         assert_eq!(tiny.width, 1.0);
     }
 

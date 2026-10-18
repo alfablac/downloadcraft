@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 fn config_dir() -> PathBuf {
     // Must match main app config_dir without depending on it (host is standalone small binary).
-    directories::ProjectDirs::from("", "", "webcraft").map(|d| d.config_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".webcraft"))
+    directories::ProjectDirs::from("", "", "webcraft")
+        .map(|d| d.config_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(".webcraft"))
 }
 
 fn inbox_dir() -> PathBuf {
@@ -11,7 +13,18 @@ fn inbox_dir() -> PathBuf {
 }
 
 fn ext_of(filename: &str, url: &str) -> String {
-    let seg = filename.rsplit(['/', '\\']).next().filter(|s| !s.is_empty()).unwrap_or_else(|| url.split(['?', '#']).next().unwrap_or(url).rsplit('/').next().unwrap_or(""));
+    let seg = filename
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            url.split(['?', '#'])
+                .next()
+                .unwrap_or(url)
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+        });
     match seg.rfind('.') {
         Some(i) if i > 0 => seg[i + 1..].to_lowercase(),
         _ => String::new(),
@@ -23,32 +36,74 @@ fn ext_of(filename: &str, url: &str) -> String {
 /// Missing/corrupt file = no filter (desktop never ran / settings default).
 /// Unknown size (0/missing) always allowed: cannot prove small.
 /// Empty ext list = all types. Explicit sends (captured=false) never reach here.
-pub fn capture_allowed(exts: &[String], min_bytes: u64, filename: &str, url: &str, mime: &str, size: u64) -> bool {
-    if min_bytes > 0 && size > 0 && size < min_bytes { return false; }
-    if exts.is_empty() { return true; }
+pub fn capture_allowed(
+    exts: &[String],
+    min_bytes: u64,
+    filename: &str,
+    url: &str,
+    mime: &str,
+    size: u64,
+) -> bool {
+    if min_bytes > 0 && size > 0 && size < min_bytes {
+        return false;
+    }
+    if exts.is_empty() {
+        return true;
+    }
     let ext = ext_of(filename, url);
-    if !ext.is_empty() { return exts.iter().any(|e| e == &ext); }
+    if !ext.is_empty() {
+        return exts.iter().any(|e| e == &ext);
+    }
     // No extension in filename/URL: fall back to MIME subtype ("video/mp4" -> "mp4").
-    let sub = mime.split(['/', ';']).nth(1).unwrap_or("").trim().to_lowercase();
+    let sub = mime
+        .split(['/', ';'])
+        .nth(1)
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
     !sub.is_empty() && exts.iter().any(|e| e == &sub)
 }
 
 fn load_capture_filter() -> (Vec<String>, u64) {
     // Legacy fallback: pre-rename desktop wrote filter under downloadcraft dir.
     let new_path = config_dir().join("capture-filter.json");
-    let legacy_path = directories::ProjectDirs::from("", "", "downloadcraft").map(|d| d.config_dir().join("capture-filter.json")).unwrap_or_else(|| PathBuf::from(".downloadcraft/capture-filter.json"));
-    let path = if new_path.exists() { new_path } else { legacy_path };
-    let Ok(txt) = std::fs::read_to_string(path) else { return (Vec::new(), 0) };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { return (Vec::new(), 0) };
-    let exts = v.get("exts").and_then(|e| e.as_array()).map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.trim().trim_start_matches('.').to_lowercase())).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
+    let legacy_path = directories::ProjectDirs::from("", "", "downloadcraft")
+        .map(|d| d.config_dir().join("capture-filter.json"))
+        .unwrap_or_else(|| PathBuf::from(".downloadcraft/capture-filter.json"));
+    let path = if new_path.exists() {
+        new_path
+    } else {
+        legacy_path
+    };
+    let Ok(txt) = std::fs::read_to_string(path) else {
+        return (Vec::new(), 0);
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+        return (Vec::new(), 0);
+    };
+    let exts = v
+        .get("exts")
+        .and_then(|e| e.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| {
+                    e.as_str()
+                        .map(|s| s.trim().trim_start_matches('.').to_lowercase())
+                })
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
     let min = v.get("minBytes").and_then(|m| m.as_u64()).unwrap_or(0);
     (exts, min)
 }
 
-
 /// Basename only: strip `/` and `\` components, reject empty / "." / "..".
 fn sanitize_filename(name: &str) -> Option<String> {
-    let base = name.rsplit(['/', '\\']).next().filter(|s| !s.is_empty() && *s != "." && *s != "..")?;
+    let base = name
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")?;
     Some(base.to_string())
 }
 
@@ -57,7 +112,9 @@ fn handle(msg: &serde_json::Value) -> serde_json::Value {
     // Echo request `id` verbatim when present; harmless for old clients that ignore it.
     let with_id = |mut resp: serde_json::Value| {
         if let Some(id) = msg.get("id") {
-            if let Some(obj) = resp.as_object_mut() { obj.insert("id".into(), id.clone()); }
+            if let Some(obj) = resp.as_object_mut() {
+                obj.insert("id".into(), id.clone());
+            }
         }
         resp
     };
@@ -65,13 +122,19 @@ fn handle(msg: &serde_json::Value) -> serde_json::Value {
         "ping" => with_id(serde_json::json!({"type":"pong"})),
         "download" | "add" => {
             let url = msg.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            if url.is_empty() { return with_id(serde_json::json!({"type":"error","error":"missing url"})); }
+            if url.is_empty() {
+                return with_id(serde_json::json!({"type":"error","error":"missing url"}));
+            }
             // Captured downloads (browser intercept/takeover) pass capture filter.
             // Explicit sends omit `captured` (or false) and always go: user intent.
             // ponytail: reply ok on filtered — contents.js deletes queue item on any
             // reply; error would leave zombie row. Browser fallback for filtered
             // capture inside extension deliberately skipped: skip means skip.
-            if msg.get("captured").and_then(|c| c.as_bool()).unwrap_or(false) {
+            if msg
+                .get("captured")
+                .and_then(|c| c.as_bool())
+                .unwrap_or(false)
+            {
                 let (exts, min_bytes) = load_capture_filter();
                 let filename = msg.get("filename").and_then(|f| f.as_str()).unwrap_or("");
                 let mime = msg.get("mime").and_then(|f| f.as_str()).unwrap_or("");
@@ -82,17 +145,31 @@ fn handle(msg: &serde_json::Value) -> serde_json::Value {
             }
             let dir = inbox_dir();
             let _ = std::fs::create_dir_all(&dir);
-            let name = format!("msg-{}.txt", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+            let name = format!(
+                "msg-{}.txt",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
             let mut body = format!("url={url}\n");
-            for k in ["filename", "referrer", "cookies", "referer", "cookie", "queue", "mime", "type"] {
+            for k in [
+                "filename", "referrer", "cookies", "referer", "cookie", "queue", "mime", "type",
+            ] {
                 if let Some(v) = msg.get(k).and_then(|v| v.as_str()) {
                     if k == "filename" {
                         // Drop traversal: write basename only; drop if basename invalid/empty.
-                        if let Some(b) = sanitize_filename(v) { body.push_str(&format!("filename={b}\n")); }
+                        if let Some(b) = sanitize_filename(v) {
+                            body.push_str(&format!("filename={b}\n"));
+                        }
                     } else if k == "mime" {
                         // Desktop parser ignores unknown keys; kept for forward-compat.
-                        if !v.contains(['\n', '\r']) { body.push_str(&format!("mime={v}\n")); }
-                    } else if k != "type" { body.push_str(&format!("{k}={v}\n")); }
+                        if !v.contains(['\n', '\r']) {
+                            body.push_str(&format!("mime={v}\n"));
+                        }
+                    } else if k != "type" {
+                        body.push_str(&format!("{k}={v}\n"));
+                    }
                 }
             }
             // headers object flattened as header lines are ignored by parser except known keys; store referrer/cookies above
@@ -112,11 +189,17 @@ fn main() {
     let mut out = stdout.lock();
     loop {
         let mut lenbuf = [0u8; 4];
-        if inp.read_exact(&mut lenbuf).is_err() { break; }
+        if inp.read_exact(&mut lenbuf).is_err() {
+            break;
+        }
         let n = u32::from_le_bytes(lenbuf) as usize;
-        if n > 10_000_000 { break; }
+        if n > 10_000_000 {
+            break;
+        }
         let mut buf = vec![0u8; n];
-        if inp.read_exact(&mut buf).is_err() { break; }
+        if inp.read_exact(&mut buf).is_err() {
+            break;
+        }
         let msg: serde_json::Value = serde_json::from_slice(&buf).unwrap_or(serde_json::json!({}));
         let resp = handle(&msg);
         let body = resp.to_string();
@@ -141,35 +224,107 @@ mod tests {
         assert_eq!(r["id"], "a1");
     }
 
-    fn exts(list: &[&str]) -> Vec<String> { list.iter().map(|s| s.to_string()).collect() }
+    fn exts(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
 
     #[test]
     fn capture_empty_exts_allows_all() {
-        assert!(capture_allowed(&[], 0, "a.bin", "https://x/a.bin", "application/octet-stream", 5));
+        assert!(capture_allowed(
+            &[],
+            0,
+            "a.bin",
+            "https://x/a.bin",
+            "application/octet-stream",
+            5
+        ));
         assert!(capture_allowed(&[], 0, "", "https://x/noext", "", 0));
     }
 
     #[test]
     fn capture_allowlist_matches_filename_or_url_ext_case_insensitively() {
         let e = exts(&["mp4", "zip"]);
-        assert!(capture_allowed(&e, 0, "Movie.MP4", "https://x/movie", "video/mp4", 10));
-        assert!(capture_allowed(&e, 0, "", "https://x/file.ZIP?token=1", "", 10));
-        assert!(!capture_allowed(&e, 0, "notes.pdf", "https://x/notes.pdf", "application/pdf", 10));
+        assert!(capture_allowed(
+            &e,
+            0,
+            "Movie.MP4",
+            "https://x/movie",
+            "video/mp4",
+            10
+        ));
+        assert!(capture_allowed(
+            &e,
+            0,
+            "",
+            "https://x/file.ZIP?token=1",
+            "",
+            10
+        ));
+        assert!(!capture_allowed(
+            &e,
+            0,
+            "notes.pdf",
+            "https://x/notes.pdf",
+            "application/pdf",
+            10
+        ));
     }
 
     #[test]
     fn capture_allowlist_falls_back_to_mime_subtype_when_no_ext() {
         let e = exts(&["mp4"]);
-        assert!(capture_allowed(&e, 0, "download", "https://x/download", "video/mp4", 10));
-        assert!(!capture_allowed(&e, 0, "download", "https://x/download", "application/pdf", 10));
-        assert!(!capture_allowed(&e, 0, "download", "https://x/download", "", 10));
+        assert!(capture_allowed(
+            &e,
+            0,
+            "download",
+            "https://x/download",
+            "video/mp4",
+            10
+        ));
+        assert!(!capture_allowed(
+            &e,
+            0,
+            "download",
+            "https://x/download",
+            "application/pdf",
+            10
+        ));
+        assert!(!capture_allowed(
+            &e,
+            0,
+            "download",
+            "https://x/download",
+            "",
+            10
+        ));
     }
 
     #[test]
     fn capture_min_size_skips_only_known_small() {
-        assert!(!capture_allowed(&[], 10 * 1024 * 1024, "a.zip", "https://x/a.zip", "", 5 * 1024 * 1024));
-        assert!(capture_allowed(&[], 10 * 1024 * 1024, "a.zip", "https://x/a.zip", "", 10 * 1024 * 1024));
-        assert!(capture_allowed(&[], 10 * 1024 * 1024, "a.zip", "https://x/a.zip", "", 0)); // unknown size: cannot prove small
+        assert!(!capture_allowed(
+            &[],
+            10 * 1024 * 1024,
+            "a.zip",
+            "https://x/a.zip",
+            "",
+            5 * 1024 * 1024
+        ));
+        assert!(capture_allowed(
+            &[],
+            10 * 1024 * 1024,
+            "a.zip",
+            "https://x/a.zip",
+            "",
+            10 * 1024 * 1024
+        ));
+        assert!(capture_allowed(
+            &[],
+            10 * 1024 * 1024,
+            "a.zip",
+            "https://x/a.zip",
+            "",
+            0
+        )); // unknown size: cannot prove small
         assert!(capture_allowed(&[], 0, "a.zip", "https://x/a.zip", "", 1)); // 0 = no minimum
     }
 }

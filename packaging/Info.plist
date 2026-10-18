@@ -2,19 +2,19 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>downloadcraft</string>
-  <key>CFBundleDisplayName</key><string>downloadcraft</string>
-  <key>CFBundleIdentifier</key><string>com.downloadcraft.app</string>
+  <key>CFBundleName</key><string>webcraft</string>
+  <key>CFBundleDisplayName</key><string>webcraft</string>
+  <key>CFBundleIdentifier</key><string>com.webcraft.app</string>
   <key>CFBundleVersion</key><string>0.3.9</string>
   <key>CFBundleShortVersionString</key><string>0.3.9</string>
-  <key>CFBundleExecutable</key><string>downloadcraft</string>
-  <key>CFBundleIconFile</key><string>downloadcraft</string>
+  <key>CFBundleExecutable</key><string>webcraft</string>
+  <key>CFBundleIconFile</key><string>webcraft</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>CFBundleURLTypes</key>
   <array><dict>
-    <key>CFBundleURLName</key><string>com.downloadcraft.app</string>
-    <key>CFBundleURLSchemes</key><array><string>downloadcraft</string></array>
+    <key>CFBundleURLName</key><string>com.webcraft.app</string>
+    <key>CFBundleURLSchemes</key><array><string>webcraft</string><string>downloadcraft</string></array>
   </dict></array>
 </dict>
 </plist>

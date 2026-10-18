@@ -1,11 +1,11 @@
 fn main() {
-    // Windows EXE icon: precompiled resource (assets/downloadcraft.rc -> .res,
+    // Windows EXE icon: precompiled resource (assets/webcraft.rc -> .res,
     // regenerate with rc.exe from Windows SDK; assets via scripts/make_icon.py).
     // GUI bin only; native host keeps no app resource.
     #[cfg(windows)]
     {
-        let res = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/downloadcraft.res");
+        let res = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/webcraft.res");
         println!("cargo:rerun-if-changed={}", res.display());
-        println!("cargo:rustc-link-arg-bin=downloadcraft={}", res.display());
+        println!("cargo:rustc-link-arg-bin=webcraft={}", res.display());
     }
 }

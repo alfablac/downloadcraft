@@ -8,7 +8,9 @@ use crate::engine::Controls;
 use crate::model::{DownloadTask, Settings, TaskStatus};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
+};
 
 // ---------- NZB parsing ----------
 
@@ -47,7 +49,12 @@ fn name_from_subject(subject: &str) -> String {
 }
 
 pub fn parse_nzb(xml: &str) -> Result<Nzb, String> {
-    let doc = roxmltree::Document::parse(xml).map_err(|e| e.to_string())?;
+    // Real NZBs ship a newzBin DOCTYPE; roxmltree rejects DTD by default.
+    let opts = roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..Default::default()
+    };
+    let doc = roxmltree::Document::parse_with_options(xml, opts).map_err(|e| e.to_string())?;
     if doc.root_element().tag_name().name() != "nzb" {
         return Err("not an NZB document".into());
     }
@@ -57,7 +64,10 @@ pub fn parse_nzb(xml: &str) -> Result<Nzb, String> {
         let mut f = NzbFile {
             name: name_from_subject(subject),
             poster: file.attribute("poster").unwrap_or("").to_string(),
-            date: file.attribute("date").and_then(|d| d.parse().ok()).unwrap_or(0),
+            date: file
+                .attribute("date")
+                .and_then(|d| d.parse().ok())
+                .unwrap_or(0),
             groups: Vec::new(),
             segments: Vec::new(),
             total_bytes: 0,
@@ -68,10 +78,22 @@ pub fn parse_nzb(xml: &str) -> Result<Nzb, String> {
                     f.groups.push(t.to_string());
                 }
             } else if n.has_tag_name("segment") {
-                let Some(id) = n.text().map(|t| t.trim()).filter(|t| !t.is_empty()) else { continue };
-                let number = n.attribute("number").and_then(|v| v.parse().ok()).unwrap_or(f.segments.len() as u32 + 1);
-                let bytes = n.attribute("bytes").and_then(|v| v.parse().ok()).unwrap_or(0);
-                f.segments.push(NzbSegment { id: id.to_string(), bytes, number });
+                let Some(id) = n.text().map(|t| t.trim()).filter(|t| !t.is_empty()) else {
+                    continue;
+                };
+                let number = n
+                    .attribute("number")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(f.segments.len() as u32 + 1);
+                let bytes = n
+                    .attribute("bytes")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                f.segments.push(NzbSegment {
+                    id: id.to_string(),
+                    bytes,
+                    number,
+                });
             }
         }
         f.segments.sort_by_key(|s| s.number);
@@ -92,7 +114,11 @@ pub fn crc32(data: &[u8]) -> u32 {
     for &b in data {
         crc ^= b as u32;
         for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -110,54 +136,77 @@ pub struct YencPart {
 }
 
 fn kv_u64(params: &str, key: &str) -> Option<u64> {
-    params.split_whitespace().find_map(|p| p.strip_prefix(key).and_then(|v| v.strip_prefix('=')).and_then(|v| v.parse().ok()))
+    params.split_whitespace().find_map(|p| {
+        p.strip_prefix(key)
+            .and_then(|v| v.strip_prefix('='))
+            .and_then(|v| v.parse().ok())
+    })
 }
 
 /// Decode one yEnc article body. Verifies `=yend` size and pcrc32/crc32 when
 /// present. Bodies without `=ybegin` pass through raw (plain text postings).
 pub fn yenc_decode(input: &[u8]) -> Result<YencPart, String> {
-    let text = String::from_utf8_lossy(input);
-    let mut part = YencPart { name: None, part: None, begin: None, end: None, data: Vec::new() };
+    // Raw bytes, NOT lossy UTF-8: encoded bytes >= 0x80 are data, UTF-8
+    // replacement chars would corrupt them.
+    let mut part = YencPart {
+        name: None,
+        part: None,
+        begin: None,
+        end: None,
+        data: Vec::new(),
+    };
     let mut in_data = false;
     let mut saw_yenc = false;
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("=ybegin") {
+    for raw in input.split(|&b| b == b'\n') {
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if let Some(rest) = line.strip_prefix(b"=ybegin".as_slice()) {
+            let rest = String::from_utf8_lossy(rest);
             saw_yenc = true;
             in_data = true;
-            part.part = kv_u64(rest, "part").map(|v| v as u32);
+            part.part = kv_u64(&rest, "part").map(|v| v as u32);
             if let Some(i) = rest.find("name=") {
                 part.name = Some(rest[i + 5..].trim().to_string());
             }
-        } else if let Some(rest) = line.strip_prefix("=ypart") {
-            part.begin = kv_u64(rest, "begin");
-            part.end = kv_u64(rest, "end");
+        } else if let Some(rest) = line.strip_prefix(b"=ypart".as_slice()) {
+            let rest = String::from_utf8_lossy(rest);
+            part.begin = kv_u64(&rest, "begin");
+            part.end = kv_u64(&rest, "end");
             in_data = true;
-        } else if let Some(rest) = line.strip_prefix("=yend") {
+        } else if let Some(rest) = line.strip_prefix(b"=yend".as_slice()) {
+            let rest = String::from_utf8_lossy(rest);
             in_data = false;
-            if let Some(want) = kv_u64(rest, "size") {
+            if let Some(want) = kv_u64(&rest, "size") {
                 if want as usize != part.data.len() {
-                    return Err(format!("yEnc size mismatch: got {} want {want}", part.data.len()));
+                    return Err(format!(
+                        "yEnc size mismatch: got {} want {want}",
+                        part.data.len()
+                    ));
                 }
             }
-            let crc_s = rest.split_whitespace().find_map(|p| p.strip_prefix("pcrc32=").or_else(|| p.strip_prefix("crc32=")));
+            let crc_s = rest.split_whitespace().find_map(|p| {
+                p.strip_prefix("pcrc32=")
+                    .or_else(|| p.strip_prefix("crc32="))
+            });
             if let Some(hex) = crc_s {
-                let want = u32::from_str_radix(hex, 16).map_err(|_| "bad yEnc crc32".to_string())?;
+                let want =
+                    u32::from_str_radix(hex, 16).map_err(|_| "bad yEnc crc32".to_string())?;
                 let got = crc32(&part.data);
                 if got != want {
-                    return Err(format!("yEnc crc32 mismatch: got {got:08x} want {want:08x}"));
+                    return Err(format!(
+                        "yEnc crc32 mismatch: got {got:08x} want {want:08x}"
+                    ));
                 }
             }
         } else if in_data {
-            let b = line.as_bytes();
             let mut i = 0;
-            while i < b.len() {
-                let mut c = b[i];
+            while i < line.len() {
+                let mut c = line[i];
                 if c == b'=' {
                     i += 1;
-                    if i >= b.len() {
+                    if i >= line.len() {
                         break;
                     }
-                    c = b[i].wrapping_sub(64);
+                    c = line[i].wrapping_sub(64);
                 }
                 part.data.push(c.wrapping_sub(42));
                 i += 1;
@@ -187,19 +236,32 @@ impl NntpConfig {
             host: s.nntp_host.clone(),
             port: s.nntp_port,
             tls: s.nntp_tls,
-            user: if task.username.is_empty() { s.nntp_user.clone() } else { task.username.clone() },
-            pass: if task.password.is_empty() { s.nntp_pass.clone() } else { task.password.clone() },
+            user: if task.username.is_empty() {
+                s.nntp_user.clone()
+            } else {
+                task.username.clone()
+            },
+            pass: if task.password.is_empty() {
+                s.nntp_pass.clone()
+            } else {
+                task.password.clone()
+            },
         }
     }
 }
 
 enum Wire {
     Plain(tokio::net::TcpStream),
-    Tls(tokio_rustls::client::TlsStream<tokio::net::TcpStream>),
+    // Boxed: TlsStream dwarfs TcpStream (clippy large_enum_variant).
+    Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
 }
 
 impl AsyncRead for Wire {
-    fn poll_read(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             Wire::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             Wire::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
@@ -207,19 +269,29 @@ impl AsyncRead for Wire {
     }
 }
 impl AsyncWrite for Wire {
-    fn poll_write(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, b: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        b: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
         match self.get_mut() {
             Wire::Plain(s) => std::pin::Pin::new(s).poll_write(cx, b),
             Wire::Tls(s) => std::pin::Pin::new(s).poll_write(cx, b),
         }
     }
-    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             Wire::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
             Wire::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
-    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             Wire::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             Wire::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
@@ -250,15 +322,25 @@ impl Nntp {
             use tokio_rustls::rustls;
             let mut roots = rustls::RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
-            let name = rustls::pki_types::ServerName::try_from(cfg.host.clone()).map_err(|_| "invalid NNTP TLS host name".to_string())?;
-            let tls = tokio_rustls::TlsConnector::from(Arc::new(config)).connect(name, tcp).await.map_err(|e| format!("NNTP TLS: {e}"))?;
-            Wire::Tls(tls)
+            let config = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let name = rustls::pki_types::ServerName::try_from(cfg.host.clone())
+                .map_err(|_| "invalid NNTP TLS host name".to_string())?;
+            let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+                .connect(name, tcp)
+                .await
+                .map_err(|e| format!("NNTP TLS: {e}"))?;
+            Wire::Tls(Box::new(tls))
         } else {
             Wire::Plain(tcp)
         };
         let (rd, wr) = tokio::io::split(wire);
-        let mut c = Self { rd: BufReader::new(rd), wr, group: None };
+        let mut c = Self {
+            rd: BufReader::new(rd),
+            wr,
+            group: None,
+        };
         let (code, text) = c.reply().await?;
         if code != 200 && code != 201 {
             return Err(format!("NNTP greeting -> {text}"));
@@ -266,7 +348,8 @@ impl Nntp {
         if !cfg.user.is_empty() {
             let (code, text) = c.cmd(&format!("AUTHINFO USER {}", cfg.user)).await?;
             if code == 381 {
-                c.expect(&format!("AUTHINFO PASS {}", cfg.pass), &[281]).await?;
+                c.expect(&format!("AUTHINFO PASS {}", cfg.pass), &[281])
+                    .await?;
             } else if code != 281 {
                 return Err(format!("NNTP AUTHINFO USER -> {text}"));
             }
@@ -279,12 +362,21 @@ impl Nntp {
         let mut line = Vec::new();
         loop {
             crate::engine::wait_not_paused(ctrl).await?;
-            let buf = match tokio::time::timeout(std::time::Duration::from_millis(200), self.rd.fill_buf()).await {
+            let buf = match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                self.rd.fill_buf(),
+            )
+            .await
+            {
                 Err(_) => continue,
                 Ok(r) => r.map_err(|e| e.to_string())?,
             };
             if buf.is_empty() {
-                return if line.is_empty() { Err("NNTP connection closed".into()) } else { Ok(line) };
+                return if line.is_empty() {
+                    Err("NNTP connection closed".into())
+                } else {
+                    Ok(line)
+                };
             }
             match buf.iter().position(|&b| b == b'\n') {
                 Some(i) => {
@@ -309,10 +401,13 @@ impl Nntp {
         // Greeting precedes any task Controls polling; no ctrl available here.
         let mut line = Vec::new();
         loop {
-            let n = tokio::time::timeout(std::time::Duration::from_secs(30), self.rd.read_until(b'\n', &mut line))
-                .await
-                .map_err(|_| "NNTP reply timeout".to_string())?
-                .map_err(|e| e.to_string())?;
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                self.rd.read_until(b'\n', &mut line),
+            )
+            .await
+            .map_err(|_| "NNTP reply timeout".to_string())?
+            .map_err(|e| e.to_string())?;
             if n == 0 {
                 return Err("NNTP connection closed".into());
             }
@@ -326,7 +421,10 @@ impl Nntp {
     }
 
     async fn cmd(&mut self, c: &str) -> Result<(u16, String), String> {
-        self.wr.write_all(format!("{c}\r\n").as_bytes()).await.map_err(|e| e.to_string())?;
+        self.wr
+            .write_all(format!("{c}\r\n").as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
         self.wr.flush().await.map_err(|e| e.to_string())?;
         self.reply().await
     }
@@ -357,10 +455,16 @@ impl Nntp {
         if msgid.contains(['\r', '\n']) {
             return Err("invalid NZB message-id".into());
         }
-        let id = if msgid.starts_with('<') { msgid.to_string() } else { format!("<{msgid}>") };
+        let id = if msgid.starts_with('<') {
+            msgid.to_string()
+        } else {
+            format!("<{msgid}>")
+        };
         let (code, text) = self.cmd(&format!("BODY {id}")).await?;
         if code == 430 {
-            return Err(format!("NNTP article {id} missing (430); PAR2 repair not in v1"));
+            return Err(format!(
+                "NNTP article {id} missing (430); PAR2 repair not in v1"
+            ));
         }
         if code != 222 {
             return Err(format!("NNTP BODY {id} -> {text}"));
@@ -374,7 +478,10 @@ impl Nntp {
                 return Ok(out);
             }
             // Dot-unstuffing: leading ".." -> "."
-            let line = line.strip_prefix(b".").filter(|_| line.starts_with(b"..")).unwrap_or(line);
+            let line = line
+                .strip_prefix(b".")
+                .filter(|_| line.starts_with(b".."))
+                .unwrap_or(line);
             out.extend_from_slice(line);
             out.push(b'\n');
         }
@@ -401,16 +508,25 @@ async fn fetch_nzb_text(client: &reqwest::Client, task: &DownloadTask) -> Result
         resp.text().await.map_err(|e| e.to_string())
     } else {
         let path = url.strip_prefix("file://").unwrap_or(url);
-        tokio::fs::read_to_string(path).await.map_err(|e| format!("NZB read {path}: {e}"))
+        tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| format!("NZB read {path}: {e}"))
     }
 }
 
 /// Download an NZB task: fetch/parse NZB, then per file fetch segments in
 /// `number` order, yEnc-decode, append to dest_dir/<sanitized NZB name>.
-pub async fn download_nzb(client: reqwest::Client, mut task: DownloadTask, ctrl: Arc<Controls>, cfg: &NntpConfig) -> Result<DownloadTask, String> {
+pub async fn download_nzb(
+    client: reqwest::Client,
+    mut task: DownloadTask,
+    ctrl: Arc<Controls>,
+    cfg: &NntpConfig,
+) -> Result<DownloadTask, String> {
     let xml = fetch_nzb_text(&client, &task).await?;
     let nzb = parse_nzb(&xml)?;
-    tokio::fs::create_dir_all(&task.dest_dir).await.map_err(|e| e.to_string())?;
+    tokio::fs::create_dir_all(&task.dest_dir)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let total_segs: u64 = nzb.files.iter().map(|f| f.segments.len() as u64).sum();
     task.total = Some(nzb.total_bytes);
@@ -423,9 +539,14 @@ pub async fn download_nzb(client: reqwest::Client, mut task: DownloadTask, ctrl:
     let mut downloaded: u64 = 0;
     let mut segs_done: u64 = 0;
     for file in &nzb.files {
-        let group = file.groups.first().ok_or_else(|| format!("NZB file '{}' has no <group>", file.name))?;
+        let group = file
+            .groups
+            .first()
+            .ok_or_else(|| format!("NZB file '{}' has no <group>", file.name))?;
         let dest = task.dest_dir.join(&file.name);
-        let mut out = tokio::fs::File::create(&dest).await.map_err(|e| e.to_string())?;
+        let mut out = tokio::fs::File::create(&dest)
+            .await
+            .map_err(|e| e.to_string())?;
         let mut written: u64 = 0;
         for seg in &file.segments {
             if let Err(e) = crate::engine::wait_not_paused(&ctrl).await {
@@ -456,10 +577,16 @@ pub async fn download_nzb(client: reqwest::Client, mut task: DownloadTask, ctrl:
                     }
                 }
             };
-            let part = yenc_decode(&body).map_err(|e| format!("NZB file '{}' segment {}: {e}", file.name, seg.number))?;
+            let part = yenc_decode(&body)
+                .map_err(|e| format!("NZB file '{}' segment {}: {e}", file.name, seg.number))?;
             if let Some(begin) = part.begin {
                 if begin != written + 1 {
-                    return Err(format!("NZB file '{}' segment {}: yEnc offset {begin} != {}", file.name, seg.number, written + 1));
+                    return Err(format!(
+                        "NZB file '{}' segment {}: yEnc offset {begin} != {}",
+                        file.name,
+                        seg.number,
+                        written + 1
+                    ));
                 }
             }
             out.write_all(&part.data).await.map_err(|e| e.to_string())?;
@@ -520,8 +647,18 @@ mod tests {
         assert_eq!(nzb.files[0].name, "file1.bin");
         assert_eq!(nzb.files[0].poster, "poster@example.com");
         assert_eq!(nzb.files[0].date, 1700000000);
-        assert_eq!(nzb.files[0].groups, vec!["alt.binaries.test", "alt.binaries.misc"]);
-        assert_eq!(nzb.files[0].segments.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), vec!["seg1@news", "seg2@news"]);
+        assert_eq!(
+            nzb.files[0].groups,
+            vec!["alt.binaries.test", "alt.binaries.misc"]
+        );
+        assert_eq!(
+            nzb.files[0]
+                .segments
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["seg1@news", "seg2@news"]
+        );
         assert_eq!(nzb.files[0].segments[0].number, 1);
         assert_eq!(nzb.files[0].total_bytes, 300);
         assert_eq!(nzb.files[1].name, "plain name.rar");
@@ -544,7 +681,11 @@ mod tests {
 
     /// Minimal yEnc encoder for tests (single line body).
     fn encode(data: &[u8], name: &str) -> Vec<u8> {
-        let mut out = format!("=ybegin part=1 total=1 line=128 size={} name={name}\r\n", data.len()).into_bytes();
+        let mut out = format!(
+            "=ybegin part=1 total=1 line=128 size={} name={name}\r\n",
+            data.len()
+        )
+        .into_bytes();
         for &b in data {
             let c = b.wrapping_add(42);
             if matches!(c, 0 | 9 | 10 | 13 | 61) {
@@ -554,7 +695,14 @@ mod tests {
                 out.push(c);
             }
         }
-        out.extend_from_slice(format!("\r\n=yend size={} part=1 pcrc32={:08x}\r\n", data.len(), crc32(data)).as_bytes());
+        out.extend_from_slice(
+            format!(
+                "\r\n=yend size={} part=1 pcrc32={:08x}\r\n",
+                data.len(),
+                crc32(data)
+            )
+            .as_bytes(),
+        );
         out
     }
 
@@ -580,14 +728,17 @@ mod tests {
     #[test]
     fn yenc_plain_body_passthrough_and_parts() {
         assert_eq!(yenc_decode(b"hello plain").unwrap().data, b"hello plain");
-        let mut body = format!("=ybegin part=2 total=2 line=128 size=4 name=f.bin\r\n=ypart begin=5 end=8\r\n").into_bytes();
-        body.extend_from_slice(&encode(b"DATA", "f.bin")[0..0]);
+        let mut body =
+            b"=ybegin part=2 total=2 line=128 size=4 name=f.bin\r\n=ypart begin=5 end=8\r\n"
+                .to_vec();
         // Encode DATA payload lines only (strip nested headers by hand).
         let enc = encode(b"DATA", "f.bin");
         let payload = &enc[enc.windows(2).position(|w| w == b"\r\n").unwrap() + 2..];
         let payload = &payload[..payload.windows(6).position(|w| w == b"\r\n=yen").unwrap()];
         body.extend_from_slice(payload);
-        body.extend_from_slice(format!("\r\n=yend size=4 part=2 pcrc32={:08x}\r\n", crc32(b"DATA")).as_bytes());
+        body.extend_from_slice(
+            format!("\r\n=yend size=4 part=2 pcrc32={:08x}\r\n", crc32(b"DATA")).as_bytes(),
+        );
         let part = yenc_decode(&body).unwrap();
         assert_eq!(part.data, b"DATA");
         assert_eq!(part.begin, Some(5));
