@@ -33,12 +33,18 @@ pub fn spawn_show_watcher() {
             fn PostMessageW(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> Bool;
             fn IsWindowVisible(hwnd: Hwnd) -> Bool;
             fn IsIconic(hwnd: Hwnd) -> Bool;
+            fn GetWindowTextW(hwnd: Hwnd, text: *mut u16, max: i32) -> i32;
         }
         extern "system" fn find(hwnd: *mut core::ffi::c_void, p: isize) -> i32 {
             unsafe {
                 let mut pid = 0;
                 GetWindowThreadProcessId(hwnd, &mut pid);
-                if pid == std::process::id() { *(p as *mut Hwnd) = hwnd; return 0; }
+                if pid != std::process::id() { return 1; }
+                // First PID window is not main window: tray-icon + winit own
+                // hidden helper HWNDs in-process. Match eframe title instead.
+                let mut buf = [0u16; 64];
+                let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), 64);
+                if n > 0 && String::from_utf16_lossy(&buf[..n as usize]).starts_with("downloadcraft") { *(p as *mut Hwnd) = hwnd; return 0; }
             }
             1
         }

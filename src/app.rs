@@ -157,6 +157,9 @@ impl DownloadApp {
         // show.request -> platform watcher shows/hides HWND, poll then syncs UI.
         {
             let rt_ev = rt.clone();
+            // MenuItem is !Send but handlers + menu live on UI thread; share
+            // via raw pointer. SAFETY: item outlives handlers (process exit).
+            let show_ptr = tray.as_ref().map(|t| &t.show_item as *const tray_icon::menu::MenuItem as usize).unwrap_or(0);
             let ids = tray.as_ref().map(|t| (t.show_id.clone(), t.add_id.clone(), t.quit_id.clone()));
             tray_icon::menu::MenuEvent::set_event_handler(Some(move |ev: tray_icon::menu::MenuEvent| {
                 let Some((show_id, add_id, quit_id)) = ids.clone() else { return; };
@@ -168,15 +171,31 @@ impl DownloadApp {
                 }
                 if ev.id == show_id {
                     let _ = std::fs::write(crate::platform::config_dir().join("show.request"), "toggle");
+                    // Flip label here too: egui poll may not run while hidden.
+                    let visible = !crate::platform::WINDOW_VISIBLE.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+                    if show_ptr != 0 { unsafe { &*(show_ptr as *const tray_icon::menu::MenuItem) }.set_text(tray_toggle_label(visible)); }
                 } else if ev.id == add_id {
                     let _ = std::fs::write(crate::platform::config_dir().join("show.request"), "add");
                 }
             }));
-            // Double-click tray icon toggles window (Windows-only event;
-            // left button only so right double-click still opens menu).
+            // Left double-click toggles; right click refreshes label just
+            // before menu shows (catches close-to-tray/taskbar changes).
             tray_icon::TrayIconEvent::set_event_handler(Some(move |ev: tray_icon::TrayIconEvent| {
-                if matches!(ev, tray_icon::TrayIconEvent::DoubleClick { button: tray_icon::MouseButton::Left, .. }) {
-                    let _ = std::fs::write(crate::platform::config_dir().join("show.request"), "toggle");
+                let item = if show_ptr == 0 { None } else { Some(unsafe { &*(show_ptr as *const tray_icon::menu::MenuItem) }) };
+                match ev {
+                    tray_icon::TrayIconEvent::DoubleClick { button: tray_icon::MouseButton::Left, .. } => {
+                        // New state known here: flip shared flag + label now,
+                        // next menu open must not wait for egui poll sync.
+                        let visible = !crate::platform::WINDOW_VISIBLE.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(item) = item { item.set_text(tray_toggle_label(visible)); }
+                        let _ = std::fs::write(crate::platform::config_dir().join("show.request"), "toggle");
+                    }
+                    // Refresh just before menu shows: catches close-to-tray,
+                    // taskbar minimize/restore, watcher-driven changes.
+                    tray_icon::TrayIconEvent::Click { button: tray_icon::MouseButton::Right, button_state: tray_icon::MouseButtonState::Down, .. } => {
+                        if let Some(item) = item { item.set_text(tray_toggle_label(crate::platform::WINDOW_VISIBLE.load(std::sync::atomic::Ordering::Relaxed))); }
+                    }
+                    _ => {}
                 }
             }));
         }
@@ -193,7 +212,8 @@ impl DownloadApp {
         let quit = tray_icon::menu::MenuItem::new("Quit", true, None);
         let (show_id, add_id, quit_id) = (show.id().clone(), add.id().clone(), quit.id().clone());
         let _ = menu.append_items(&[&show, &add, &quit]);
-        let tray = tray_icon::TrayIconBuilder::new().with_icon(icon).with_menu(Box::new(menu.clone())).with_tooltip("downloadcraft").build().ok()?;
+        // Menu on right click only: left click reserved for double-click toggle.
+        let tray = tray_icon::TrayIconBuilder::new().with_icon(icon).with_menu(Box::new(menu.clone())).with_tooltip("downloadcraft").with_menu_on_left_click(false).build().ok()?;
         Some(TrayNav { _tray: tray, _menu: menu, show_item: show, show_id, add_id, quit_id })
     }
 
