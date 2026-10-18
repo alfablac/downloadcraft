@@ -151,10 +151,10 @@ impl DownloadApp {
         // Cap workers: default = CPU cores (32 threads parked forever). Downloads are network-bound; 4 is ample.
         let tokio_rt = Arc::new(tokio::runtime::Builder::new_multi_thread().worker_threads(4).max_blocking_threads(16).enable_all().build().expect("tokio rt"));
         let tray = Self::make_tray(!hidden);
-        // Tray Quit must not depend on egui poll: hidden viewport stops update(),
+        // Tray actions must not depend on egui poll: hidden viewport stops update(),
         // so poll-drained Quit starved and process needed Task Manager. Handler runs
-        // on muda event delivery; Quit saves + exits directly. Show/Add write
-        // show.request -> platform watcher restores HWND, poll then unhides UI.
+        // on muda event delivery; Quit saves + exits directly. Toggle/Add write
+        // show.request -> platform watcher shows/hides HWND, poll then syncs UI.
         {
             let rt_ev = rt.clone();
             let ids = tray.as_ref().map(|t| (t.show_id.clone(), t.add_id.clone(), t.quit_id.clone()));

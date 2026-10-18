@@ -155,6 +155,7 @@ pub fn run_host_handshake(host: &std::path::Path) -> Result<(), String> {
 }
 
 fn run_gui(initial_urls: Vec<String>, hidden: bool) {
+    platform::WINDOW_VISIBLE.store(!hidden, std::sync::atomic::Ordering::Relaxed);
     platform::spawn_show_watcher();
     // Register native messaging hosts on every launch: host exe path can move (portable/update), stale manifest = dead extension.
     let _ = platform::register_native_hosts(&sibling_host_path());
