@@ -19,16 +19,13 @@ pub fn day_of_yyyymmdd(v: u32) -> i64 {
     days_from_civil((v / 10000) as i64, (v / 100) % 100, v % 100)
 }
 
-pub fn should_start(s: &Schedule, day: i64, secs_of_day: u32) -> bool {
-    if !s.enabled {
-        return false;
-    }
-    if secs_of_day < s.start_secs {
-        return false;
-    }
-    if s.last_started_day == day {
-        return false;
-    }
+/// Window for treating a late start as on-time rather than missed: mirrors
+/// latency of two app polls (poll cadence is 500ms busy / 5s idle, see
+/// app.rs poll tail). App launches later than `start_secs+GRACE_SECS` only
+/// catch up when `run_missed` is set.
+pub const GRACE_SECS: u32 = 60;
+
+fn recurrence_matches(s: &Schedule, day: i64) -> bool {
     match s.recurrence {
         Recurrence::Daily => {
             if s.repeat_days > 1 && s.once_date != 0 {
@@ -45,6 +42,41 @@ pub fn should_start(s: &Schedule, day: i64, secs_of_day: u32) -> bool {
         }
         Recurrence::Once => s.once_date != 0 && day_of_yyyymmdd(s.once_date) == day,
     }
+}
+
+/// Scheduled time has passed today; the queue has not started today.
+/// Caller restarts the queue (caller owns setting `last_started_day`).
+pub fn missed_run(now: (i64, u32), s: &Schedule, last_triggered_date: i64) -> bool {
+    let (day, secs_of_day) = now;
+    if !s.enabled || !s.run_missed {
+        return false;
+    }
+    if last_triggered_date == day {
+        return false;
+    }
+    // Include the exact start second: late-but-within-grace always fires.
+    if secs_of_day <= s.start_secs.saturating_add(GRACE_SECS) {
+        return false;
+    }
+    recurrence_matches(s, day)
+}
+
+pub fn should_start(s: &Schedule, day: i64, secs_of_day: u32) -> bool {
+    if !s.enabled {
+        return false;
+    }
+    if secs_of_day < s.start_secs {
+        return false;
+    }
+    if s.last_started_day == day {
+        return false;
+    }
+    // On-time starts (including grace window) fire regardless of run_missed;
+    // starts later than that are missed runs, gated on run_missed.
+    if secs_of_day > s.start_secs.saturating_add(GRACE_SECS) && !s.run_missed {
+        return false;
+    }
+    recurrence_matches(s, day)
 }
 pub fn should_stop(s: &Schedule, day: i64, secs_of_day: u32) -> bool {
     if !s.enabled {
@@ -167,6 +199,53 @@ mod tests {
         assert!(!should_start(&s, sat, 7200));
         s.last_started_day = mon;
         assert!(!should_start(&s, mon, 7200));
+    }
+
+    #[test]
+    fn missed_run_cases() {
+        // Start 01:00, already 02:00 Monday, enabled, queued, run_missed on.
+        let mut s = Schedule {
+            id: "1".into(),
+            queue_id: "main".into(),
+            enabled: true,
+            recurrence: Recurrence::Daily,
+            start_secs: 3600,
+            run_missed: true,
+            ..Default::default()
+        };
+        let mon = days_from_civil(2026, 10, 19);
+        // missed today -> true (once; start time already passed)
+        assert!(missed_run((mon, 7200), &s, 0));
+        // already triggered today -> false (once per day)
+        assert!(!missed_run((mon, 7200), &s, mon));
+        // `Schedule.last_started_day` mirrors the same once-per-day guard.
+        s.last_started_day = mon;
+        assert!(!should_start(&s, mon, 7200));
+        s.last_started_day = 0;
+        assert!(should_start(&s, mon, 7200));
+        // future time -> false (not yet due)
+        assert!(!missed_run((mon, 3599), &s, 0));
+        // run_missed off -> false
+        s.run_missed = false;
+        assert!(!missed_run((mon, 7200), &s, 0));
+        assert!(!should_start(&s, mon, 7200));
+        // disabled -> false
+        s.run_missed = true;
+        s.enabled = false;
+        assert!(!missed_run((mon, 7200), &s, 0));
+        s.enabled = true;
+        // grace window: on-time start fires even with run_missed off
+        let s2 = Schedule {
+            id: "2".into(),
+            queue_id: "main".into(),
+            enabled: true,
+            recurrence: Recurrence::Daily,
+            start_secs: 3600,
+            ..Default::default()
+        };
+        assert!(should_start(&s2, mon, 3600));
+        assert!(should_start(&s2, mon, 3600 + GRACE_SECS));
+        assert!(!missed_run((mon, 3600 + GRACE_SECS), &s2, 0));
     }
     #[test]
     fn once_and_next() {

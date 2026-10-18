@@ -5,7 +5,7 @@
 | Segmented multi-connection HTTP download (default 8) | Done | `engine::plan_segments`, e2e `http_segmented_download_and_resume` |
 | Resume / pause / crash recovery, ETag validation | Done | `.downloadcraft-<id>/state.json`, preseeded-resume e2e |
 | Retry with backoff (engine), queue retry policy | Done | engine attempt loop; app queue retry requeue |
-| Speed limiter (global + per task) | Done | `Controls.limit_kbps` throttle |
+| Speed limiter (global aggregate-divided + per task, Progress dialog field) | Done | `Controls.limit_kbps` throttle; `app::effective_limit_kbps` |
 | Proxy + auth (URL form) | Done | `build_client(proxy)` reqwest |
 | Checksum SHA-256 verify | Done | `finish_check` |
 | Queues: caps, priority, drag order (Up/Down), FIFO order field | Done | `queue::plan_starts` unit + GUI buttons |
@@ -20,16 +20,29 @@
 | Chromium extension ID pinned (`key` in manifest) | Done | `platform::CHROME_EXT_ID` = `ajkokpbgjajmkenllekaokjbglbcingk` + drift test; private key NOT in repo |
 | Queue retry count/interval enforced, scheduler respects caps, completion only when queue drained | Done | task `attempts`/`next_retry_at`, planner-routed schedule starts |
 | Dynamic segment splitting / work stealing (IDM dynamic segmentation) | Done | engine `split_point`/`claim_or_split`, split tests |
-| Mirrors (Url0..UrlN) + per-URL Basic auth | Done | task `mirrors`/`username`/`password`, engine probe failover |
+| Mirrors (Url0..UrlN) + shared task Basic auth | Done | task `mirrors`/`username`/`password` (one credential pair per task), engine probe failover |
 | FTP (PASV, REST resume) | Done | `src/ftp.rs` + fake-server tests |
+| Desktop notifications (complete/failed/queue-drained, toggle) | Done | `platform::notify`, `app.rs` poll |
+| Update checker (GitHub latest, download-as-task, no self-replace) | Done | `src/update.rs`, About tab |
+| Rename templates `{name}{ext}{date}{host}{category}` + category subfolders | Done | `model::expand_template`, `main.rs` funnel |
+| Extension candidate ranking (file>playlist>segment, dedupe) | Done | `extensions/*/rank.js`, `extensions/rank.test.mjs` (node) |
+| Browser capture filter (ext allowlist + min size) | Done | `src/bin/webcraft_host.rs`, `capture-filter.json` |
+| State crash recovery (atomic save + `.bak` fallback) | Done | `main::load_state`/`save_state` |
+| Progress dialog extras (per-task speed graph, part status words, resume row) | Done | `app.rs` progress dialog |
 | Scheduler quota (no more than X MB every Y hours) | Done | schedule `quota_*`, `quota_exhausted` gate |
 | Scheduler IDM dialog layout (named list New/Delete, Turn-on master, HH:MM AM/PM, Once date, Repeat N days, weekdays, Stop at, files-at-once, completion/power confirm) | Done | IDM two-pane page; `Schedule.name/repeat_days`, `Settings.scheduler_enabled`, repeat logic in `scheduler.rs`; hang-up modem N/A |
 | Row interaction (aligned fixed-height rows, working Start/Stop, pointer cursor) | Done | allocate-first `icon_btn_enabled`, 20px `cell` (22px pitch, IDM 17px parity), labels `selectable(false)`; engine cancel e2e |
 | Version onscreen (title, top-bar chip, About, `--version`) | Done | `env!("CARGO_PKG_VERSION")` single source |
 | Browser manifest sniffing (webRequest) → download panel candidates | Done | Chromium + Firefox candidates map, panel merge |
 | Content-Type manifest dispatch (no extension in URL) | Done | `stream::probe_manifest` |
-| Release v0.1.0 published (matrix + release job green, SHA256SUMS verified) | Done | GitHub Release v0.1.0 assets; NSIS/AppImage best-effort in CI |
-| FTP plain, FTPS explicit/implicit (`ftps://`/`ftpsi://`, TLS data, resume), SFTP (russh, TOFU), NNTP/NZB (yEnc, TLS), BitTorrent (librqbit, magnet + .torrent), Metalink/WebDAV, yt-dlp | Done | src/ftp.rs, src/sftp.rs, src/nntp.rs, src/torrent.rs, src/metalink.rs, src/ytdlp.rs |
+| Current release published (matrix + release job green, SHA256SUMS verified) | Done | GitHub Releases (latest v0.8.0); NSIS/AppImage best-effort in CI |
+| yt-dlp sidecar (14 video hosts, format pick, 30d auto-update) | Done | `src/ytdlp.rs`; native fallback in `stream.rs` |
+| Metalink v3/v4 (first file, mirrors + SHA-256) | Done | `src/metalink.rs`, `stream.rs`, `tests/metalink.rs` |
+| WebDAV (`webdav://`/`webdavs://` scheme map, Add dialog + capture ingress) | Done | `app::normalize_webdav` |
+| SFTP (russh, TOFU known-hosts, key/password, seek resume) | Done | `src/sftp.rs` |
+| FTPS explicit `ftps://` + implicit `ftpsi://` (TLS data, resume; no live TLS fixture) | Done | `src/ftp.rs` |
+| NNTP/NZB (yEnc + CRC32, TLS, fake-server e2e; PAR2/unpack/per-segment resume deferred) | Done | `src/nntp.rs`, `tests/nntp.rs` |
+| BitTorrent magnet + .torrent (librqbit, persistence, seed-after-complete opt-in) | Done | `src/torrent.rs`, `model::Settings` torrent fields |
 | HLS AES-128 decrypt (plain key over HTTP, not DRM) | Done | `hls::decrypt_segment` + `stream` encrypted temp-parts path; unit vectors + `tests/hls_aes.rs` e2e (sequence IV, explicit IV); SAMPLE-AES/other methods → Protected; RE round 5: IDM manual-add saves playlist plain (KEY never fetched), browser-panel path unverified |
 | DASH nested BaseURL, `$Number%05d$`/`$RepresentationID$` | Done | unit tests |
 | DASH multi-Representation A/V mux | Done (ffmpeg when present) | e2e with fake segs concat; ffmpeg mux fn |
@@ -41,7 +54,7 @@
 | DASH kill-resume segment cache | Done | `seg-<kind>-<i>.bin` replay, manifest snapshot before fetch (same e2e) |
 | Content-Type-only manifest detection (`video/vnd.mpeg.dash.mpd`, `application/vnd.apple.mpegurl`) | Done | `stream::probe_manifest` (REA round 6 MIME map) |
 | Browser ext Chromium MV3 + Firefox, native host, per-OS registration paths | Done | extensions/, `platform::native_host_manifest_paths` unit |
-| Video panel (qualities) | Done | content.js panel + rep_label |
+| Video panel (ranked candidates, top preselected) | Done | content.js panel + `rank.js`; quality labels (WxH) not surfaced |
 | Queues scheduler start/stop, recurrence, missed policy flag, next-run | Done | scheduler unit + GUI |
 | Per-queue completion actions incl. power (opt-in flag field) | Done | `run_completion`, power cmd construction unit |
 | Site Grabber: depth/scope/filters/dedupe/robots/delay/export/project save-load | Done | grabber e2e + GUI |

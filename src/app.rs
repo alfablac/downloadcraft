@@ -4,7 +4,7 @@ use crate::icons::{icon, Icon};
 use crate::model::*;
 use crate::platform;
 use crate::queue::plan_starts;
-use crate::scheduler::{next_run_in, should_start, should_stop};
+use crate::scheduler::{missed_run, next_run_in, should_start, should_stop};
 use crate::theme;
 use crate::Runtime;
 use downloadcraft_lib::update::{self, CheckOutcome};
@@ -63,6 +63,40 @@ fn normalize_webdav(url: &str) -> String {
         format!("https://{rest}")
     } else {
         t.to_string()
+    }
+}
+
+/// Effective per-Controls KB/s cap: own limit wins, else global split
+/// across active tasks (count includes own-limit tasks, so no-own sum
+/// never exceeds global; own tasks sit on top by design).
+/// ponytail: static division, not token bucket — idle shares not reclaimed.
+/// Upgrade: shared token bucket in engine::throttle when that matters.
+fn effective_limit_kbps(global_kbps: u64, active_count: usize, own_kbps: u64) -> u64 {
+    if own_kbps > 0 {
+        own_kbps
+    } else if global_kbps == 0 {
+        0
+    } else {
+        global_kbps / (active_count.max(1) as u64)
+    }
+}
+
+fn apply_effective_limits(
+    state: &AppState,
+    controls: &std::collections::HashMap<String, Arc<engine::Controls>>,
+) {
+    let count = controls.len();
+    for (id, c) in controls {
+        let own = state
+            .tasks
+            .iter()
+            .find(|t| &t.id == id)
+            .map(|t| t.speed_limit_kbps)
+            .unwrap_or(0);
+        let eff = effective_limit_kbps(state.settings.speed_limit_kbps, count, own);
+        if c.limit_kbps.load(Ordering::Relaxed) != eff {
+            c.limit_kbps.store(eff, Ordering::Relaxed);
+        }
     }
 }
 
@@ -238,6 +272,8 @@ pub struct DownloadApp {
     selected: Option<String>,
     selected_schedule: Option<String>,
     completed_notice: Option<String>,
+    /// Completion power action awaiting user confirm (mirrors Runtime.pending_power).
+    pending_power_confirm: Option<crate::platform::PowerAction>,
     /// Task ids already Complete when app started (or already notified).
     /// Seeded in new() so restored history never pops "Download complete";
     /// only tasks finishing this session notify.
@@ -473,6 +509,7 @@ impl DownloadApp {
             selected: None,
             selected_schedule: None,
             completed_notice: None,
+            pending_power_confirm: None,
             seen_completed,
             seen_failed,
             was_active: false,
@@ -659,7 +696,7 @@ impl DownloadApp {
                                 && matches!(t.status, TaskStatus::Queued | TaskStatus::Downloading)
                         });
                         if drained {
-                            run_completion(&g, &queue_id, &tid);
+                            run_completion(&mut g, &queue_id, &tid);
                         }
                     }
                 }
@@ -880,6 +917,49 @@ impl DownloadApp {
         }
     }
 
+    /// Modal confirm for completion power actions (Schedule.power_confirmed).
+    /// request_power (worker thread) parks the action on Runtime.pending_power;
+    /// Execute runs it, Cancel drops it. Shown every frame until resolved.
+    fn show_pending_power(&mut self, ctx: &egui::Context) {
+        if self.pending_power_confirm.is_none() {
+            self.pending_power_confirm = self.rt.lock().unwrap().pending_power.take();
+        }
+        let Some(action) = self.pending_power_confirm else {
+            return;
+        };
+        let label = match action {
+            crate::platform::PowerAction::Shutdown => "Shut down",
+            crate::platform::PowerAction::Sleep => "Sleep",
+        };
+        let mut execute = false;
+        let mut cancel = false;
+        egui::Window::new("Confirm power action")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("Downloads complete. {label} this computer now?"));
+                ui.horizontal(|ui| {
+                    if ui.button(format!("{label} now")).clicked() {
+                        execute = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if execute {
+            self.pending_power_confirm = None;
+            let _ = crate::platform::execute_power(action);
+        } else if cancel {
+            self.pending_power_confirm = None;
+            self.rt
+                .lock()
+                .unwrap()
+                .log(format!("Power action {action:?} cancelled by user"));
+        }
+    }
+
     fn poll(&mut self, ctx: &egui::Context) {
         if !self.ytdlp_checked {
             self.ytdlp_checked = true;
@@ -1027,6 +1107,10 @@ impl DownloadApp {
         // progress sync
         {
             let mut g = self.rt.lock().unwrap();
+            // Re-apply limits each poll: global split tracks active count,
+            // per-task edits live-apply without restart. Covers settings
+            // slider / schedule stores that write controls directly.
+            apply_effective_limits(&g.state, &g.controls);
             let ctrls: Vec<(String, u64)> = g
                 .controls
                 .iter()
@@ -1231,7 +1315,10 @@ impl DownloadApp {
                 } else {
                     Vec::new()
                 } {
-                    if should_start(&s, day, secs) {
+                    // should_start covers on-time+grace; missed_run fires late
+                    // catch-up only when Schedule.run_missed set (once/day via
+                    // last_started_day latch below).
+                    if should_start(&s, day, secs) || missed_run((day, secs), &s, s.last_started_day) {
                         // mark started
                         if let Some(sch) = g.state.schedules.iter_mut().find(|x| x.id == s.id) {
                             sch.last_started_day = day;
@@ -1436,7 +1523,38 @@ fn split_cmdline(s: &str) -> Vec<String> {
     out
 }
 
-fn run_completion(g: &Runtime, queue_id: &str, task_id: &str) {
+/// True when any enabled schedule targets `queue_id` with power action `a`
+/// and asked for confirmation. Completion action lives on sched (copied onto
+/// queue at trigger) and on queue itself; queue-level completions have no
+/// confirm flag (no owning schedule) and execute immediately.
+pub fn any_power_confirm_required(
+    state: &crate::model::AppState,
+    queue_id: &str,
+    a: CompletionAction,
+) -> bool {
+    state.schedules.iter().any(|s| {
+        s.enabled && s.queue_id == queue_id && s.on_complete == a && s.power_confirmed
+    })
+}
+
+/// Execute power action, or defer to GUI confirm dialog when
+/// `power_confirmed` applies. `run_completion` runs on the worker thread
+/// (engines), so egui dialog cannot be shown here: park the request on
+/// `Runtime.pending_power`, which the frame loop renders as a modal.
+fn request_power(g: &mut Runtime, queue_id: &str, action: platform::PowerAction) {
+    let ca = match action {
+        platform::PowerAction::Shutdown => CompletionAction::Shutdown,
+        platform::PowerAction::Sleep => CompletionAction::Sleep,
+    };
+    if any_power_confirm_required(&g.state, queue_id, ca) {
+        g.pending_power = Some(action);
+        g.log(format!("Power action {action:?} awaiting confirmation"));
+    } else {
+        let _ = platform::execute_power(action);
+    }
+}
+
+fn run_completion(g: &mut Runtime, queue_id: &str, task_id: &str) {
     let Some(q) = g.state.queues.iter().find(|q| q.id == queue_id) else {
         return;
     };
@@ -1475,10 +1593,10 @@ fn run_completion(g: &Runtime, queue_id: &str, task_id: &str) {
             std::process::exit(0);
         }
         CompletionAction::Shutdown => {
-            let _ = platform::execute_power(platform::PowerAction::Shutdown);
+            request_power(g, queue_id, platform::PowerAction::Shutdown);
         }
         CompletionAction::Sleep => {
-            let _ = platform::execute_power(platform::PowerAction::Sleep);
+            request_power(g, queue_id, platform::PowerAction::Sleep);
         }
         CompletionAction::None => {}
     }
@@ -1979,6 +2097,7 @@ impl eframe::App for DownloadApp {
                 if ui.button("Close").clicked() { self.show_about = false; }
             });
         }
+        self.show_pending_power(ctx);
         if self.show_add {
             self.ui_add_dialog(ctx);
         }
@@ -3509,6 +3628,31 @@ impl DownloadApp {
                     ui.end_row();
                     form_label(ui, "Save to");
                     ui.label(t.dest_dir.display().to_string());
+                    ui.end_row();
+                    form_label(ui, "Limit (KB/s, 0=off)");
+                    {
+                        let mut lim = t.speed_limit_kbps;
+                        if ui
+                            .add_sized([DRAG_W, theme::BTN_H], drag(&mut lim).range(0..=1_000_000))
+                            .changed()
+                        {
+                            let mut g = self.rt.lock().unwrap();
+                            if let Some(x) = g.state.tasks.iter_mut().find(|x| x.id == t.id) {
+                                x.speed_limit_kbps = lim;
+                            }
+                            // Live-apply; poll re-derives every tick anyway.
+                            if let Some(c) = g.controls.get(&t.id) {
+                                let n = g.controls.len();
+                                let eff = effective_limit_kbps(
+                                    g.state.settings.speed_limit_kbps,
+                                    n,
+                                    lim,
+                                );
+                                c.limit_kbps.store(eff, Ordering::Relaxed);
+                            }
+                            g.save();
+                        }
+                    }
                     ui.end_row();
                     form_label(ui, "Queue");
                     ui.label(if t.queue_id.is_empty() {
@@ -5111,6 +5255,20 @@ pub fn fmt_bytes(n: u64) -> String {
 #[cfg(test)]
 mod progress_tests {
     use super::*;
+
+    #[test]
+    fn effective_limit_division() {
+        // own wins, even above global
+        assert_eq!(effective_limit_kbps(1000, 4, 200), 200);
+        // global split
+        assert_eq!(effective_limit_kbps(1000, 4, 0), 250);
+        assert_eq!(effective_limit_kbps(1000, 1, 0), 1000);
+        assert_eq!(effective_limit_kbps(999, 2, 0), 499);
+        // unlimited / degenerate
+        assert_eq!(effective_limit_kbps(0, 4, 0), 0);
+        assert_eq!(effective_limit_kbps(1000, 0, 0), 1000);
+        assert_eq!(effective_limit_kbps(0, 4, 50), 50);
+    }
 
     #[test]
     fn tray_toggle_label_follows_visibility() {

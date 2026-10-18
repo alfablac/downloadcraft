@@ -202,10 +202,16 @@ async fn nntp_downloads_nzb_files_via_fake_server() {
         ctrl.downloaded.load(std::sync::atomic::Ordering::Relaxed),
         (data1.len() + data2.len()) as u64
     );
-    assert!(ctrl
+    // Multi-file NZB: per-file byte parts (on-wire totals 640/320, snapped full).
+    assert!(!ctrl
         .parts_are_segments
         .load(std::sync::atomic::Ordering::Relaxed));
-    assert_eq!(ctrl.parts.lock().unwrap().clone(), vec![(3, 3)]);
+    assert_eq!(
+        ctrl.parts.lock().unwrap().clone(),
+        vec![(640, 640), (320, 320)]
+    );
+    // Sidecars cleaned up on full success.
+    assert!(!dir.join("file1.bin.nzbstate").exists());
     let cmds = fake.cmds.lock().unwrap().clone();
     assert!(cmds.iter().any(|c| c == "AUTHINFO USER alice"), "{cmds:?}");
     assert!(cmds.iter().any(|c| c == "AUTHINFO PASS secret"), "{cmds:?}");
@@ -240,7 +246,79 @@ async fn nntp_missing_article_430_errors() {
     )
     .await;
     assert!(r.is_err(), "430 must error, got {r:?}");
-    assert!(r.unwrap_err().contains("430"));
+    let e = r.unwrap_err();
+    assert!(e.contains("430") && e.contains("gone.bin"), "{e}");
+    assert!(!dir.join("gone.bin").exists(), "incomplete file removed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn nntp_missing_file_fails_others_continue_resume_skips_done() {
+    let data1: Vec<u8> = (0u32..600).map(|i| (i % 256) as u8).collect();
+    let data2: Vec<u8> = (0u32..300).map(|i| (255 - (i % 256)) as u8).collect();
+    let nzb = nzb_xml(&[
+        (
+            "poster &quot;file1.bin&quot; yEnc (1/2)",
+            vec![("s1@news", 320, 1), ("s2@news", 320, 2)],
+        ),
+        (
+            "poster &quot;file2.bin&quot; yEnc (1/1)",
+            vec![("s3@news", 320, 1)],
+        ),
+    ]);
+    let dir = tmpdir("resume430");
+    let nzb_path = dir.join("test.nzb");
+    std::fs::write(&nzb_path, &nzb).unwrap();
+    // Run 1: file2 article absent (430) — file1 must still complete.
+    let fake1 = fake_nntp(vec![
+        ("s1@news".into(), yenc(&data1[..300], "file1.bin")),
+        ("s2@news".into(), yenc(&data1[300..], "file1.bin")),
+    ]);
+    let settings1 = settings_for(&fake1);
+    let task = DownloadTask {
+        id: "n4".into(),
+        url: nzb_path.to_string_lossy().into_owned(),
+        filename: "x.nzb".into(),
+        dest_dir: dir.clone(),
+        ..Default::default()
+    };
+    let ctrl = Arc::new(Controls::new(0));
+    let r = download_url_with_settings(build_client(""), task.clone(), ctrl.clone(), &settings1)
+        .await;
+    let e = r.unwrap_err();
+    assert!(e.contains("file2.bin") && e.contains("430"), "{e}");
+    assert_eq!(std::fs::read(dir.join("file1.bin")).unwrap(), data1);
+    assert!(!dir.join("file2.bin").exists(), "failed file dest removed");
+    assert!(dir.join("file1.bin.nzbstate").exists(), "done file sidecar kept");
+    assert!(!ctrl
+        .parts_are_segments
+        .load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(
+        ctrl.parts.lock().unwrap().clone(),
+        vec![(640, 640), (0, 320)],
+        "failed file part reset, done file full"
+    );
+    // Run 2: server gains file2; file1 skipped via sidecar (no BODY s1/s2).
+    let fake2 = fake_nntp(vec![("s3@news".into(), yenc(&data2, "file2.bin"))]);
+    let settings2 = settings_for(&fake2);
+    let ctrl2 = Arc::new(Controls::new(0));
+    let done = download_url_with_settings(build_client(""), task, ctrl2.clone(), &settings2)
+        .await
+        .unwrap();
+    assert_eq!(done.status, TaskStatus::Complete, "{}", done.error);
+    assert_eq!(done.downloaded, 900);
+    assert_eq!(std::fs::read(dir.join("file1.bin")).unwrap(), data1);
+    assert_eq!(std::fs::read(dir.join("file2.bin")).unwrap(), data2);
+    assert_eq!(
+        ctrl2.parts.lock().unwrap().clone(),
+        vec![(640, 640), (320, 320)]
+    );
+    let cmds = fake2.cmds.lock().unwrap().clone();
+    assert!(
+        !cmds.iter().any(|c| c.contains("s1@news") || c.contains("s2@news")),
+        "completed file not refetched: {cmds:?}"
+    );
+    assert!(cmds.iter().any(|c| c == "BODY <s3@news>"), "{cmds:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

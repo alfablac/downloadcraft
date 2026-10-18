@@ -2,8 +2,9 @@
 // fetched sequentially per file over one NNTP connection (plain or TLS),
 // yEnc-decoded, assembled to sanitized NZB file names in dest_dir.
 // ponytail: no PAR2/repair, no archive unpack, no per-segment resume (pause
-// restarts the NZB from scratch), one connection. Add when real providers
-// require them: par2 crate + segment cache dir keyed like engine part dirs.
+// restarts current file; completed files skipped via nzbstate sidecar),
+// one connection. Add when real providers require them: par2 crate +
+// segment cache in .downloadcraft-{task.id} workdir.
 use crate::engine::Controls;
 use crate::model::{DownloadTask, Settings, TaskStatus};
 use std::sync::atomic::Ordering;
@@ -531,29 +532,69 @@ pub async fn download_nzb(
     let total_segs: u64 = nzb.files.iter().map(|f| f.segments.len() as u64).sum();
     task.total = Some(nzb.total_bytes);
     ctrl.total.store(nzb.total_bytes, Ordering::Relaxed);
-    ctrl.parts_are_segments.store(true, Ordering::Relaxed);
-    *ctrl.parts.lock().unwrap() = vec![(0, total_segs)];
+    // Multi-file: one Controls.parts entry per file (decoded bytes done,
+    // NZB on-wire bytes total — done snaps to total on completion/skip,
+    // mirroring global total/downloaded convention). Single file keeps
+    // segment-count convention (parts_are_segments).
+    let multi = nzb.files.len() > 1;
+    ctrl.parts_are_segments.store(!multi, Ordering::Relaxed);
+    *ctrl.parts.lock().unwrap() = if multi {
+        nzb.files.iter().map(|f| (0, f.total_bytes)).collect()
+    } else {
+        vec![(0, total_segs)]
+    };
     task.status = TaskStatus::Downloading;
 
     let mut conn = Nntp::connect(cfg).await?;
     let mut downloaded: u64 = 0;
     let mut segs_done: u64 = 0;
-    for file in &nzb.files {
+    let mut failed: Vec<String> = Vec::new();
+    for (file_idx, file) in nzb.files.iter().enumerate() {
+        let dest = task.dest_dir.join(&file.name);
+        // File-level resume: sidecar written on file completion records
+        // decoded bytes. Dest with exactly that size is skipped whole;
+        // mid-file partials carry no sidecar and restart from scratch.
+        let state_path = task.dest_dir.join(format!("{}.nzbstate", file.name));
+        let skip = std::fs::read_to_string(&state_path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .filter(|v| {
+                v.get("file_idx").and_then(|x| x.as_u64()) == Some(file_idx as u64)
+                    && v.get("seg_idx").and_then(|x| x.as_u64())
+                        == Some(file.segments.len() as u64)
+            })
+            .and_then(|v| v.get("bytes").and_then(|x| x.as_u64()))
+            .filter(|&b| std::fs::metadata(&dest).map(|m| m.len()).ok() == Some(b));
+        if let Some(b) = skip {
+            downloaded += b;
+            ctrl.downloaded.store(downloaded, Ordering::Relaxed);
+            task.downloaded = downloaded;
+            segs_done += file.segments.len() as u64;
+            if multi {
+                if let Some(p) = ctrl.parts.lock().unwrap().get_mut(file_idx) {
+                    *p = (file.total_bytes, file.total_bytes);
+                }
+            } else if let Some(p) = ctrl.parts.lock().unwrap().first_mut() {
+                p.0 = segs_done;
+            }
+            continue;
+        }
         let group = file
             .groups
             .first()
             .ok_or_else(|| format!("NZB file '{}' has no <group>", file.name))?;
-        let dest = task.dest_dir.join(&file.name);
         let mut out = tokio::fs::File::create(&dest)
             .await
             .map_err(|e| e.to_string())?;
         let mut written: u64 = 0;
+        let mut missing: u64 = 0;
         for seg in &file.segments {
             if let Err(e) = crate::engine::wait_not_paused(&ctrl).await {
                 return paused(task, downloaded, e);
             }
             // One reconnect+retry on transport errors; 430/cancel stay fatal.
             let mut attempt = 0;
+            let mut seg_missing = false;
             let body = loop {
                 attempt += 1;
                 let r = async {
@@ -573,20 +614,32 @@ pub async fn download_nzb(
                             let _ = tokio::fs::remove_file(&dest).await;
                             return paused(task, downloaded, e);
                         }
+                        // 430 missing article: tolerate per segment, mark
+                        // file failed below, continue other files.
+                        if e.contains("430") {
+                            seg_missing = true;
+                            break Vec::new();
+                        }
                         return Err(format!("NZB file '{}': {e}", file.name));
                     }
                 }
             };
+            if seg_missing {
+                missing += 1;
+                continue;
+            }
             let part = yenc_decode(&body)
                 .map_err(|e| format!("NZB file '{}' segment {}: {e}", file.name, seg.number))?;
-            if let Some(begin) = part.begin {
-                if begin != written + 1 {
-                    return Err(format!(
-                        "NZB file '{}' segment {}: yEnc offset {begin} != {}",
-                        file.name,
-                        seg.number,
-                        written + 1
-                    ));
+            if missing == 0 {
+                if let Some(begin) = part.begin {
+                    if begin != written + 1 {
+                        return Err(format!(
+                            "NZB file '{}' segment {}: yEnc offset {begin} != {}",
+                            file.name,
+                            seg.number,
+                            written + 1
+                        ));
+                    }
                 }
             }
             out.write_all(&part.data).await.map_err(|e| e.to_string())?;
@@ -594,18 +647,60 @@ pub async fn download_nzb(
             downloaded += part.data.len() as u64;
             segs_done += 1;
             ctrl.downloaded.store(downloaded, Ordering::Relaxed);
-            if let Some(p) = ctrl.parts.lock().unwrap().first_mut() {
+            if multi {
+                if let Some(p) = ctrl.parts.lock().unwrap().get_mut(file_idx) {
+                    p.0 = written.min(p.1);
+                }
+            } else if let Some(p) = ctrl.parts.lock().unwrap().first_mut() {
                 p.0 = segs_done;
             }
             task.downloaded = downloaded;
         }
         out.flush().await.map_err(|e| e.to_string())?;
         drop(out);
+        if missing > 0 {
+            // Incomplete file must not masquerade as output; fetched bytes discarded.
+            let _ = tokio::fs::remove_file(&dest).await;
+            downloaded -= written;
+            ctrl.downloaded.store(downloaded, Ordering::Relaxed);
+            task.downloaded = downloaded;
+            if multi {
+                if let Some(p) = ctrl.parts.lock().unwrap().get_mut(file_idx) {
+                    p.0 = 0;
+                }
+            }
+            failed.push(format!(
+                "{} ({missing} missing segment(s), 430)",
+                file.name
+            ));
+            continue;
+        }
         if written == 0 && !file.segments.is_empty() {
             return Err(format!("NZB file '{}' assembled empty", file.name));
         }
+        if multi {
+            if let Some(p) = ctrl.parts.lock().unwrap().get_mut(file_idx) {
+                *p = (file.total_bytes, file.total_bytes);
+            }
+        }
+        // Sidecar marks file complete for file-level resume (see top of loop).
+        let _ = tokio::fs::write(
+            &state_path,
+            serde_json::json!({"file_idx": file_idx, "seg_idx": file.segments.len(), "bytes": written}).to_string(),
+        )
+        .await;
     }
     let _ = conn.cmd("QUIT").await;
+    if !failed.is_empty() {
+        return Err(format!(
+            "NZB: {} file(s) failed: {}",
+            failed.len(),
+            failed.join("; ")
+        ));
+    }
+    for file in &nzb.files {
+        let _ = tokio::fs::remove_file(task.dest_dir.join(format!("{}.nzbstate", file.name))).await;
+    }
     // NZB totals are on-wire sizes; report decoded bytes actually written.
     task.total = Some(downloaded);
     ctrl.total.store(downloaded, Ordering::Relaxed);

@@ -86,6 +86,8 @@ pub struct Controls {
     pub total: AtomicU64,
     /// Per-part (done, expected). Segmented HTTP/FTP/single-file use bytes;
     /// manifest downloads use segment counts and set `parts_are_segments`.
+    /// Multi-file NZB: one entry per file (bytes, flag false); single-file
+    /// NZB keeps segment-count convention (flag true).
     pub parts: std::sync::Mutex<Vec<(u64, u64)>>,
     pub parts_are_segments: AtomicBool,
 }

@@ -21,6 +21,9 @@ pub struct Runtime {
     /// inbox files are already deleted when a capture lands here, so an
     /// unconfirmed capture does not survive restart (accepted trade-off).
     pub pending_captures: Vec<DownloadTask>,
+    /// Completion power action awaiting GUI confirm (Schedule.power_confirmed).
+    /// Set by run_completion on worker thread; drained by the egui dialog.
+    pub pending_power: Option<downloadcraft_lib::platform::PowerAction>,
 }
 
 impl Runtime {
@@ -44,6 +47,7 @@ impl Runtime {
             clip_last: String::new(),
             tray_visible: false,
             pending_captures: Vec::new(),
+            pending_power: None,
         }
     }
     pub fn save(&self) {
