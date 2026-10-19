@@ -2,6 +2,7 @@
 set -euo pipefail
 VERSION="${1:?version required (no fallback)}"
 DEB_VERSION="${VERSION#v}"
+case "$DEB_VERSION" in *[!0-9.]*) DEB_VERSION="0.0.0" ;; esac # branch builds (CI arg=main): dpkg needs numeric
 ROOT="$(pwd)"
 mkdir -p dist staging/usr/bin staging/usr/share/applications staging/usr/share/icons/hicolor/512x512/apps staging/DEBIAN
 cp target/release/webcraft staging/usr/bin/
