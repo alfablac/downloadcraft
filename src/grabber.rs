@@ -44,6 +44,10 @@ pub struct GrabberProject {
     pub only_paths: Vec<String>,
     #[serde(default)]
     pub exclude_paths: Vec<String>,
+    /// Browser session cookie header ("name=value; ..."). Sent only to start
+    /// host. Never persisted in exported project JSON by GUI (cleared there).
+    #[serde(default)]
+    pub cookies: String,
 }
 fn def_depth() -> usize {
     2
@@ -374,6 +378,146 @@ pub struct Crawler {
     pub progress: Option<std::sync::Arc<std::sync::Mutex<CrawlProgress>>>,
 }
 
+/// True for SharePoint/OneDrive library pages. Static HTML there is JS shell;
+/// file list only exists via REST API (needs session cookies).
+fn is_sharepoint_page(url: &Url) -> bool {
+    let host = url.host_str().unwrap_or("");
+    if !host.ends_with(".sharepoint.com") {
+        return false;
+    }
+    let p = url.path().to_ascii_lowercase();
+    let has_id = url.query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("id"));
+    (p.contains("onedrive.aspx") || p.ends_with("/allitems.aspx") || p.ends_with("/forms/allitems.aspx"))
+        && has_id
+}
+
+/// Server-relative path from SP item: classic ServerRelativeUrl string, or
+/// newer ServerRelativePath {DecodedUrl} object. Empty if neither.
+fn sp_item_path(it: &serde_json::Value) -> &str {
+    if let Some(s) = it.get("ServerRelativeUrl").and_then(|x| x.as_str()) {
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    it.get("ServerRelativePath")
+        .and_then(|x| x.get("DecodedUrl"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+}
+
+/// Percent-encode one URL path-ish value, keeping `/` and given extra chars.
+fn pct_encode(s: &str, keep: &[u8]) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
+            _ if keep.contains(&b) => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// (web_url, server-relative folder) from .../_layouts/15/onedrive.aspx?id=%2F...
+fn sharepoint_root(url: &Url) -> Result<(String, String), String> {
+    let id = url
+        .query_pairs()
+        .find(|(k, _)| k.eq_ignore_ascii_case("id"))
+        .map(|(_, v)| v.into_owned())
+        .filter(|v| !v.is_empty())
+        .ok_or("SharePoint URL missing id= folder parameter")?;
+    let path = url.path();
+    let web_path = path
+        .to_ascii_lowercase()
+        .find("/_layouts/")
+        .map(|i| &path[..i])
+        .unwrap_or("");
+    let web = format!(
+        "{}://{}{}",
+        url.scheme(),
+        url.host_str().unwrap_or_default(),
+        web_path
+    );
+    Ok((web, id))
+}
+
+/// One SP REST collection page: (items, next_url). Handles nometadata
+/// {value:[...]} and verbose {d:{results:[...],__next}} shapes.
+fn sp_page(v: &serde_json::Value) -> (Vec<serde_json::Value>, Option<String>) {
+    if let Some(a) = v.get("value").and_then(|x| x.as_array()) {
+        return (
+            a.clone(),
+            v.get("@odata.nextLink")
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
+        );
+    }
+    if let Some(d) = v.get("d") {
+        if let Some(a) = d.get("results").and_then(|x| x.as_array()) {
+            return (
+                a.clone(),
+                d.get("__next").and_then(|x| x.as_str()).map(str::to_string),
+            );
+        }
+        if d.is_object() {
+            return (vec![d.clone()], None);
+        }
+    }
+    (Vec::new(), None)
+}
+
+/// Percent-encode SP download SourceUrl value (keep `/` readable).
+fn sp_download_url(web: &str, server_relative: &str) -> String {
+    format!(
+        "{web}/_layouts/15/download.aspx?SourceUrl={}",
+        pct_encode(server_relative, &[])
+    )
+}
+
+/// GetFolderByServerRelativeUrl endpoint for folder. OData literal: `'`
+/// doubled, rest percent-encoded so `# ? % \` in names can't break URL.
+fn sp_folder_base(web: &str, folder: &str) -> String {
+    let lit = pct_encode(&folder.replace('\'', "''"), b"'");
+    format!("{web}/_api/web/GetFolderByServerRelativeUrl('{lit}')")
+}
+
+/// GET one SP REST endpoint, following @odata.nextLink/__next paging.
+async fn sp_get_all(
+    client: &reqwest::Client,
+    first_url: String,
+    cookies: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = Vec::new();
+    let mut next = Some(first_url);
+    let mut guard = 0usize;
+    while let Some(u) = next {
+        guard += 1;
+        if guard > 100 {
+            break; // ponytail: 100 pages/collection cap, raise if huge libraries truncated
+        }
+        let mut req = client
+            .get(&u)
+            .header(reqwest::header::USER_AGENT, CRAWL_UA)
+            .header(reqwest::header::ACCEPT, "application/json;odata=nometadata");
+        if !cookies.is_empty() {
+            req = req.header(reqwest::header::COOKIE, cookies);
+        }
+        let resp = req.send().await.map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "SharePoint API HTTP {} for {u} — sign in via browser, use extension Grab site (cookies expire), or paste fresh Cookies",
+                resp.status()
+            ));
+        }
+        let body = resp.bytes().await.map_err(|e| e.to_string())?;
+        let v: serde_json::Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+        let (items, nx) = sp_page(&v);
+        out.extend(items);
+        next = nx;
+    }
+    Ok(out)
+}
+
 /// Live crawl state, updated per page/file so GUI shows results as depth grows (IDM Grabber behavior).
 #[derive(Default, Clone)]
 pub struct CrawlProgress {
@@ -403,20 +547,117 @@ impl Crawler {
             g.current_url = current.to_string();
         }
     }
+    /// SharePoint/OneDrive folder listing via REST. Static crawl sees only
+    /// JS shell + login redirect, so branch before it. Cookies required for
+    /// private tenants; public share links may work without.
+    async fn crawl_sharepoint(
+        &self,
+        client: &reqwest::Client,
+        start: &Url,
+    ) -> Result<(Vec<String>, Vec<FoundFile>), String> {
+        let (web, root) = sharepoint_root(start)?;
+        let page_url = start.to_string();
+        let mut files: Vec<FoundFile> = Vec::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut folders: VecDeque<String> = VecDeque::new();
+        folders.push_back(root);
+        let mut pages = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        // ponytail: 500-folder cap; raise when deep libraries need it.
+        while let Some(folder) = folders.pop_front() {
+            pages += 1;
+            if pages > 500 {
+                break;
+            }
+            let base = sp_folder_base(&web, &folder);
+            for kind in ["Files", "Folders"] {
+                // One bad subfolder must not abort whole crawl / wipe results.
+                let items = match sp_get_all(
+                    client,
+                    format!("{base}/{kind}"),
+                    self.project.cookies.trim(),
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        errors.push(format!("{folder}/{kind}: {e}"));
+                        continue;
+                    }
+                };
+                for it in items {
+                    let p = sp_item_path(&it);
+                    if p.is_empty() {
+                        continue;
+                    }
+                    if kind == "Folders" {
+                        // Skip only SP system folder; `_`-prefixed user folders legit.
+                        if !p.rsplit('/').next().unwrap_or("").eq_ignore_ascii_case("forms") {
+                            folders.push_back(p.to_string());
+                        }
+                        continue;
+                    }
+                    if !seen.insert(p.to_ascii_lowercase()) {
+                        continue;
+                    }
+                    if !self.project.extensions.is_empty() {
+                        let name = p.rsplit('/').next().unwrap_or("");
+                        let ext = name
+                            .rsplit_once('.')
+                            .map(|(_, e)| e.to_ascii_lowercase())
+                            .unwrap_or_default();
+                        if !self
+                            .project
+                            .extensions
+                            .iter()
+                            .any(|e| e.trim_start_matches('.').eq_ignore_ascii_case(&ext))
+                        {
+                            continue;
+                        }
+                    }
+                    files.push(FoundFile {
+                        url: sp_download_url(&web, p),
+                        size: it.get("Length").and_then(|x| {
+                            x.as_u64()
+                                .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+                        }),
+                        mime: String::new(),
+                        page_url: page_url.clone(),
+                        selected: true,
+                    });
+                }
+            }
+            self.publish(std::slice::from_ref(&page_url), folders.len(), 0, &files, &folder);
+        }
+        if files.is_empty() {
+            let detail = if errors.is_empty() {
+                "empty folder or wrong id= path".to_string()
+            } else {
+                errors.join(" · ")
+            };
+            return Err(format!("SharePoint listed 0 files ({detail}). For private folders: open folder signed-in in browser, then extension Grab site with webcraft (sends session cookies)."));
+        }
+        Ok((vec![page_url], files))
+    }
+
     pub async fn crawl(
         &self,
         client: &reqwest::Client,
     ) -> Result<(Vec<String>, Vec<FoundFile>), String> {
         let start = normalize_start_url(&self.project.start_url)?;
+        if is_sharepoint_page(&start) {
+            return self.crawl_sharepoint(client, &start).await;
+        }
         let mut robots = String::new();
         if self.project.respect_robots {
             let robots_url = start.join("/robots.txt").map_err(|e| e.to_string())?;
-            if let Ok(r) = client
+            let mut rb = client
                 .get(robots_url)
-                .header(reqwest::header::USER_AGENT, CRAWL_UA)
-                .send()
-                .await
-            {
+                .header(reqwest::header::USER_AGENT, CRAWL_UA);
+            if !self.project.cookies.trim().is_empty() {
+                rb = rb.header(reqwest::header::COOKIE, self.project.cookies.trim());
+            }
+            if let Ok(r) = rb.send().await {
                 if r.status().is_success() {
                     robots = r.text().await.unwrap_or_default();
                 }
@@ -447,16 +688,18 @@ impl Crawler {
                 ))
                 .await;
             }
-            let resp = match client
+            // Cookies only to start host: scope=Any must not leak session.
+            let mut page_req = client
                 .get(url.clone())
                 .header(reqwest::header::USER_AGENT, CRAWL_UA)
                 .header(
                     reqwest::header::ACCEPT,
                     "text/html,application/xhtml+xml,*/*",
-                )
-                .send()
-                .await
-            {
+                );
+            if !self.project.cookies.trim().is_empty() && url.host_str() == start.host_str() {
+                page_req = page_req.header(reqwest::header::COOKIE, self.project.cookies.trim());
+            }
+            let resp = match page_req.send().await {
                 Ok(r) => r,
                 Err(e) => {
                     if is_start {
@@ -636,8 +879,13 @@ impl Crawler {
                 let mut set = tokio::task::JoinSet::new();
                 for (i, cand) in chunk.iter().cloned().enumerate() {
                     let client = client.clone();
+                    let cookies = if cand.host_str() == start.host_str() {
+                        self.project.cookies.trim().to_string()
+                    } else {
+                        String::new()
+                    };
                     set.spawn(async move {
-                        let info = head_info(&client, &cand).await;
+                        let info = head_info(&client, &cand, &cookies).await;
                         (i, cand, info)
                     });
                 }
@@ -694,10 +942,13 @@ impl Crawler {
     }
 }
 
-async fn head_info(client: &reqwest::Client, url: &Url) -> (Option<u64>, String) {
-    let req = client
+async fn head_info(client: &reqwest::Client, url: &Url, cookies: &str) -> (Option<u64>, String) {
+    let mut req = client
         .head(url.clone())
         .header(reqwest::header::USER_AGENT, CRAWL_UA);
+    if !cookies.is_empty() {
+        req = req.header(reqwest::header::COOKIE, cookies);
+    }
     match tokio::time::timeout(std::time::Duration::from_secs(10), req.send())
         .await
         .map_err(|_| "timeout".to_string())
@@ -1034,6 +1285,34 @@ pub fn rewrite_links(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sharepoint_detection_and_rest_shapes() {
+        let u = Url::parse("https://stievano-my.sharepoint.com/personal/yatogam1_stievano_onmicrosoft_com/_layouts/15/onedrive.aspx?id=%2Fpersonal%2Fyatogam1%5Fstievano%5Fonmicrosoft%5Fcom%2FDocuments%2FAnimes%2FDragon%20Ball%20Super&ga=1").unwrap();
+        assert!(is_sharepoint_page(&u));
+        let (web, folder) = sharepoint_root(&u).unwrap();
+        assert_eq!(web, "https://stievano-my.sharepoint.com/personal/yatogam1_stievano_onmicrosoft_com");
+        assert_eq!(folder, "/personal/yatogam1_stievano_onmicrosoft_com/Documents/Animes/Dragon Ball Super");
+        assert_eq!(
+            sp_download_url(&web, "/personal/x/Documents/Dragon Ball/e 1.mkv"),
+            "https://stievano-my.sharepoint.com/personal/yatogam1_stievano_onmicrosoft_com/_layouts/15/download.aspx?SourceUrl=/personal/x/Documents/Dragon%20Ball/e%201.mkv"
+        );
+        let (items, next) = sp_page(&serde_json::json!({"value":[{"Name":"a.mkv"}],"@odata.nextLink":"https://x/next"}));
+        assert_eq!(items.len(), 1);
+        assert_eq!(next.as_deref(), Some("https://x/next"));
+        let (items, next) = sp_page(&serde_json::json!({"d":{"results":[{"Name":"b"}],"__next":"https://x/n2"}}));
+        assert_eq!(items.len(), 1);
+        assert_eq!(next.as_deref(), Some("https://x/n2"));
+        assert!(!is_sharepoint_page(&Url::parse("https://example.com/_layouts/15/onedrive.aspx?id=/x").unwrap()));
+        // Widened: modern library view also routes to REST listing.
+        assert!(is_sharepoint_page(&Url::parse("https://t.sharepoint.com/sites/x/Docs/Forms/AllItems.aspx?id=%2Fsites%2Fx%2FDocs%2Fa").unwrap()));
+        // OData literal: apostrophe doubled, space/#/% encoded, cannot break URL.
+        let b = sp_folder_base("https://t.sharepoint.com/p", "/p/Documents/A #1/it's 100%");
+        assert_eq!(b, "https://t.sharepoint.com/p/_api/web/GetFolderByServerRelativeUrl('/p/Documents/A%20%231/it''s%20100%25')");
+        // Newer item shape fallback.
+        assert_eq!(sp_item_path(&serde_json::json!({"ServerRelativePath":{"DecodedUrl":"/p/Docs/a.mkv"}})), "/p/Docs/a.mkv");
+        assert_eq!(sp_item_path(&serde_json::json!({"ServerRelativeUrl":"/p/Docs/b.mkv","ServerRelativePath":{"DecodedUrl":"/ignored"}})), "/p/Docs/b.mkv");
+    }
+
     #[test]
     fn document_base_href_resolution() {
         let page = Url::parse("https://ex.com/dir/p.html").unwrap();

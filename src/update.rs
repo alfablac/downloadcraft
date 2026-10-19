@@ -70,9 +70,7 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
 pub fn pick_asset(assets: &[Asset], os: &str, arch: &str) -> Option<(String, String)> {
     fn tier(name: &str, os: &str) -> Option<u8> {
         match os {
-            "windows" if name.ends_with(".exe") => {
-                Some(if name.contains("setup") { 0 } else { 1 })
-            }
+            "windows" if name.ends_with(".exe") => Some(if name.contains("setup") { 0 } else { 1 }),
             "windows" if name.ends_with(".msi") => Some(2),
             "macos" if name.ends_with(".dmg") => Some(0),
             "macos" if name.ends_with(".pkg") => Some(1),
@@ -179,7 +177,10 @@ mod tests {
         let r = fake_release();
         assert_eq!(
             pick_asset(&r.assets, "windows", "x86_64"),
-            Some(("webcraft-setup-x64.exe".into(), "https://x/setup.exe".into()))
+            Some((
+                "webcraft-setup-x64.exe".into(),
+                "https://x/setup.exe".into()
+            ))
         );
         assert_eq!(
             pick_asset(&r.assets, "macos", "x86_64").map(|a| a.0),

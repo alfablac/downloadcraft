@@ -130,7 +130,11 @@ fn run_timeout(
             Some(status) => {
                 let stdout = out_th.and_then(|h| h.join().ok()).unwrap_or_default();
                 let stderr = err_th.and_then(|h| h.join().ok()).unwrap_or_default();
-                return Ok(std::process::Output { status, stdout, stderr });
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
             }
             None if start.elapsed().as_secs() >= secs => {
                 let _ = child.kill();
@@ -267,7 +271,9 @@ struct CookieEntry {
 }
 
 fn clean_field(s: &str) -> String {
-    s.chars().filter(|c| !matches!(c, '\t' | '\r' | '\n')).collect()
+    s.chars()
+        .filter(|c| !matches!(c, '\t' | '\r' | '\n'))
+        .collect()
 }
 
 /// Write task cookies_json as Netscape cookie jar for yt-dlp --cookies.
@@ -295,8 +301,12 @@ impl Drop for CookieJar {
 
 /// Sweep stale jars (killed-process leftovers) older than 24h. Cheap, errors ignored.
 fn sweep_cookie_jars(dir: &std::path::Path) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    let Some(cutoff) = std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(24 * 3600)) else {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let Some(cutoff) =
+        std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(24 * 3600))
+    else {
         return;
     };
     for e in rd.flatten() {
@@ -304,7 +314,9 @@ fn sweep_cookie_jars(dir: &std::path::Path) {
         let Some(name) = name.to_str() else { continue };
         if name.starts_with("cookies-")
             && name.ends_with(".txt")
-            && e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t < cutoff)
+            && e.metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t < cutoff)
         {
             let _ = std::fs::remove_file(e.path());
         }
@@ -322,7 +334,11 @@ pub fn write_cookie_jar(task: &DownloadTask) -> Option<CookieJar> {
     let dir = crate::platform::config_dir().join("cookies");
     std::fs::create_dir_all(&dir).ok()?;
     sweep_cookie_jars(&dir);
-    let path = dir.join(format!("cookies-{}-{}.txt", std::process::id(), crate::model::new_id()));
+    let path = dir.join(format!(
+        "cookies-{}-{}.txt",
+        std::process::id(),
+        crate::model::new_id()
+    ));
     let mut out = String::from("# Netscape HTTP Cookie File\n");
     let mut written = 0usize;
     for c in &entries {
@@ -335,9 +351,16 @@ pub fn write_cookie_jar(task: &DownloadTask) -> Option<CookieJar> {
         }
         let path_s = {
             let p = clean_field(&c.path);
-            if p.is_empty() { "/".to_string() } else { p }
+            if p.is_empty() {
+                "/".to_string()
+            } else {
+                p
+            }
         };
-        let expires = c.expiration_date.map(|e| if e > 0.0 { e as u64 } else { 0 }).unwrap_or(0);
+        let expires = c
+            .expiration_date
+            .map(|e| if e > 0.0 { e as u64 } else { 0 })
+            .unwrap_or(0);
         out.push_str(&format!(
             "{}{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             if c.http_only { "#HttpOnly_" } else { "" },
@@ -361,8 +384,23 @@ pub fn write_cookie_jar(task: &DownloadTask) -> Option<CookieJar> {
     Some(CookieJar(path))
 }
 
+/// Direct manifest URL (.m3u8/.mpd path, query/fragment stripped).
+/// Site extractors claim some manifest hosts (GloboArticle on *.globo.com)
+/// and crash; generic extractor parses manifest itself.
+pub fn is_manifest_url(url: &str) -> bool {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    path.ends_with(".m3u8") || path.ends_with(".mpd")
+}
+
 fn base_args(url: &str, task: &DownloadTask, cookie_jar: Option<&std::path::Path>) -> Vec<String> {
     let mut a: Vec<String> = vec!["--no-playlist".into(), "--no-warnings".into()];
+    if is_manifest_url(url) {
+        a.push("--force-generic-extractor".into());
+    }
     if !task.referrer.is_empty() {
         a.push("--referer".into());
         a.push(task.referrer.clone());
@@ -379,6 +417,7 @@ fn base_args(url: &str, task: &DownloadTask, cookie_jar: Option<&std::path::Path
         // With a jar, Cookie comes from file; user Cookie header would duplicate/override.
         if YT_HEADER_KEYS.iter().any(|x| k.eq_ignore_ascii_case(x))
             || k.eq_ignore_ascii_case("x-page-url")
+            || k.eq_ignore_ascii_case("x-page-title")
             || k.eq_ignore_ascii_case("x-page-stream")
             || k.eq_ignore_ascii_case("x-page-intent")
             || (cookie_jar.is_some() && k.eq_ignore_ascii_case("cookie"))
@@ -418,11 +457,37 @@ pub struct YtDump {
     pub subtitles: std::collections::BTreeMap<String, Vec<YtSubTrack>>,
     #[serde(default)]
     pub automatic_captions: std::collections::BTreeMap<String, Vec<YtSubTrack>>,
+    /// Playlist dumps nest video info in entries; empty for single videos.
+    #[serde(default)]
+    pub entries: Vec<YtDump>,
 }
 
 impl YtDump {
+    /// Playlist dump with no own formats: descend into first entry carrying
+    /// formats (recursively). Parent title wins when entry title empty.
+    /// Entry subtitles/captions/metadata replace parent's (entry is video).
+    pub fn flatten_entries(mut self) -> Self {
+        if !self.formats.is_empty() || self.entries.is_empty() {
+            return self;
+        }
+        let parent_title = std::mem::take(&mut self.title);
+        for entry in std::mem::take(&mut self.entries) {
+            let mut entry = entry.flatten_entries();
+            if !entry.formats.is_empty() {
+                if entry.title.is_empty() {
+                    entry.title = parent_title;
+                }
+                return entry;
+            }
+        }
+        self.title = parent_title;
+        self
+    }
     pub fn uploader(&self) -> &str {
-        self.uploader.as_deref().or(self.channel.as_deref()).unwrap_or("")
+        self.uploader
+            .as_deref()
+            .or(self.channel.as_deref())
+            .unwrap_or("")
     }
     /// Video-bearing formats, tallest then highest bitrate first.
     pub fn video_formats(&self) -> Vec<&YtFormat> {
@@ -502,7 +567,10 @@ impl YtChoice {
         }
     }
     pub fn is_audio_only(&self) -> bool {
-        self.format.as_deref().map(|f| f.starts_with("audio:")).unwrap_or(false)
+        self.format
+            .as_deref()
+            .map(|f| f.starts_with("audio:"))
+            .unwrap_or(false)
             || self.extract.is_some()
     }
     pub fn write_headers(&self, h: &mut std::collections::BTreeMap<String, String>) {
@@ -530,7 +598,11 @@ impl YtChoice {
         if self.sub_embed {
             h.insert("x-yt-sub-embed".into(), "1".into());
         }
-        if self.format.is_some() || self.extract.is_some() || !self.subs.is_empty() || !self.auto_subs.is_empty() {
+        if self.format.is_some()
+            || self.extract.is_some()
+            || !self.subs.is_empty()
+            || !self.auto_subs.is_empty()
+        {
             h.insert("x-ytdlp".into(), "1".into());
         }
     }
@@ -564,7 +636,12 @@ pub fn build_selector(choice: &YtChoice, dump: Option<&YtDump>) -> (String, Vec<
         },
         None if audio_mode => "ba/b".to_string(),
         // Auto video + specific audio track picked.
-        None if choice.audio.as_deref().map(|a| a != "best" && a != "none").unwrap_or(false) => {
+        None if choice
+            .audio
+            .as_deref()
+            .map(|a| a != "best" && a != "none")
+            .unwrap_or(false) =>
+        {
             let a = choice.audio.as_deref().unwrap_or("");
             format!("bv*+{a}/bv*+ba/b")
         }
@@ -609,7 +686,11 @@ pub async fn fetch_formats(url: &str, task: &DownloadTask) -> Result<YtDump, Str
     fetch_formats_jar(url, task, jar.as_deref()).await
 }
 
-async fn fetch_formats_jar(url: &str, task: &DownloadTask, jar: Option<&std::path::Path>) -> Result<YtDump, String> {
+async fn fetch_formats_jar(
+    url: &str,
+    task: &DownloadTask,
+    jar: Option<&std::path::Path>,
+) -> Result<YtDump, String> {
     let path = ytdlp_path().ok_or("yt-dlp not found")?;
     let mut args = vec!["-J".to_string()];
     args.extend(base_args(url, task, jar));
@@ -624,7 +705,7 @@ async fn fetch_formats_jar(url: &str, task: &DownloadTask, jar: Option<&std::pat
     .await
     .map_err(|e| e.to_string())??;
     let dump: YtDump = serde_json::from_slice(&out).map_err(|e| e.to_string())?;
-    Ok(dump)
+    Ok(dump.flatten_entries())
 }
 
 fn parse_progress(
@@ -662,7 +743,9 @@ pub async fn download_with_ytdlp(
     // Also adopt video title as filename when seeded name is extensionless ID.
     // One jar for probe + download (yt-dlp may rewrite jar between calls).
     let jar = write_cookie_jar(&task);
-    let dump = fetch_formats_jar(&task.url, &task, jar.as_deref()).await.ok();
+    let dump = fetch_formats_jar(&task.url, &task, jar.as_deref())
+        .await
+        .ok();
     let mut task = task;
     // Explicit x-yt-* choice (picker) wins over auto pick_best.
     let choice = YtChoice::from_headers(&task.headers);
@@ -690,7 +773,11 @@ pub async fn download_with_ytdlp(
             ex.clone()
         } else if audio_exts.contains(&cur0.as_str()) {
             cur0.clone()
-        } else if let Some(fid) = choice.format.as_deref().and_then(|f| f.strip_prefix("audio:")) {
+        } else if let Some(fid) = choice
+            .format
+            .as_deref()
+            .and_then(|f| f.strip_prefix("audio:"))
+        {
             dump.as_ref()
                 .and_then(|d| d.formats.iter().find(|x| x.format_id == fid))
                 .map(|x| x.ext.clone())
@@ -987,7 +1074,10 @@ fn run_ytdlp_download(
                 if status.success() {
                     return Ok(());
                 }
-                let t = err_tail.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
+                let t = err_tail
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .join("\n");
                 return Err(if t.trim().is_empty() {
                     "yt-dlp exited with error".into()
                 } else {
@@ -1050,19 +1140,78 @@ mod tests {
     #[test]
     fn pick_best_prefers_muxed_then_height() {
         let fs = vec![
-            YtFormat { format_id: "a".into(), ext: "mp4".into(), width: None, height: Some(720), fps: None, vcodec: Some("avc".into()), acodec: Some("none".into()), tbr: None, abr: None, language: None, format_note: None, filesize: None, filesize_approx: None },
-            YtFormat { format_id: "b".into(), ext: "mp4".into(), width: None, height: Some(360), fps: None, vcodec: Some("avc".into()), acodec: Some("aac".into()), tbr: None, abr: None, language: None, format_note: None, filesize: None, filesize_approx: None },
-            YtFormat { format_id: "sb".into(), ext: "mhtml".into(), width: None, height: None, fps: None, vcodec: Some("none".into()), acodec: Some("none".into()), tbr: None, abr: None, language: None, format_note: None, filesize: None, filesize_approx: None },
+            YtFormat {
+                format_id: "a".into(),
+                ext: "mp4".into(),
+                width: None,
+                height: Some(720),
+                fps: None,
+                vcodec: Some("avc".into()),
+                acodec: Some("none".into()),
+                tbr: None,
+                abr: None,
+                language: None,
+                format_note: None,
+                filesize: None,
+                filesize_approx: None,
+            },
+            YtFormat {
+                format_id: "b".into(),
+                ext: "mp4".into(),
+                width: None,
+                height: Some(360),
+                fps: None,
+                vcodec: Some("avc".into()),
+                acodec: Some("aac".into()),
+                tbr: None,
+                abr: None,
+                language: None,
+                format_note: None,
+                filesize: None,
+                filesize_approx: None,
+            },
+            YtFormat {
+                format_id: "sb".into(),
+                ext: "mhtml".into(),
+                width: None,
+                height: None,
+                fps: None,
+                vcodec: Some("none".into()),
+                acodec: Some("none".into()),
+                tbr: None,
+                abr: None,
+                language: None,
+                format_note: None,
+                filesize: None,
+                filesize_approx: None,
+            },
         ];
         assert_eq!(pick_best(&fs).unwrap().format_id, "b");
-        let fs2 = vec![YtFormat { format_id: "a".into(), ext: "mp4".into(), width: None, height: Some(720), fps: None, vcodec: Some("avc".into()), acodec: Some("none".into()), tbr: None, abr: None, language: None, format_note: None, filesize: None, filesize_approx: None }];
+        let fs2 = vec![YtFormat {
+            format_id: "a".into(),
+            ext: "mp4".into(),
+            width: None,
+            height: Some(720),
+            fps: None,
+            vcodec: Some("avc".into()),
+            acodec: Some("none".into()),
+            tbr: None,
+            abr: None,
+            language: None,
+            format_note: None,
+            filesize: None,
+            filesize_approx: None,
+        }];
         assert_eq!(pick_best(&fs2).unwrap().format_id, "a");
     }
 
     #[test]
     fn selector_video_only_without_audio_choice_adds_bestaudio() {
         // No dump: format 18 unknown -> must not emit bare "18" (silent video risk).
-        let c = YtChoice { format: Some("18".into()), ..Default::default() };
+        let c = YtChoice {
+            format: Some("18".into()),
+            ..Default::default()
+        };
         let (s, _, _) = build_selector(&c, None);
         assert_eq!(s, "18+bestaudio/18/bv*+ba/b");
         // With dump proving muxed, id + generic fallback (id can rotate away).
@@ -1073,26 +1222,46 @@ mod tests {
         let (s, _, _) = build_selector(&c, Some(&d));
         assert_eq!(s, "18/bv*+ba/b");
         // Muxed + stale audio choice: audio ignored.
-        let c2 = YtChoice { format: Some("18".into()), audio: Some("251".into()), ..Default::default() };
+        let c2 = YtChoice {
+            format: Some("18".into()),
+            audio: Some("251".into()),
+            ..Default::default()
+        };
         let (s, _, _) = build_selector(&c2, Some(&d));
         assert_eq!(s, "18/bv*+ba/b");
         // Auto + specific audio.
-        let c3 = YtChoice { audio: Some("251".into()), ..Default::default() };
+        let c3 = YtChoice {
+            audio: Some("251".into()),
+            ..Default::default()
+        };
         let (s, _, _) = build_selector(&c3, None);
         assert_eq!(s, "bv*+251/bv*+ba/b");
     }
 
     #[test]
     fn selector_from_choice() {
-        let c = YtChoice { format: Some("137".into()), audio: Some("251".into()), ..Default::default() };
+        let c = YtChoice {
+            format: Some("137".into()),
+            audio: Some("251".into()),
+            ..Default::default()
+        };
         let (s, extra, audio) = build_selector(&c, None);
         assert_eq!(s, "137+251/137+bestaudio/bv*+ba/b");
         assert!(extra.is_empty() && !audio);
-        let c = YtChoice { format: Some("audio:251".into()), extract: Some("mp3".into()), ..Default::default() };
+        let c = YtChoice {
+            format: Some("audio:251".into()),
+            extract: Some("mp3".into()),
+            ..Default::default()
+        };
         let (s, extra, audio) = build_selector(&c, None);
         assert_eq!(s, "251/ba/b");
         assert!(audio && extra.contains(&"-x".to_string()));
-        let c = YtChoice { subs: vec!["en".into()], auto_subs: vec!["vi".into()], sub_embed: true, ..Default::default() };
+        let c = YtChoice {
+            subs: vec!["en".into()],
+            auto_subs: vec!["vi".into()],
+            sub_embed: true,
+            ..Default::default()
+        };
         let (_, extra, _) = build_selector(&c, None);
         assert!(extra.contains(&"--write-subs".to_string()));
         assert!(extra.contains(&"--write-auto-subs".to_string()));
@@ -1102,9 +1271,14 @@ mod tests {
         let mut h = std::collections::BTreeMap::new();
         c.write_headers(&mut h);
         assert_eq!(YtChoice::from_headers(&h), c);
-        let t = crate::model::DownloadTask { headers: h, ..Default::default() };
+        let t = crate::model::DownloadTask {
+            headers: h,
+            ..Default::default()
+        };
         let a = base_args("https://x/watch", &t, None);
-        assert!(!a.iter().any(|x| x.starts_with("x-yt") || x.starts_with("x-ytdlp")));
+        assert!(!a
+            .iter()
+            .any(|x| x.starts_with("x-yt") || x.starts_with("x-ytdlp")));
     }
 
     #[test]
@@ -1115,30 +1289,55 @@ mod tests {
         };
         let jar = write_cookie_jar(&t).expect("jar");
         let s = std::fs::read_to_string(&jar).unwrap();
-        assert!(s.contains("#HttpOnly_.example.com\tTRUE\t/\tTRUE\t1893456000\ta\t1"), "{s}");
+        assert!(
+            s.contains("#HttpOnly_.example.com\tTRUE\t/\tTRUE\t1893456000\ta\t1"),
+            "{s}"
+        );
         assert!(s.contains(".example.com\tFALSE\t/x\tFALSE\t0\tb\t2"), "{s}");
         // sweep: stale jar removed, fresh jar + non-jar files kept
         let dir = std::env::temp_dir().join(format!("wc-sweep-{}", crate::model::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let (old, new, other) = (dir.join("cookies-1-old.txt"), dir.join("cookies-1-new.txt"), dir.join("keep.txt"));
-        for p in [&old, &new, &other] { std::fs::write(p, "x").unwrap(); }
+        let (old, new, other) = (
+            dir.join("cookies-1-old.txt"),
+            dir.join("cookies-1-new.txt"),
+            dir.join("keep.txt"),
+        );
+        for p in [&old, &new, &other] {
+            std::fs::write(p, "x").unwrap();
+        }
         let past = std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 3600);
         for p in [&old, &other] {
-            std::fs::OpenOptions::new().write(true).open(p).unwrap().set_times(std::fs::FileTimes::new().set_modified(past)).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(past))
+                .unwrap();
         }
         sweep_cookie_jars(&dir);
         assert!(!old.exists() && new.exists() && other.exists());
         let _ = std::fs::remove_dir_all(&dir);
         // RAII: drop removes the jar file (no manual remove_file needed).
-        assert!(std::path::Path::new(&*jar).exists(), "jar alive while guard alive");
+        assert!(
+            std::path::Path::new(&*jar).exists(),
+            "jar alive while guard alive"
+        );
         let jar_path = jar.to_path_buf();
         drop(jar);
         assert!(!jar_path.exists(), "guard drop removes jar");
         // Jar present: --cookies used, Cookie header suppressed.
         let mut h = std::collections::BTreeMap::new();
         h.insert("Cookie".to_string(), "a=1".to_string());
-        let t2 = crate::model::DownloadTask { cookies: "a=1".into(), headers: h, ..Default::default() };
-        let a = base_args("https://x/watch", &t2, Some(std::path::Path::new("jar.txt")));
+        let t2 = crate::model::DownloadTask {
+            cookies: "a=1".into(),
+            headers: h,
+            ..Default::default()
+        };
+        let a = base_args(
+            "https://x/watch",
+            &t2,
+            Some(std::path::Path::new("jar.txt")),
+        );
         assert!(a.iter().any(|x| x == "--cookies"));
         assert!(!a.iter().any(|x| x.starts_with("Cookie:")));
     }
@@ -1147,7 +1346,9 @@ mod tests {
     fn cookie_jar_all_filtered_returns_none() {
         // Empty domains filtered -> zero lines -> None (legacy header fallback).
         let t = crate::model::DownloadTask {
-            cookies_json: r#"[{"name":"a","value":"1","domain":"","path":"/"},{"name":"b","value":"2"}]"#.into(),
+            cookies_json:
+                r#"[{"name":"a","value":"1","domain":"","path":"/"},{"name":"b","value":"2"}]"#
+                    .into(),
             ..Default::default()
         };
         assert!(write_cookie_jar(&t).is_none());
@@ -1156,6 +1357,79 @@ mod tests {
             ..Default::default()
         };
         assert!(write_cookie_jar(&t).is_none());
+    }
+
+    #[test]
+    fn manifest_url_detection() {
+        assert!(is_manifest_url("https://cdn.globo.com/v/pl.m3u8"));
+        assert!(is_manifest_url(
+            "https://cdn.globo.com/v/PL.M3U8?token=x#frag"
+        ));
+        assert!(is_manifest_url("https://x/v/pl.mpd?a=1"));
+        assert!(!is_manifest_url("https://x/watch?f=.m3u8"));
+        assert!(!is_manifest_url(
+            "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+        ));
+        assert!(!is_manifest_url("https://x/v/pl.m3u8x"));
+    }
+
+    #[test]
+    fn base_args_manifest_forces_generic_and_strips_page_title() {
+        let mut h = std::collections::BTreeMap::new();
+        h.insert("X-Page-Title".to_string(), "Some Title".to_string());
+        h.insert("Referer".to_string(), "https://x/".to_string());
+        let t = crate::model::DownloadTask {
+            headers: h,
+            ..Default::default()
+        };
+        let a = base_args("https://cdn.globo.com/v/pl.m3u8?sig=1", &t, None);
+        assert!(a.iter().any(|x| x == "--force-generic-extractor"), "{a:?}");
+        assert!(
+            !a.iter()
+                .any(|x| x.to_ascii_lowercase().starts_with("x-page-title")),
+            "{a:?}"
+        );
+        assert!(a.iter().any(|x| x.starts_with("Referer:")), "{a:?}");
+        // Page URL: no generic flag.
+        let a = base_args("https://globo.com/g1/play/123", &t, None);
+        assert!(!a.iter().any(|x| x == "--force-generic-extractor"), "{a:?}");
+        assert!(
+            !a.iter()
+                .any(|x| x.to_ascii_lowercase().starts_with("x-page-title")),
+            "{a:?}"
+        );
+    }
+
+    #[test]
+    fn flatten_entries_descends_to_first_formatted_entry() {
+        // Playlist fixture: formats nested in entries[0] (page-URL probe shape).
+        let j = r#"{"title":"Playlist","formats":[],"entries":[{"title":"","formats":[],"entries":[]},{"title":"Entry Vid","duration":42.0,"uploader":"Globo","formats":[{"format_id":"hls-4370","ext":"mp4","height":1080,"vcodec":"avc1","acodec":"mp4a"}],"subtitles":{"pt":[{"ext":"srt"}]},"automatic_captions":{},"entries":[]}],"subtitles":{},"automatic_captions":{}}"#;
+        let d = serde_json::from_str::<YtDump>(j).unwrap().flatten_entries();
+        assert_eq!(d.formats.len(), 1);
+        assert_eq!(d.formats[0].format_id, "hls-4370");
+        assert_eq!(d.title, "Entry Vid");
+        assert_eq!(d.uploader(), "Globo");
+        assert_eq!(d.sub_langs(), vec!["pt".to_string()]);
+        // Entry title empty: parent title kept.
+        let j2 = r#"{"title":"Parent Title","formats":[],"entries":[{"title":"","formats":[{"format_id":"f1","ext":"mp4"}]}]}"#;
+        let d2 = serde_json::from_str::<YtDump>(j2)
+            .unwrap()
+            .flatten_entries();
+        assert_eq!(d2.title, "Parent Title");
+        assert_eq!(d2.formats[0].format_id, "f1");
+        // Single video untouched; empty playlist stays empty.
+        let j3 = r#"{"title":"Solo","formats":[{"format_id":"f9","ext":"mp4"}],"entries":[]}"#;
+        let d3 = serde_json::from_str::<YtDump>(j3)
+            .unwrap()
+            .flatten_entries();
+        assert_eq!(d3.title, "Solo");
+        assert!(serde_json::from_str::<YtDump>(
+            r#"{"title":"P","formats":[],"entries":[{"title":"E","formats":[]}]}"#
+        )
+        .unwrap()
+        .flatten_entries()
+        .formats
+        .is_empty());
     }
 
     #[test]

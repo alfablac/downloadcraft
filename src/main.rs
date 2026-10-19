@@ -90,11 +90,8 @@ impl Runtime {
         };
         // Single funnel: rename template + category subfolder for every
         // task created via add_url (UI, clipboard, grabber, tray, CLI).
-        let filename = model::apply_folder_template(
-            &self.state.settings.folder_template,
-            &filename,
-            url,
-        );
+        let filename =
+            model::apply_folder_template(&self.state.settings.folder_template, &filename, url);
         let order = self.state.tasks.len() as i64 + 1;
         let task = DownloadTask {
             id: new_id(),
@@ -209,10 +206,17 @@ fn parse_kv_file(path: &std::path::Path) -> Option<DownloadTask> {
                 "pageUrl" => {
                     t.headers.insert("x-page-url".into(), v.trim().to_string());
                 }
+                "pageTitle" => {
+                    let v = v.trim();
+                    if !v.is_empty() {
+                        t.headers.insert("x-page-title".into(), v.to_string());
+                    }
+                }
                 // intent=page: user picked "this video" row — promote even off
                 // host allowlist. intent=stream: never promote (manifest pick).
                 "intent" => {
-                    t.headers.insert("x-page-intent".into(), v.trim().to_string());
+                    t.headers
+                        .insert("x-page-intent".into(), v.trim().to_string());
                 }
                 "queue" => t.queue_id = v.trim().to_string(),
                 "size" => t.total = v.trim().parse::<u64>().ok().filter(|n| *n > 0),
@@ -463,14 +467,58 @@ fn url_decode(s: &str) -> String {
 /// Re-apply rename template + category subfolder to tasks built outside
 /// add_url (browser inbox override). Keeps funnel invariant: stored
 /// dest_dir/filename already reflect current settings at capture time.
+/// Filename stem is auto-generated garbage: URL/intent evidence cannot name
+/// file (hash slug, bare id, or manifest ext). Strong names (spaces / words
+/// with separator) left alone. ponytail: charset heuristic, no language check.
+fn filename_stem_is_weak(filename: &str) -> bool {
+    let (stem, ext) = model::split_stem_ext(filename);
+    let ext = ext.trim_start_matches('.').to_ascii_lowercase();
+    if matches!(ext.as_str(), "m3u8" | "mpd" | "m3u") {
+        return true;
+    }
+    if !stem.is_empty() && stem.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    stem.len() >= 6
+        && !stem.contains(' ')
+        && stem
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Page title names download only when current filename stem weak.
+/// Manifest/stream/page tasks yield playable container name (.mp4);
+/// direct media/files keep original ext with new title stem.
+fn apply_page_title_naming(t: &mut DownloadTask) {
+    let Some(title) = t.headers.get("x-page-title").map(|s| s.trim().to_string()) else {
+        return;
+    };
+    if title.is_empty() || !filename_stem_is_weak(&t.filename) {
+        return;
+    }
+    let clean = model::sanitize_filename(&title);
+    if clean.is_empty() || clean == "download.bin" {
+        return;
+    }
+    let (title_stem, _) = model::split_stem_ext(&clean);
+    if title_stem.is_empty() {
+        return;
+    }
+    let (_, ext) = model::split_stem_ext(&t.filename);
+    let ext_lc = ext.trim_start_matches('.').to_ascii_lowercase();
+    let promoted = t.headers.contains_key("x-ytdlp") || t.headers.contains_key("x-page-stream");
+    let manifest = promoted || matches!(ext_lc.as_str(), "m3u8" | "mpd" | "m3u") || ext.is_empty();
+    t.filename = model::sanitize_filename(&if manifest {
+        format!("{title_stem}.mp4")
+    } else {
+        format!("{title_stem}{ext}")
+    });
+}
+
 fn apply_task_naming(s: &Settings, t: &mut DownloadTask) {
     t.filename = model::apply_folder_template(&s.folder_template, &t.filename, &t.url);
     t.category = category_for(&t.filename).into();
-    t.dest_dir = model::dest_dir_for(
-        &s.download_dir,
-        &t.filename,
-        s.category_subfolders,
-    );
+    t.dest_dir = model::dest_dir_for(&s.download_dir, &t.filename, s.category_subfolders);
 }
 
 pub fn take_inbox_tasks(rt: &Arc<Mutex<Runtime>>) -> Vec<DownloadTask> {
@@ -485,9 +533,10 @@ pub fn take_inbox_tasks(rt: &Arc<Mutex<Runtime>>) -> Vec<DownloadTask> {
                     .strip_prefix("webcraft://grab?url=")
                     .or_else(|| t.url.strip_prefix("downloadcraft://grab?url="))
                 {
+                    // Cookies ride along: SharePoint/auth crawls need browser session.
                     let _ = std::fs::write(
-                        platform::config_dir().join("pending-grab.txt"),
-                        url_decode(enc),
+                        platform::config_dir().join("pending-grab.json"),
+                        serde_json::json!({"url": url_decode(enc), "cookies": t.cookies, "cookiesJson": t.cookies_json}).to_string(),
                     );
                     let _ = std::fs::remove_file(&p);
                     continue;
@@ -524,6 +573,7 @@ pub fn take_inbox_tasks(rt: &Arc<Mutex<Runtime>>) -> Vec<DownloadTask> {
                 if t.filename.is_empty() {
                     t.filename = filename_from_url(&t.url);
                 }
+                apply_page_title_naming(&mut t);
                 if t.queue_id.is_empty() {
                     t.queue_id = "main".into();
                 }
@@ -565,8 +615,14 @@ mod state_tests {
         let page = "https://x.com/u/status/123";
         let stream = "https://video.twimg.com/amplify_video/123/vid/x.mp4";
         assert!(should_promote(stream, page, ""));
-        assert!(!should_promote(stream, page, "stream"), "manifest pick never hijacked");
-        assert!(should_promote(stream, "https://unknown-site.example/watch/1", "page"), "page intent off-allowlist");
+        assert!(
+            !should_promote(stream, page, "stream"),
+            "manifest pick never hijacked"
+        );
+        assert!(
+            should_promote(stream, "https://unknown-site.example/watch/1", "page"),
+            "page intent off-allowlist"
+        );
         assert!(!should_promote(page, page, "page"), "already page target");
         assert!(!should_promote(stream, "https://example.com/file.mp4", ""));
     }

@@ -2,7 +2,7 @@
 
 webcraft is a download manager written in Rust with egui. It reimplements the observable parts of Internet Download Manager: segmented downloads, queues, schedules, DASH and HLS, a site grabber, and browser integration. The code was written from scratch. It has no IDM code, binaries, icons, or activation logic, and it is not affiliated with Tonec.
 
-Current version: 0.10.3.
+Current version: 0.11.0. Changelog lives in GitHub Releases.
 
 Runs on Windows 10/11 x86_64, macOS 13 or later (Intel and Apple Silicon), and Linux x86_64 (Ubuntu 22.04 or later, X11 and Wayland).
 
@@ -35,19 +35,6 @@ Runs on Windows 10/11 x86_64, macOS 13 or later (Intel and Apple Silicon), and L
 - --smoke-test for CI
 
 Multi-track downloads are muxed with ffmpeg when ffmpeg is on PATH or beside the exe. Single-track downloads do not need it. The app never downloads ffmpeg at runtime. yt-dlp is different: if no yt-dlp binary is found for a video page, the app fetches one from the yt-dlp GitHub releases, and updates an existing copy once it is more than 30 days old.
-
-## Recent versions
-
-- 0.10.3: fix Linux package filenames in release (Debian version strip only); v0.10.2 tag built but release blocked by missing-asset gate, superseded
-- 0.10.2: release packaging complete - CI now also ships Chromium extension zip, Windows setup exe and Linux .deb, and fails release if any expected file missing; extension panel ranks playlists first and hides segment/range slices; signed-in page cookies passed to yt-dlp so login-gated pages download instead of 403; MP4 validation walks boxes and rejects unplayable init fragments; capture/Add dialogs raise on open
-- 0.10.1: fix output validation (empty/playlist results now quarantined correctly, checked before renaming over existing files), bare `.ts` stream URLs allowed through probe, strict check after muxing
-- 0.10.0: NZB downloads in parallel over several NNTP connections (1-64 in Options) with in-process PAR2 repair and a file list preview before starting; pick files inside torrents before and during download; video pages probe formats first (quality, audio track, audio-only MP3/M4A, subtitles); extension matches streams to the clicked video only and adds a "This video" quality entry; downloads list gains multi-select, search shortcut, time-left/rate/progress sorting, and delete confirmation with delete-from-disk; colored count badges in the side bar; finished files validated (bad output quarantined as `.bad`) and resumed HLS/DASH cache poisoning fixed. See git history for full list
-- 0.9.0: crash fixes (tray menu pointer, progress bar NaN, poisoned locks, worker panics turned into task errors, duplicate magnets), protocol labels and a type filter in the downloads table, Progress, Add, and Capture as separate windows, per-file torrent parts and swarm figures, and a browser extension that only picks up real downloads and leaves JSON, scripts, and stylesheets alone
-- 0.8.0: per-task speed graph, part status words, and a resume row in the progress dialog; extension starts ranking stream candidates (files before playlists before segments) and preselecting the top one. Scheduler catch up for missed runs, an optional confirmation before power actions, and NNTP tolerance fixes landed after this tag, on the way to 0.9.0
-- 0.7.0: spacing and form layout pass over the dialogs, torrent options in Settings (listen port, seed after complete), and desktop notifications
-- 0.6.0: folder rules and category subfolders, rename templates, update checker, retry and import fixes, and speed limit windows
-- 0.5.0: FTPS and BitTorrent added; state file and filename handling hardened against reserved names and missing fields
-- 0.4.0: renamed from downloadcraft to webcraft; yt-dlp video pages, Metalink, WebDAV, SFTP, and NNTP/NZB added
 
 ## Build
 

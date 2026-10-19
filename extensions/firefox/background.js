@@ -215,6 +215,7 @@ async function sendDownload(url, tab, extra = {}) {
   const referrer = extra.referrer != null ? extra.referrer : (extra.pageUrl || extra.cookieUrl || (tab ? tab.url : ""));
   const msg = { type: "download", url, referrer, referer: referrer, cookies, cookiesJson, filename: extra.filename ? basename(extra.filename) : filenameFromUrl(url) };
   if (extra.pageUrl) msg.pageUrl = extra.pageUrl;
+  if (extra.pageTitle) msg.pageTitle = extra.pageTitle;
   if (extra.intent) msg.intent = extra.intent;
   if (extra.mime) msg.mime = extra.mime;
   // Captured (intercepted) downloads pass host-side capture filter (extension
@@ -239,8 +240,9 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === "downloadcraft-link" && info.linkUrl) safeSend(info.linkUrl, tab).catch(() => {});
   else if (info.menuItemId === "downloadcraft-media" && info.srcUrl && /^(blob|data):/.test(info.srcUrl)) { if (tab && tab.id) browser.tabs.sendMessage(tab.id, { type: "downloadcraft-scan" }).catch(() => {}); }
   else if (info.menuItemId === "downloadcraft-media" && info.srcUrl) safeSend(info.srcUrl, tab).catch(() => {});
-  else if (info.menuItemId === "downloadcraft-page" && tab && tab.id) browser.tabs.sendMessage(tab.id, { type: "downloadcraft-grab-all" });
-  else if (info.menuItemId === "downloadcraft-grab" && tab && tab.url) safeSend("webcraft://grab?url=" + encodeURIComponent(tab.url), tab, { referrer: tab.url }).catch(() => {});
+  // Stale tab (no content script): fall back to grab-site instead of silent dead click.
+  else if (info.menuItemId === "downloadcraft-page" && tab && tab.id) browser.tabs.sendMessage(tab.id, { type: "downloadcraft-grab-all" }).catch(() => { if (tab.url) safeSend("webcraft://grab?url=" + encodeURIComponent(tab.url), tab, { referrer: tab.url, cookieUrl: tab.url }).catch(() => {}); });
+  else if (info.menuItemId === "downloadcraft-grab" && tab && tab.url) safeSend("webcraft://grab?url=" + encodeURIComponent(tab.url), tab, { referrer: tab.url, cookieUrl: tab.url }).catch(() => {});
 });
 // Never intercept page-asset downloads (json/js/css) even with download attr.
 function isAssetDownload(item) {
@@ -292,7 +294,8 @@ browser.runtime.onMessage.addListener((msg, sender) => {
     const list = (typeof rankCandidates === "function" ? rankCandidates : (x) => x)(pool);
     return Promise.resolve({ type: "candidates", candidates: list });
   }
-  if (msg && (msg.type === "downloadcraft-download" || msg.type === "downloadcraft-video-panel")) return safeSend(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer || msg.pageUrl, pageUrl: msg.intent === "page" ? msg.pageUrl : undefined, cookieUrl: msg.pageUrl, intent: msg.intent });
+  if (msg && msg.type === "downloadcraft-grab-site" && sender.tab && sender.tab.url) return safeSend("webcraft://grab?url=" + encodeURIComponent(sender.tab.url), sender.tab, { referrer: sender.tab.url, cookieUrl: sender.tab.url });
+  if (msg && (msg.type === "downloadcraft-download" || msg.type === "downloadcraft-video-panel")) return safeSend(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer || msg.pageUrl, pageTitle: msg.pageTitle, pageUrl: msg.intent === "page" ? msg.pageUrl : undefined, cookieUrl: msg.pageUrl, intent: msg.intent });
 });
 
 // Toolbar click: scan tab for video / page download (was no-op).

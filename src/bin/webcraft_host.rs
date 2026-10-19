@@ -174,14 +174,40 @@ fn handle(msg: &serde_json::Value) -> serde_json::Value {
                 }
             }
             for k in [
-                "filename", "referrer", "cookies", "cookiesJson", "referer", "cookie", "queue", "mime", "type",
-                "pageUrl", "intent", "size",
+                "filename",
+                "referrer",
+                "cookies",
+                "cookiesJson",
+                "referer",
+                "cookie",
+                "queue",
+                "mime",
+                "type",
+                "pageUrl",
+                "pageTitle",
+                "intent",
+                "size",
             ] {
                 if k == "size" {
                     continue;
                 }
                 if let Some(v) = msg.get(k).and_then(|v| v.as_str()) {
-                    if k == "filename" {
+                    if k == "pageTitle" {
+                        let clean: String = v
+                            .chars()
+                            .map(|c| {
+                                if matches!(c, '\r' | '\n' | '\t') {
+                                    ' '
+                                } else {
+                                    c
+                                }
+                            })
+                            .take(300)
+                            .collect();
+                        if !clean.trim().is_empty() {
+                            body.push_str(&format!("pageTitle={clean}\n"));
+                        }
+                    } else if k == "filename" {
                         // Drop traversal: write basename only; drop if basename invalid/empty.
                         if let Some(b) = sanitize_filename(v) {
                             body.push_str(&format!("filename={b}\n"));
@@ -257,8 +283,22 @@ mod tests {
         // Defaults = empty exts + min 0: always allow. Pure via capture_allowed
         // (handle() would read real user capture-filter.json — non-hermetic).
         assert!(capture_allowed(&[], 0, "f.bin", "https://x/f.bin", "", 10));
-        assert!(!capture_allowed(&exts(&["zip"]), 0, "f.bin", "https://x/f.bin", "", 10));
-        assert!(!capture_allowed(&[], 100, "f.zip", "https://x/f.zip", "", 10));
+        assert!(!capture_allowed(
+            &exts(&["zip"]),
+            0,
+            "f.bin",
+            "https://x/f.bin",
+            "",
+            10
+        ));
+        assert!(!capture_allowed(
+            &[],
+            100,
+            "f.zip",
+            "https://x/f.zip",
+            "",
+            10
+        ));
     }
 
     #[test]

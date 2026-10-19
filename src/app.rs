@@ -29,9 +29,8 @@ type TorrentProbeSlot = std::sync::Arc<
 >;
 
 /// Add-dialog NZB probe result: (trimmed URL probed, result). Same stale-drop.
-type NzbProbeSlot = std::sync::Arc<
-    std::sync::Mutex<Option<(String, Result<crate::nntp::Nzb, String>)>>,
->;
+type NzbProbeSlot =
+    std::sync::Arc<std::sync::Mutex<Option<(String, Result<crate::nntp::Nzb, String>)>>>;
 
 /// yt-dlp -J probe result slot: (url probed, result). Same stale-drop pattern.
 type YtProbeSlot =
@@ -96,6 +95,74 @@ impl SegView {
     }
 }
 
+/// Extract URL from pasted text: HTML `href=`/`src=` attribute first
+/// (quoted or bare value), else first bare http(s) token, else trimmed input.
+/// Hand-scan, no regex crate.
+fn extract_pasted_url(text: &str) -> String {
+    let t = text.trim();
+    if t.contains('<') {
+        let lower = t.to_ascii_lowercase();
+        for attr in ["href=", "src="] {
+            let mut from = 0usize;
+            while let Some(off) = lower[from..].find(attr) {
+                let i = from + off + attr.len();
+                let rest = &t[i..];
+                match rest.chars().next() {
+                    Some(q @ ('"' | '\'')) => {
+                        if let Some(end) = rest[1..].find(q) {
+                            let v = &rest[1..1 + end];
+                            if v.starts_with("http://") || v.starts_with("https://") {
+                                return v.to_string();
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        let end = rest
+                            .find(|c: char| {
+                                c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>')
+                            })
+                            .unwrap_or(rest.len());
+                        let v = &rest[..end];
+                        if v.starts_with("http://") || v.starts_with("https://") {
+                            return v.to_string();
+                        }
+                    }
+                    None => {}
+                }
+                from = i;
+            }
+        }
+    }
+    // First bare http(s) token.
+    for tok in t.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>')) {
+        if tok.starts_with("http://") || tok.starts_with("https://") {
+            return tok.to_string();
+        }
+    }
+    t.to_string()
+}
+
+/// Add-dialog yt-dlp probe gate: any http(s) URL except torrent/NZB (own
+/// pickers own those) and direct media files (probe adds nothing; native
+/// path handles them). Includes .m3u8/.mpd/pages/playlists. Extension check
+/// on query/fragment-stripped path.
+fn yt_probe_eligible(url: &str) -> bool {
+    let u = url.trim();
+    let lower = u.to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return false;
+    }
+    if crate::torrent::is_torrent_url(u) || crate::stream::is_nzb_url_str(u) {
+        return false;
+    }
+    let path = lower.split(['?', '#']).next().unwrap_or(&lower);
+    const MEDIA: &[&str] = &[
+        ".mp4", ".mkv", ".webm", ".mov", ".avi", ".mpg", ".mpeg", ".mp3", ".wav", ".flac", ".ogg",
+        ".aac", ".m4a", ".wma",
+    ];
+    !MEDIA.iter().any(|e| path.ends_with(e))
+}
+
 /// WebDAV is plain HTTP(S) download: map webdav:// -> http://, webdavs:// -> https://.
 fn normalize_webdav(url: &str) -> String {
     let t = url.trim();
@@ -145,7 +212,12 @@ fn apply_effective_limits(
 /// Progress-dialog file toggle: after toggling `idx`, rebuild stored selection.
 /// Full selection canonicalizes to empty vec (= all). Empty selection -> None
 /// (rejected: task could never finish; caller ignores toggle).
-fn toggled_selection(cur: &[usize], total_files: usize, idx: usize, on: bool) -> Option<Vec<usize>> {
+fn toggled_selection(
+    cur: &[usize],
+    total_files: usize,
+    idx: usize,
+    on: bool,
+) -> Option<Vec<usize>> {
     let mut set: std::collections::HashSet<usize> = if cur.is_empty() {
         (0..total_files).collect()
     } else {
@@ -220,10 +292,12 @@ fn resume_supported(task: &DownloadTask) -> bool {
         && (std::fs::metadata(task.dest_dir.join(format!("{}.part", task.filename)))
             .map(|m| m.len() > 0)
             .unwrap_or(false)
-            || task.dest_dir
+            || task
+                .dest_dir
                 .join(format!(".downloadcraft-media-{}", task.id))
                 .exists()
-            || task.dest_dir
+            || task
+                .dest_dir
                 .join(format!(".downloadcraft-hls-{}", task.id))
                 .exists())
 }
@@ -330,6 +404,7 @@ pub struct DownloadApp {
     grab_only_paths: String,
     grab_exclude_paths: String,
     grab_files: Vec<FoundFile>,
+    grab_cookies: String,
     grab_project_json: String,
     grab_status: String,
     grab_busy: bool,
@@ -400,8 +475,7 @@ pub struct DownloadApp {
     rate_smooth: std::collections::HashMap<String, f64>,
     /// Per-task (epoch_s, downloaded) history for progress-dialog sparkline.
     /// Derived from `rate_map` each poll; capped 120 samples.
-    task_hist:
-        std::collections::HashMap<String, std::collections::VecDeque<(f64, u64)>>,
+    task_hist: std::collections::HashMap<String, std::collections::VecDeque<(f64, u64)>>,
     /// Spawned download tasks; Remove aborts handle so background work really stops.
     handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
     /// Tray Quit / Tasks Quit set this so close-to-tray intercept lets window close.
@@ -424,6 +498,8 @@ pub struct DownloadApp {
     capture_raise: bool,
     yt_probe_add: YtProbeState,
     yt_probe_cap: YtProbeState,
+    add_vp_sent: Option<egui::Vec2>,
+    cap_vp_sent: Option<egui::Vec2>,
 }
 
 /// Tray toggle label for current window visibility.
@@ -451,10 +527,7 @@ struct TrayNav {
 impl DownloadApp {
     pub fn new(cc: &eframe::CreationContext<'_>, rt: Arc<Mutex<Runtime>>, hidden: bool) -> Self {
         theme::apply(&cc.egui_ctx);
-        let saved_settings: Option<Settings> = rt
-            .lock()
-            .ok()
-            .map(|g| g.state.settings.clone());
+        let saved_settings: Option<Settings> = rt.lock().ok().map(|g| g.state.settings.clone());
         // Seed before first poll(): restored Complete tasks are history, not news.
         let seen_completed: std::collections::HashSet<String> = rt
             .lock()
@@ -601,6 +674,7 @@ impl DownloadApp {
             grab_only_paths: String::new(),
             grab_exclude_paths: String::new(),
             grab_files: Vec::new(),
+            grab_cookies: String::new(),
             grab_project_json: String::new(),
             grab_status: "Enter a start URL, then Explore.".into(),
             grab_busy: false,
@@ -622,7 +696,10 @@ impl DownloadApp {
             category: "All Downloads".into(),
             type_filter: None,
             sort_col: saved_settings.as_ref().map(|s| s.dl_sort_col).unwrap_or(0),
-            sort_asc: saved_settings.as_ref().map(|s| s.dl_sort_asc).unwrap_or(true),
+            sort_asc: saved_settings
+                .as_ref()
+                .map(|s| s.dl_sort_asc)
+                .unwrap_or(true),
             options_tab: 0,
             options_notice: "Changes save automatically.".into(),
             show_add: false,
@@ -648,9 +725,15 @@ impl DownloadApp {
             task_hist: std::collections::HashMap::new(),
             handles: std::collections::HashMap::new(),
             allow_close: false,
-            dl_widths: saved_settings.as_ref().and_then(|s| (!s.dl_col_widths.is_empty()).then(|| s.dl_col_widths.clone())),
-            dl_widths_compact: saved_settings.as_ref().and_then(|s| (!s.dl_col_widths_compact.is_empty()).then(|| s.dl_col_widths_compact.clone())),
-            grab_widths: saved_settings.as_ref().and_then(|s| (!s.grab_col_widths.is_empty()).then(|| s.grab_col_widths.clone())),
+            dl_widths: saved_settings
+                .as_ref()
+                .and_then(|s| (!s.dl_col_widths.is_empty()).then(|| s.dl_col_widths.clone())),
+            dl_widths_compact: saved_settings.as_ref().and_then(|s| {
+                (!s.dl_col_widths_compact.is_empty()).then(|| s.dl_col_widths_compact.clone())
+            }),
+            grab_widths: saved_settings
+                .as_ref()
+                .and_then(|s| (!s.grab_col_widths.is_empty()).then(|| s.grab_col_widths.clone())),
             capture_task: None,
             capture_revealed: false,
             capture_name: String::new(),
@@ -658,6 +741,8 @@ impl DownloadApp {
             capture_raise: false,
             yt_probe_add: YtProbeState::default(),
             yt_probe_cap: YtProbeState::default(),
+            add_vp_sent: None,
+            cap_vp_sent: None,
         }
     }
 
@@ -1100,11 +1185,26 @@ impl DownloadApp {
         }
         let mut g = crate::lock_unpoison(&self.rt);
         let mut changed = false;
-        if g.state.settings.dl_sort_col != cur.0 { g.state.settings.dl_sort_col = cur.0; changed = true; }
-        if g.state.settings.dl_sort_asc != cur.1 { g.state.settings.dl_sort_asc = cur.1; changed = true; }
-        if g.state.settings.dl_col_widths != cur.2 { g.state.settings.dl_col_widths = cur.2.clone(); changed = true; }
-        if g.state.settings.dl_col_widths_compact != cur.3 { g.state.settings.dl_col_widths_compact = cur.3.clone(); changed = true; }
-        if g.state.settings.grab_col_widths != cur.4 { g.state.settings.grab_col_widths = cur.4.clone(); changed = true; }
+        if g.state.settings.dl_sort_col != cur.0 {
+            g.state.settings.dl_sort_col = cur.0;
+            changed = true;
+        }
+        if g.state.settings.dl_sort_asc != cur.1 {
+            g.state.settings.dl_sort_asc = cur.1;
+            changed = true;
+        }
+        if g.state.settings.dl_col_widths != cur.2 {
+            g.state.settings.dl_col_widths = cur.2.clone();
+            changed = true;
+        }
+        if g.state.settings.dl_col_widths_compact != cur.3 {
+            g.state.settings.dl_col_widths_compact = cur.3.clone();
+            changed = true;
+        }
+        if g.state.settings.grab_col_widths != cur.4 {
+            g.state.settings.grab_col_widths = cur.4.clone();
+            changed = true;
+        }
         if changed {
             g.save();
         }
@@ -1220,7 +1320,10 @@ impl DownloadApp {
     fn poll(&mut self, ctx: &egui::Context) {
         if !self.ytdlp_checked {
             self.ytdlp_checked = true;
-            let auto = crate::lock_unpoison(&self.rt).state.settings.ytdlp_auto_update;
+            let auto = crate::lock_unpoison(&self.rt)
+                .state
+                .settings
+                .ytdlp_auto_update;
             let rt_b = self.tokio_rt.clone();
             std::thread::spawn(move || {
                 rt_b.block_on(async move {
@@ -1281,7 +1384,10 @@ impl DownloadApp {
             "add" => {
                 self.show_window(ctx);
                 self.tab = Tab::Downloads;
-                { self.show_add = true; self.add_just_opened = true; }
+                {
+                    self.show_add = true;
+                    self.add_just_opened = true;
+                }
             }
             "quit" => {
                 self.allow_close = true;
@@ -1298,7 +1404,10 @@ impl DownloadApp {
                 "add" => {
                     self.show_window(ctx);
                     self.tab = Tab::Downloads;
-                    { self.show_add = true; self.add_just_opened = true; }
+                    {
+                        self.show_add = true;
+                        self.add_just_opened = true;
+                    }
                 }
                 _ => self.show_window(ctx),
             }
@@ -1316,24 +1425,53 @@ impl DownloadApp {
             }
         }
         // Extension "Grab site": prefill Grabber and auto-explore.
+        // JSON carries browser cookies (auth crawls); txt = legacy URL-only.
         {
-            let grabf = crate::platform::config_dir().join("pending-grab.txt");
-            if let Ok(u) = std::fs::read_to_string(&grabf) {
-                let _ = std::fs::remove_file(&grabf);
-                let u = u.trim().to_string();
-                if !u.is_empty() {
-                    self.grab_url = u;
-                    self.tab = Tab::Grabber;
-                    self.grab_auto_explore = true;
+            let pj = crate::platform::config_dir().join("pending-grab.json");
+            let pt = crate::platform::config_dir().join("pending-grab.txt");
+            let mut pending: Option<(String, String)> = None;
+            // Delete only when accepted below; busy/corrupt = retry next poll.
+            if !self.grab_busy {
+                if let Ok(s) = std::fs::read_to_string(&pj) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                        pending = v.get("url").and_then(|x| x.as_str()).map(|u| {
+                            (
+                                u.to_string(),
+                                v.get("cookies")
+                                    .and_then(|c| c.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                            )
+                        });
+                        if pending.is_some() {
+                            let _ = std::fs::remove_file(&pj);
+                        }
+                    }
                 }
+                if pending.is_none() {
+                    if let Ok(s) = std::fs::read_to_string(&pt) {
+                        let u = s.trim().to_string();
+                        if !u.is_empty() {
+                            let _ = std::fs::remove_file(&pt);
+                            pending = Some((u, String::new()));
+                        }
+                    }
+                }
+            }
+            if let Some((u, cookies)) = pending {
+                self.grab_url = u;
+                self.grab_cookies = cookies;
+                self.tab = Tab::Grabber;
+                self.grab_auto_explore = true;
+                self.show_window(ctx);
             }
         }
         crate::drain_inbox(&self.rt);
         // Browser capture arrived: reveal window so user sees confirm dialog.
         // Downloaded already-running pages fire no task.start guard — captures
         // sit in rt.pending_captures until confirmed, so no auto-start here.
-        let has_capture =
-            self.capture_task.is_some() || !crate::lock_unpoison(&self.rt).pending_captures.is_empty();
+        let has_capture = self.capture_task.is_some()
+            || !crate::lock_unpoison(&self.rt).pending_captures.is_empty();
         if has_capture && !self.capture_revealed {
             self.show_window(ctx);
         }
@@ -1351,7 +1489,8 @@ impl DownloadApp {
                     } }
                     let done = { let o = slot.lock().unwrap(); if o.done { Some((o.apply_files, o.files.clone(), o.message.clone())) } else { None } };
                     if let Some((apply, files, message)) = done {
-                        if apply { self.grab_files = files; }
+                        // Error outcome carries empty files: keep live partial results.
+                        if apply && (!files.is_empty() || self.grab_files.is_empty()) { self.grab_files = files; }
                         self.grab_status = message;
                         self.grab_busy = false;
                     }
@@ -1560,7 +1699,10 @@ impl DownloadApp {
         {
             let (day, secs) = today_parts();
             self.minutes_today = (day, secs);
-            let master = crate::lock_unpoison(&self.rt).state.settings.scheduler_enabled;
+            let master = crate::lock_unpoison(&self.rt)
+                .state
+                .settings
+                .scheduler_enabled;
             let mut to_start: Vec<String> = Vec::new();
             let mut to_stop: Vec<String> = Vec::new();
             let mut latched_stop = false;
@@ -1574,7 +1716,9 @@ impl DownloadApp {
                     // should_start covers on-time+grace; missed_run fires late
                     // catch-up only when Schedule.run_missed set (once/day via
                     // last_started_day latch below).
-                    if should_start(&s, day, secs) || missed_run((day, secs), &s, s.last_started_day) {
+                    if should_start(&s, day, secs)
+                        || missed_run((day, secs), &s, s.last_started_day)
+                    {
                         // mark started
                         if let Some(sch) = g.state.schedules.iter_mut().find(|x| x.id == s.id) {
                             sch.last_started_day = day;
@@ -1748,7 +1892,11 @@ impl DownloadApp {
             50
         } else if busy {
             500
-        } else if crate::lock_unpoison(&self.rt).state.settings.clipboard_monitor {
+        } else if crate::lock_unpoison(&self.rt)
+            .state
+            .settings
+            .clipboard_monitor
+        {
             1_000
         } else {
             5_000
@@ -1803,9 +1951,10 @@ pub fn any_power_confirm_required(
     queue_id: &str,
     a: CompletionAction,
 ) -> bool {
-    state.schedules.iter().any(|s| {
-        s.enabled && s.queue_id == queue_id && s.on_complete == a && s.power_confirmed
-    })
+    state
+        .schedules
+        .iter()
+        .any(|s| s.enabled && s.queue_id == queue_id && s.on_complete == a && s.power_confirmed)
 }
 
 /// Execute power action, or defer to GUI confirm dialog when
@@ -1897,6 +2046,7 @@ impl DownloadApp {
             dont_explore_parent_dirs: self.grab_parent_dirs,
             only_paths: split(&self.grab_only_paths),
             exclude_paths: split(&self.grab_exclude_paths),
+            cookies: self.grab_cookies.clone(),
             ..Default::default()
         }
     }
@@ -1965,7 +2115,10 @@ impl eframe::App for DownloadApp {
         // Ctrl+F focuses main-window search (switches to Downloads so the
         // filter target is visible). Text fields keep native Ctrl+F.
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F))
-            && !ctx.memory(|m| m.focused().is_some_and(|id| id != egui::Id::new("main-search")))
+            && !ctx.memory(|m| {
+                m.focused()
+                    .is_some_and(|id| id != egui::Id::new("main-search"))
+            })
         {
             self.tab = Tab::Downloads;
             self.search_focus = true;
@@ -2044,7 +2197,10 @@ impl eframe::App for DownloadApp {
                     egui::menu::bar(ui, |ui| {
                         ui.menu_button("Tasks", |ui| {
                             if ui.button("Add new download…").clicked() {
-                                { self.show_add = true; self.add_just_opened = true; }
+                                {
+                                    self.show_add = true;
+                                    self.add_just_opened = true;
+                                }
                                 ui.close_menu();
                             }
                             if ui.button("Add batch from clipboard").clicked() {
@@ -2206,61 +2362,58 @@ impl eframe::App for DownloadApp {
                         // edge — siblings allocated there get zero width /
                         // clipped (search vanished). Inside, available_width
                         // = true remainder; RTL tail anchors to panel right.
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                let avail_w = ui.available_width();
-                                let busy = !self.search.is_empty();
-                                // RTL: [SP_SM][Clear?][TextEdit][count? SP_XS]
-                                let reserve = if busy {
-                                    theme::SP_SM
-                                        + 52.0
-                                        + theme::SP_SM
-                                        + 56.0
-                                        + theme::SP_XS
-                                        + theme::SP_SM
-                                } else {
-                                    theme::SP_SM
-                                };
-                                let w = (avail_w - reserve).clamp(96.0, 320.0);
-                                if avail_w >= 96.0 {
-                                    ui.add_space(theme::SP_SM);
-                                    if busy && theme::ghost_btn(ui, "Clear").clicked() {
-                                        self.search.clear();
-                                    }
-                                    let resp = ui.add_sized(
-                                        [w, theme::BTN_H],
-                                        egui::TextEdit::singleline(&mut self.search)
-                                            .id(egui::Id::new("main-search"))
-                                            .hint_text("Search downloads…")
-                                            .desired_width(w),
-                                    );
-                                    if self.search_focus {
-                                        resp.request_focus();
-                                        self.search_focus = false;
-                                    }
-                                    if resp.has_focus()
-                                        && ui.input(|i| i.key_pressed(egui::Key::Escape))
-                                    {
-                                        self.search.clear();
-                                        resp.surrender_focus();
-                                    }
-                                    if resp.changed() {
-                                        self.tab = Tab::Downloads;
-                                    }
-                                    resp.on_hover_text("Search downloads  (Ctrl+F)");
-                                    if busy {
-                                        let (shown, total) = self.search_counts;
-                                        ui.label(
-                                            egui::RichText::new(format!("{shown} of {total}"))
-                                                .color(theme::TEXT_MUTED)
-                                                .size(11.0),
-                                        );
-                                        ui.add_space(theme::SP_XS);
-                                    }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let avail_w = ui.available_width();
+                            let busy = !self.search.is_empty();
+                            // RTL: [SP_SM][Clear?][TextEdit][count? SP_XS]
+                            let reserve = if busy {
+                                theme::SP_SM
+                                    + 52.0
+                                    + theme::SP_SM
+                                    + 56.0
+                                    + theme::SP_XS
+                                    + theme::SP_SM
+                            } else {
+                                theme::SP_SM
+                            };
+                            let w = (avail_w - reserve).clamp(96.0, 320.0);
+                            if avail_w >= 96.0 {
+                                ui.add_space(theme::SP_SM);
+                                if busy && theme::ghost_btn(ui, "Clear").clicked() {
+                                    self.search.clear();
                                 }
-                            },
-                        );
+                                let resp = ui.add_sized(
+                                    [w, theme::BTN_H],
+                                    egui::TextEdit::singleline(&mut self.search)
+                                        .id(egui::Id::new("main-search"))
+                                        .hint_text("Search downloads…")
+                                        .desired_width(w),
+                                );
+                                if self.search_focus {
+                                    resp.request_focus();
+                                    self.search_focus = false;
+                                }
+                                if resp.has_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Escape))
+                                {
+                                    self.search.clear();
+                                    resp.surrender_focus();
+                                }
+                                if resp.changed() {
+                                    self.tab = Tab::Downloads;
+                                }
+                                resp.on_hover_text("Search downloads  (Ctrl+F)");
+                                if busy {
+                                    let (shown, total) = self.search_counts;
+                                    ui.label(
+                                        egui::RichText::new(format!("{shown} of {total}"))
+                                            .color(theme::TEXT_MUTED)
+                                            .size(11.0),
+                                    );
+                                    ui.add_space(theme::SP_XS);
+                                }
+                            }
+                        });
                     });
                 });
             });
@@ -2304,7 +2457,8 @@ impl eframe::App for DownloadApp {
                     (Tab::Grabber, "Site Grabber", Icon::Globe),
                     (Tab::Options, "Options", Icon::Settings),
                 ] {
-                    if nav_row_c(ui, ic, label, self.tab == tab, None, rail_compact, None).clicked() {
+                    if nav_row_c(ui, ic, label, self.tab == tab, None, rail_compact, None).clicked()
+                    {
                         self.tab = tab;
                     }
                 }
@@ -2372,8 +2526,19 @@ impl eframe::App for DownloadApp {
                 };
                 let badged = nav_settings.nav_count_badges;
                 for ((c, ic), n) in cats.iter().zip(counts.iter()) {
-                    let badge = badged.then(|| theme::category_color_or(c, &nav_settings.category_colors));
-                    if nav_row_c(ui, *ic, c, self.category == *c, Some(*n), rail_compact, badge).clicked() {
+                    let badge =
+                        badged.then(|| theme::category_color_or(c, &nav_settings.category_colors));
+                    if nav_row_c(
+                        ui,
+                        *ic,
+                        c,
+                        self.category == *c,
+                        Some(*n),
+                        rail_compact,
+                        badge,
+                    )
+                    .clicked()
+                    {
                         self.category = c.to_string();
                         self.tab = Tab::Downloads;
                     }
@@ -2409,13 +2574,34 @@ impl eframe::App for DownloadApp {
                     }
                     tc
                 };
-                if nav_row_c(ui, Icon::Download, "All types", self.type_filter.is_none(), None, rail_compact, None).clicked() {
+                if nav_row_c(
+                    ui,
+                    Icon::Download,
+                    "All types",
+                    self.type_filter.is_none(),
+                    None,
+                    rail_compact,
+                    None,
+                )
+                .clicked()
+                {
                     self.type_filter = None;
                     self.tab = Tab::Downloads;
                 }
                 for sel in TypeSel::ALL {
-                    let badge = badged.then(|| theme::type_color_or(sel.key(), &nav_settings.type_colors));
-                    if nav_row_c(ui, sel.icon(), sel.label(), self.type_filter == Some(sel), Some(type_counts[sel.index()]), rail_compact, badge).clicked() {
+                    let badge =
+                        badged.then(|| theme::type_color_or(sel.key(), &nav_settings.type_colors));
+                    if nav_row_c(
+                        ui,
+                        sel.icon(),
+                        sel.label(),
+                        self.type_filter == Some(sel),
+                        Some(type_counts[sel.index()]),
+                        rail_compact,
+                        badge,
+                    )
+                    .clicked()
+                    {
                         self.type_filter = Some(sel);
                         self.tab = Tab::Downloads;
                     }
@@ -2430,8 +2616,8 @@ impl eframe::App for DownloadApp {
                     );
                     ui.label(
                         egui::RichText::new("DRM content refused")
-                        .color(theme::TEXT_FAINT)
-                        .small(),
+                            .color(theme::TEXT_FAINT)
+                            .small(),
                     );
                 }
             });
@@ -2618,6 +2804,12 @@ impl eframe::App for DownloadApp {
                         if theme::primary_btn(ui, "Open file").clicked() {
                             if let Some(p) = &path {
                                 let _ = crate::platform::open_path(p);
+                            }
+                            self.completed_notice = None;
+                        }
+                        if theme::ghost_btn(ui, "Open folder").clicked() {
+                            if let Some(p) = &path {
+                                let _ = crate::platform::reveal_path(p);
                             }
                             self.completed_notice = None;
                         }
@@ -2861,13 +3053,9 @@ fn task_disk_paths(task: &crate::model::DownloadTask) -> Vec<std::path::PathBuf>
             if let Ok(rd) = std::fs::read_dir(d) {
                 for e in rd.flatten() {
                     let name = e.file_name().to_string_lossy().into_owned();
-                    let hit = name
-                        .strip_prefix(&stem)
-                        .is_some_and(|rest| {
-                            rest.starts_with(".f")
-                                || rest.ends_with(".part")
-                                || rest.ends_with(".ytdl")
-                        });
+                    let hit = name.strip_prefix(&stem).is_some_and(|rest| {
+                        rest.starts_with(".f") || rest.ends_with(".part") || rest.ends_with(".ytdl")
+                    });
                     if hit {
                         v.push(e.path());
                     }
@@ -3032,8 +3220,7 @@ fn import_urls_file(app: &mut DownloadApp) {
             added += 1;
         }
     }
-    crate::lock_unpoison(&app.rt)
-        .log(format!("Imported {added} URLs from {}", path.display()));
+    crate::lock_unpoison(&app.rt).log(format!("Imported {added} URLs from {}", path.display()));
 }
 
 fn add_batch_clipboard(app: &mut DownloadApp) {
@@ -3108,7 +3295,11 @@ fn nav_row_c(
         theme::TEXT_MUTED
     };
     let icon_rect = egui::Rect::from_min_size(
-        if compact { egui::pos2(rect.center().x - 8.0, rect.min.y + 2.0) } else { rect.left_top() + egui::vec2(8.0, 2.0) },
+        if compact {
+            egui::pos2(rect.center().x - 8.0, rect.min.y + 2.0)
+        } else {
+            rect.left_top() + egui::vec2(8.0, 2.0)
+        },
         egui::vec2(16.0, 16.0),
     );
     icon(painter, &ic, icon_rect, fg);
@@ -3357,7 +3548,12 @@ fn col_bounds(cols: &[f32]) -> Vec<f32> {
 /// to i, subtracted from i+1, clamped per mode). Double-click resets pair
 /// to default widths. `compact` selects the column-min table — callers MUST
 /// pass the table's actual mode (hardcoded full-mode mins corrupt compact).
-fn col_resize_handles(ui: &mut egui::Ui, header: egui::Rect, cols: &mut [f32], compact: bool) -> bool {
+fn col_resize_handles(
+    ui: &mut egui::Ui,
+    header: egui::Rect,
+    cols: &mut [f32],
+    compact: bool,
+) -> bool {
     let mut changed = false;
     for (i, bx) in col_bounds(cols).into_iter().enumerate() {
         let x = header.min.x + bx;
@@ -3571,7 +3767,14 @@ fn section(ui: &mut egui::Ui, title: &str) {
 
 /// Start silent yt-dlp -J probe (thread + slot, torrent-picker pattern).
 /// Probe task carries referrer/cookies so gated pages (X/Reddit) resolve.
-fn start_yt_probe(st: &mut YtProbeState, rt: &tokio::runtime::Runtime, url: &str, referrer: &str, cookies: &str, cookies_json: &str) {
+fn start_yt_probe(
+    st: &mut YtProbeState,
+    rt: &tokio::runtime::Runtime,
+    url: &str,
+    referrer: &str,
+    cookies: &str,
+    cookies_json: &str,
+) {
     let slot: YtProbeSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
     st.slot = Some(slot.clone());
     st.url = url.to_string();
@@ -3643,6 +3846,44 @@ fn yt_probe_poll(st: &mut YtProbeState, url: &str) -> bool {
     false
 }
 
+/// Viewport height allowance for probe section: 55 base (header/loading row);
+/// dump adds 90 (title/meta/quality) + 120 (audio/convert) + subtitle list
+/// rows at 28px capped 110 (21 label above). Mirrors ui_yt_probe_section.
+fn yt_probe_h(st: &YtProbeState) -> f32 {
+    let mut h = 55.0f32;
+    if let Some(dump) = &st.dump {
+        h += 90.0 + 120.0;
+        let rows = dump.sub_langs().len() + dump.auto_langs().len();
+        if rows > 0 {
+            h += 21.0 + (rows as f32 * 28.0).min(110.0);
+        }
+    }
+    h
+}
+
+/// Grow/shrink native dialog viewport to fit probe section. `sent` dedupes
+/// commands; None = viewport just opened, next fit always sends.
+fn fit_vp(
+    ctx: &egui::Context,
+    vp: egui::ViewportId,
+    base: egui::Vec2,
+    st: &YtProbeState,
+    sent: &mut Option<egui::Vec2>,
+) {
+    let max_h = ctx
+        .input(|i| i.viewport().monitor_size.map(|m| m.y).filter(|y| *y > 0.0))
+        .unwrap_or(900.0)
+        * 0.85;
+    let want = egui::vec2(
+        base.x,
+        (base.y + yt_probe_h(st) - 55.0).clamp(base.y, max_h.max(base.y)),
+    );
+    if *sent != Some(want) {
+        ctx.send_viewport_cmd_to(vp, egui::ViewportCommand::InnerSize(want));
+        *sent = Some(want);
+    }
+}
+
 /// Choice -> persisted pseudo-headers on task (see ytdlp::YtChoice).
 fn yt_choice_from_state(st: &YtProbeState) -> ytdlp::YtChoice {
     let mut subs: Vec<String> = st.subs.iter().cloned().collect();
@@ -3650,9 +3891,21 @@ fn yt_choice_from_state(st: &YtProbeState) -> ytdlp::YtChoice {
     let mut auto: Vec<String> = st.auto_subs.iter().cloned().collect();
     auto.sort();
     ytdlp::YtChoice {
-        format: if st.format.is_empty() { None } else { Some(st.format.clone()) },
-        audio: if st.audio.is_empty() { None } else { Some(st.audio.clone()) },
-        extract: if st.extract.is_empty() { None } else { Some(st.extract.clone()) },
+        format: if st.format.is_empty() {
+            None
+        } else {
+            Some(st.format.clone())
+        },
+        audio: if st.audio.is_empty() {
+            None
+        } else {
+            Some(st.audio.clone())
+        },
+        extract: if st.extract.is_empty() {
+            None
+        } else {
+            Some(st.extract.clone())
+        },
         subs,
         auto_subs: auto,
         sub_embed: st.sub_embed,
@@ -3681,11 +3934,25 @@ fn ui_yt_probe_section(
         return;
     }
     if !st.error.is_empty() {
-        ui.label(
-            egui::RichText::new(format!("yt-dlp probe failed: {}", st.error))
-                .color(theme::ERR)
-                .small(),
-        );
+        // Extractor bugs (GloboArticle NoneType crash) surface as raw
+        // ERROR:/traceback text; friendly line first, raw kept below.
+        let e = st.error.trim();
+        let extractor_err =
+            e.contains("NoneType") || e.contains("has no attribute") || e.starts_with("ERROR:");
+        if extractor_err {
+            ui.label(
+                egui::RichText::new("yt-dlp could not read this page/stream (extractor error). Download below still works.")
+                    .color(theme::ERR)
+                    .small(),
+            );
+            ui.label(egui::RichText::new(e).color(theme::TEXT_FAINT).small());
+        } else {
+            ui.label(
+                egui::RichText::new(format!("yt-dlp probe failed: {}", st.error))
+                    .color(theme::ERR)
+                    .small(),
+            );
+        }
         if ghost_btn_w(ui, "Retry probe").clicked() {
             start_yt_probe(st, rt, url, referrer, cookies, cookies_json);
         }
@@ -3708,7 +3975,11 @@ fn ui_yt_probe_section(
         meta.push(format!("{}:{:02}", (d / 60.0) as u32, (d % 60.0) as u32));
     }
     if !meta.is_empty() {
-        ui.label(egui::RichText::new(meta.join(" · ")).color(theme::TEXT_MUTED).small());
+        ui.label(
+            egui::RichText::new(meta.join(" · "))
+                .color(theme::TEXT_MUTED)
+                .small(),
+        );
     }
     let videos = dump.video_formats();
     let audios = dump.audio_formats();
@@ -3728,11 +3999,17 @@ fn ui_yt_probe_section(
                     .unwrap_or_else(|| st.format.clone())
             })
             .show_ui(ui, |ui| {
-                if ui.selectable_label(st.format.is_empty(), "Auto (best)").clicked() {
+                if ui
+                    .selectable_label(st.format.is_empty(), "Auto (best)")
+                    .clicked()
+                {
                     st.format.clear();
                 }
                 for f in &videos {
-                    if ui.selectable_label(st.format == f.format_id, f.label()).clicked() {
+                    if ui
+                        .selectable_label(st.format == f.format_id, f.label())
+                        .clicked()
+                    {
                         st.format = f.format_id.clone();
                         st.extract.clear();
                         if f.is_video_only() {
@@ -3748,7 +4025,10 @@ fn ui_yt_probe_section(
                     ui.separator();
                     for f in &audios {
                         let v = format!("audio:{}", f.format_id);
-                        if ui.selectable_label(st.format == v, format!("Audio only · {}", f.label())).clicked() {
+                        if ui
+                            .selectable_label(st.format == v, format!("Audio only · {}", f.label()))
+                            .clicked()
+                        {
                             st.format = v;
                         }
                     }
@@ -3771,15 +4051,27 @@ fn ui_yt_probe_section(
                             .unwrap_or_else(|| other.to_string()),
                     })
                     .show_ui(ui, |ui| {
-                        if ui.selectable_label(st.audio.is_empty() || st.audio == "best", "Best audio").clicked() {
+                        if ui
+                            .selectable_label(
+                                st.audio.is_empty() || st.audio == "best",
+                                "Best audio",
+                            )
+                            .clicked()
+                        {
                             st.audio = "best".into();
                         }
                         for f in &audios {
-                            if ui.selectable_label(st.audio == f.format_id, f.label()).clicked() {
+                            if ui
+                                .selectable_label(st.audio == f.format_id, f.label())
+                                .clicked()
+                            {
                                 st.audio = f.format_id.clone();
                             }
                         }
-                        if ui.selectable_label(st.audio == "none", "None (silent)").clicked() {
+                        if ui
+                            .selectable_label(st.audio == "none", "None (silent)")
+                            .clicked()
+                        {
                             st.audio = "none".into();
                         }
                     });
@@ -3794,16 +4086,25 @@ fn ui_yt_probe_section(
                     _ => "Original",
                 })
                 .show_ui(ui, |ui| {
-                    if ui.selectable_label(st.extract.is_empty(), "Original").clicked() {
+                    if ui
+                        .selectable_label(st.extract.is_empty(), "Original")
+                        .clicked()
+                    {
                         st.extract.clear();
                     }
-                    if ui.selectable_label(st.extract == "mp3", "MP3 (extract)").clicked() {
+                    if ui
+                        .selectable_label(st.extract == "mp3", "MP3 (extract)")
+                        .clicked()
+                    {
                         st.extract = "mp3".into();
                         if st.format.is_empty() {
                             st.format = "audio:ba".into();
                         }
                     }
-                    if ui.selectable_label(st.extract == "m4a", "M4A (extract)").clicked() {
+                    if ui
+                        .selectable_label(st.extract == "m4a", "M4A (extract)")
+                        .clicked()
+                    {
                         st.extract = "m4a".into();
                         if st.format.is_empty() {
                             st.format = "audio:ba".into();
@@ -3817,7 +4118,11 @@ fn ui_yt_probe_section(
     let auto = dump.auto_langs();
     if !man.is_empty() || !auto.is_empty() {
         ui.add_space(4.0);
-        ui.label(egui::RichText::new("Subtitles (.srt sidecar)").color(theme::TEXT_MUTED).small());
+        ui.label(
+            egui::RichText::new("Subtitles (.srt sidecar)")
+                .color(theme::TEXT_MUTED)
+                .small(),
+        );
         egui::ScrollArea::vertical()
             .id_salt(format!("{id}-yt-subs"))
             .max_height(110.0)
@@ -3844,7 +4149,10 @@ fn ui_yt_probe_section(
                 }
             });
         if !is_audio_sel {
-            ui.checkbox(&mut st.sub_embed, "Embed subtitles in video (instead of .srt sidecar)");
+            ui.checkbox(
+                &mut st.sub_embed,
+                "Embed subtitles in video (instead of .srt sidecar)",
+            );
         }
     }
 }
@@ -3922,7 +4230,11 @@ impl DownloadApp {
         // Header + actions (IDM toolbar: Add URL, Resume, Stop, Stop All, Delete, Options…)
         ui.horizontal_wrapped(|ui| {
             ui.heading("Downloads");
-            theme::badge(ui, &self.category.clone(), theme::category_color(&self.category));
+            theme::badge(
+                ui,
+                &self.category.clone(),
+                theme::category_color(&self.category),
+            );
         });
         ui.add_space(4.0);
         let selected_task = self.selected.as_ref().and_then(|id| {
@@ -3946,7 +4258,10 @@ impl DownloadApp {
         ui.horizontal_wrapped(|ui| {
             action_group(ui, "Add", |ui| {
                 if icon_btn(ui, Icon::Plus, "Add URL", true, 86.0).clicked() {
-                    { self.show_add = true; self.add_just_opened = true; }
+                    {
+                        self.show_add = true;
+                        self.add_just_opened = true;
+                    }
                 }
             });
             action_group(ui, "Selected download", |ui| {
@@ -3983,11 +4298,11 @@ impl DownloadApp {
                     selected_task.is_some(),
                 )
                 .clicked()
-                    && !self.selected_ids.is_empty() {
-                        self.pending_delete =
-                            Some(self.selected_ids.iter().cloned().collect());
-                        self.delete_from_disk = false;
-                    }
+                    && !self.selected_ids.is_empty()
+                {
+                    self.pending_delete = Some(self.selected_ids.iter().cloned().collect());
+                    self.delete_from_disk = false;
+                }
             });
             action_group(ui, "All downloads", |ui| {
                 if icon_btn_enabled(ui, Icon::Pause, "Stop all", false, 74.0, has_active).clicked()
@@ -4131,7 +4446,11 @@ impl DownloadApp {
                 }
                 _ => a.order.cmp(&b.order),
             };
-            if asc { ord } else { ord.reverse() }
+            if asc {
+                ord
+            } else {
+                ord.reverse()
+            }
         };
         tasks.sort_by(cmp);
 
@@ -4337,6 +4656,7 @@ impl DownloadApp {
                     self.capture_name = t.filename.clone();
                     self.capture_task = Some(t);
                     self.capture_just_opened = true;
+                    self.cap_vp_sent = None;
                     self.capture_raise = true;
                 }
                 None => return,
@@ -4352,187 +4672,217 @@ impl DownloadApp {
                 .collect()
         };
         let mut action: Option<&'static str> = None; // "start" | "later" | "cancel"
-        // Independent native window: no main-rect clip / shrink-wrap.
+                                                     // Independent native window: no main-rect clip / shrink-wrap.
         let builder = egui::ViewportBuilder::default()
             .with_title("Download file")
             .with_inner_size([520.0, 480.0])
             .with_min_inner_size([440.0, 360.0])
             .with_resizable(true);
         let cap_body = |ui: &mut egui::Ui, app: &mut DownloadApp| {
-                ui.label(
-                    egui::RichText::new("URL")
-                        .color(theme::TEXT_MUTED)
-                        .small()
-                        .strong(),
+            ui.label(
+                egui::RichText::new("URL")
+                    .color(theme::TEXT_MUTED)
+                    .small()
+                    .strong(),
+            );
+            // Task clone edited locally; writes back into capture_task below.
+            let mut t = task.clone();
+            ui.add(
+                egui::Label::new(egui::RichText::new(&t.url).color(theme::STEEL_TEXT).small())
+                    .wrap(),
+            );
+            ui.horizontal(|ui| {
+                let kind = crate::stream::proto_kind(&t);
+                theme::badge(ui, kind.label(), theme::proto_color(kind));
+                let cat = if t.category.is_empty() {
+                    crate::model::category_for(&t.filename)
+                } else {
+                    t.category.as_str()
+                };
+                theme::badge(ui, cat, theme::category_color(cat));
+            });
+            ui.add_space(6.0);
+            ui.add_space(6.0);
+            let mut focus_name = false;
+            form_grid("cap-grid").show(ui, |ui| {
+                form_label(ui, "Save as");
+                let name_resp = ui.add(
+                    egui::TextEdit::singleline(&mut app.capture_name)
+                        .id(egui::Id::new("capture-name"))
+                        .desired_width(f32::INFINITY),
                 );
-                // Task clone edited locally; writes back into capture_task below.
-                let mut t = task.clone();
-                ui.add(
-                    egui::Label::new(egui::RichText::new(&t.url).color(theme::STEEL_TEXT).small())
-                        .wrap(),
-                );
-                ui.horizontal(|ui| {
-                    let kind = crate::stream::proto_kind(&t);
-                    theme::badge(ui, kind.label(), theme::proto_color(kind));
-                    let cat = if t.category.is_empty() {
-                        crate::model::category_for(&t.filename)
-                    } else {
-                        t.category.as_str()
-                    };
-                    theme::badge(ui, cat, theme::category_color(cat));
-                });
-                ui.add_space(6.0);
-                ui.add_space(6.0);
-                let mut focus_name = false;
-                form_grid("cap-grid").show(ui, |ui| {
-                    form_label(ui, "Save as");
-                    let name_resp = ui.add(
-                        egui::TextEdit::singleline(&mut app.capture_name)
-                            .id(egui::Id::new("capture-name"))
-                            .desired_width(f32::INFINITY),
-                    );
-                    if app.capture_just_opened {
-                        name_resp.request_focus();
-                        focus_name = true;
-                    }
-                    ui.end_row();
-                    if let Some(total) = t.total {
-                        if total > 0 {
-                            form_label(ui, "Size");
-                            ui.label(egui::RichText::new(fmt_bytes(total)).color(theme::TEXT).small());
-                            ui.end_row();
-                        }
-                    }
-                    form_label(ui, "Folder");
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(t.dest_dir.display().to_string())
-                                    .color(theme::TEXT)
-                                    .small(),
-                            )
-                            .truncate(),
+                if app.capture_just_opened {
+                    name_resp.request_focus();
+                    focus_name = true;
+                }
+                ui.end_row();
+                if let Some(total) = t.total {
+                    if total > 0 {
+                        form_label(ui, "Size");
+                        ui.label(
+                            egui::RichText::new(fmt_bytes(total))
+                                .color(theme::TEXT)
+                                .small(),
                         );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ghost_btn_w(ui, "Browse…").clicked() {
-                                if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                                    t.dest_dir = p;
-                                }
-                            }
-                        });
-                    });
-                    ui.end_row();
-                    form_label(ui, "Category");
-                    egui::ComboBox::from_id_salt("cap-cat")
-                        .selected_text(t.category.clone())
-                        .width(ui.available_width())
-                        .show_ui(ui, |ui| {
-                            for c in [
-                                "General",
-                                "Compressed",
-                                "Documents",
-                                "Programs",
-                                "Video",
-                                "Audio",
-                            ] {
-                                ui.selectable_value(&mut t.category, c.to_string(), c);
-                            }
-                        });
-                    ui.end_row();
-                    form_label(ui, "Queue");
-                    let cur = queues
-                        .iter()
-                        .find(|(id, _)| *id == t.queue_id)
-                        .map(|(_, n)| n.clone())
-                        .unwrap_or_else(|| t.queue_id.clone());
-                    egui::ComboBox::from_id_salt("cap-queue")
-                        .selected_text(cur)
-                        .width(ui.available_width())
-                        .show_ui(ui, |ui| {
-                            for (id, name) in &queues {
-                                if ui.selectable_label(t.queue_id == *id, name).clicked() {
-                                    t.queue_id = id.clone();
-                                }
-                            }
-                        });
-                    ui.end_row();
-                });
-                // Engine choice for streams/video pages: native (default) vs yt-dlp.
-                // Stored as x-ytdlp header, honored before manifest dispatch.
-                {
-                    use crate::stream::ProtoKind as K;
-                    let kind = crate::stream::proto_kind(&t);
-                    if matches!(kind, K::Dash | K::Hls | K::YtDlp) {
-                        let mut use_ytdlp = t.headers.contains_key("x-ytdlp");
-                        if ui.checkbox(&mut use_ytdlp, "Use yt-dlp for this stream (else built-in)").changed() {
-                            if use_ytdlp {
-                                t.headers.insert("x-ytdlp".into(), "1".into());
-                            } else {
-                                t.headers.remove("x-ytdlp");
-                            }
-                        }
+                        ui.end_row();
                     }
                 }
-                // yt-dlp picker: video page or explicit yt-dlp engine.
-                // Auto-start probe once per capture (silent, cookies attached).
-                {
-                    let is_yt = t.headers.contains_key("x-ytdlp")
-                        || ytdlp::is_video_page(&t.url)
-                        || t.headers.get("x-page-intent").map(|s| s == "page").unwrap_or(false);
-                    if is_yt {
-                        // New capture: probe state still tagged with previous URL.
-                        // Poll resets tag; autostart when state is virgin for this URL.
-                        let virgin = app.yt_probe_cap.url != t.url
-                            && !app.yt_probe_cap.loading
-                            && app.yt_probe_cap.dump.is_none();
-                        if virgin {
-                            let rt = app.tokio_rt.clone();
-                            start_yt_probe(&mut app.yt_probe_cap, &rt, &t.url, &t.referrer, &t.cookies, &t.cookies_json);
-                        }
-                        let (u, r, c) = (t.url.clone(), t.referrer.clone(), t.cookies.clone());
-                        let rt = app.tokio_rt.clone();
-                        ui.add_space(6.0);
-                        ui_yt_probe_section(ui, &mut app.yt_probe_cap, "cap", &u, &r, &c, &t.cookies_json, &rt);
-                        // Probe title fills filename while user kept funnel name.
-                        if let Some(d) = &app.yt_probe_cap.dump {
-                            if !d.title.is_empty() && (app.capture_name.is_empty() || !app.capture_name.contains('.')) {
-                                let ext = "mp4";
-                                app.capture_name = crate::model::sanitize_filename(&format!("{}.{}", d.title, ext));
-                            }
-                        }
-                        if let Some(stream) = t.headers.get("x-page-stream").cloned() {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new("Sniffed stream fallback:")
-                                        .color(theme::TEXT_FAINT)
-                                        .small(),
-                                );
-                                if ghost_btn_w(ui, "Use sniffed stream instead").clicked() {
-                                    // Title-filled capture name belongs to page video, not stream.
-                                    app.capture_name = crate::model::filename_from_url(&stream);
-                                    t.url = stream;
-                                    t.headers.remove("x-ytdlp");
-                                    t.headers.remove("x-page-stream");
-                                    app.yt_probe_cap = YtProbeState::default();
-                                }
-                            });
-                        }
-                    }
-                }
-                // Write back every edit (Browse/Category/Queue were dropped unless stream kind).
-                app.capture_task = Some(t.clone());
-                if focus_name {
-                    ui.ctx().memory_mut(|m| m.request_focus(egui::Id::new("capture-name")));
-                    app.capture_just_opened = false;
-                }
-                if !t.referrer.is_empty() {
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(format!("Referrer: {}", t.referrer))
-                            .color(theme::TEXT_FAINT)
-                            .small(),
+                form_label(ui, "Folder");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(t.dest_dir.display().to_string())
+                                .color(theme::TEXT)
+                                .small(),
+                        )
+                        .truncate(),
                     );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ghost_btn_w(ui, "Browse…").clicked() {
+                            if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                                t.dest_dir = p;
+                            }
+                        }
+                    });
+                });
+                ui.end_row();
+                form_label(ui, "Category");
+                egui::ComboBox::from_id_salt("cap-cat")
+                    .selected_text(t.category.clone())
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        for c in [
+                            "General",
+                            "Compressed",
+                            "Documents",
+                            "Programs",
+                            "Video",
+                            "Audio",
+                        ] {
+                            ui.selectable_value(&mut t.category, c.to_string(), c);
+                        }
+                    });
+                ui.end_row();
+                form_label(ui, "Queue");
+                let cur = queues
+                    .iter()
+                    .find(|(id, _)| *id == t.queue_id)
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_else(|| t.queue_id.clone());
+                egui::ComboBox::from_id_salt("cap-queue")
+                    .selected_text(cur)
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        for (id, name) in &queues {
+                            if ui.selectable_label(t.queue_id == *id, name).clicked() {
+                                t.queue_id = id.clone();
+                            }
+                        }
+                    });
+                ui.end_row();
+            });
+            // Engine choice for streams/video pages: native (default) vs yt-dlp.
+            // Stored as x-ytdlp header, honored before manifest dispatch.
+            {
+                use crate::stream::ProtoKind as K;
+                let kind = crate::stream::proto_kind(&t);
+                if matches!(kind, K::Dash | K::Hls | K::YtDlp) {
+                    let mut use_ytdlp = t.headers.contains_key("x-ytdlp");
+                    if ui
+                        .checkbox(&mut use_ytdlp, "Use yt-dlp for this stream (else built-in)")
+                        .changed()
+                    {
+                        if use_ytdlp {
+                            t.headers.insert("x-ytdlp".into(), "1".into());
+                        } else {
+                            t.headers.remove("x-ytdlp");
+                        }
+                    }
                 }
+            }
+            // yt-dlp picker: video page or explicit yt-dlp engine.
+            // Auto-start probe once per capture (silent, cookies attached).
+            {
+                let is_yt = t.headers.contains_key("x-ytdlp")
+                    || ytdlp::is_video_page(&t.url)
+                    || t.headers
+                        .get("x-page-intent")
+                        .map(|s| s == "page")
+                        .unwrap_or(false);
+                if is_yt {
+                    // New capture: probe state still tagged with previous URL.
+                    // Poll resets tag; autostart when state is virgin for this URL.
+                    let virgin = app.yt_probe_cap.url != t.url
+                        && !app.yt_probe_cap.loading
+                        && app.yt_probe_cap.dump.is_none();
+                    if virgin {
+                        let rt = app.tokio_rt.clone();
+                        start_yt_probe(
+                            &mut app.yt_probe_cap,
+                            &rt,
+                            &t.url,
+                            &t.referrer,
+                            &t.cookies,
+                            &t.cookies_json,
+                        );
+                    }
+                    let (u, r, c) = (t.url.clone(), t.referrer.clone(), t.cookies.clone());
+                    let rt = app.tokio_rt.clone();
+                    ui.add_space(6.0);
+                    ui_yt_probe_section(
+                        ui,
+                        &mut app.yt_probe_cap,
+                        "cap",
+                        &u,
+                        &r,
+                        &c,
+                        &t.cookies_json,
+                        &rt,
+                    );
+                    // Probe title fills filename while user kept funnel name.
+                    if let Some(d) = &app.yt_probe_cap.dump {
+                        if !d.title.is_empty()
+                            && (app.capture_name.is_empty() || !app.capture_name.contains('.'))
+                        {
+                            let ext = "mp4";
+                            app.capture_name =
+                                crate::model::sanitize_filename(&format!("{}.{}", d.title, ext));
+                        }
+                    }
+                    if let Some(stream) = t.headers.get("x-page-stream").cloned() {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Sniffed stream fallback:")
+                                    .color(theme::TEXT_FAINT)
+                                    .small(),
+                            );
+                            if ghost_btn_w(ui, "Use sniffed stream instead").clicked() {
+                                // Title-filled capture name belongs to page video, not stream.
+                                app.capture_name = crate::model::filename_from_url(&stream);
+                                t.url = stream;
+                                t.headers.remove("x-ytdlp");
+                                t.headers.remove("x-page-stream");
+                                app.yt_probe_cap = YtProbeState::default();
+                            }
+                        });
+                    }
+                }
+            }
+            // Write back every edit (Browse/Category/Queue were dropped unless stream kind).
+            app.capture_task = Some(t.clone());
+            if focus_name {
+                ui.ctx()
+                    .memory_mut(|m| m.request_focus(egui::Id::new("capture-name")));
+                app.capture_just_opened = false;
+            }
+            if !t.referrer.is_empty() {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!("Referrer: {}", t.referrer))
+                        .color(theme::TEXT_FAINT)
+                        .small(),
+                );
+            }
         };
         if self.capture_raise {
             self.capture_raise = false;
@@ -4540,6 +4890,15 @@ impl DownloadApp {
         }
         let mut cap_body = Some(cap_body);
         ctx.show_viewport_immediate(vp_id("webcraft-capture"), builder, |ctx, class| {
+            if !matches!(class, egui::ViewportClass::Embedded) {
+                fit_vp(
+                    ctx,
+                    vp_id("webcraft-capture"),
+                    egui::vec2(520.0, 480.0),
+                    &self.yt_probe_cap,
+                    &mut self.cap_vp_sent,
+                );
+            }
             if ctx.input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape)) {
                 action = Some("cancel");
             }
@@ -4549,7 +4908,20 @@ impl DownloadApp {
                 ui.separator();
                 btn_row(ui, |ui| {
                     // Start during probe would silently drop picker intent (Auto).
-                    if ui.add_enabled_ui(!yt_loading, |ui| primary_btn_w(ui, if yt_loading { "Probing formats…" } else { "Start download" })).inner.clicked() {
+                    if ui
+                        .add_enabled_ui(!yt_loading, |ui| {
+                            primary_btn_w(
+                                ui,
+                                if yt_loading {
+                                    "Probing formats…"
+                                } else {
+                                    "Start download"
+                                },
+                            )
+                        })
+                        .inner
+                        .clicked()
+                    {
                         *action = Some("start");
                     }
                     if ghost_btn_w(ui, "Download later").clicked() {
@@ -4568,7 +4940,10 @@ impl DownloadApp {
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                     .default_size([520.0, 480.0])
                     .min_size([360.0, 300.0])
-                    .max_size([(scr.width() - 24.0).max(360.0), (scr.height() - 24.0).max(300.0)])
+                    .max_size([
+                        (scr.width() - 24.0).max(360.0),
+                        (scr.height() - 24.0).max(300.0),
+                    ])
                     .show(ctx, |ui| {
                         let max_h = (ui.available_height() - FOOTER_H).max(48.0);
                         egui::ScrollArea::vertical()
@@ -4578,14 +4953,16 @@ impl DownloadApp {
                         footer(ui, &mut action);
                     });
             } else {
-                egui::CentralPanel::default().frame(dialog_frame()).show(ctx, |ui| {
-                    let avail = ui.available_height();
-                    egui::ScrollArea::vertical()
-                        .id_salt("cap-main")
-                        .max_height((avail - FOOTER_H).max(48.0))
-                        .show(ui, |ui| bb(ui, self));
-                    footer(ui, &mut action);
-                });
+                egui::CentralPanel::default()
+                    .frame(dialog_frame())
+                    .show(ctx, |ui| {
+                        let avail = ui.available_height();
+                        egui::ScrollArea::vertical()
+                            .id_salt("cap-main")
+                            .max_height((avail - FOOTER_H).max(48.0))
+                            .show(ui, |ui| bb(ui, self));
+                        footer(ui, &mut action);
+                    });
             }
         });
         let Some(act) = action else { return };
@@ -4655,7 +5032,11 @@ impl DownloadApp {
         }
         // Consume probe result; drop result tagged for another URL.
         if self.add_torrent_loading {
-            let done = self.add_torrent_slot.try_lock().ok().and_then(|mut g| g.take());
+            let done = self
+                .add_torrent_slot
+                .try_lock()
+                .ok()
+                .and_then(|mut g| g.take());
             if let Some((probed_url, res)) = done {
                 if probed_url != self.add_url.trim() {
                     // Stale: keep loading state for any live probe; ignore result.
@@ -4666,8 +5047,7 @@ impl DownloadApp {
                     self.add_torrent_loading = false;
                     match res {
                         Ok(files) => {
-                            self.add_torrent_files =
-                                files.into_iter().map(|f| (f, true)).collect();
+                            self.add_torrent_files = files.into_iter().map(|f| (f, true)).collect();
                         }
                         Err(e) => self.add_torrent_error = e,
                     }
@@ -4956,9 +5336,13 @@ impl DownloadApp {
         let mut start: Option<bool> = None; // Some(true)=now, Some(false)=later
         let mut cancel = false;
         if self.add_just_opened {
+            self.add_vp_sent = None;
             ctx.send_viewport_cmd_to(vp_id("webcraft-add"), egui::ViewportCommand::Focus);
         }
         ctx.show_viewport_immediate(vp_id("webcraft-add"), builder, |ctx, class| {
+            if !matches!(class, egui::ViewportClass::Embedded) {
+                fit_vp(ctx, vp_id("webcraft-add"), egui::vec2(560.0, 680.0), &self.yt_probe_add, &mut self.add_vp_sent);
+            }
             if ctx.input(|i| i.viewport().close_requested()) {
                 cancel = true;
             }
@@ -4986,7 +5370,7 @@ impl DownloadApp {
                         }
                         // Same gates as Start button: no Enter bypass while
                         // probing or with zero torrent files selected.
-                        let enter_blocked = app.add_torrent_loading
+                        let enter_blocked = app.add_torrent_loading || app.yt_probe_add.loading
                             || (crate::torrent::is_torrent_url(&app.add_url)
                                 && app.add_torrent_files.len() > 1
                                 && app.add_torrent_files.iter().all(|(_, s)| !s));
@@ -4996,10 +5380,13 @@ impl DownloadApp {
                         {
                             *start = Some(app.add_start_now);
                         }
+                        if app.add_url.contains('<') {
+                            app.add_url = extract_pasted_url(&app.add_url.clone());
+                        }
                         if ghost_btn_w(ui, "Paste").clicked() {
                             if let Ok(mut cb) = arboard::Clipboard::new() {
                                 if let Ok(text) = cb.get_text() {
-                                    app.add_url = text.trim().to_string();
+                                    app.add_url = extract_pasted_url(&text);
                                 }
                             }
                         }
@@ -5068,7 +5455,7 @@ impl DownloadApp {
                         ui.add(fill_edit(&mut app.add_cookies));
                         ui.end_row();
                     });
-                    if ytdlp::is_video_page(app.add_url.trim()) {
+                    if yt_probe_eligible(app.add_url.trim()) {
                         ui.add_space(theme::SP_SM);
                         let (u, r, c) = (app.add_url.trim().to_string(), app.add_referrer.clone(), app.add_cookies.clone());
                         let rt = app.tokio_rt.clone();
@@ -5134,7 +5521,7 @@ impl DownloadApp {
                     }
                     if ui
                         .add_enabled_ui(
-                            !app.add_url.trim().is_empty() && !app.add_torrent_loading && !torrent_blocked,
+                            !app.add_url.trim().is_empty() && !app.add_torrent_loading && !app.yt_probe_add.loading && !torrent_blocked,
                             |ui| primary_btn_w(ui, "Start download"),
                         )
                         .inner
@@ -5175,13 +5562,21 @@ impl DownloadApp {
                 let (referrer, cookies, queue) = (
                     self.add_referrer.clone(),
                     self.add_cookies.clone(),
-                    if self.add_queue.is_empty() { "main".into() } else { self.add_queue.clone() },
+                    if self.add_queue.is_empty() {
+                        "main".into()
+                    } else {
+                        self.add_queue.clone()
+                    },
                 );
                 let (user, pass, key, mirrors, desc) = (
                     self.add_user.clone(),
                     self.add_pass.clone(),
                     self.add_key.clone(),
-                    self.add_mirrors.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>(),
+                    self.add_mirrors
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>(),
                     self.add_desc.clone(),
                 );
                 let id = {
@@ -5229,8 +5624,7 @@ impl DownloadApp {
                         if crate::stream::is_nzb_url_str(&t.url) {
                             if let Some(nzb) = &self.add_nzb {
                                 if self.add_nzb_url == url.trim() {
-                                    t.filename =
-                                        crate::nntp::output_name(nzb, &t.url);
+                                    t.filename = crate::nntp::output_name(nzb, &t.url);
                                     t.category =
                                         crate::model::category_for(&t.filename).to_string();
                                 }
@@ -5240,6 +5634,19 @@ impl DownloadApp {
                         if self.yt_probe_add.url == url.trim() && self.yt_probe_add.dump.is_some() {
                             let ch = yt_choice_from_state(&self.yt_probe_add);
                             ch.write_headers(&mut t.headers);
+                            // write_headers adds x-ytdlp only for explicit choices; route
+                            // generic pages/playlists through yt-dlp too (probe matched).
+                            t.headers.insert("x-ytdlp".into(), "1".into());
+                            // Probe title as filename (mirror capture): only over virgin
+                            // seed (no dot), user edits / URL-derived names untouched.
+                            if !t.filename.contains('.') {
+                                if let Some(d) = &self.yt_probe_add.dump {
+                                    if !d.title.trim().is_empty() {
+                                        t.filename =
+                                            crate::model::sanitize_filename(d.title.trim());
+                                    }
+                                }
+                            }
                             if let Some(want) = &ch.extract {
                                 let stem = crate::model::split_stem_ext(&t.filename).0.to_string();
                                 t.filename = format!("{stem}.{want}");
@@ -5329,13 +5736,16 @@ impl DownloadApp {
                     ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
                 ui.painter()
                     .rect_filled(irect, theme::R_CTRL, theme::SURFACE_RAISED);
-                icon(ui.painter(), &cat_icon(&t.filename), irect.shrink(6.0), theme::TEXT_MUTED);
+                icon(
+                    ui.painter(),
+                    &cat_icon(&t.filename),
+                    irect.shrink(6.0),
+                    theme::TEXT_MUTED,
+                );
                 ui.vertical(|ui| {
                     ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&t.filename).strong().size(13.0),
-                        )
-                        .truncate(),
+                        egui::Label::new(egui::RichText::new(&t.filename).strong().size(13.0))
+                            .truncate(),
                     )
                     .on_hover_text(&t.filename);
                     ui.add(
@@ -5399,36 +5809,36 @@ impl DownloadApp {
             );
             ui.add_space(theme::SP_XS);
             ui.columns(4, |c| {
-                    let ui = &mut c[0];
-                    stat_tile(
-                        ui,
-                        "RATE",
-                        if t.status == TaskStatus::Downloading {
-                            fmt_rate(task_rate as f32)
-                        } else {
-                            "—".into()
-                        },
-                    );
-                    stat_tile(&mut c[1], "ETA", eta_txt.clone());
-                    stat_tile(
-                        &mut c[2],
-                        "DOWNLOADED",
-                        format!(
-                            "{} / {}",
-                            fmt_bytes(t.downloaded),
-                            t.total.map(fmt_bytes).unwrap_or_else(|| "—".into())
-                        ),
-                    );
-                    stat_tile(
-                        &mut c[3],
-                        "PEAK",
-                        if samples.is_empty() {
-                            "—".into()
-                        } else {
-                            fmt_rate(peak as f32)
-                        },
-                    );
-                });
+                let ui = &mut c[0];
+                stat_tile(
+                    ui,
+                    "RATE",
+                    if t.status == TaskStatus::Downloading {
+                        fmt_rate(task_rate as f32)
+                    } else {
+                        "—".into()
+                    },
+                );
+                stat_tile(&mut c[1], "ETA", eta_txt.clone());
+                stat_tile(
+                    &mut c[2],
+                    "DOWNLOADED",
+                    format!(
+                        "{} / {}",
+                        fmt_bytes(t.downloaded),
+                        t.total.map(fmt_bytes).unwrap_or_else(|| "—".into())
+                    ),
+                );
+                stat_tile(
+                    &mut c[3],
+                    "PEAK",
+                    if samples.is_empty() {
+                        "—".into()
+                    } else {
+                        fmt_rate(peak as f32)
+                    },
+                );
+            });
             egui::CollapsingHeader::new("Speed graph")
                 .default_open(t.status == TaskStatus::Downloading && series.len() > 1)
                 .show(ui, |ui| {
@@ -5458,8 +5868,10 @@ impl DownloadApp {
                             })
                             .collect();
                         for w in pts.windows(2) {
-                            ui.painter()
-                                .line_segment([w[0], w[1]], egui::Stroke::new(1.5_f32, theme::TEAL_500));
+                            ui.painter().line_segment(
+                                [w[0], w[1]],
+                                egui::Stroke::new(1.5_f32, theme::TEAL_500),
+                            );
                         }
                         if let Some(last) = pts.last() {
                             ui.painter().circle_filled(*last, 2.0, theme::TEAL_500);
@@ -5478,7 +5890,9 @@ impl DownloadApp {
                 ui.add_space(theme::SP_XS);
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Error").color(theme::ERR).strong());
-                    ui.add(egui::Label::new(egui::RichText::new(&t.error).color(theme::ERR)).wrap());
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&t.error).color(theme::ERR)).wrap(),
+                    );
                 });
             }
             // Scrollable middle: sections never widen window; footer pinned below.
@@ -5964,7 +6378,10 @@ impl DownloadApp {
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                     .default_size([640.0, 720.0])
                     .min_size([380.0, 320.0])
-                    .max_size([(scr.width() - 24.0).max(380.0), (scr.height() - 24.0).max(320.0)])
+                    .max_size([
+                        (scr.width() - 24.0).max(380.0),
+                        (scr.height() - 24.0).max(320.0),
+                    ])
                     .show(ctx, |ui| bb(ui, self))
                     .and_then(|r| r.inner)
                     .unwrap_or((false, false, false))
@@ -6087,7 +6504,11 @@ impl DownloadApp {
                                 egui::Label::new(&t.filename).truncate().selectable(false),
                             )
                             .on_hover_text(t.filename.clone());
-                            let sc = if t.status == TaskStatus::Downloading { theme::STEEL_TEXT } else { theme::status_color(t.status) };
+                            let sc = if t.status == TaskStatus::Downloading {
+                                theme::STEEL_TEXT
+                            } else {
+                                theme::status_color(t.status)
+                            };
                             ui.label(
                                 egui::RichText::new(format!("{:?}", t.status))
                                     .color(sc)
@@ -6116,16 +6537,24 @@ impl DownloadApp {
                         // Priority on its own row: never glued to move buttons.
                         ui.horizontal(|ui| {
                             ui.add_space(52.0);
-                            ui.label(egui::RichText::new("Priority").color(theme::TEXT_FAINT).small());
+                            ui.label(
+                                egui::RichText::new("Priority")
+                                    .color(theme::TEXT_FAINT)
+                                    .small(),
+                            );
                             for (label, pr) in [
                                 ("Low", Priority::Low),
                                 ("Normal", Priority::Normal),
                                 ("High", Priority::High),
                             ] {
                                 let cur = t.priority == pr;
-                                if ui.add_enabled(!cur, egui::Button::new(label).selected(cur)).clicked() {
+                                if ui
+                                    .add_enabled(!cur, egui::Button::new(label).selected(cur))
+                                    .clicked()
+                                {
                                     let mut g = crate::lock_unpoison(&self.rt);
-                                    if let Some(x) = g.state.tasks.iter_mut().find(|x| x.id == t.id) {
+                                    if let Some(x) = g.state.tasks.iter_mut().find(|x| x.id == t.id)
+                                    {
                                         x.priority = pr;
                                     }
                                     g.save();
@@ -6179,7 +6608,10 @@ impl DownloadApp {
             ui.horizontal(|ui| {
                 ui.heading("Scheduler");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut master = crate::lock_unpoison(&self.rt).state.settings.scheduler_enabled;
+                    let mut master = crate::lock_unpoison(&self.rt)
+                        .state
+                        .settings
+                        .scheduler_enabled;
                     if ui.checkbox(&mut master, "Turn on scheduler").changed() {
                         let mut g = crate::lock_unpoison(&self.rt);
                         g.state.settings.scheduler_enabled = master;
@@ -6670,13 +7102,24 @@ impl DownloadApp {
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
+                form_label(ui, "Cookies");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.grab_cookies)
+                        .hint_text("name=value; ... (browser Grab site fills this; SharePoint needs it)")
+                        .password(true)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.end_row();
             });
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 if icon_btn_enabled(ui, Icon::Search, "Explore", true, 92.0, !self.grab_url.trim().is_empty()).clicked() || (self.grab_auto_explore && !self.grab_busy && !self.grab_url.trim().is_empty()) {
                     self.grab_auto_explore = false;
                     let proj = self.grab_project(false);
-                    self.grab_project_json = serde_json::to_string_pretty(&proj).unwrap_or_default();
+                    // Never show/persist session cookies in project JSON.
+                    let mut shown = proj.clone();
+                    shown.cookies.clear();
+                    self.grab_project_json = serde_json::to_string_pretty(&shown).unwrap_or_default();
                     self.grab_busy = true;
                     self.grab_status = "Exploring site...".into();
                     let rt = self.rt.clone(); let client = engine::build_client("");
@@ -6736,11 +7179,23 @@ impl DownloadApp {
                     .clicked()
                     {
                         for f in self.grab_files.iter().filter(|f| f.selected) {
+                            // Session cookies only to files on start host.
+                            let fh = url::Url::parse(&f.url)
+                                .ok()
+                                .and_then(|u| u.host_str().map(|h| h.to_string()));
+                            let sh = url::Url::parse(&self.grab_url)
+                                .ok()
+                                .and_then(|u| u.host_str().map(|h| h.to_string()));
+                            let ck = if fh.is_some() && fh == sh {
+                                self.grab_cookies.as_str()
+                            } else {
+                                ""
+                            };
                             let id = crate::lock_unpoison(&self.rt).add_url(
                                 &f.url.clone(),
                                 "main",
                                 &f.page_url.clone(),
-                                "",
+                                ck,
                             );
                             let _ = id;
                         }
@@ -6851,6 +7306,7 @@ impl DownloadApp {
                                 self.grab_project_json = t.clone();
                                 if let Ok(proj) = serde_json::from_str::<GrabberProject>(&t) {
                                     self.grab_url = proj.start_url;
+                                    self.grab_cookies = proj.cookies.clone();
                                     self.grab_depth = proj.depth;
                                     self.grab_ext_depth = proj.external_depth;
                                     self.grab_scope = proj.scope;
@@ -6942,19 +7398,41 @@ impl DownloadApp {
                                     ui.spacing_mut().item_spacing.x = COL_GAP;
                                     cell(ui, disp[0], |ui| ui.label(theme::table_header_text("")));
                                     // Sortable headers: click toggles direction.
-                                    for (ci, (label, col)) in [("URL", 0u8), ("Size", 1u8), ("Type", 2u8)].iter().enumerate() {
-                                        let arrow = if self.grab_sort.0 == *col { if self.grab_sort.1 { " \u{25b2}" } else { " \u{25bc}" } } else { "" };
+                                    for (ci, (label, col)) in
+                                        [("URL", 0u8), ("Size", 1u8), ("Type", 2u8)]
+                                            .iter()
+                                            .enumerate()
+                                    {
+                                        let arrow = if self.grab_sort.0 == *col {
+                                            if self.grab_sort.1 {
+                                                " \u{25b2}"
+                                            } else {
+                                                " \u{25bc}"
+                                            }
+                                        } else {
+                                            ""
+                                        };
                                         cell(ui, disp[ci + 1], |ui| {
                                             let r = ui.add(
-                                                egui::Label::new(theme::table_header_text(&format!("{label}{arrow}")))
-                                                    .truncate()
-                                                    .selectable(false)
-                                                    .sense(egui::Sense::click()),
+                                                egui::Label::new(theme::table_header_text(
+                                                    &format!("{label}{arrow}"),
+                                                ))
+                                                .truncate()
+                                                .selectable(false)
+                                                .sense(egui::Sense::click()),
                                             );
                                             if r.clicked() {
-                                                if self.grab_sort.0 == *col { self.grab_sort.1 = !self.grab_sort.1; } else { self.grab_sort = (*col, true); }
+                                                if self.grab_sort.0 == *col {
+                                                    self.grab_sort.1 = !self.grab_sort.1;
+                                                } else {
+                                                    self.grab_sort = (*col, true);
+                                                }
                                             }
-                                            if r.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+                                            if r.hovered() {
+                                                ui.ctx().set_cursor_icon(
+                                                    egui::CursorIcon::PointingHand,
+                                                );
+                                            }
                                         });
                                     }
                                 });
@@ -6980,11 +7458,21 @@ impl DownloadApp {
                             let mut order: Vec<usize> = (0..n).collect();
                             order.sort_by(|&a, &b| {
                                 let ord = match gcol {
-                                    0 => self.grab_files[a].url.to_lowercase().cmp(&self.grab_files[b].url.to_lowercase()),
-                                    1 => self.grab_files[a].size.unwrap_or(0).cmp(&self.grab_files[b].size.unwrap_or(0)),
+                                    0 => self.grab_files[a]
+                                        .url
+                                        .to_lowercase()
+                                        .cmp(&self.grab_files[b].url.to_lowercase()),
+                                    1 => self.grab_files[a]
+                                        .size
+                                        .unwrap_or(0)
+                                        .cmp(&self.grab_files[b].size.unwrap_or(0)),
                                     _ => self.grab_files[a].mime.cmp(&self.grab_files[b].mime),
                                 };
-                                if gasc { ord } else { ord.reverse() }
+                                if gasc {
+                                    ord
+                                } else {
+                                    ord.reverse()
+                                }
                             });
                             for (idx, &fi) in order.iter().enumerate() {
                                 let f = &mut self.grab_files[fi];
@@ -7533,7 +8021,10 @@ mod progress_tests {
             ..Default::default()
         };
         for p in task_disk_paths(&t) {
-            if p.extension().is_some() || p.file_name().is_some_and(|n| n.to_string_lossy().contains('.')) {
+            if p.extension().is_some()
+                || p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains('.'))
+            {
                 let _ = std::fs::write(&p, b"x");
             }
         }
@@ -7654,5 +8145,71 @@ mod progress_tests {
         std::fs::write(dir.join("x.part"), b"bytes").unwrap();
         assert!(resume_supported(&t));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn extract_pasted_url_variants() {
+        // Double-quoted href.
+        assert_eq!(
+            extract_pasted_url(r#"<a href="https://example.com/v?id=1">x</a>"#),
+            "https://example.com/v?id=1"
+        );
+        // Single-quoted src.
+        assert_eq!(
+            extract_pasted_url("<img src='https://cdn.example.com/a.mp4'>"),
+            "https://cdn.example.com/a.mp4"
+        );
+        // Bare href value, >-delimited.
+        assert_eq!(
+            extract_pasted_url("<a href=https://example.com/bare>x</a>"),
+            "https://example.com/bare"
+        );
+        // No href/src http: first bare http token wins.
+        assert_eq!(
+            extract_pasted_url("see https://example.com/page now"),
+            "https://example.com/page"
+        );
+        // No URL at all: trimmed input unchanged.
+        assert_eq!(extract_pasted_url("  just text  "), "just text");
+        assert_eq!(
+            extract_pasted_url("  https://example.com/plain  "),
+            "https://example.com/plain"
+        );
+    }
+
+    #[test]
+    fn yt_probe_eligible_gate() {
+        assert!(yt_probe_eligible("https://example.com/watch?v=1"));
+        assert!(yt_probe_eligible("https://example.com/list.m3u8?tok=1"));
+        assert!(yt_probe_eligible("https://example.com/manifest.mpd"));
+        assert!(!yt_probe_eligible("https://example.com/movie.mp4?tok=1"));
+        assert!(!yt_probe_eligible("https://example.com/song.MP3#frag"));
+        assert!(!yt_probe_eligible("https://example.com/file.torrent"));
+        assert!(!yt_probe_eligible("https://example.com/file.nzb?x=1"));
+        assert!(!yt_probe_eligible("magnet:?xt=urn:btih:abc"));
+        assert!(!yt_probe_eligible("ftp://example.com/page"));
+        assert!(!yt_probe_eligible("not a url"));
+    }
+
+    #[test]
+    fn yt_probe_h_sizing() {
+        let st = YtProbeState::default();
+        assert_eq!(yt_probe_h(&st), 55.0);
+        let dump: crate::ytdlp::YtDump =
+            serde_json::from_str(r#"{"title":"t","formats":[]}"#).unwrap();
+        let st = YtProbeState {
+            dump: Some(dump),
+            ..Default::default()
+        };
+        assert_eq!(yt_probe_h(&st), 55.0 + 90.0 + 120.0);
+        let dump: crate::ytdlp::YtDump = serde_json::from_str(
+            r#"{"title":"t","formats":[],"subtitles":{"en":[],"vi":[]},"automatic_captions":{"en":[],"ja":[]}}"#,
+        )
+        .unwrap();
+        // auto ja only (en filtered as duplicate of manual) -> rows = 2 + 1 = 3.
+        let st = YtProbeState {
+            dump: Some(dump),
+            ..Default::default()
+        };
+        assert_eq!(yt_probe_h(&st), 55.0 + 90.0 + 120.0 + 21.0 + 84.0);
     }
 }

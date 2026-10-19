@@ -158,8 +158,11 @@ impl ProtoKind {
 /// Pseudo-headers (task config) must never go on wire. headers_for in
 /// engine.rs strips for HTTP path; stream fetches copy headers manually.
 fn is_pseudo_header(k: &str) -> bool {
-    crate::ytdlp::YT_HEADER_KEYS.iter().any(|x| k.eq_ignore_ascii_case(x))
+    crate::ytdlp::YT_HEADER_KEYS
+        .iter()
+        .any(|x| k.eq_ignore_ascii_case(x))
         || k.eq_ignore_ascii_case("x-page-url")
+        || k.eq_ignore_ascii_case("x-page-title")
         || k.eq_ignore_ascii_case("x-page-stream")
         || k.eq_ignore_ascii_case("x-page-intent")
         || k.eq_ignore_ascii_case("x-rep-id")
@@ -317,9 +320,8 @@ pub async fn download_url_with_settings(
     if crate::torrent::is_torrent_task(&task) {
         return crate::torrent::download_torrent(client, task, ctrl, settings).await;
     }
-    if lower.starts_with("ftp://")
-        || lower.starts_with("ftps://")
-        || lower.starts_with("ftpsi://") {
+    if lower.starts_with("ftp://") || lower.starts_with("ftps://") || lower.starts_with("ftpsi://")
+    {
         return crate::ftp::download_ftp(task, ctrl).await;
     }
     if lower.starts_with("sftp://") || lower.starts_with("ssh://") {
@@ -401,7 +403,10 @@ mod manifest_classify_tests {
 
     #[test]
     fn body_sniff_classifies() {
-        assert_eq!(classify_body(b"#EXTM3U\n#EXT-X-VERSION:3\n"), Some(Manifest::Hls));
+        assert_eq!(
+            classify_body(b"#EXTM3U\n#EXT-X-VERSION:3\n"),
+            Some(Manifest::Hls)
+        );
         assert_eq!(
             classify_body(b"<?xml version=\"1.0\"?><MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\">"),
             Some(Manifest::Dash)
@@ -849,7 +854,8 @@ async fn download_hls_media(
         std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
         ctrl.parts_are_segments
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        *ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()) = vec![(0, media.segments.len() as u64)];
+        *ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()) =
+            vec![(0, media.segments.len() as u64)];
         let mut parts: Vec<std::path::PathBuf> = Vec::new();
         if let Some(init) = &media.init_uri {
             let p = work.join("init.bin");
@@ -879,7 +885,12 @@ async fn download_hls_media(
             .await?;
             ctrl.downloaded
                 .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-            if let Some(part) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
+            if let Some(part) = ctrl
+                .parts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .first_mut()
+            {
                 part.0 = (i + 1) as u64;
             }
             if let Some(Some(ki)) = media.key_infos.get(i) {
@@ -994,8 +1005,14 @@ mod tests {
         assert_eq!(kind_of("https://x.org/watch?f=.m3u8"), ProtoKind::Http);
         assert_eq!(manifest_kind_from_url("https://x.org/watch?f=.mpd"), None);
         // Real manifest path (query noise ok) still routes.
-        assert_eq!(manifest_kind_from_url("https://x.org/m.mpd?token=1"), Some(Manifest::Dash));
-        assert_eq!(manifest_kind_from_url("https://x.org/m.m3u8#frag"), Some(Manifest::Hls));
+        assert_eq!(
+            manifest_kind_from_url("https://x.org/m.mpd?token=1"),
+            Some(Manifest::Dash)
+        );
+        assert_eq!(
+            manifest_kind_from_url("https://x.org/m.m3u8#frag"),
+            Some(Manifest::Hls)
+        );
         assert!(url_path_ends("https://x.org/M.MPD?token=1", &[".mpd"]));
         assert!(!url_path_ends("https://x.org/watch?f=.mpd", &[".mpd"]));
         // Reddit packaged: path .mp4, query m=DASHPlaylist.mpd.
@@ -1029,14 +1046,16 @@ mod tests {
         assert!(segment_only_reject(&page_ctx).is_none());
         // Page URL is the parent manifest: allowed (manifest context).
         let mut man_ctx = bare_ts.clone();
-        man_ctx
-            .headers
-            .insert("x-page-url".into(), "https://cdn.example.com/v/pl.m3u8".into());
+        man_ctx.headers.insert(
+            "x-page-url".into(),
+            "https://cdn.example.com/v/pl.m3u8".into(),
+        );
         assert!(segment_only_reject(&man_ctx).is_none());
         let mut dash_ctx = bare.clone();
-        dash_ctx
-            .headers
-            .insert("x-page-url".into(), "https://cdn.example.com/v/pl.mpd".into());
+        dash_ctx.headers.insert(
+            "x-page-url".into(),
+            "https://cdn.example.com/v/pl.mpd".into(),
+        );
         assert!(segment_only_reject(&dash_ctx).is_none());
         // Non-segment URL never rejected.
         let file = DownloadTask {

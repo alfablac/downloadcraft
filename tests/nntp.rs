@@ -314,16 +314,22 @@ async fn nntp_missing_file_fails_others_continue_resume_skips_done() {
         ..Default::default()
     };
     let ctrl = Arc::new(Controls::new(0));
-    let r = download_url_with_settings(build_client(""), task.clone(), ctrl.clone(), &settings1)
-        .await;
+    let r =
+        download_url_with_settings(build_client(""), task.clone(), ctrl.clone(), &settings1).await;
     let e = r.unwrap_err();
     assert!(e.contains("file2.bin") && e.contains("430"), "{e}");
     let out1 = dir.join("test");
     assert_eq!(std::fs::read(out1.join("file1.bin")).unwrap(), data1);
     // Failed file retained partial (padded hole candidate for PAR2).
     assert!(out1.join("file2.bin").exists(), "failed file dest retained");
-    assert!(out1.join("file1.bin.nzbstate").exists(), "done file sidecar kept");
-    assert!(!out1.join("file2.bin.nzbstate").exists(), "failed file no sidecar");
+    assert!(
+        out1.join("file1.bin.nzbstate").exists(),
+        "done file sidecar kept"
+    );
+    assert!(
+        !out1.join("file2.bin.nzbstate").exists(),
+        "failed file no sidecar"
+    );
     assert!(!ctrl
         .parts_are_segments
         .load(std::sync::atomic::Ordering::Relaxed));
@@ -349,7 +355,9 @@ async fn nntp_missing_file_fails_others_continue_resume_skips_done() {
     );
     let cmds = fake2.cmds.lock().unwrap().clone();
     assert!(
-        !cmds.iter().any(|c| c.contains("s1@news") || c.contains("s2@news")),
+        !cmds
+            .iter()
+            .any(|c| c.contains("s1@news") || c.contains("s2@news")),
         "completed file not refetched: {cmds:?}"
     );
     assert!(cmds.iter().any(|c| c == "BODY <s3@news>"), "{cmds:?}");
@@ -417,7 +425,11 @@ async fn nntp_par2_repairs_missing_segment() {
     let nzb = nzb_xml(&[
         (
             "p &quot;movie.bin&quot;",
-            vec![("pm1@news", 320, 1), ("pm2@news", 320, 2), ("pm3@news", 320, 3)],
+            vec![
+                ("pm1@news", 320, 1),
+                ("pm2@news", 320, 2),
+                ("pm3@news", 320, 3),
+            ],
         ),
         ("p &quot;set.par2&quot;", vec![("pi1@news", 4096, 1)]),
         (
@@ -527,7 +539,12 @@ async fn nntp_parallel_connections_bounded_and_ordered() {
         .iter()
         .filter(|c| c.starts_with("AUTHINFO PASS"))
         .count();
-    assert_eq!(auths, 2, "expected 2 NNTP connections, cmds: {:?}", fake.cmds.lock().unwrap());
+    assert_eq!(
+        auths,
+        2,
+        "expected 2 NNTP connections, cmds: {:?}",
+        fake.cmds.lock().unwrap()
+    );
     let peak = fake.peak_body.load(std::sync::atomic::Ordering::SeqCst);
     assert!(peak >= 2, "BODY fetches never overlapped (peak {peak})");
     let _ = std::fs::remove_dir_all(&dir);
@@ -554,11 +571,19 @@ async fn nntp_files_share_one_connection_pool() {
     let nzb = nzb_xml(&[
         (
             "p &quot;f1.bin&quot; (1/1)",
-            vec![("a1@news", 320, 1), ("a2@news", 320, 2), ("a3@news", 320, 3)],
+            vec![
+                ("a1@news", 320, 1),
+                ("a2@news", 320, 2),
+                ("a3@news", 320, 3),
+            ],
         ),
         (
             "p &quot;f2.bin&quot; (1/1)",
-            vec![("b1@news", 320, 1), ("b2@news", 320, 2), ("b3@news", 320, 3)],
+            vec![
+                ("b1@news", 320, 1),
+                ("b2@news", 320, 2),
+                ("b3@news", 320, 3),
+            ],
         ),
     ]);
     let nzb_path = dir.join("pack.nzb");
@@ -579,8 +604,17 @@ async fn nntp_files_share_one_connection_pool() {
     assert_eq!(std::fs::read(out.join("f1.bin")).unwrap(), data1);
     assert_eq!(std::fs::read(out.join("f2.bin")).unwrap(), data2);
     let cmds = fake.cmds.lock().unwrap().clone();
-    let auths = cmds.iter().filter(|c| c.starts_with("AUTHINFO PASS")).count();
-    assert_eq!(auths, 2, "pool must span files, not per-file pools: {cmds:?}");
-    assert_eq!(ctrl.parts.lock().unwrap().clone(), vec![(960, 960), (960, 960)]);
+    let auths = cmds
+        .iter()
+        .filter(|c| c.starts_with("AUTHINFO PASS"))
+        .count();
+    assert_eq!(
+        auths, 2,
+        "pool must span files, not per-file pools: {cmds:?}"
+    );
+    assert_eq!(
+        ctrl.parts.lock().unwrap().clone(),
+        vec![(960, 960), (960, 960)]
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

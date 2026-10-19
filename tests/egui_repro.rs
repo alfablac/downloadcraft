@@ -33,9 +33,13 @@ fn frame(ctx: &Context, pos: egui::Pos2, pressed: bool) {
             .default_size([484.0, 0.0])
             .show(ctx, |ui| {
                 ui.set_min_width(460.0);
-                ui.label(egui::RichText::new(
-                    "Bonuses, MULTi8) [FitGirl Repack, Selective Download - from 1.3 GB]",
-                ).strong().size(14.0));
+                ui.label(
+                    egui::RichText::new(
+                        "Bonuses, MULTi8) [FitGirl Repack, Selective Download - from 1.3 GB]",
+                    )
+                    .strong()
+                    .size(14.0),
+                );
                 let bar_w = ui.available_width();
                 ui.add(egui::ProgressBar::new(0.25).desired_width(bar_w));
                 egui::Grid::new("prog-grid")
@@ -53,10 +57,15 @@ fn frame(ctx: &Context, pos: egui::Pos2, pressed: bool) {
                         ui.end_row();
                         ui.label("Limit (KB/s, 0=off)");
                         let mut lim: i64 = 0;
-                        ui.add_sized([56.0, 32.0], egui::DragValue::new(&mut lim).range(0..=1_000_000));
+                        ui.add_sized(
+                            [56.0, 32.0],
+                            egui::DragValue::new(&mut lim).range(0..=1_000_000),
+                        );
                         ui.end_row();
                         ui.label("URL");
-                        let mut url = "magnet:?xt=urn:btih:15A7DB908759C576A2A0724055DF460A8EC4E3A3".to_string();
+                        let mut url =
+                            "magnet:?xt=urn:btih:15A7DB908759C576A2A0724055DF460A8EC4E3A3"
+                                .to_string();
                         ui.add(egui::TextEdit::singleline(&mut url).desired_width(f32::INFINITY));
                         ui.end_row();
                     });
@@ -74,8 +83,10 @@ fn frame(ctx: &Context, pos: egui::Pos2, pressed: bool) {
                         ui.vertical(|ui| {
                             for i in 0..21 {
                                 ui.add(
-                                    egui::Label::new(format!("udp://tracker{i}.example.org:1337/announce"))
-                                        .truncate(),
+                                    egui::Label::new(format!(
+                                        "udp://tracker{i}.example.org:1337/announce"
+                                    ))
+                                    .truncate(),
                                 );
                             }
                         });
@@ -101,7 +112,11 @@ fn topbar_search_visible() {
                 std::rc::Rc::new(RefCell::new(None));
             for _ in 0..3 {
                 let cell = search_rect.clone();
-                let mut search = if busy { "zip".to_string() } else { String::new() };
+                let mut search = if busy {
+                    "zip".to_string()
+                } else {
+                    String::new()
+                };
                 let input = RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -111,14 +126,12 @@ fn topbar_search_visible() {
                 };
                 let _ = ctx.run(input, |ctx| {
                     egui::TopBottomPanel::top("topbar")
-                        .frame(
-                            egui::Frame::none().inner_margin(egui::Margin {
-                                left: 12.0,
-                                right: 12.0,
-                                top: 4.0,
-                                bottom: 4.0,
-                            }),
-                        )
+                        .frame(egui::Frame::none().inner_margin(egui::Margin {
+                            left: 12.0,
+                            right: 12.0,
+                            top: 4.0,
+                            bottom: 4.0,
+                        }))
                         .show(ctx, |ui| {
                             ui.horizontal_centered(|ui| {
                                 egui::menu::bar(ui, |ui| {

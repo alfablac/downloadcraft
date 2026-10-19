@@ -3,17 +3,17 @@
 // One shared Session for process (per-task Sessions would clash on listen
 // port); persistence = config_dir/torrent-session (JSON) so restarts resume.
 // File selection: task.torrent_files (empty = all) -> AddTorrentOptions.only_files.
-use crate::engine::{Controls, wait_not_paused};
+use crate::engine::{wait_not_paused, Controls};
 use crate::model::{DownloadTask, Settings, TaskStatus};
 use librqbit::{
-    AddTorrent, AddTorrentOptions, ListenerOptions, Magnet, Session,
-    SessionOptions, SessionPersistenceConfig, TorrentStatsState,
+    AddTorrent, AddTorrentOptions, ListenerOptions, Magnet, Session, SessionOptions,
+    SessionPersistenceConfig, TorrentStatsState,
 };
 
 /// librqbit handle type (lib.rs re-exports ManagedTorrent, not the Arc alias).
 type ManagedTorrentHandle = std::sync::Arc<librqbit::ManagedTorrent>;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 static SESSION: tokio::sync::OnceCell<Arc<Session>> = tokio::sync::OnceCell::const_new();
 
@@ -183,10 +183,7 @@ pub async fn list_torrent_files(
 /// Normalize selection against torrent file count -> concrete set for
 /// librqbit (which instant-finishes on empty). Empty/out-of-range-clamped-to-
 /// nothing selections become the full set.
-fn normalize_selection(
-    selected: &[usize],
-    count: usize,
-) -> std::collections::HashSet<usize> {
+fn normalize_selection(selected: &[usize], count: usize) -> std::collections::HashSet<usize> {
     let set: std::collections::HashSet<usize> =
         selected.iter().copied().filter(|i| *i < count).collect();
     if set.is_empty() {
@@ -330,7 +327,12 @@ fn publish(
     {
         let peer = s.live.as_ref().map(|l| &l.snapshot.peer_stats);
         let snap = crate::engine::TorrentSnap {
-            trackers: handle.shared().trackers.iter().map(|u| u.to_string()).collect(),
+            trackers: handle
+                .shared()
+                .trackers
+                .iter()
+                .map(|u| u.to_string())
+                .collect(),
             peers_live: peer.map(|p| p.live).unwrap_or(0),
             peers_connecting: peer.map(|p| p.connecting).unwrap_or(0),
             peers_seen: peer.map(|p| p.seen).unwrap_or(0),
@@ -568,14 +570,8 @@ mod tests {
         assert_eq!(normalize_selection(&[], 3), (0..3).collect::<HashSet<_>>());
         // Out-of-range clamped; nothing survives -> all.
         assert_eq!(normalize_selection(&[9], 3), (0..3).collect::<HashSet<_>>());
-        assert_eq!(
-            normalize_selection(&[2, 9], 3),
-            HashSet::from([2])
-        );
-        assert_eq!(
-            normalize_selection(&[1, 1], 3),
-            HashSet::from([1])
-        );
+        assert_eq!(normalize_selection(&[2, 9], 3), HashSet::from([2]));
+        assert_eq!(normalize_selection(&[1, 1], 3), HashSet::from([1]));
     }
 
     #[test]

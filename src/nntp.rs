@@ -176,7 +176,9 @@ fn common_prefix(files: &[NzbFile]) -> Option<String> {
     }
     let prefix = std::str::from_utf8(&first[..len]).ok()?;
     let boundary = prefix.rfind(['.', '_', '-', ' ', '[', '(']).unwrap_or(0);
-    let cut = prefix[..boundary].trim_end_matches(['.', '_', '-', ' ']).trim();
+    let cut = prefix[..boundary]
+        .trim_end_matches(['.', '_', '-', ' '])
+        .trim();
     if cut.chars().count() < 4 {
         return None;
     }
@@ -679,8 +681,12 @@ pub async fn download_nzb(
         vec![(0, total_segs)]
     };
     if multi {
-        *ctrl.part_files.lock().unwrap_or_else(|e| e.into_inner()) =
-            nzb.files.iter().enumerate().map(|(i, f)| (i, f.name.clone())).collect();
+        *ctrl.part_files.lock().unwrap_or_else(|e| e.into_inner()) = nzb
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (i, f.name.clone()))
+            .collect();
     }
     task.status = TaskStatus::Downloading;
 
@@ -722,8 +728,7 @@ pub async fn download_nzb(
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
             .filter(|v| {
                 v.get("file_idx").and_then(|x| x.as_u64()) == Some(file_idx as u64)
-                    && v.get("seg_idx").and_then(|x| x.as_u64())
-                        == Some(file.segments.len() as u64)
+                    && v.get("seg_idx").and_then(|x| x.as_u64()) == Some(file.segments.len() as u64)
             })
             .and_then(|v| v.get("bytes").and_then(|x| x.as_u64()))
             .filter(|&b| std::fs::metadata(&dest).map(|m| m.len()).ok() == Some(b));
@@ -737,10 +742,20 @@ pub async fn download_nzb(
             downloaded += b;
             segs_done += file.segments.len() as u64;
             if multi {
-                if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).get_mut(file_idx) {
+                if let Some(p) = ctrl
+                    .parts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(file_idx)
+                {
                     *p = (file.total_bytes, file.total_bytes);
                 }
-            } else if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
+            } else if let Some(p) = ctrl
+                .parts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .first_mut()
+            {
                 p.0 = segs_done;
             }
             states.push(Some(FileSt {
@@ -759,7 +774,9 @@ pub async fn download_nzb(
             file_jobs.push(Vec::new());
             continue;
         }
-        let out = tokio::fs::File::create(&dest).await.map_err(|e| e.to_string())?;
+        let out = tokio::fs::File::create(&dest)
+            .await
+            .map_err(|e| e.to_string())?;
         let empty = file.segments.is_empty();
         if empty {
             let _ = std::fs::write(
@@ -787,12 +804,15 @@ pub async fn download_nzb(
     let total_jobs: usize = file_jobs.iter().map(|j| j.len()).sum();
     if total_jobs > 0 {
         use std::sync::atomic::AtomicBool;
-        let queue = std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::VecDeque::<(usize, usize)>::new(),
-        ));
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<(
+            usize,
+            usize,
+        )>::new()));
         let pool_done = std::sync::Arc::new(AtomicBool::new(false));
         let dead = std::sync::Arc::new(
-            (0..nzb.files.len()).map(|_| AtomicBool::new(false)).collect::<Vec<_>>(),
+            (0..nzb.files.len())
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>(),
         );
         let mut active_dests: std::collections::HashSet<std::path::PathBuf> = Default::default();
         let mut queued_files: std::collections::HashSet<usize> = Default::default();
@@ -811,7 +831,10 @@ pub async fn download_nzb(
         let nworkers = (cfg.connections as usize).clamp(1, total_jobs);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, usize, SegOut)>(nworkers * 2);
         let segs_all = std::sync::Arc::new(
-            nzb.files.iter().map(|f| f.segments.clone()).collect::<Vec<_>>(),
+            nzb.files
+                .iter()
+                .map(|f| f.segments.clone())
+                .collect::<Vec<_>>(),
         );
         let groups_a = std::sync::Arc::new(groups.clone());
         let mut handles = Vec::new();
@@ -977,7 +1000,9 @@ pub async fn download_nzb(
                                     let mut pad = want - st.written;
                                     while pad > 0 {
                                         let n = pad.min(zeros.len() as u64) as usize;
-                                        o.write_all(&zeros[..n]).await.map_err(|e| e.to_string())?;
+                                        o.write_all(&zeros[..n])
+                                            .await
+                                            .map_err(|e| e.to_string())?;
                                         pad -= n as u64;
                                     }
                                     st.written = want;
@@ -1009,10 +1034,20 @@ pub async fn download_nzb(
                             segs_done += 1;
                             ctrl.downloaded.store(downloaded, Ordering::Relaxed);
                             if multi {
-                                if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).get_mut(fi) {
+                                if let Some(p) = ctrl
+                                    .parts
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .get_mut(fi)
+                                {
                                     p.0 = st.written.min(p.1);
                                 }
-                            } else if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
+                            } else if let Some(p) = ctrl
+                                .parts
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .first_mut()
+                            {
                                 p.0 = segs_done;
                             }
                             task.downloaded = downloaded;
@@ -1053,7 +1088,12 @@ pub async fn download_nzb(
                         drop(o);
                     }
                     if multi {
-                        if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).get_mut(fi) {
+                        if let Some(p) = ctrl
+                            .parts
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_mut(fi)
+                        {
                             *p = (file.total_bytes, file.total_bytes);
                         }
                     }
@@ -1076,7 +1116,10 @@ pub async fn download_nzb(
                         queued_files.insert(nfi);
                         continue;
                     }
-                    let blocked = states.iter().flatten().any(|s| !std::ptr::eq(s, st) && !s.done && s.dest == st.dest);
+                    let blocked = states
+                        .iter()
+                        .flatten()
+                        .any(|s| !std::ptr::eq(s, st) && !s.done && s.dest == st.dest);
                     if blocked {
                         continue;
                     }
@@ -1130,12 +1173,21 @@ pub async fn download_nzb(
                             continue;
                         };
                         let after = meta.len();
-                        let b = before.iter().find(|(i, _)| *i == fi).map(|(_, v)| *v).unwrap_or(0);
+                        let b = before
+                            .iter()
+                            .find(|(i, _)| *i == fi)
+                            .map(|(_, v)| *v)
+                            .unwrap_or(0);
                         downloaded = downloaded.saturating_sub(b).saturating_add(after);
                         ctrl.downloaded.store(downloaded, Ordering::Relaxed);
                         task.downloaded = downloaded;
                         if multi {
-                            if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).get_mut(fi) {
+                            if let Some(p) = ctrl
+                                .parts
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get_mut(fi)
+                            {
                                 p.0 = p.1;
                             }
                         }
@@ -1158,7 +1210,11 @@ pub async fn download_nzb(
         let mut msg = format!(
             "NZB: {} file(s) failed: {}",
             failed.len(),
-            failed.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>().join("; ")
+            failed
+                .iter()
+                .map(|(_, s)| s.clone())
+                .collect::<Vec<_>>()
+                .join("; ")
         );
         if let Some(n) = repair_note {
             msg.push_str("; ");

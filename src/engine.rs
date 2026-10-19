@@ -58,8 +58,11 @@ fn headers_for(task: &DownloadTask) -> reqwest::header::HeaderMap {
     }
     for (k, v) in &task.headers {
         // Pseudo-headers are task config, never sent on wire.
-        if crate::ytdlp::YT_HEADER_KEYS.iter().any(|x| k.eq_ignore_ascii_case(x))
+        if crate::ytdlp::YT_HEADER_KEYS
+            .iter()
+            .any(|x| k.eq_ignore_ascii_case(x))
             || k.eq_ignore_ascii_case("x-page-url")
+            || k.eq_ignore_ascii_case("x-page-title")
             || k.eq_ignore_ascii_case("x-page-stream")
             || k.eq_ignore_ascii_case("x-page-intent")
             || k.eq_ignore_ascii_case("x-rep-id")
@@ -295,7 +298,8 @@ fn pct_decode_bytes(s: &str) -> Vec<u8> {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16)
+            if let Ok(v) =
+                u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16)
             {
                 out.push(v);
                 i += 3;
@@ -675,7 +679,12 @@ pub async fn download_http(
             ctrl.downloaded.store(n, Ordering::Relaxed);
             task.downloaded = n;
             if let Some(t) = task.total {
-                if let Some(part) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
+                if let Some(part) = ctrl
+                    .parts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .first_mut()
+                {
                     part.0 = n.min(t);
                 }
             }
@@ -825,7 +834,10 @@ pub async fn download_http(
     ctrl.parts_are_segments.store(false, Ordering::Relaxed);
     {
         let mut pg = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner());
-        *pg = segs.iter().map(|x| (x.done, x.end.saturating_add(1).saturating_sub(x.start))).collect();
+        *pg = segs
+            .iter()
+            .map(|x| (x.done, x.end.saturating_add(1).saturating_sub(x.start)))
+            .collect();
     }
     // Work-stealing pool: fixed worker count (= initial segment count). Idle
     // worker splits largest remaining in-flight segment, steals its tail.
@@ -1212,7 +1224,12 @@ async fn download_range(
     if let Some(e) = err {
         ctrl.downloaded.fetch_sub(n, Ordering::Relaxed);
         if let Some(pi) = part_index {
-            if let Some(part) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).get_mut(pi) {
+            if let Some(part) = ctrl
+                .parts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(pi)
+            {
                 part.0 = prior.min(part.1);
             }
         }
@@ -1801,7 +1818,10 @@ fn mp4_scan(head: &[u8]) -> Mp4Scan {
                 if off + 16 > head.len() {
                     break;
                 }
-                (16, u64::from_be_bytes(head[off + 8..off + 16].try_into().unwrap()))
+                (
+                    16,
+                    u64::from_be_bytes(head[off + 8..off + 16].try_into().unwrap()),
+                )
             }
             0 => (8, (head.len() - off) as u64), // extends to EOF
             s => (8, s as u64),
@@ -1885,7 +1905,9 @@ fn validate_output_impl(
     // First 64KB is plenty for magic; whole-file read would be wasteful on
     // multi-GB outputs, size comes from metadata.
     use std::io::Read as _;
-    let size = std::fs::metadata(dest).map_err(|_| ValidateFail::Empty)?.len();
+    let size = std::fs::metadata(dest)
+        .map_err(|_| ValidateFail::Empty)?
+        .len();
     let ctx_ext = ext_of_str(filename_for_error_context);
     let dest_ext = dest
         .extension()
@@ -1942,11 +1964,12 @@ fn validate_output_impl(
         // mov legacy: permissive (no ftyp, e.g. legacy QuickTime). mp4/m4v:
         // ftyp OR styp start; styp files still subject to box walk below.
         // m4a excluded: ADTS-.m4a has no ftyp.
-        "mp4" | "m4v" => {
-            head.len() >= 8 && (&head[4..8] == b"ftyp" || &head[4..8] == b"styp")
-        }
+        "mp4" | "m4v" => head.len() >= 8 && (&head[4..8] == b"ftyp" || &head[4..8] == b"styp"),
         "webm" | "mkv" => head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]),
-        "mp3" => head.starts_with(b"ID3") || (head.len() >= 2 && head[0] == 0xFF && head[1] & 0xE0 == 0xE0),
+        "mp3" => {
+            head.starts_with(b"ID3")
+                || (head.len() >= 2 && head[0] == 0xFF && head[1] & 0xE0 == 0xE0)
+        }
         "ts" => is_ts(head),
         _ => true,
     };
@@ -2112,7 +2135,10 @@ mod tests {
         let moof = bx(b"moof", b"frag");
         let styp = bx(b"styp", b"msdh");
         let cat = |parts: &[&Vec<u8>]| {
-            parts.iter().flat_map(|p| p.iter().copied()).collect::<Vec<u8>>()
+            parts
+                .iter()
+                .flat_map(|p| p.iter().copied())
+                .collect::<Vec<u8>>()
         };
         // init segment only (ftyp+moov): no media -> reject
         assert!(!mp4_has_media(&cat(&[&ftyp, &moov])));
@@ -2162,9 +2188,15 @@ mod tests {
             "mp4 styp+moof+mdat without moov rejected"
         );
         let p = tmp_file("bw7", "v.mp4", &cat(&[&styp, &moov, &moof, &mdat]));
-        assert!(validate_output(&p, "v.mp4").is_ok(), "styp+moov+moof accepted");
+        assert!(
+            validate_output(&p, "v.mp4").is_ok(),
+            "styp+moov+moof accepted"
+        );
         let p = tmp_file("bw8", "v.mp4", &cat(&[&styp, &moov, &moof]));
-        assert!(validate_output(&p, "v.mp4").is_ok(), "styp+moov+moof (no mdat) accepted");
+        assert!(
+            validate_output(&p, "v.mp4").is_ok(),
+            "styp+moov+moof (no mdat) accepted"
+        );
         // .mov: walk runs when ftyp/styp present; legacy no-ftyp/no-styp stays permissive.
         let p = tmp_file("bw9", "v.mov", &cat(&[&ftyp, &moof]));
         assert!(
@@ -2172,14 +2204,21 @@ mod tests {
             "mov ftyp+moof without moov rejected"
         );
         let p = tmp_file("bw10", "v.mov", &cat(&[&styp, &moov, &moof, &mdat]));
-        assert!(validate_output(&p, "v.mov").is_ok(), "mov styp+moov+moof accepted");
+        assert!(
+            validate_output(&p, "v.mov").is_ok(),
+            "mov styp+moov+moof accepted"
+        );
     }
 
     #[test]
     fn validate_output_magic_table() {
         // Real boxes: ftyp + moov + mdat (24-byte total also used sub-size below).
         let mut mp4 = Vec::new();
-        for (typ, payload) in [(b"ftyp", &b"isom"[..]), (b"moov", &b"meta"[..]), (b"mdat", &[0u8; 16][..])] {
+        for (typ, payload) in [
+            (b"ftyp", &b"isom"[..]),
+            (b"moov", &b"meta"[..]),
+            (b"mdat", &[0u8; 16][..]),
+        ] {
             mp4.extend_from_slice(&((payload.len() + 8) as u32).to_be_bytes());
             mp4.extend_from_slice(typ);
             mp4.extend_from_slice(payload);
@@ -2299,7 +2338,10 @@ mod tests {
         assert_eq!(recorded_seg_len(&legacy, "video", 0), None);
         // Fresh object snapshot round-trips per-segment lengths.
         let tracks: MediaTracks = vec![
-            ("video".into(), vec![(None, "s0".into()), (None, "s1".into())]),
+            (
+                "video".into(),
+                vec![(None, "s0".into()), (None, "s1".into())],
+            ),
             ("audio".into(), vec![(None, "a0".into())]),
         ];
         let mut lens = SegLenSnapshot::new();
@@ -2372,10 +2414,8 @@ mod tests {
     #[test]
     fn cd_rfc5987_utf8() {
         assert_eq!(
-            parse_content_disposition(
-                "attachment; filename*=UTF-8''%E2%82%AC%20rates.pdf"
-            )
-            .as_deref(),
+            parse_content_disposition("attachment; filename*=UTF-8''%E2%82%AC%20rates.pdf")
+                .as_deref(),
             Some("€ rates.pdf")
         );
     }
@@ -2407,8 +2447,7 @@ mod tests {
             Some("evil.exe")
         );
         assert_eq!(
-            parse_content_disposition("attachment; filename*=UTF-8''..%2F..%2Fevil.exe")
-                .as_deref(),
+            parse_content_disposition("attachment; filename*=UTF-8''..%2F..%2Fevil.exe").as_deref(),
             Some("evil.exe")
         );
         assert_eq!(parse_content_disposition("attachment"), None);
@@ -2418,8 +2457,7 @@ mod tests {
     fn cd_latin1_star() {
         // 0xE9 = é in ISO-8859-1
         assert_eq!(
-            parse_content_disposition("attachment; filename*=ISO-8859-1''caf%E9.txt")
-                .as_deref(),
+            parse_content_disposition("attachment; filename*=ISO-8859-1''caf%E9.txt").as_deref(),
             Some("café.txt")
         );
     }

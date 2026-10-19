@@ -14,7 +14,11 @@ fn crc32(data: &[u8]) -> u32 {
         for (i, v) in t.iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
-                c = if c & 1 != 0 { 0xEDB88320 ^ (c >> 1) } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    0xEDB88320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
             }
             *v = c;
         }
@@ -113,7 +117,11 @@ fn input_base_logs(count: usize) -> Vec<u16> {
     let mut out = Vec::with_capacity(count);
     let mut k: u32 = 1;
     while out.len() < count {
-        if !k.is_multiple_of(3) && !k.is_multiple_of(5) && !k.is_multiple_of(17) && !k.is_multiple_of(257) {
+        if !k.is_multiple_of(3)
+            && !k.is_multiple_of(5)
+            && !k.is_multiple_of(17)
+            && !k.is_multiple_of(257)
+        {
             out.push((k % 65535) as u16);
         }
         k += 1;
@@ -179,7 +187,7 @@ struct Par2Set {
     main: Option<MainPkt>,
     descs: HashMap<[u8; 16], FileDesc>,
     ifsc: HashMap<[u8; 16], Vec<([u8; 16], u32)>>, // per-block (md5, crc32)
-    recv: HashMap<u32, Vec<u8>>,                    // exponent -> slice data (first wins)
+    recv: HashMap<u32, Vec<u8>>,                   // exponent -> slice data (first wins)
 }
 
 fn parse_packets(data: &[u8], sets: &mut HashMap<[u8; 16], Par2Set>) {
@@ -241,7 +249,11 @@ fn parse_packets(data: &[u8], sets: &mut HashMap<[u8; 16], Par2Set>) {
                     Some(m) => rec.len() > m.recovery_ids.len(),
                 };
                 if better {
-                    set.main = Some(MainPkt { slice_size, recovery_ids: rec, non_recovery_ids: non });
+                    set.main = Some(MainPkt {
+                        slice_size,
+                        recovery_ids: rec,
+                        non_recovery_ids: non,
+                    });
                 }
             }
         } else if typ == *TYPE_FILEDESC {
@@ -251,9 +263,21 @@ fn parse_packets(data: &[u8], sets: &mut HashMap<[u8; 16], Par2Set>) {
                 let hash_16k = arr16(&body[32..48]);
                 let length = u64le(&body[48..56]);
                 let raw_name = &body[56..];
-                let nul = raw_name.iter().position(|&c| c == 0).unwrap_or(raw_name.len());
+                let nul = raw_name
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(raw_name.len());
                 let name = String::from_utf8_lossy(&raw_name[..nul]).into_owned();
-                set.descs.insert(file_id, FileDesc { file_id, hash_full, hash_16k, length, name });
+                set.descs.insert(
+                    file_id,
+                    FileDesc {
+                        file_id,
+                        hash_full,
+                        hash_16k,
+                        length,
+                        name,
+                    },
+                );
             }
         } else if typ == *TYPE_IFSC {
             if body.len() >= 16 {
@@ -262,15 +286,19 @@ fn parse_packets(data: &[u8], sets: &mut HashMap<[u8; 16], Par2Set>) {
                 let n = rest.len() / 20;
                 let mut v = Vec::with_capacity(n);
                 for i in 0..n {
-                    v.push((arr16(&rest[i * 20..i * 20 + 16]), u32le(&rest[i * 20 + 16..i * 20 + 20])));
+                    v.push((
+                        arr16(&rest[i * 20..i * 20 + 16]),
+                        u32le(&rest[i * 20 + 16..i * 20 + 20]),
+                    ));
                 }
                 set.ifsc.entry(file_id).or_insert(v);
             }
-        } else if typ == *TYPE_RECV
-            && body.len() >= 4 {
-                let exponent = u32le(&body[0..4]);
-                set.recv.entry(exponent).or_insert_with(|| body[4..].to_vec());
-            }
+        } else if typ == *TYPE_RECV && body.len() >= 4 {
+            let exponent = u32le(&body[0..4]);
+            set.recv
+                .entry(exponent)
+                .or_insert_with(|| body[4..].to_vec());
+        }
         // Crit / other packets ignored.
         off = end;
     }
@@ -373,11 +401,7 @@ pub mod test_support {
         for e in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
             let e = e.map_err(|e| e.to_string())?;
             let p = e.path();
-            if !e
-                .file_type()
-                .map_err(|e| e.to_string())?
-                .is_file()
-            {
+            if !e.file_type().map_err(|e| e.to_string())?.is_file() {
                 continue;
             }
             let name = e.file_name().to_string_lossy().into_owned();
@@ -505,7 +529,10 @@ pub fn repair_dir(dir: &Path) -> Result<RepairReport, String> {
     let rd = std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
     for e in rd.flatten() {
         let p = e.path();
-        if p.extension().map(|x| x.eq_ignore_ascii_case("par2")).unwrap_or(false) {
+        if p.extension()
+            .map(|x| x.eq_ignore_ascii_case("par2"))
+            .unwrap_or(false)
+        {
             par2_paths.push(p);
         }
     }
@@ -533,7 +560,8 @@ pub fn repair_dir(dir: &Path) -> Result<RepairReport, String> {
                 let bm = b.main.as_ref().unwrap();
                 let sm = s.main.as_ref().unwrap();
                 s.recv.len() > b.recv.len()
-                    || (s.recv.len() == b.recv.len() && sm.recovery_ids.len() > bm.recovery_ids.len())
+                    || (s.recv.len() == b.recv.len()
+                        && sm.recovery_ids.len() > bm.recovery_ids.len())
             }
         };
         if b {
@@ -550,7 +578,9 @@ pub fn repair_dir(dir: &Path) -> Result<RepairReport, String> {
     // Recovery-set files in Main order. Skip verify-only (non-recovery) files.
     let mut files: Vec<FileState> = Vec::new();
     for id in &main.recovery_ids {
-        let Some(desc) = set.descs.get(id) else { continue };
+        let Some(desc) = set.descs.get(id) else {
+            continue;
+        };
         // Guard against path traversal in stored names: use file_name only.
         let fname = Path::new(&desc.name)
             .file_name()
@@ -564,23 +594,38 @@ pub fn repair_dir(dir: &Path) -> Result<RepairReport, String> {
             Ok(d) => (true, d),
             Err(_) => (false, Vec::new()),
         };
-        files.push(FileState { desc: desc.clone(), path, present, data });
+        files.push(FileState {
+            desc: desc.clone(),
+            path,
+            present,
+            data,
+        });
     }
     if files.is_empty() {
         return Err("no recovery-set files described".to_string());
     }
 
     // Global slice layout.
-    let counts: Vec<usize> = files.iter().map(|f| slices_for_len(f.desc.length, main.slice_size)).collect();
+    let counts: Vec<usize> = files
+        .iter()
+        .map(|f| slices_for_len(f.desc.length, main.slice_size))
+        .collect();
     let total_slices: usize = counts.iter().sum();
     if total_slices == 0 {
-        return Ok(RepairReport { files_repaired: 0, blocks_recovered: 0, already_ok: true });
+        return Ok(RepairReport {
+            files_repaired: 0,
+            blocks_recovered: 0,
+            already_ok: true,
+        });
     }
     if total_slices >= 65535 {
         return Err("too many input slices".to_string());
     }
     let base_logs = input_base_logs(total_slices);
-    let gens: Vec<u16> = base_logs.iter().map(|&k| generator_for_base_log(k)).collect();
+    let gens: Vec<u16> = base_logs
+        .iter()
+        .map(|&k| generator_for_base_log(k))
+        .collect();
 
     // Present slice bytes (padded to slice_size) + missing mask.
     // slice_data[global_idx] = Some(padded bytes) if block verifies, else None.
@@ -642,12 +687,17 @@ pub fn repair_dir(dir: &Path) -> Result<RepairReport, String> {
         }
     }
 
-    let missing: Vec<usize> = (0..total_slices).filter(|&i| slice_data[i].is_none()).collect();
+    let missing: Vec<usize> = (0..total_slices)
+        .filter(|&i| slice_data[i].is_none())
+        .collect();
     if missing.is_empty() {
         // Re-verify full hashes for IFSC files too: catch trailing-length issues.
         let mut all_ok = true;
         for f in &files {
-            if !f.present || md5(&f.data) != f.desc.hash_full || f.data.len() as u64 != f.desc.length {
+            if !f.present
+                || md5(&f.data) != f.desc.hash_full
+                || f.data.len() as u64 != f.desc.length
+            {
                 // Block checks passed; length/md5 discrepancy means file needs rewrite from slices.
                 // Only flag if we have all slices (we do).
                 all_ok = false;
@@ -655,14 +705,21 @@ pub fn repair_dir(dir: &Path) -> Result<RepairReport, String> {
             }
         }
         if all_ok {
-            return Ok(RepairReport { files_repaired: 0, blocks_recovered: 0, already_ok: true });
+            return Ok(RepairReport {
+                files_repaired: 0,
+                blocks_recovered: 0,
+                already_ok: true,
+            });
         }
         // Fall through to rewrite files from verified slices (counts as repair of those files).
         return rewrite_files(&files, &counts, slice_size, &slice_data, 0, true);
     }
 
     if set.recv.is_empty() {
-        return Err(format!("{} blocks missing, no recovery slices", missing.len()));
+        return Err(format!(
+            "{} blocks missing, no recovery slices",
+            missing.len()
+        ));
     }
     if missing.len() > set.recv.len() {
         return Err(format!(
@@ -720,7 +777,9 @@ pub fn repair_dir(dir: &Path) -> Result<RepairReport, String> {
     // Gauss-Jordan.
     for col in 0..m {
         // Pivot.
-        let piv = (col..m).find(|&r| mat[r][col] != 0).ok_or("singular recovery matrix")?;
+        let piv = (col..m)
+            .find(|&r| mat[r][col] != 0)
+            .ok_or("singular recovery matrix")?;
         mat.swap(col, piv);
         let inv = gf_inv(mat[col][col]);
         // ponytail: index loops kept; row split-borrow blocks iter_mut rewrite
@@ -770,10 +829,17 @@ pub fn repair_dir(dir: &Path) -> Result<RepairReport, String> {
         for fi in 0..files.len() {
             if gi < acc + counts[fi] {
                 let bi = gi - acc;
-                if let Some(chk) = set.ifsc.get(&files[fi].desc.file_id).and_then(|c| c.get(bi)) {
+                if let Some(chk) = set
+                    .ifsc
+                    .get(&files[fi].desc.file_id)
+                    .and_then(|c| c.get(bi))
+                {
                     let d = slice_data[gi].as_ref().unwrap();
                     if !block_ok(d, &chk.0, chk.1) {
-                        return Err(format!("recovered block {} in {} failed MD5/CRC32 verify", bi, files[fi].desc.name));
+                        return Err(format!(
+                            "recovered block {} in {} failed MD5/CRC32 verify",
+                            bi, files[fi].desc.name
+                        ));
                     }
                 }
                 break;
@@ -782,7 +848,14 @@ pub fn repair_dir(dir: &Path) -> Result<RepairReport, String> {
         }
     }
 
-    rewrite_files(&files, &counts, slice_size, &slice_data, missing.len(), true)
+    rewrite_files(
+        &files,
+        &counts,
+        slice_size,
+        &slice_data,
+        missing.len(),
+        true,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -804,7 +877,12 @@ fn build_packet(set_id: &[u8; 16], typ: &[u8; 16], body: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-fn compute_recv_slice(slices: &[Vec<u8>], gens: &[u16], exponent: u32, slice_size: usize) -> Vec<u8> {
+fn compute_recv_slice(
+    slices: &[Vec<u8>],
+    gens: &[u16],
+    exponent: u32,
+    slice_size: usize,
+) -> Vec<u8> {
     // R_e = sum_i g_i^e * D_i over GF words.
     let words = slice_size / 2;
     let mut acc = vec![0u16; words];
@@ -842,7 +920,9 @@ fn rewrite_files(
     for (fi, f) in files.iter().enumerate() {
         let mut rebuilt: Vec<u8> = Vec::with_capacity(f.desc.length as usize);
         for bi in 0..counts[fi] {
-            let sd = slice_data[g + bi].as_ref().ok_or_else(|| format!("slice {} unavailable", g + bi))?;
+            let sd = slice_data[g + bi]
+                .as_ref()
+                .ok_or_else(|| format!("slice {} unavailable", g + bi))?;
             let want = ((f.desc.length as usize).saturating_sub(bi * slice_size)).min(slice_size);
             rebuilt.extend_from_slice(&sd[..want]);
         }
@@ -852,10 +932,16 @@ fn rewrite_files(
         }
         // Verify before writing.
         if md5(&rebuilt) != f.desc.hash_full {
-            return Err(format!("rebuilt file {} failed full MD5 verify", f.desc.name));
+            return Err(format!(
+                "rebuilt file {} failed full MD5 verify",
+                f.desc.name
+            ));
         }
         if md5(&rebuilt[..rebuilt.len().min(16384)]) != f.desc.hash_16k {
-            return Err(format!("rebuilt file {} failed 16k MD5 verify", f.desc.name));
+            return Err(format!(
+                "rebuilt file {} failed 16k MD5 verify",
+                f.desc.name
+            ));
         }
         let changed = !f.present || f.data != rebuilt;
         if changed || !only_changed {
@@ -864,16 +950,22 @@ fn rewrite_files(
             std::fs::write(&tmp, &rebuilt).map_err(|e| format!("write {}: {e}", tmp.display()))?;
             // Windows: rename over existing fails; remove first.
             let _ = std::fs::remove_file(&f.path);
-            std::fs::rename(&tmp, &f.path).map_err(|e| format!("rename {}: {e}", f.path.display()))?;
+            std::fs::rename(&tmp, &f.path)
+                .map_err(|e| format!("rename {}: {e}", f.path.display()))?;
             files_repaired += 1;
         }
         // Re-verify on disk.
-        let disk = std::fs::read(&f.path).map_err(|e| format!("reread {}: {e}", f.path.display()))?;
+        let disk =
+            std::fs::read(&f.path).map_err(|e| format!("reread {}: {e}", f.path.display()))?;
         if md5(&disk) != f.desc.hash_full {
             return Err(format!("post-write MD5 verify failed for {}", f.desc.name));
         }
     }
-    Ok(RepairReport { files_repaired, blocks_recovered, already_ok: false })
+    Ok(RepairReport {
+        files_repaired,
+        blocks_recovered,
+        already_ok: false,
+    })
 }
 
 #[cfg(test)]
@@ -940,11 +1032,20 @@ mod tests {
                 slices.push(block);
             }
             per_file_blocks.push(blocks);
-            descs.push(FileDesc { file_id, hash_full, hash_16k, length: data.len() as u64, name: name.to_string() });
+            descs.push(FileDesc {
+                file_id,
+                hash_full,
+                hash_16k,
+                length: data.len() as u64,
+                name: name.to_string(),
+            });
         }
         let total = slices.len();
         let base_logs = input_base_logs(total);
-        let gens: Vec<u16> = base_logs.iter().map(|&k| generator_for_base_log(k)).collect();
+        let gens: Vec<u16> = base_logs
+            .iter()
+            .map(|&k| generator_for_base_log(k))
+            .collect();
         let mut out: Vec<u8> = Vec::new();
         // Main
         {
@@ -986,7 +1087,9 @@ mod tests {
     fn packet_roundtrip_and_repair_flip() {
         let dir = tempdir("flip");
         let f1: Vec<u8> = (0..40u8).collect(); // 3 slices @16
-        let f2: Vec<u8> = (0..33u8).map(|x| x.wrapping_mul(7).wrapping_add(3)).collect(); // 3 slices, tail padded
+        let f2: Vec<u8> = (0..33u8)
+            .map(|x| x.wrapping_mul(7).wrapping_add(3))
+            .collect(); // 3 slices, tail padded
         std::fs::write(dir.join("a.bin"), &f1).unwrap();
         std::fs::write(dir.join("b.bin"), &f2).unwrap();
         let par2 = build_set(&[("a.bin", f1.clone()), ("b.bin", f2.clone())], 16, 3);
@@ -1080,4 +1183,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

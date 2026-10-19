@@ -189,6 +189,7 @@ async function sendDownload(url, tab, extra = {}) {
   const referrer = extra.referrer != null ? extra.referrer : (extra.pageUrl || extra.cookieUrl || (tab ? tab.url : ""));
   const msg = { type: "download", url, referrer, referer: referrer, cookies, cookiesJson, filename: extra.filename ? basename(extra.filename) : filenameFromUrl(url) };
   if (extra.pageUrl) msg.pageUrl = extra.pageUrl;
+  if (extra.pageTitle) msg.pageTitle = extra.pageTitle;
   if (extra.intent) msg.intent = extra.intent;
   if (extra.mime) msg.mime = extra.mime;
   // Captured (intercepted) downloads pass host-side capture filter (extension
@@ -206,13 +207,17 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({ id: "downloadcraft-link", title: "Download with webcraft", contexts: ["link"] });
   chrome.contextMenus.create({ id: "downloadcraft-media", title: "Download media with webcraft", contexts: ["video", "audio", "image"] });
   chrome.contextMenus.create({ id: "downloadcraft-page", title: "Download all links with webcraft", contexts: ["page"] });
+  chrome.contextMenus.create({ id: "downloadcraft-grab", title: "Grab site with webcraft", contexts: ["page"] });
 });
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === "downloadcraft-link" && info.linkUrl) sendDownload(info.linkUrl, tab);
   // blob:/data: srcUrl dies in native host; open panel (page yt-dlp row works).
   else if (info.menuItemId === "downloadcraft-media" && info.srcUrl && /^(blob|data):/.test(info.srcUrl)) { if (tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "downloadcraft-scan" }); }
   else if (info.menuItemId === "downloadcraft-media" && info.srcUrl) sendDownload(info.srcUrl, tab);
-  else if (info.menuItemId === "downloadcraft-page" && tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "downloadcraft-grab-all" });
+  // Stale tab (no content script): fall back to grab-site instead of silent dead click.
+  else if (info.menuItemId === "downloadcraft-page" && tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "downloadcraft-grab-all" }).catch(() => { if (tab.url) sendDownload("webcraft://grab?url=" + encodeURIComponent(tab.url), tab, { referrer: tab.url, cookieUrl: tab.url }); });
+  // cookieUrl=tab.url: cookies must scope to real page, not webcraft:// pseudo-URL.
+  else if (info.menuItemId === "downloadcraft-grab" && tab && tab.url) sendDownload("webcraft://grab?url=" + encodeURIComponent(tab.url), tab, { referrer: tab.url, cookieUrl: tab.url });
 });
 // Captured downloads go DIRECTLY to webcraft (its modal is the config box,
 // like IDM). No browser ask box. Filter = webcraft Settings, decided by
@@ -290,10 +295,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
     return true;
   }
-  if (msg && msg.type === "downloadcraft-download") { sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer }).then(sendResponse, (e) => sendResponse({ type: "error", error: String((e && e.message) || e) })); return true; }
+  if (msg && msg.type === "downloadcraft-download") { sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer, pageTitle: msg.pageTitle }).then(sendResponse, (e) => sendResponse({ type: "error", error: String((e && e.message) || e) })); return true; }
+  if (msg && msg.type === "downloadcraft-grab-site" && sender.tab && sender.tab.url) { sendDownload("webcraft://grab?url=" + encodeURIComponent(sender.tab.url), sender.tab, { referrer: sender.tab.url, cookieUrl: sender.tab.url }).then(sendResponse, (e) => sendResponse({ type: "error", error: String((e && e.message) || e) })); return true; }
   // intent=stream: picked manifest/file is target; pageUrl must NOT promote
   // to yt-dlp page (else manifest choice lost). Only cookies scope passes.
-  if (msg && msg.type === "downloadcraft-video-panel") { sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer || msg.pageUrl, pageUrl: msg.intent === "page" ? msg.pageUrl : undefined, cookieUrl: msg.pageUrl, intent: msg.intent }).then(sendResponse, (e) => sendResponse({ type: "error", error: String((e && e.message) || e) })); return true; }
+  if (msg && msg.type === "downloadcraft-video-panel") { sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer || msg.pageUrl, pageTitle: msg.pageTitle, pageUrl: msg.intent === "page" ? msg.pageUrl : undefined, cookieUrl: msg.pageUrl, intent: msg.intent }).then(sendResponse, (e) => sendResponse({ type: "error", error: String((e && e.message) || e) })); return true; }
 });
 chrome.action.onClicked.addListener((tab) => { if (tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "downloadcraft-scan" }).catch(() => {}); });
 // SPA pushState nav fires url change without status=loading: drop stale streams then too.

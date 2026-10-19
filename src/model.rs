@@ -410,13 +410,15 @@ pub fn sanitize_filename(name: &str) -> String {
     // Cap name length: hostile 10k names / >260-char full paths fail on Windows.
     if out.len() > 120 {
         let (ext, stem_part) = match out.rfind('.') {
-            Some(i) if i > 0 && out.len() - i <= 10 => {
-                (out[i..].to_string(), out[..i].to_string())
-            }
+            Some(i) if i > 0 && out.len() - i <= 10 => (out[i..].to_string(), out[..i].to_string()),
             _ => (String::new(), out.clone()),
         };
         let keep = 120usize.saturating_sub(ext.len());
-        out = format!("{}{}", stem_part.chars().take(keep).collect::<String>(), ext);
+        out = format!(
+            "{}{}",
+            stem_part.chars().take(keep).collect::<String>(),
+            ext
+        );
     }
     out
 }
@@ -424,7 +426,11 @@ pub fn sanitize_filename(name: &str) -> String {
 pub fn filename_from_url(url: &str) -> String {
     // Magnet has no path segment: use dn= display name, else placeholder
     // "torrent" (torrent poll loop replaces it once metadata arrives).
-    if url.trim_start().to_ascii_lowercase().starts_with("magnet:?") {
+    if url
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("magnet:?")
+    {
         if let Some(q) = url.split_once('?').map(|(_, q)| q) {
             for pair in q.split('&') {
                 if let Some(v) = pair.strip_prefix("dn=") {
@@ -495,7 +501,11 @@ pub fn expand_template(
         .replace("{host}", host)
         .replace("{category}", category);
     // Template may reference only {category} etc and omit {ext}; keep ext.
-    let out = if !ext.is_empty() && !out.to_ascii_lowercase().ends_with(&ext.to_ascii_lowercase()) {
+    let out = if !ext.is_empty()
+        && !out
+            .to_ascii_lowercase()
+            .ends_with(&ext.to_ascii_lowercase())
+    {
         format!("{out}{ext}")
     } else {
         out
@@ -558,7 +568,11 @@ pub fn apply_folder_template(tpl: &str, filename: &str, url: &str) -> String {
 
 /// Destination dir for new task: category subfolder when enabled and
 /// category != "General" (this crate's Other-equivalent), else base.
-pub fn dest_dir_for(base: &std::path::Path, filename: &str, category_subfolders: bool) -> std::path::PathBuf {
+pub fn dest_dir_for(
+    base: &std::path::Path,
+    filename: &str,
+    category_subfolders: bool,
+) -> std::path::PathBuf {
     let cat = category_for(filename);
     if category_subfolders && cat != "General" {
         base.join(cat)
@@ -590,20 +604,47 @@ mod tests {
     #[test]
     fn expand_template_exact() {
         assert_eq!(
-            expand_template("{name}-{date}{ext}", "Vid", ".mp4", "cdn.example", "Video", "2026-10-17"),
+            expand_template(
+                "{name}-{date}{ext}",
+                "Vid",
+                ".mp4",
+                "cdn.example",
+                "Video",
+                "2026-10-17"
+            ),
             "Vid-2026-10-17.mp4"
         );
         assert_eq!(
-            expand_template("{category}_{host}_{name}{ext}", "a", ".mkv", "cdn.example", "Video", "2026-10-17"),
+            expand_template(
+                "{category}_{host}_{name}{ext}",
+                "a",
+                ".mkv",
+                "cdn.example",
+                "Video",
+                "2026-10-17"
+            ),
             "Video_cdn.example_a.mkv"
         );
         assert_eq!(
-            expand_template("{name} from {host}", "a", ".mkv", "h", "Video", "2026-10-17"),
+            expand_template(
+                "{name} from {host}",
+                "a",
+                ".mkv",
+                "h",
+                "Video",
+                "2026-10-17"
+            ),
             "a from h.mkv",
             "missing ext appended"
         );
-        assert_eq!(expand_template("", "a", ".mp4", "h", "Video", "2026-10-17"), "a.mp4");
-        assert_eq!(expand_template("  ", "a", ".mp4", "h", "Video", "2026-10-17"), "a.mp4");
+        assert_eq!(
+            expand_template("", "a", ".mp4", "h", "Video", "2026-10-17"),
+            "a.mp4"
+        );
+        assert_eq!(
+            expand_template("  ", "a", ".mp4", "h", "Video", "2026-10-17"),
+            "a.mp4"
+        );
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(20743), (2026, 10, 17));
     }
@@ -640,8 +681,7 @@ mod tests {
             torrent_files: vec![0, 2],
             ..Default::default()
         };
-        let back: DownloadTask =
-            serde_json::from_value(serde_json::to_value(&t).unwrap()).unwrap();
+        let back: DownloadTask = serde_json::from_value(serde_json::to_value(&t).unwrap()).unwrap();
         assert_eq!(back.torrent_files, vec![0, 2]);
         // Old state.json without field -> empty (all files).
         t.torrent_files.clear();
@@ -669,13 +709,23 @@ mod tests {
         assert_eq!(back.grab_col_widths, vec![300.0, 80.0, 90.0]);
         // Old state without table fields deserializes to defaults.
         let mut v = serde_json::to_value(Settings::default()).unwrap();
-        for k in ["dl_sort_col", "dl_sort_asc", "dl_col_widths", "dl_col_widths_compact", "grab_col_widths"] {
+        for k in [
+            "dl_sort_col",
+            "dl_sort_asc",
+            "dl_col_widths",
+            "dl_col_widths_compact",
+            "grab_col_widths",
+        ] {
             v.as_object_mut().unwrap().remove(k);
         }
         let old: Settings = serde_json::from_value(v).unwrap();
         assert_eq!(old.dl_sort_col, 0);
         assert!(old.dl_sort_asc);
-        assert!(old.dl_col_widths.is_empty() && old.dl_col_widths_compact.is_empty() && old.grab_col_widths.is_empty());
+        assert!(
+            old.dl_col_widths.is_empty()
+                && old.dl_col_widths_compact.is_empty()
+                && old.grab_col_widths.is_empty()
+        );
     }
 
     #[test]
@@ -705,7 +755,10 @@ mod tests {
         let mut v = serde_json::to_value(Settings::default()).unwrap();
         v.as_object_mut().unwrap().remove("nntp_connections");
         let s: Settings = serde_json::from_value(v).unwrap();
-        assert_eq!(s.nntp_connections, 30, "old state without field defaults 30");
+        assert_eq!(
+            s.nntp_connections, 30,
+            "old state without field defaults 30"
+        );
     }
 
     #[test]

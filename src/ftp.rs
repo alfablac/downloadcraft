@@ -327,7 +327,12 @@ pub async fn download_ftp(
         if code != 350 {
             offset = 0;
             ctrl.downloaded.store(0, Ordering::Relaxed);
-            if let Some(part) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
+            if let Some(part) = ctrl
+                .parts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .first_mut()
+            {
                 part.0 = 0;
             }
         } // server cannot resume: restart below via truncate
@@ -382,7 +387,12 @@ pub async fn download_ftp(
         file.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
         downloaded += n as u64;
         ctrl.downloaded.store(downloaded, Ordering::Relaxed);
-        if let Some(part) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
+        if let Some(part) = ctrl
+            .parts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .first_mut()
+        {
             part.0 = downloaded;
         }
         task.downloaded = downloaded;
@@ -411,7 +421,12 @@ pub async fn download_ftp(
     if task.total.is_none() {
         task.total = Some(downloaded);
         ctrl.total.store(downloaded, Ordering::Relaxed);
-        if let Some(part) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
+        if let Some(part) = ctrl
+            .parts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .first_mut()
+        {
             *part = (downloaded, downloaded);
         }
     }
@@ -438,7 +453,10 @@ mod tests {
         let mut offset = 0u64;
         wr.write_all(b"220 fake\r\n").await.unwrap();
         while let Ok(Some(line)) = lines.next_line().await {
-            st.cmds.lock().unwrap_or_else(|e| e.into_inner()).push(line.clone());
+            st.cmds
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(line.clone());
             let mut it = line.splitn(2, ' ');
             let cmd = it.next().unwrap_or("").to_ascii_uppercase();
             let arg = it.next().unwrap_or("");

@@ -358,7 +358,12 @@ pub async fn download_sftp(
         file.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
         downloaded += n as u64;
         ctrl.downloaded.store(downloaded, Ordering::Relaxed);
-        if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
+        if let Some(p) = ctrl
+            .parts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .first_mut()
+        {
             p.0 = downloaded;
         }
         task.downloaded = downloaded;

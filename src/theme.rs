@@ -245,9 +245,13 @@ pub fn badge(ui: &mut egui::Ui, label: &str, color: Color32) {
 /// Natural badge width for label at BADGE_FONT (for fixed table cells).
 pub fn badge_width(ui: &egui::Ui, label: &str) -> f32 {
     ui.fonts(|f| {
-        f.layout_no_wrap(label.into(), egui::FontId::proportional(BADGE_FONT), Color32::WHITE)
-            .size()
-            .x
+        f.layout_no_wrap(
+            label.into(),
+            egui::FontId::proportional(BADGE_FONT),
+            Color32::WHITE,
+        )
+        .size()
+        .x
     }) + 14.0 // 6+6 inner margin + 1+1 border
 }
 

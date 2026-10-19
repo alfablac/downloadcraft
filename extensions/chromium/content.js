@@ -74,7 +74,7 @@
       b.textContent = it.label;
       if (i === 0) { b.setAttribute("aria-selected", "true"); b.dataset.selected = "1"; }
       b.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #555;padding:4px 6px;" + (i === 0 ? "outline:2px solid #8ab4f8;" : "");
-      b.addEventListener("click", () => { api.runtime.sendMessage({ type: "downloadcraft-video-panel", url: it.url, intent: it.intent || "stream", pageUrl: it.pageUrl || pageUrl(), filename: it.filename || filenameFromUrl(it.url), mime: it.mime || it.type || "" }); panel.remove(); });
+      b.addEventListener("click", () => { api.runtime.sendMessage({ type: "downloadcraft-video-panel", url: it.url, intent: it.intent || "stream", pageUrl: it.pageUrl || pageUrl(), pageTitle: document.title, filename: it.filename || filenameFromUrl(it.url), mime: it.mime || it.type || "" }); panel.remove(); });
       box.appendChild(b);
     });
     const r = anchor.getBoundingClientRect();
@@ -141,7 +141,7 @@
     } catch (e) { return String(u || location.href); }
   }
   function isVideoPageUrl(u) {
-    return /\/status\/\d+|\/comments\/[a-z0-9]+|\/watch\?v=|\/shorts\/|youtu\.be\/|\/videos\/|\/reel\/|\/video\//i.test(String(u || ""));
+    return /\/status\/\d+|\/comments\/[a-z0-9]+|\/watch\?v=|\/shorts\/|youtu\.be\/|\/videos\/|\/reel\/|\/video\/|\.globo\.com\/.*\.ghtml|g1\.globo\.com/i.test(String(u || ""));
   }
   function permalinkFor(video) {
     try {
@@ -349,13 +349,25 @@
       }
       return;
     }
-    if (msg.type === "downloadcraft-grab-all") {
+    if (msg.type === "downloadcraft-grab-all" && self === top) {
+      // SharePoint/OneDrive: file rows virtualized, no file <a href>. Hand
+      // page to Site Grabber with tab cookies; Rust lists folder via REST.
+      if (/\.sharepoint\.com$/i.test(location.hostname)) { api.runtime.sendMessage({ type: "downloadcraft-grab-site" }); return; }
       // IDM "Download all links": <a href> with downloadable extension, deduped.
+      // Extension may sit in path (file.mp4/view) or query (download.aspx?SourceUrl=x.mp4).
       const seenUrls = new Set();
+      const send = (u) => { if (u && !seenUrls.has(u)) { seenUrls.add(u); api.runtime.sendMessage({ type: "downloadcraft-download", url: u, pageTitle: document.title }); } };
       document.querySelectorAll("a[href]").forEach((a) => {
         const u = a.href;
         if (!u || seenUrls.has(u)) return;
-        if (/\.(zip|rar|7z|gz|pdf|exe|msi|mp4|mp3|mkv|iso|tar)(\?|#|$)/i.test(u)) { seenUrls.add(u); api.runtime.sendMessage({ type: "downloadcraft-download", url: u }); }
+        if (/\.(zip|rar|7z|gz|bz2|xz|pdf|exe|msi|dmg|deb|apk|iso|tar|tgz|mp4|mp3|mkv|webm|flac|wav|mov|avi|epub|docx?|xlsx?|pptx?|csv|txt|png|jpe?g|gif|webp|svg)(\?|#|\/|$)/i.test(u)) { send(u); return; }
+        try {
+          const x = new URL(u);
+          // SharePoint viewer links: id=/file=/SourceUrl= carries real file path.
+          const inner = x.searchParams.get("SourceUrl") || x.searchParams.get("id") || x.searchParams.get("file") || "";
+          const webBase = x.origin + (x.pathname.split("/_layouts/")[0] || "");
+          if (/\.[a-z0-9]{2,8}$/i.test(inner) && !/\.(aspx|html?)(\?|#|$)/i.test(inner)) send(webBase + "/_layouts/15/download.aspx?SourceUrl=" + encodeURIComponent(inner.startsWith("/") ? inner : "/" + inner));
+        } catch (e) {}
       });
     }
   });
