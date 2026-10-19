@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 VERSION="${1:?version required (no fallback)}"
-VERSION="${VERSION#v}"
+DEB_VERSION="${VERSION#v}"
 ROOT="$(pwd)"
 mkdir -p dist staging/usr/bin staging/usr/share/applications staging/usr/share/icons/hicolor/512x512/apps staging/DEBIAN
 cp target/release/webcraft staging/usr/bin/
@@ -10,14 +10,14 @@ cp packaging/webcraft.desktop staging/usr/share/applications/
 cp assets/webcraft.png staging/usr/share/icons/hicolor/512x512/apps/webcraft.png
 cat > staging/DEBIAN/control <<EOF
 Package: webcraft
-Version: ${VERSION}
+Version: ${DEB_VERSION}
 Section: net
 Priority: optional
 Architecture: amd64
 Maintainer: webcraft contributors
 Description: Cross-platform download manager (clean-room IDM clone)
 EOF
-dpkg-deb --build staging "dist/webcraft_${VERSION}_amd64.deb"
+dpkg-deb --build staging "dist/webcraft_${DEB_VERSION}_amd64.deb"
 # AppImage-style directory + tarball fallback (AppImage needs linuxdeploy/appimagetool; tarball always works)
 mkdir -p AppDir/usr/bin
 cp target/release/webcraft target/release/webcraft-host AppDir/usr/bin/

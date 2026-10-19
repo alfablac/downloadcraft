@@ -2,7 +2,7 @@
 
 webcraft is a download manager written in Rust with egui. It reimplements the observable parts of Internet Download Manager: segmented downloads, queues, schedules, DASH and HLS, a site grabber, and browser integration. The code was written from scratch. It has no IDM code, binaries, icons, or activation logic, and it is not affiliated with Tonec.
 
-Current version: 0.10.2.
+Current version: 0.10.3.
 
 Runs on Windows 10/11 x86_64, macOS 13 or later (Intel and Apple Silicon), and Linux x86_64 (Ubuntu 22.04 or later, X11 and Wayland).
 
@@ -38,6 +38,7 @@ Multi-track downloads are muxed with ffmpeg when ffmpeg is on PATH or beside the
 
 ## Recent versions
 
+- 0.10.3: fix Linux package filenames in release (Debian version strip only); v0.10.2 tag built but release blocked by missing-asset gate, superseded
 - 0.10.2: release packaging complete - CI now also ships Chromium extension zip, Windows setup exe and Linux .deb, and fails release if any expected file missing; extension panel ranks playlists first and hides segment/range slices; signed-in page cookies passed to yt-dlp so login-gated pages download instead of 403; MP4 validation walks boxes and rejects unplayable init fragments; capture/Add dialogs raise on open
 - 0.10.1: fix output validation (empty/playlist results now quarantined correctly, checked before renaming over existing files), bare `.ts` stream URLs allowed through probe, strict check after muxing
 - 0.10.0: NZB downloads in parallel over several NNTP connections (1-64 in Options) with in-process PAR2 repair and a file list preview before starting; pick files inside torrents before and during download; video pages probe formats first (quality, audio track, audio-only MP3/M4A, subtitles); extension matches streams to the clicked video only and adds a "This video" quality entry; downloads list gains multi-select, search shortcut, time-left/rate/progress sorting, and delete confirmation with delete-from-disk; colored count badges in the side bar; finished files validated (bad output quarantined as `.bad`) and resumed HLS/DASH cache poisoning fixed. See git history for full list
