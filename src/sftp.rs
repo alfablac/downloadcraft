@@ -173,6 +173,68 @@ fn default_key_path() -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SftpAuth {
+    /// Explicit key (task.ssh_key_path) or probed default key; password = passphrase.
+    Key,
+    Password,
+    KeyboardInteractive,
+    None,
+}
+
+/// Auth order: explicit key wins; password-only otherwise. On key failure the
+/// caller falls back to password, then keyboard-interactive (same secret).
+fn pick_auth(has_key: bool, has_password: bool) -> Vec<SftpAuth> {
+    let mut v = Vec::new();
+    if has_key {
+        v.push(SftpAuth::Key);
+    }
+    if has_password {
+        v.push(SftpAuth::Password);
+        v.push(SftpAuth::KeyboardInteractive);
+    }
+    if v.is_empty() {
+        v.push(SftpAuth::None);
+    }
+    v
+}
+
+async fn auth_keyboard_interactive(
+    session: &mut client::Handle<Handler>,
+    user: &str,
+    pass: &str,
+) -> Result<bool, String> {
+    use russh::client::KeyboardInteractiveAuthResponse as R;
+    match session
+        .authenticate_keyboard_interactive_start(user.to_string(), None::<String>)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        R::Success => Ok(true),
+        R::Failure { .. } => Ok(false),
+        R::InfoRequest { prompts, .. } => {
+            let answers: Vec<String> = prompts
+                .iter()
+                .map(|_| {
+                    if pass.is_empty() {
+                        String::new()
+                    } else {
+                        pass.to_string()
+                    }
+                })
+                .collect();
+            match session
+                .authenticate_keyboard_interactive_respond(answers)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                R::Success => Ok(true),
+                _ => Ok(false),
+            }
+        }
+    }
+}
+
 /// SFTP download: metadata size, seek-resume from `<filename>.part`, rename on complete.
 pub async fn download_sftp(
     mut task: DownloadTask,
@@ -212,7 +274,9 @@ pub async fn download_sftp(
         return Err(m);
     }
 
-    // Key auth when ssh_key_path set or password empty (default key probe); else password.
+    // Auth order from pick_auth: explicit/default key first, then password,
+    // then keyboard-interactive. Key load/reject falls through instead of
+    // hard-failing (wrong passphrase would otherwise never try password).
     let key_path: Option<PathBuf> = if !task.ssh_key_path.is_empty() {
         Some(PathBuf::from(&task.ssh_key_path))
     } else if u.pass.is_empty() {
@@ -220,36 +284,72 @@ pub async fn download_sftp(
     } else {
         None
     };
-    let authed = if let Some(kp) = &key_path {
-        let passphrase = if !u.pass.is_empty() {
-            Some(u.pass.as_str())
-        } else {
-            None
-        };
-        let key = load_secret_key(kp, passphrase)
-            .map_err(|e| format!("load key {}: {e}", kp.display()))?;
-        let hash = session
-            .best_supported_rsa_hash()
-            .await
-            .map_err(|e| e.to_string())?
-            .flatten();
-        session
-            .authenticate_publickey(
-                u.user.clone(),
-                PrivateKeyWithHashAlg::new(Arc::new(key), hash),
-            )
-            .await
-            .map_err(|e| e.to_string())?
-    } else if !u.pass.is_empty() {
-        session
-            .authenticate_password(u.user.clone(), u.pass.clone())
-            .await
-            .map_err(|e| e.to_string())?
-    } else {
-        return Err("SFTP: no password and no SSH key (set task password or ssh_key_path)".into());
-    };
-    if !authed.success() {
-        return Err(format!("SFTP auth failed for {}@{hostport}", u.user));
+    let mut authed = false;
+    let mut tried: Vec<&str> = Vec::new();
+    for method in pick_auth(key_path.is_some(), !u.pass.is_empty()) {
+        match method {
+            SftpAuth::Key => {
+                let kp = key_path.as_ref().unwrap();
+                tried.push("publickey");
+                let passphrase = if u.pass.is_empty() {
+                    None
+                } else {
+                    Some(u.pass.as_str())
+                };
+                let loaded = load_secret_key(kp, passphrase);
+                if let Ok(key) = loaded {
+                    let hash = session
+                        .best_supported_rsa_hash()
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .flatten();
+                    if session
+                        .authenticate_publickey(
+                            u.user.clone(),
+                            PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .success()
+                    {
+                        authed = true;
+                        break;
+                    }
+                }
+                // fall through to password methods
+            }
+            SftpAuth::Password => {
+                tried.push("password");
+                if session
+                    .authenticate_password(u.user.clone(), u.pass.clone())
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .success()
+                {
+                    authed = true;
+                    break;
+                }
+            }
+            SftpAuth::KeyboardInteractive => {
+                tried.push("keyboard-interactive");
+                if auth_keyboard_interactive(&mut session, &u.user, &u.pass).await? {
+                    authed = true;
+                    break;
+                }
+            }
+            SftpAuth::None => {
+                return Err(
+                    "SFTP: no password and no SSH key (set task password or ssh_key_path)".into(),
+                );
+            }
+        }
+    }
+    if !authed {
+        return Err(format!(
+            "SFTP auth failed for {}@{hostport} (tried: {})",
+            u.user,
+            tried.join(", ")
+        ));
     }
 
     let channel = session
@@ -448,6 +548,23 @@ mod tests {
             Some("SHA256:AAA")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn pick_auth_order() {
+        assert_eq!(
+            pick_auth(true, true),
+            vec![
+                SftpAuth::Key,
+                SftpAuth::Password,
+                SftpAuth::KeyboardInteractive
+            ]
+        );
+        assert_eq!(
+            pick_auth(false, true),
+            vec![SftpAuth::Password, SftpAuth::KeyboardInteractive]
+        );
+        assert_eq!(pick_auth(true, false), vec![SftpAuth::Key]);
+        assert_eq!(pick_auth(false, false), vec![SftpAuth::None]);
     }
     #[test]
     fn b64_nopad_vectors() {
