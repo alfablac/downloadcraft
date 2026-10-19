@@ -36,6 +36,42 @@ type NzbProbeSlot =
 type YtProbeSlot =
     std::sync::Arc<std::sync::Mutex<Option<(String, Result<ytdlp::YtDump, String>)>>>;
 
+/// Add-dialog debrid magnet awaiting fan-out resolution.
+#[derive(Clone)]
+struct PendingDebridAdd {
+    url: String,
+    referrer: String,
+    cookies: String,
+    queue_id: String,
+    start_now: bool,
+}
+
+type DebridAddSlot =
+    std::sync::Arc<std::sync::Mutex<Option<Result<Vec<crate::debrid::ResolvedFile>, String>>>>;
+type DebridHostsSlot =
+    std::sync::Arc<std::sync::Mutex<Option<(String, Vec<crate::debrid::HostStatus>)>>>;
+
+/// Debrid Options probes: ("provider_id:account"|"provider_id:hosts", result text).
+/// Tokens never in slot, never logged.
+type DebridProbeSlot = std::sync::Arc<std::sync::Mutex<Option<(String, Result<String, String>)>>>;
+
+/// In-memory debrid hoster cache (Options + stale refresh). Not persisted.
+#[derive(Default)]
+struct DebridUiCache {
+    /// provider id -> hosts
+    hosts: std::collections::HashMap<String, Vec<crate::debrid::HostStatus>>,
+    /// provider id -> last fetch (unix secs)
+    checked_at: std::collections::HashMap<String, i64>,
+    /// provider id -> account summary line
+    account: std::collections::HashMap<String, String>,
+    /// provider id -> last error
+    error: std::collections::HashMap<String, String>,
+    /// provider ids with probe in flight
+    busy: std::collections::HashSet<String>,
+    /// auto-refresh attempted this Options visit per provider
+    stale_checked: std::collections::HashSet<String>,
+}
+
 #[derive(Default)]
 struct YtProbeState {
     slot: Option<YtProbeSlot>,
@@ -388,6 +424,11 @@ pub struct DownloadApp {
     add_torrent_files: Vec<(crate::torrent::TorrentFile, bool)>,
     add_torrent_loading: bool,
     add_torrent_error: String,
+    /// Debrid magnet fan-out: confirm spawns resolve, drain creates one
+    /// task per resolved file (debrid_file_name set). Failed resolve ->
+    /// normal single magnet task (stream falls back to local torrent).
+    debrid_add_slot: DebridAddSlot,
+    pending_debrid_add: Option<PendingDebridAdd>,
     /// NZB probe result slot (parse-only, spawned on thread).
     add_nzb_slot: NzbProbeSlot,
     add_nzb_url: String,
@@ -416,13 +457,17 @@ pub struct DownloadApp {
     ytdlp_checked: bool,
     update_check: Option<CheckOutcome>,
     update_slot: std::sync::Arc<std::sync::Mutex<Option<CheckOutcome>>>,
+    debrid_slot: DebridProbeSlot,
+    debrid_hosts_slot: DebridHostsSlot,
+    debrid_ctx: Option<egui::Context>,
+    debrid_ui: DebridUiCache,
     show_about: bool,
     search: String,
     /// Ctrl+F pressed: focus the topbar search field next frame.
     search_focus: bool,
     /// Visible matches vs total from last table render (status feedback).
     search_counts: (usize, usize),
-    /// Grabber results sort: (col 0=URL,1=Size,2=Type, asc).
+    /// Grabber results sort: (col 0=Name,1=URL,2=Size,3=Type, asc).
     grab_sort: (u8, bool),
     /// Rail collapsed to icon-only (narrow window).
     rail_compact: bool,
@@ -500,6 +545,14 @@ pub struct DownloadApp {
     yt_probe_cap: YtProbeState,
     add_vp_sent: Option<egui::Vec2>,
     cap_vp_sent: Option<egui::Vec2>,
+    prog_vp_sent: Option<egui::Vec2>,
+    prog_task: Option<String>,
+    /// Last frame's measured dialog body height (+ closed-section heights);
+    /// fed to fit_vp next frame so native viewports fit content as if all
+    /// collapsible sections were expanded. None = not measured yet.
+    cap_body_h: Option<f32>,
+    add_body_h: Option<f32>,
+    prog_body_h: Option<f32>,
 }
 
 /// Tray toggle label for current window visibility.
@@ -660,6 +713,8 @@ impl DownloadApp {
             add_torrent_loading: false,
             add_torrent_error: String::new(),
             add_nzb_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            debrid_add_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            pending_debrid_add: None,
             add_nzb_url: String::new(),
             add_nzb: None,
             add_nzb_loading: false,
@@ -685,6 +740,10 @@ impl DownloadApp {
             ytdlp_checked: false,
             update_check: None,
             update_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            debrid_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            debrid_hosts_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            debrid_ctx: None,
+            debrid_ui: DebridUiCache::default(),
             show_about: false,
             search: String::new(),
             search_focus: false,
@@ -743,6 +802,11 @@ impl DownloadApp {
             yt_probe_cap: YtProbeState::default(),
             add_vp_sent: None,
             cap_vp_sent: None,
+            prog_vp_sent: None,
+            prog_task: None,
+            cap_body_h: None,
+            add_body_h: None,
+            prog_body_h: None,
         }
     }
 
@@ -803,6 +867,135 @@ impl DownloadApp {
         } else {
             self.hide_window(ctx);
         }
+    }
+
+    /// Debrid Options probe: thread + rt.block_on + slot + repaint (update-check
+    /// pattern). kind: account summary or hoster list. Token cloned into
+    /// thread, never logged / never in slot tag.
+    fn spawn_debrid_probe(
+        &mut self,
+        p: crate::debrid::Provider,
+        account: bool,
+        settings: &Settings,
+    ) {
+        let pid = p.id().to_string();
+        if self.debrid_ui.busy.contains(&pid) {
+            return;
+        }
+        let cfg = p.cfg(settings);
+        if !cfg.usable() {
+            return;
+        }
+        let key = cfg.api_key.clone();
+        self.debrid_ui.busy.insert(pid.clone());
+        let slot = self.debrid_slot.clone();
+        let hosts_slot = self.debrid_hosts_slot.clone();
+        let rt = self.tokio_rt.clone();
+        let proxy = {
+            let g = crate::lock_unpoison(&self.rt);
+            g.state.settings.proxy_url.clone()
+        };
+        let ctx = self.debrid_ctx.clone();
+        std::thread::spawn(move || {
+            let client = crate::engine::build_client(&proxy);
+            let tag = format!("{}:{}", pid, if account { "account" } else { "hosts" });
+            let res = rt.block_on(async move {
+                if account {
+                    crate::debrid::account(client, p, &key)
+                        .await
+                        .map(|a| a.summary())
+                } else {
+                    match crate::debrid::hosts(client, p, &key).await {
+                        Ok(list) => {
+                            let n = list.len();
+                            let up = list.iter().filter(|h| h.supported && h.up).count();
+                            if let Ok(mut g) = hosts_slot.lock() {
+                                *g = Some((pid.clone(), list));
+                            }
+                            Ok(format!("{n} hosters, {up} up"))
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            });
+            if let Ok(mut g) = slot.lock() {
+                *g = Some((tag, res));
+            }
+            if let Some(ctx) = ctx {
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Drain Add-dialog debrid magnet resolve: success = one task per
+    /// resolved file (shared magnet URL, debrid_file_name per file; dedup
+    /// in add_url bypassed by pushing tasks directly). Failure/empty =
+    /// single normal magnet task (stream/local fallback).
+    fn poll_debrid_add(&mut self, ctx: &egui::Context) {
+        if self.pending_debrid_add.is_none() {
+            return;
+        }
+        let taken = self
+            .debrid_add_slot
+            .try_lock()
+            .ok()
+            .and_then(|mut g| g.take());
+        let Some(res) = taken else { return };
+        let pending = self.pending_debrid_add.take().unwrap();
+        let files = match res {
+            Ok(f) if !f.is_empty() => f,
+            _ => Vec::new(),
+        };
+        let mut ids: Vec<String> = Vec::new();
+        {
+            let mut g = crate::lock_unpoison(&self.rt);
+            if files.is_empty() {
+                let id = g.add_url(
+                    &pending.url,
+                    &pending.queue_id,
+                    &pending.referrer,
+                    &pending.cookies,
+                );
+                ids.push(id);
+            } else {
+                for f in &files {
+                    let fname = crate::model::sanitize_filename(&f.name);
+                    let order = g.state.tasks.len() as i64 + 1;
+                    let task = DownloadTask {
+                        id: crate::model::new_id(),
+                        url: pending.url.clone(),
+                        dest_dir: crate::model::dest_dir_for(
+                            &g.state.settings.download_dir,
+                            &fname,
+                            g.state.settings.category_subfolders,
+                        ),
+                        filename: fname,
+                        queue_id: if pending.queue_id.is_empty() {
+                            "main".into()
+                        } else {
+                            pending.queue_id.clone()
+                        },
+                        order,
+                        status: TaskStatus::Queued,
+                        category: crate::model::category_for(&f.name).into(),
+                        debrid_file_name: f.name.clone(),
+                        total: f.size,
+                        referrer: pending.referrer.clone(),
+                        cookies: pending.cookies.clone(),
+                        ..Default::default()
+                    };
+                    ids.push(task.id.clone());
+                    g.state.tasks.push(task);
+                }
+                g.save();
+            }
+        }
+        if pending.start_now {
+            for id in &ids {
+                self.start_task(id);
+            }
+        }
+        ctx.request_repaint();
     }
 
     fn start_task(&mut self, id: &str) {
@@ -2079,6 +2272,7 @@ impl eframe::App for DownloadApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_debrid_add(ctx);
         // Paint full viewport first: panel gaps otherwise show OS black (#09) as a vertical bar.
         ctx.layer_painter(egui::LayerId::background()).rect_filled(
             ctx.screen_rect(),
@@ -3709,21 +3903,33 @@ fn cell_align<R>(
 const LABEL_W: f32 = 120.0;
 const DRAG_W: f32 = 90.0;
 
+/// Download filename derived from URL (segment after last `/`, decoded).
+fn grab_name(url: &str) -> String {
+    crate::model::filename_from_url(url)
+}
+
+/// Viewport height fitting content as if every collapsible section were
+/// expanded: measured body + still-collapsed section heights. Floor = base
+/// (dialog minimum usable size), cap = 85% monitor. Width never inferred.
+fn fit_content_h(base_h: f32, content_h: f32, monitor_h: f32) -> f32 {
+    let cap = (monitor_h * 0.85).max(base_h);
+    (base_h.max(content_h)).min(cap)
+}
+
 /// 2-col form grid: label col fixed 120 (right-aligned via col layout), field fills.
-/// ponytail: max_col_width() is global in egui 0.29 (clamps ALL cols incl. field
-/// col to 120px, shrinking every input); 1024 cap keeps cell wrap for long labels.
+/// No max_col_width: egui caps the LAST col at max_cell_size, so any finite cap
+/// froze fields (1024) once the window grew past it — resize did nothing.
 fn form_grid(id: &str) -> egui::Grid {
     egui::Grid::new(id)
         .num_columns(2)
         .spacing([12.0, 6.0])
         .min_col_width(LABEL_W)
-        .max_col_width(1024.0)
 }
 
 /// Right-aligned muted form label (use inside `form_grid` col 0).
 fn form_label(ui: &mut egui::Ui, text: &str) {
-    // Fixed LABEL_W cell: RTL in a non-last Grid col got max_col_width (1024) and
-    // painted label off-screen, widening the parent (right-aligned footers vanished).
+    // Fixed LABEL_W cell: RTL in a non-last Grid col can paint the label
+    // off-screen and widen the parent (right-aligned footers vanish).
     ui.allocate_ui_with_layout(
         egui::vec2(LABEL_W, theme::BTN_H),
         egui::Layout::right_to_left(egui::Align::Center),
@@ -3846,38 +4052,24 @@ fn yt_probe_poll(st: &mut YtProbeState, url: &str) -> bool {
     false
 }
 
-/// Viewport height allowance for probe section: 55 base (header/loading row);
-/// dump adds 90 (title/meta/quality) + 120 (audio/convert) + subtitle list
-/// rows at 28px capped 110 (21 label above). Mirrors ui_yt_probe_section.
-fn yt_probe_h(st: &YtProbeState) -> f32 {
-    let mut h = 55.0f32;
-    if let Some(dump) = &st.dump {
-        h += 90.0 + 120.0;
-        let rows = dump.sub_langs().len() + dump.auto_langs().len();
-        if rows > 0 {
-            h += 21.0 + (rows as f32 * 28.0).min(110.0);
-        }
-    }
-    h
-}
-
-/// Grow/shrink native dialog viewport to fit probe section. `sent` dedupes
-/// commands; None = viewport just opened, next fit always sends.
+/// Grow/shrink native dialog viewport to fit content height (measured last
+/// frame, all sections as-if expanded). `sent` dedupes commands; None =
+/// viewport just opened, next fit always sends. Width stays at base.
 fn fit_vp(
     ctx: &egui::Context,
     vp: egui::ViewportId,
     base: egui::Vec2,
-    st: &YtProbeState,
+    content_h: Option<f32>,
     sent: &mut Option<egui::Vec2>,
 ) {
-    let max_h = ctx
+    let monitor_h = ctx
         .input(|i| i.viewport().monitor_size.map(|m| m.y).filter(|y| *y > 0.0))
-        .unwrap_or(900.0)
-        * 0.85;
-    let want = egui::vec2(
-        base.x,
-        (base.y + yt_probe_h(st) - 55.0).clamp(base.y, max_h.max(base.y)),
-    );
+        .unwrap_or(900.0);
+    let want_h = match content_h {
+        Some(h) => fit_content_h(base.y, h, monitor_h),
+        None => base.y,
+    };
+    let want = egui::vec2(base.x, want_h);
     if *sent != Some(want) {
         ctx.send_viewport_cmd_to(vp, egui::ViewportCommand::InnerSize(want));
         *sent = Some(want);
@@ -3937,9 +4129,17 @@ fn ui_yt_probe_section(
         // Extractor bugs (GloboArticle NoneType crash) surface as raw
         // ERROR:/traceback text; friendly line first, raw kept below.
         let e = st.error.trim();
+        let cookie_err = e.contains("page needs") || e.contains("Sign in");
         let extractor_err =
             e.contains("NoneType") || e.contains("has no attribute") || e.starts_with("ERROR:");
-        if extractor_err {
+        if cookie_err {
+            ui.label(
+                egui::RichText::new("YouTube rejected browser cookies (yt-dlp limitation). Webcraft retries without cookies; public videos need no login. If persists, paste link in Add URL instead.")
+                    .color(theme::ERR)
+                    .small(),
+            );
+            ui.label(egui::RichText::new(e).color(theme::TEXT_FAINT).small());
+        } else if extractor_err {
             ui.label(
                 egui::RichText::new("yt-dlp could not read this page/stream (extractor error). Download below still works.")
                     .color(theme::ERR)
@@ -4657,6 +4857,7 @@ impl DownloadApp {
                     self.capture_task = Some(t);
                     self.capture_just_opened = true;
                     self.cap_vp_sent = None;
+                    self.cap_body_h = None;
                     self.capture_raise = true;
                 }
                 None => return,
@@ -4677,6 +4878,7 @@ impl DownloadApp {
             .with_title("Download file")
             .with_inner_size([520.0, 480.0])
             .with_min_inner_size([440.0, 360.0])
+            .with_max_inner_size([4096.0, 4096.0])
             .with_resizable(true);
         let cap_body = |ui: &mut egui::Ui, app: &mut DownloadApp| {
             ui.label(
@@ -4895,7 +5097,7 @@ impl DownloadApp {
                     ctx,
                     vp_id("webcraft-capture"),
                     egui::vec2(520.0, 480.0),
-                    &self.yt_probe_cap,
+                    self.cap_body_h,
                     &mut self.cap_vp_sent,
                 );
             }
@@ -4957,10 +5159,11 @@ impl DownloadApp {
                     .frame(dialog_frame())
                     .show(ctx, |ui| {
                         let avail = ui.available_height();
-                        egui::ScrollArea::vertical()
+                        let out = egui::ScrollArea::vertical()
                             .id_salt("cap-main")
                             .max_height((avail - FOOTER_H).max(48.0))
                             .show(ui, |ui| bb(ui, self));
+                        self.cap_body_h = Some(out.content_size.y + FOOTER_H + 36.0);
                         footer(ui, &mut action);
                     });
             }
@@ -5332,16 +5535,18 @@ impl DownloadApp {
             .with_title("Add download")
             .with_inner_size([560.0, 680.0])
             .with_min_inner_size([460.0, 420.0])
+            .with_max_inner_size([4096.0, 4096.0])
             .with_resizable(true);
         let mut start: Option<bool> = None; // Some(true)=now, Some(false)=later
         let mut cancel = false;
         if self.add_just_opened {
             self.add_vp_sent = None;
+            self.add_body_h = None;
             ctx.send_viewport_cmd_to(vp_id("webcraft-add"), egui::ViewportCommand::Focus);
         }
         ctx.show_viewport_immediate(vp_id("webcraft-add"), builder, |ctx, class| {
             if !matches!(class, egui::ViewportClass::Embedded) {
-                fit_vp(ctx, vp_id("webcraft-add"), egui::vec2(560.0, 680.0), &self.yt_probe_add, &mut self.add_vp_sent);
+                fit_vp(ctx, vp_id("webcraft-add"), egui::vec2(560.0, 680.0), self.add_body_h, &mut self.add_vp_sent);
             }
             if ctx.input(|i| i.viewport().close_requested()) {
                 cancel = true;
@@ -5350,7 +5555,7 @@ impl DownloadApp {
                 cancel = true;
             }
             let body = |ui: &mut egui::Ui, app: &mut Self, start: &mut Option<bool>, cancel: &mut bool| {
-                egui::ScrollArea::vertical()
+                let out = egui::ScrollArea::vertical()
                     .id_salt("add-main")
                     .auto_shrink([false, false])
                     .max_height((ui.available_height() - FOOTER_H).max(48.0))
@@ -5409,7 +5614,15 @@ impl DownloadApp {
                             .small(),
                     );
                     // Torrent file picker (magnet / .torrent): probe file list first.
-                    if crate::torrent::is_torrent_url(&app.add_url) {
+                    // Debrid-for-magnets route skips picker: provider file
+                    // list != librqbit indices; fan-out uses all files.
+                    let debrid_magnet = crate::debrid::is_magnet(&app.add_url) && {
+                        let g = crate::lock_unpoison(&app.rt);
+                        crate::debrid::any_for_magnets(&g.state.settings)
+                    };
+                    if debrid_magnet {
+                        ui.label(egui::RichText::new("Debrid enabled for magnets: Add resolves via debrid and creates one task per file (local torrent picker skipped). Disable debrid magnets in Options to use local torrent.").color(theme::TEXT_FAINT).small());
+                    } else if crate::torrent::is_torrent_url(&app.add_url) {
                         app.ui_add_torrent_picker(ui);
                     }
                     if crate::stream::is_nzb_url_str(&app.add_url) {
@@ -5482,7 +5695,8 @@ impl DownloadApp {
                         ui.end_row();
                     });
                     ui.add_space(theme::SP_SM);
-                    egui::CollapsingHeader::new("Auth (advanced)")
+                    let auth_resp = egui::CollapsingHeader::new("Auth (advanced)")
+                        .id_salt("add-auth-hdr")
                         .default_open(false)
                         .show(ui, |ui| {
                             form_grid("add-auth").show(ui, |ui| {
@@ -5505,7 +5719,15 @@ impl DownloadApp {
                                 ui.end_row();
                             });
                         });
+                    auth_resp.body_response.is_none()
                 });
+                // content_size clamps to viewport when scrolled: floor = base size,
+                // so an over-cap measurement only ever grows to the 85% cap.
+                let mut content_h = out.content_size.y;
+                if out.inner {
+                    content_h += 96.0;
+                }
+                app.add_body_h = Some(content_h + FOOTER_H + 36.0);
                 ui.separator();
                 // Zero-selected torrent files can never finish: gate confirm.
                 let torrent_blocked = crate::torrent::is_torrent_url(&app.add_url)
@@ -5579,6 +5801,43 @@ impl DownloadApp {
                         .collect::<Vec<_>>(),
                     self.add_desc.clone(),
                 );
+                // Debrid magnet fan-out: resolve async, poll_debrid_add
+                // creates one task per file. Picker selection ignored here
+                // (provider file names != librqbit indices).
+                if crate::debrid::is_magnet(&url) && self.pending_debrid_add.is_none() {
+                    let (settings, proxy) = {
+                        let g = crate::lock_unpoison(&self.rt);
+                        (g.state.settings.clone(), g.state.settings.proxy_url.clone())
+                    };
+                    if crate::debrid::any_for_magnets(&settings) {
+                        if let Ok(mut s) = self.debrid_add_slot.try_lock() {
+                            *s = None;
+                        }
+                        self.pending_debrid_add = Some(PendingDebridAdd {
+                            url: url.clone(),
+                            referrer: referrer.clone(),
+                            cookies: cookies.clone(),
+                            queue_id: queue.clone(),
+                            start_now,
+                        });
+                        let slot = self.debrid_add_slot.clone();
+                        let rt2 = self.tokio_rt.clone();
+                        let ctx2 = ctx.clone();
+                        let magnet = url.clone();
+                        std::thread::spawn(move || {
+                            let client = engine::build_client(&proxy);
+                            let res = rt2
+                                .block_on(crate::debrid::resolve_magnet(client, &settings, &magnet))
+                                .map(|(_p, files)| files);
+                            if let Ok(mut g) = slot.lock() {
+                                *g = Some(res);
+                            }
+                            ctx2.request_repaint();
+                        });
+                        self.show_add = false;
+                        return;
+                    }
+                }
                 let id = {
                     let mut g = crate::lock_unpoison(&self.rt);
                     let id = g.add_url(&url, &queue, &referrer, &cookies);
@@ -5685,6 +5944,12 @@ impl DownloadApp {
     }
 
     fn ui_progress_dialog(&mut self, ctx: &egui::Context, id: &str) {
+        // New task in same viewport slot: drop stale measured height.
+        if self.prog_task.as_deref() != Some(id) {
+            self.prog_task = Some(id.to_owned());
+            self.prog_body_h = None;
+            self.prog_vp_sent = None;
+        }
         let task = {
             let g = crate::lock_unpoison(&self.rt);
             g.state.tasks.iter().find(|t| t.id == id).cloned()
@@ -5702,6 +5967,7 @@ impl DownloadApp {
             .with_title(format!("Progress - {}", t.filename))
             .with_inner_size([640.0, 720.0])
             .with_min_inner_size([440.0, 380.0])
+            .with_max_inner_size([4096.0, 4096.0])
             .with_resizable(true);
         if self.progress_raise {
             self.progress_raise = false;
@@ -5728,6 +5994,10 @@ impl DownloadApp {
         let frac_opt = display_fraction(&t, self.seg_info.get(&t.id));
         let frac = frac_opt.unwrap_or(0.0);
         let seg_view = self.seg_info.get(&t.id).cloned();
+        // Viewport closure needs whole self (bb(ui, self)); measured-fit values
+        // ride in as locals to avoid disjoint field captures conflicting.
+        let prog_h_in = self.prog_body_h;
+        let mut prog_sent = self.prog_vp_sent;
         let body = |ui: &mut egui::Ui, app: &mut Self| -> (bool, bool, bool) {
             let (mut b_close, mut b_toggle, mut b_copy) = (false, false, false);
             // HEADER: icon + filename + chips; URL truncated, hover full.
@@ -5839,7 +6109,7 @@ impl DownloadApp {
                     },
                 );
             });
-            egui::CollapsingHeader::new("Speed graph")
+            let graph_resp = egui::CollapsingHeader::new("Speed graph")
                 .default_open(t.status == TaskStatus::Downloading && series.len() > 1)
                 .show(ui, |ui| {
                     let (rect, _) = ui.allocate_exact_size(
@@ -5896,7 +6166,7 @@ impl DownloadApp {
                 });
             }
             // Scrollable middle: sections never widen window; footer pinned below.
-            egui::ScrollArea::vertical()
+            let prog_scroll = egui::ScrollArea::vertical()
                 .id_salt("prog-main")
                 .auto_shrink([false, false])
                 .max_height((ui.available_height() - FOOTER_H).max(48.0))
@@ -6329,6 +6599,11 @@ impl DownloadApp {
                         }
                     }
                 });
+            let mut prog_h = prog_scroll.content_size.y + 208.0;
+            if graph_resp.body_response.is_none() {
+                prog_h += 74.0;
+            }
+            app.prog_body_h = Some(prog_h);
             ui.separator();
             btn_row(ui, |ui| {
                 if t.status == TaskStatus::Downloading {
@@ -6386,6 +6661,13 @@ impl DownloadApp {
                     .and_then(|r| r.inner)
                     .unwrap_or((false, false, false))
             } else {
+                fit_vp(
+                    ctx,
+                    vp_id("webcraft-progress"),
+                    egui::vec2(640.0, 720.0),
+                    prog_h_in,
+                    &mut prog_sent,
+                );
                 egui::CentralPanel::default()
                     .frame(dialog_frame())
                     .show(ctx, |ui| bb(ui, self))
@@ -6396,6 +6678,7 @@ impl DownloadApp {
             toggle_pause |= out.1;
             copy_link |= out.2;
         });
+        self.prog_vp_sent = prog_sent;
         if copy_link {
             if let Ok(mut cb) = arboard::Clipboard::new() {
                 let _ = cb.set_text(t.url.clone());
@@ -6633,7 +6916,7 @@ impl DownloadApp {
             ui.horizontal_top(|ui| {
                 // Left: schedule list
                 ui.vertical(|ui| {
-                    ui.set_width(220.0);
+                    ui.set_width((ui.available_width() * 0.28).clamp(160.0, 260.0));
                     ui.label(
                         egui::RichText::new("Schedules")
                             .color(theme::TEXT_MUTED)
@@ -7060,6 +7343,7 @@ impl DownloadApp {
         ui.add_space(4.0);
         ui.add_space(4.0);
         theme::panel().show(ui, |ui| {
+            ui.set_width(ui.available_width());
             form_grid("grab-grid").show(ui, |ui| {
                 form_label(ui, "Start URL");
                 ui.add(
@@ -7083,8 +7367,8 @@ impl DownloadApp {
                 });
                 ui.end_row();
                 form_label(ui, "Scope");
-                ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("grab-scope").selected_text(["Same host", "Same domain", "Any host"][self.grab_scope.min(2) as usize]).show_ui(ui, |ui| { for (i, l) in ["Same host", "Same domain", "Any host"].iter().enumerate() { ui.selectable_value(&mut self.grab_scope, i as u8, *l); } });
+                ui.horizontal_wrapped(|ui| {
+                    egui::ComboBox::from_id_salt("grab-scope").width(ui.available_width()).selected_text(["Same host", "Same domain", "Any host"][self.grab_scope.min(2) as usize]).show_ui(ui, |ui| { for (i, l) in ["Same host", "Same domain", "Any host"].iter().enumerate() { ui.selectable_value(&mut self.grab_scope, i as u8, *l); } });
                     ui.checkbox(&mut self.grab_parent_dirs, "Don't explore parent dirs");
                 });
                 ui.end_row();
@@ -7344,44 +7628,57 @@ impl DownloadApp {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             let avail = ui.available_width().max(200.0);
-                            // Grab cols are [check, URL, Size, Type]; stored vec uses URL at idx 0 for helpers (clamped NAME_MIN).
-                            let grab_defaults = [28.0f32, 76.0, 90.0];
-                            let mut gcols: Vec<f32> =
-                                match self.grab_widths.as_deref().filter(|s| s.len() == 3) {
-                                    Some(s) => {
-                                        let mut v: Vec<f32> = s
-                                            .iter()
-                                            .enumerate()
-                                            .map(|(i, w)| {
-                                                if i == 0 {
-                                                    w.max(NAME_MIN)
-                                                } else {
-                                                    w.max(COL_MIN)
-                                                }
-                                            })
-                                            .collect();
-                                        let total: f32 = v.iter().sum::<f32>()
-                                            + grab_defaults[0]
-                                            + COL_GAP * 3.0;
-                                        if total <= avail {
-                                            v[0] = (avail
-                                                - v[1..].iter().sum::<f32>()
-                                                - grab_defaults[0]
-                                                - COL_GAP * 3.0)
-                                                .max(NAME_MIN);
-                                        }
-                                        v
+                            // Grab cols [check, Name, URL, Size, Type]; stored vec uses
+                            // Name at idx 0 (helpers clamp idx0 to NAME_MIN). Old 3-wide
+                            // saves [URL, Size, Type] migrate: prepend Name width.
+                            const CHECK_W: f32 = 28.0;
+                            const NAME_W: f32 = 140.0;
+                            const SIZE_T_W: [f32; 2] = [76.0, 90.0];
+                            let stored: Option<Vec<f32>> = match self.grab_widths.as_deref() {
+                                Some(s) if s.len() == 4 => Some(s.to_vec()),
+                                Some(s) if s.len() == 3 => Some(vec![NAME_W, s[0], s[1], s[2]]),
+                                _ => None,
+                            };
+                            let mut gcols: Vec<f32> = match stored {
+                                Some(s) => {
+                                    let mut v: Vec<f32> = s
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, w)| {
+                                            if i <= 1 {
+                                                w.max(NAME_MIN)
+                                            } else {
+                                                w.max(COL_MIN)
+                                            }
+                                        })
+                                        .collect();
+                                    let total: f32 =
+                                        v.iter().sum::<f32>() + CHECK_W + COL_GAP * 4.0;
+                                    if total <= avail {
+                                        v[1] = (avail
+                                            - v[0]
+                                            - v[2..].iter().sum::<f32>()
+                                            - CHECK_W
+                                            - COL_GAP * 4.0)
+                                            .max(NAME_MIN);
                                     }
-                                    None => vec![
-                                        (avail - grab_defaults.iter().sum::<f32>() - COL_GAP * 3.0)
-                                            .max(NAME_MIN),
-                                        grab_defaults[1],
-                                        grab_defaults[2],
-                                    ],
-                                };
-                            // Display widths in cell order: [check, URL, Size, Type].
-                            let disp = [grab_defaults[0], gcols[0], gcols[1], gcols[2]];
-                            let row_w = disp.iter().sum::<f32>() + COL_GAP * 3.0;
+                                    v
+                                }
+                                None => vec![
+                                    NAME_W,
+                                    (avail
+                                        - NAME_W
+                                        - SIZE_T_W.iter().sum::<f32>()
+                                        - CHECK_W
+                                        - COL_GAP * 4.0)
+                                        .max(NAME_MIN),
+                                    SIZE_T_W[0],
+                                    SIZE_T_W[1],
+                                ],
+                            };
+                            // Display widths in cell order: [check, Name, URL, Size, Type].
+                            let disp = [CHECK_W, gcols[0], gcols[1], gcols[2], gcols[3]];
+                            let row_w = disp.iter().sum::<f32>() + COL_GAP * 4.0;
                             let (hdr_rect, _) = ui.allocate_exact_size(
                                 egui::vec2(row_w, ROW_H + 2.0),
                                 egui::Sense::hover(),
@@ -7399,7 +7696,7 @@ impl DownloadApp {
                                     cell(ui, disp[0], |ui| ui.label(theme::table_header_text("")));
                                     // Sortable headers: click toggles direction.
                                     for (ci, (label, col)) in
-                                        [("URL", 0u8), ("Size", 1u8), ("Type", 2u8)]
+                                        [("Name", 0u8), ("URL", 1u8), ("Size", 2u8), ("Type", 3u8)]
                                             .iter()
                                             .enumerate()
                                     {
@@ -7437,36 +7734,30 @@ impl DownloadApp {
                                     }
                                 });
                             }
-                            // Resize handles operate on gcols [URL, Size, Type]; check col fixed.
+                            // Resize handles operate on gcols [Name, URL, Size, Type]; check col fixed.
                             let hdr_shifted = egui::Rect::from_min_size(
-                                egui::pos2(
-                                    hdr_rect.min.x + grab_defaults[0] + COL_GAP,
-                                    hdr_rect.min.y,
-                                ),
-                                egui::vec2(
-                                    hdr_rect.width() - grab_defaults[0] - COL_GAP,
-                                    hdr_rect.height(),
-                                ),
+                                egui::pos2(hdr_rect.min.x + CHECK_W + COL_GAP, hdr_rect.min.y),
+                                egui::vec2(hdr_rect.width() - CHECK_W - COL_GAP, hdr_rect.height()),
                             );
                             if col_resize_handles(ui, hdr_shifted, &mut gcols, false) {
                                 self.grab_widths = Some(gcols.clone());
                             }
-                            let disp = [grab_defaults[0], gcols[0], gcols[1], gcols[2]];
+                            let disp = [CHECK_W, gcols[0], gcols[1], gcols[2], gcols[3]];
                             let n = self.grab_files.len();
                             // Sorted view order (stable; selection lives on items).
                             let (gcol, gasc) = self.grab_sort;
                             let mut order: Vec<usize> = (0..n).collect();
                             order.sort_by(|&a, &b| {
+                                let (fa, fb) = (&self.grab_files[a], &self.grab_files[b]);
+                                let url_ord = fa.url.to_lowercase().cmp(&fb.url.to_lowercase());
                                 let ord = match gcol {
-                                    0 => self.grab_files[a]
-                                        .url
+                                    0 => grab_name(&fa.url)
                                         .to_lowercase()
-                                        .cmp(&self.grab_files[b].url.to_lowercase()),
-                                    1 => self.grab_files[a]
-                                        .size
-                                        .unwrap_or(0)
-                                        .cmp(&self.grab_files[b].size.unwrap_or(0)),
-                                    _ => self.grab_files[a].mime.cmp(&self.grab_files[b].mime),
+                                        .cmp(&grab_name(&fb.url).to_lowercase())
+                                        .then(url_ord),
+                                    1 => url_ord,
+                                    2 => fa.size.unwrap_or(0).cmp(&fb.size.unwrap_or(0)),
+                                    _ => fa.mime.cmp(&fb.mime),
                                 };
                                 if gasc {
                                     ord
@@ -7498,6 +7789,17 @@ impl DownloadApp {
                                             }
                                         });
                                         cell(ui, disp[1], |ui| {
+                                            let name = grab_name(&f.url);
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(&name).color(theme::TEXT),
+                                                )
+                                                .truncate()
+                                                .selectable(false),
+                                            )
+                                            .on_hover_text(name)
+                                        });
+                                        cell(ui, disp[2], |ui| {
                                             ui.add(
                                                 egui::Label::new(
                                                     egui::RichText::new(&f.url).color(theme::TEXT),
@@ -7510,7 +7812,7 @@ impl DownloadApp {
                                                 f.url, f.page_url
                                             ))
                                         });
-                                        cell(ui, disp[2], |ui| {
+                                        cell(ui, disp[3], |ui| {
                                             ui.add(
                                                 egui::Label::new(
                                                     egui::RichText::new(
@@ -7525,7 +7827,7 @@ impl DownloadApp {
                                                 .selectable(false),
                                             )
                                         });
-                                        cell(ui, disp[3], |ui| {
+                                        cell(ui, disp[4], |ui| {
                                             ui.add(
                                                 egui::Label::new(
                                                     egui::RichText::new(&f.mime)
@@ -7541,6 +7843,18 @@ impl DownloadApp {
                                 if resp.double_clicked() {
                                     f.selected = !f.selected;
                                 }
+                                resp.context_menu(|ui| {
+                                    if ui.button("Copy filename").clicked() {
+                                        ui.output_mut(|o| {
+                                            o.copied_text = grab_name(&f.url);
+                                        });
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Copy URL").clicked() {
+                                        ui.output_mut(|o| o.copied_text = f.url.clone());
+                                        ui.close_menu();
+                                    }
+                                });
                             }
                         });
                 });
@@ -7574,6 +7888,7 @@ impl DownloadApp {
                 (4, "Connection", Icon::Globe),
                 (5, "Proxy", Icon::Link),
                 (6, "Browser", Icon::Globe),
+                (8, "Debrid", Icon::Link),
                 (7, "About", Icon::Info),
             ] {
                 if icon_btn(ui, ic, name, self.options_tab == i, 104.0).clicked() {
@@ -7592,6 +7907,11 @@ impl DownloadApp {
         let mut repair_hosts = false;
         let mut remove_hosts = false;
         let mut update_ytdlp = false;
+        let mut test_provider: Option<crate::debrid::Provider> = None;
+        let mut refresh_provider: Option<crate::debrid::Provider> = None;
+        let mut stale_provider: Option<crate::debrid::Provider> = None;
+        let mut export_settings_flag = false;
+        let mut import_settings_flag = false;
 
         theme::panel().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -7620,6 +7940,13 @@ impl DownloadApp {
                         ui.end_row();
                     });
                     ui.label(egui::RichText::new(format!("Config directory: {}", platform::config_dir().display())).color(theme::TEXT_FAINT).small());
+                    ui.add_space(10.0);
+                    section(ui, "Backup (settings only)");
+                    ui.horizontal_wrapped(|ui| {
+                        if icon_btn(ui, Icon::Download, "Export Settings", false, 140.0).clicked() { export_settings_flag = true; }
+                        if icon_btn(ui, Icon::FolderOpen, "Import Settings", false, 140.0).clicked() { import_settings_flag = true; }
+                    });
+                    ui.label(egui::RichText::new("Exported file contains API tokens and passwords in plain text. Keep it private. Import replaces all settings; downloads and queues unchanged.").color(theme::ERR).small());
                 }
                 1 => {
                     section(ui, "File types");
@@ -7797,6 +8124,109 @@ impl DownloadApp {
                     });
                     ui.label(egui::RichText::new("Downloads video-page URLs (YouTube, Vimeo, ...). Binary: bundled next to exe, config bin/, or PATH; fetched on first use.").color(theme::TEXT_FAINT).small());
                 }
+                8 => {
+                    section(ui, "Debrid providers");
+                    ui.label(egui::RichText::new("Magnets and supported hoster links resolve to direct HTTP downloads. Failure falls back to local torrent / direct HTTP. Tokens stored plain in state.json (like NNTP creds), masked here, never logged. Resolved links expire/IP-bound: tasks keep original URL and re-resolve on every start.").color(theme::TEXT_FAINT).small());
+                    form_grid("opts-debrid-pref").show(ui, |ui| {
+                        form_label(ui, "Preferred");
+                        let mut pref = crate::debrid::Provider::from_id(&settings.debrid_preferred);
+                        egui::ComboBox::from_id_salt("debrid-pref")
+                            .selected_text(match pref { Some(p) => p.label(), None => "Auto (RD, AD, TorBox order)" })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut pref, None, "Auto");
+                                for p in crate::debrid::ALL {
+                                    ui.selectable_value(&mut pref, Some(p), p.label());
+                                }
+                            });
+                        settings.debrid_preferred = pref.map(|p| p.id().to_string()).unwrap_or_default();
+                        ui.end_row();
+                    });
+                    self.debrid_ctx = Some(ui.ctx().clone());
+                    if let Ok(mut g) = self.debrid_hosts_slot.try_lock() {
+                        if let Some((pid, list)) = g.take() {
+                            self.debrid_ui.hosts.insert(pid, list);
+                        }
+                    }
+                    if let Ok(mut g) = self.debrid_slot.try_lock() {
+                        if let Some((tag, res)) = g.take() {
+                            if let Some((pid, kind)) = tag.split_once(':') {
+                                self.debrid_ui.busy.remove(pid);
+                                match (kind, res) {
+                                    ("account", Ok(txt)) => { self.debrid_ui.account.insert(pid.to_string(), txt); self.debrid_ui.error.remove(pid); }
+                                    ("hosts", Ok(_)) => { self.debrid_ui.checked_at.insert(pid.to_string(), crate::debrid::now_unix()); self.debrid_ui.error.remove(pid); }
+                                    (_, Err(e)) => { self.debrid_ui.error.insert(pid.to_string(), e); }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    for p in crate::debrid::ALL {
+                        let pid = p.id();
+                        section(ui, p.label());
+                        let cfg = match p {
+                            crate::debrid::Provider::Rd => &mut settings.debrid_rd,
+                            crate::debrid::Provider::Ad => &mut settings.debrid_ad,
+                            crate::debrid::Provider::Tb => &mut settings.debrid_tb,
+                        };
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut cfg.enabled, "Enabled");
+                            ui.checkbox(&mut cfg.use_for_hosters, "Use for hosters");
+                            ui.checkbox(&mut cfg.use_for_magnets, "Use for magnets");
+                            ui.checkbox(&mut cfg.cached_only, "Magnets: cached only");
+                        });
+                        form_grid(&format!("opts-debrid-{pid}")).show(ui, |ui| {
+                            form_label(ui, "API token");
+                            ui.add(egui::TextEdit::singleline(&mut cfg.api_key).password(true).desired_width(f32::INFINITY));
+                            ui.end_row();
+                        });
+                        ui.label(egui::RichText::new(match p {
+                            crate::debrid::Provider::Rd => "Get token: real-debrid.com/apitoken",
+                            crate::debrid::Provider::Ad => "Get token: alldebrid.com/apikeys",
+                            crate::debrid::Provider::Tb => "Get token: torbox.app -> Settings / API",
+                        }).color(theme::TEXT_FAINT).small());
+                        let busy = self.debrid_ui.busy.contains(pid);
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(!busy && cfg.usable(), egui::Button::new(if busy { "Testing..." } else { "Test connection" })).clicked() {
+                                test_provider = Some(p);
+                            }
+                            if ui.add_enabled(!busy && cfg.usable(), egui::Button::new("Refresh hosters")).clicked() {
+                                refresh_provider = Some(p);
+                            }
+                            if let Some(ts) = self.debrid_ui.checked_at.get(pid) {
+                                ui.label(egui::RichText::new(format!("hosters checked {}", crate::debrid::fmt_date(*ts))).color(theme::TEXT_FAINT).small());
+                            }
+                        });
+                        if let Some(a) = self.debrid_ui.account.get(pid).cloned() {
+                            ui.label(&a);
+                            if a.contains("NOT premium") {
+                                ui.label(egui::RichText::new("Warning: account not premium - debrid downloads will fail until renewed.").color(theme::ERR).small());
+                            }
+                        }
+                        if let Some(e) = self.debrid_ui.error.get(pid).cloned() {
+                            ui.label(egui::RichText::new(e).color(theme::ERR).small());
+                        }
+                        if let Some(list) = self.debrid_ui.hosts.get(pid).cloned() {
+                            let up = list.iter().filter(|h| h.supported && h.up).count();
+                            ui.label(egui::RichText::new(format!("{} hosters, {} up", list.len(), up)).color(theme::TEXT_FAINT).small());
+                            egui::ScrollArea::vertical().id_salt(format!("debrid-hosts-{pid}")).max_height(140.0).show(ui, |ui| {
+                                for h in &list {
+                                    let (txt, col) = if !h.supported { ("unsupported", theme::TEXT_FAINT) } else if h.up { ("up", theme::OK) } else { ("down", theme::ERR) };
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(txt).color(col).small());
+                                        ui.label(format!("{} ({})", h.name, h.domain));
+                                    });
+                                }
+                            });
+                        }
+                        if cfg.usable() && !busy && !self.debrid_ui.stale_checked.contains(pid) {
+                            let stale = self.debrid_ui.checked_at.get(pid).map(|t| crate::debrid::now_unix() - t > 600).unwrap_or(true);
+                            if stale {
+                                stale_provider = Some(p);
+                            }
+                        }
+                    }
+                    ui.label(egui::RichText::new("Hoster status re-checked on Options open when stale (>10 min) and via Refresh. Multi-file magnets: Add dialog resolves via debrid and creates one task per file; starting a single magnet task directly only works for single-file magnets (falls back to local torrent otherwise).").color(theme::TEXT_FAINT).small());
+                }
                 _ => {
                     section(ui, "About");
                     ui.label(egui::RichText::new("App updates").strong());
@@ -7878,6 +8308,13 @@ impl DownloadApp {
             }
         });
 
+        if let Some(p) = test_provider {
+            self.spawn_debrid_probe(p, true, &settings);
+        }
+        if let Some(p) = refresh_provider.or(stale_provider) {
+            self.spawn_debrid_probe(p, false, &settings);
+            self.debrid_ui.stale_checked.insert(p.id().to_string());
+        }
         if update_ytdlp {
             self.options_notice = "Updating yt-dlp...".into();
             let rt = self.rt.clone();
@@ -7928,6 +8365,52 @@ impl DownloadApp {
             crate::lock_unpoison(&self.rt).log(self.options_notice.clone());
         }
 
+        // Export/import: import swaps `settings` before compare below, so existing
+        // persist + autostart/capture-filter/speed-limit path applies. Errors leave it untouched.
+        if export_settings_flag {
+            if let Some(p) = rfd::FileDialog::new()
+                .set_title("Export Settings")
+                .add_filter("Settings JSON", &["json"])
+                .set_file_name("webcraft-settings.json")
+                .save_file()
+            {
+                let snapshot = { crate::lock_unpoison(&self.rt).state.settings.clone() };
+                match crate::model::settings_export_json(&snapshot)
+                    .map_err(|e| e.to_string())
+                    .and_then(|json| std::fs::write(&p, json).map_err(|e| e.to_string()))
+                {
+                    Ok(()) => {
+                        self.options_notice = format!("Settings exported to {}", p.display());
+                        crate::lock_unpoison(&self.rt).log("Settings exported.");
+                    }
+                    Err(e) => {
+                        self.options_notice = format!("Export failed: {e}");
+                    }
+                }
+            }
+        }
+        if import_settings_flag {
+            if let Some(p) = rfd::FileDialog::new()
+                .set_title("Import Settings")
+                .add_filter("Settings JSON", &["json"])
+                .pick_file()
+            {
+                let parsed = std::fs::read_to_string(&p)
+                    .map_err(|e| format!("cannot read file: {e}"))
+                    .and_then(|txt| crate::model::parse_settings_import(&txt));
+                match parsed {
+                    Ok(imported) => {
+                        settings = imported;
+                        self.options_notice =
+                            "Settings imported. Restart may be needed for startup-only settings."
+                                .into();
+                    }
+                    Err(e) => {
+                        self.options_notice = format!("Import failed: {e}. Settings unchanged.");
+                    }
+                }
+            }
+        }
         // Apply immediately. Options previously looked inert because edits only
         // persisted from a Save button that could sit below the visible page.
         if serde_json::to_string(&settings).unwrap_or_default() != before {
@@ -8191,25 +8674,23 @@ mod progress_tests {
     }
 
     #[test]
-    fn yt_probe_h_sizing() {
-        let st = YtProbeState::default();
-        assert_eq!(yt_probe_h(&st), 55.0);
-        let dump: crate::ytdlp::YtDump =
-            serde_json::from_str(r#"{"title":"t","formats":[]}"#).unwrap();
-        let st = YtProbeState {
-            dump: Some(dump),
-            ..Default::default()
-        };
-        assert_eq!(yt_probe_h(&st), 55.0 + 90.0 + 120.0);
-        let dump: crate::ytdlp::YtDump = serde_json::from_str(
-            r#"{"title":"t","formats":[],"subtitles":{"en":[],"vi":[]},"automatic_captions":{"en":[],"ja":[]}}"#,
-        )
-        .unwrap();
-        // auto ja only (en filtered as duplicate of manual) -> rows = 2 + 1 = 3.
-        let st = YtProbeState {
-            dump: Some(dump),
-            ..Default::default()
-        };
-        assert_eq!(yt_probe_h(&st), 55.0 + 90.0 + 120.0 + 21.0 + 84.0);
+    fn fit_content_h_floors_and_caps() {
+        // Floor = base even when content smaller; grows to content; 85% cap.
+        assert_eq!(fit_content_h(680.0, 100.0, 1000.0), 680.0);
+        assert_eq!(fit_content_h(680.0, 800.0, 1000.0), 800.0);
+        assert_eq!(fit_content_h(680.0, 5000.0, 1000.0), 850.0);
+        // Tiny monitor: cap never below base.
+        assert_eq!(fit_content_h(680.0, 5000.0, 600.0), 680.0);
+    }
+
+    #[test]
+    fn grab_name_takes_last_segment() {
+        assert_eq!(grab_name("https://ex.com/a/b/file.zip?x=1"), "file.zip");
+        assert_eq!(grab_name("https://ex.com/a/My%20File.pdf"), "My File.pdf");
+        assert_eq!(grab_name("https://ex.com/a/"), "download.bin");
+        assert_eq!(
+            grab_name("magnet:?xt=urn:btih:abc&dn=Cool+Torrent"),
+            "Cool Torrent"
+        );
     }
 }

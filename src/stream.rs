@@ -316,6 +316,39 @@ pub async fn download_url_with_settings(
     settings: &Settings,
 ) -> Result<DownloadTask, String> {
     let lower = task.url.to_ascii_lowercase();
+    // Debrid before torrent/HTTP: magnets + hoster URLs. Resolved direct
+    // URLs expire/IP-bound, so resolution runs fresh here on every start
+    // (same client = same egress IP); persisted task keeps original URL
+    // (download_via_debrid restores it). Any debrid failure falls through
+    // to local torrent / plain HTTP below.
+    if (crate::debrid::is_magnet(&task.url) && crate::debrid::any_for_magnets(settings))
+        || (!crate::torrent::is_torrent_task(&task)
+            && (lower.starts_with("http://") || lower.starts_with("https://"))
+            && crate::debrid::any_for_hosters(settings))
+    {
+        // Hoster route only when URL is not plain file/manifest/video-page:
+        // cheap gate = debrid hosts check is provider-side on unrestrict;
+        // avoid hijacking normal HTTP by requiring hoster match attempt
+        // only for non-manifest URLs. Failure falls through anyway, but
+        // skip obvious manifests/video pages to save API calls.
+        let skip =
+            manifest_kind_from_url(&task.url).is_some() || crate::ytdlp::is_video_page(&task.url);
+        if !skip {
+            match crate::debrid::download_via_debrid(
+                client.clone(),
+                task.clone(),
+                ctrl.clone(),
+                settings,
+            )
+            .await
+            {
+                Ok(t) => return Ok(t),
+                Err(_) => {
+                    // fall through: local torrent / HTTP. Never log URL/token.
+                }
+            }
+        }
+    }
     // BitTorrent before HTTP probe: magnet has no HTTP form, .torrent probe would download metadata as file.
     if crate::torrent::is_torrent_task(&task) {
         return crate::torrent::download_torrent(client, task, ctrl, settings).await;

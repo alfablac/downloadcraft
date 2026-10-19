@@ -83,6 +83,11 @@ pub struct DownloadTask {
     /// Torrent file indices to download (empty = all files).
     #[serde(default)]
     pub torrent_files: Vec<usize>,
+    /// Debrid fan-out marker: provider file name this magnet task downloads
+    /// on debrid re-resolve (multi-file magnet = one task per file sharing
+    /// magnet URL; stream matches resolved file by this name, not task filename).
+    #[serde(default)]
+    pub debrid_file_name: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -194,7 +199,7 @@ pub struct Schedule {
     pub quota_used_bytes: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
     // No default here broke whole-state parse (data loss) when absent in old state files.
     #[serde(default)]
@@ -245,6 +250,17 @@ pub struct Settings {
     /// NNTP provider connections per NZB, independent of HTTP max_connections.
     #[serde(default = "def_nntp_connections")]
     pub nntp_connections: u32,
+    /// Debrid providers (Real-Debrid / AllDebrid / TorBox). Tokens stored
+    /// plain in state.json like NNTP/proxy creds — ponytail: no OS keychain;
+    /// add keyring when credential theft matters. Tokens never logged.
+    #[serde(default)]
+    pub debrid_preferred: String,
+    #[serde(default)]
+    pub debrid_rd: DebridProviderCfg,
+    #[serde(default)]
+    pub debrid_ad: DebridProviderCfg,
+    #[serde(default)]
+    pub debrid_tb: DebridProviderCfg,
     /// BitTorrent listen port. 0 = librqbit default (random).
     #[serde(default)]
     pub torrent_listen_port: u16,
@@ -292,6 +308,42 @@ fn def_nntp_port() -> u16 {
 fn def_nntp_connections() -> u32 {
     30
 }
+
+/// One debrid provider's config. `Default` = disabled, empty token,
+/// hosters+magnets routing on (matches Settings::default entries).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DebridProviderCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "def_true")]
+    pub use_for_hosters: bool,
+    #[serde(default = "def_true")]
+    pub use_for_magnets: bool,
+    /// Magnets: only route via debrid when already cached there;
+    /// otherwise fall back to local torrent engine.
+    #[serde(default)]
+    pub cached_only: bool,
+}
+
+impl Default for DebridProviderCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: String::new(),
+            use_for_hosters: true,
+            use_for_magnets: true,
+            cached_only: false,
+        }
+    }
+}
+
+impl DebridProviderCfg {
+    pub fn usable(&self) -> bool {
+        self.enabled && !self.api_key.trim().is_empty()
+    }
+}
 fn def_conn() -> u32 {
     8
 }
@@ -321,6 +373,10 @@ impl Default for Settings {
             nntp_user: String::new(),
             nntp_pass: String::new(),
             nntp_connections: 30,
+            debrid_preferred: String::new(),
+            debrid_rd: DebridProviderCfg::default(),
+            debrid_ad: DebridProviderCfg::default(),
+            debrid_tb: DebridProviderCfg::default(),
             torrent_listen_port: 0,
             torrent_seed_after_complete: false,
             folder_template: String::new(),
@@ -597,6 +653,27 @@ pub fn category_for(filename: &str) -> &'static str {
     }
 }
 
+/// Pretty JSON for Settings export (Options > General > Backup).
+/// ponytail: plain Settings JSON, no versioned wrapper; Settings #[serde(default)]
+/// on every field keeps old/partial files importable.
+pub fn settings_export_json(s: &Settings) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(s)
+}
+
+/// Parse imported Settings. Rejects non-object JSON and AppState shapes
+/// (`tasks`/`settings` keys) so wrong file type fails without touching state.
+pub fn parse_settings_import(txt: &str) -> Result<Settings, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(txt).map_err(|e| format!("invalid settings file: {e}"))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| "invalid settings file: expected JSON object".to_string())?;
+    if obj.contains_key("tasks") || obj.contains_key("settings") {
+        return Err("invalid settings file: looks like app state, not settings".into());
+    }
+    serde_json::from_value(v).map_err(|e| format!("invalid settings file: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,5 +845,58 @@ mod tests {
         v.as_object_mut().unwrap().remove("notifications");
         let s: Settings = serde_json::from_value(v).unwrap();
         assert!(s.notifications, "old state without field defaults on");
+    }
+
+    #[test]
+    fn settings_export_import_roundtrip_incl_debrid_tokens() {
+        // Dummy fixture tokens only; never real credentials.
+        let s = Settings {
+            debrid_rd: DebridProviderCfg {
+                api_key: "fixture-token".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let s = Settings {
+            debrid_preferred: "rd".into(),
+            speed_limit_kbps: 123,
+            ..s
+        };
+        let exported = settings_export_json(&s).unwrap();
+        assert_eq!(parse_settings_import(&exported), Ok(s.clone()));
+        // Token present in export, length only checked (present + nonzero).
+        let v: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        assert!(v["debrid_rd"]["api_key"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()));
+    }
+
+    #[test]
+    fn settings_import_partial_file_uses_defaults() {
+        // Missing fields keep serde defaults, do not fail.
+        let s = parse_settings_import(r#"{"speed_limit_kbps":42}"#).unwrap();
+        assert_eq!(s.speed_limit_kbps, 42);
+        assert_eq!(s.max_connections, Settings::default().max_connections);
+        assert_eq!(
+            s.debrid_rd,
+            DebridProviderCfg::default(),
+            "missing debrid cfg defaults"
+        );
+    }
+
+    #[test]
+    fn settings_import_invalid_json_leaves_settings_unchanged() {
+        let before = Settings {
+            speed_limit_kbps: 99,
+            ..Default::default()
+        };
+        let mut current = before.clone();
+        if let Ok(imported) = parse_settings_import("{not json") {
+            current = imported;
+        }
+        assert_eq!(current.speed_limit_kbps, before.speed_limit_kbps);
+        assert!(parse_settings_import("{not json").is_err());
+        assert!(parse_settings_import("null").is_err());
+        assert!(parse_settings_import(r#"{"tasks":[]}"#).is_err());
     }
 }

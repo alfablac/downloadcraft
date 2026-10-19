@@ -7,7 +7,7 @@ mod app;
 mod icons;
 mod theme;
 use downloadcraft_lib::{
-    engine, grabber, model, nntp, platform, queue, scheduler, stream, torrent, ytdlp,
+    debrid, engine, grabber, model, nntp, platform, queue, scheduler, stream, torrent, ytdlp,
 };
 use model::*;
 use std::collections::HashMap;

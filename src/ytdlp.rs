@@ -396,8 +396,66 @@ pub fn is_manifest_url(url: &str) -> bool {
     path.ends_with(".m3u8") || path.ends_with(".mpd")
 }
 
+pub fn is_youtube_url(url: &str) -> bool {
+    let Ok(u) = url::Url::parse(url) else {
+        return false;
+    };
+    let host = u.host_str().unwrap_or("").to_ascii_lowercase();
+    let h = host.strip_prefix("www.").unwrap_or(&host);
+    let h = h.strip_prefix("m.").unwrap_or(h);
+    matches!(h, "youtube.com" | "music.youtube.com" | "youtu.be")
+}
+
+fn has_node() -> bool {
+    static HAS_NODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS_NODE.get_or_init(|| {
+        let mut cmd = Command::new("node");
+        cmd.arg("--version")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        crate::platform::no_window(&mut cmd);
+        cmd.output().map(|o| o.status.success()).unwrap_or(false)
+    })
+}
+
+fn anon_task(task: &DownloadTask) -> DownloadTask {
+    let mut t = task.clone();
+    t.cookies.clear();
+    t.cookies_json.clear();
+    t.headers.retain(|k, _| !k.eq_ignore_ascii_case("cookie"));
+    t
+}
+
+fn should_retry_anon(url: &str, task: &DownloadTask, err: &str) -> bool {
+    if !is_youtube_url(url) {
+        return false;
+    }
+    let has_cookies = !task.cookies.trim().is_empty()
+        || !task.cookies_json.trim().is_empty()
+        || task
+            .headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("cookie") && !v.trim().is_empty());
+    if !has_cookies {
+        return false;
+    }
+    let e = err.to_ascii_lowercase();
+    [
+        "page needs to be reloaded",
+        "page needs be reloaded",
+        "sign in to confirm",
+        "sign in confirm",
+    ]
+    .iter()
+    .any(|p| e.contains(p))
+}
+
 fn base_args(url: &str, task: &DownloadTask, cookie_jar: Option<&std::path::Path>) -> Vec<String> {
     let mut a: Vec<String> = vec!["--no-playlist".into(), "--no-warnings".into()];
+    if has_node() {
+        a.push("--js-runtimes".into());
+        a.push("node".into());
+    }
     if is_manifest_url(url) {
         a.push("--force-generic-extractor".into());
     }
@@ -691,6 +749,21 @@ async fn fetch_formats_jar(
     task: &DownloadTask,
     jar: Option<&std::path::Path>,
 ) -> Result<YtDump, String> {
+    match fetch_formats_jar_once(url, task, jar).await {
+        Err(e) if should_retry_anon(url, task, &e) => {
+            let t = anon_task(task);
+            let jar2 = write_cookie_jar(&t);
+            fetch_formats_jar_once(url, &t, jar2.as_deref()).await
+        }
+        other => other,
+    }
+}
+
+async fn fetch_formats_jar_once(
+    url: &str,
+    task: &DownloadTask,
+    jar: Option<&std::path::Path>,
+) -> Result<YtDump, String> {
     let path = ytdlp_path().ok_or("yt-dlp not found")?;
     let mut args = vec!["-J".to_string()];
     args.extend(base_args(url, task, jar));
@@ -827,12 +900,20 @@ pub async fn download_with_ytdlp(
     // URL last (base_args appends it); insert flags before it.
     let mut full = base_args(&task.url, &task, jar.as_deref());
     let url = full.pop().expect("url");
-    full.extend(args);
+    full.extend(args.clone());
     full.push(url);
+    // Prebuilt anonymous retry (no cookies/headers): used only if should_retry_anon.
+    let t_anon = anon_task(&task);
+    let jar2 = write_cookie_jar(&t_anon);
+    let mut full2 = base_args(&t_anon.url, &t_anon, jar2.as_deref());
+    let url2 = full2.pop().expect("url");
+    full2.extend(args);
+    full2.push(url2);
 
     let ctrl2 = ctrl.clone();
+    let path2 = path.clone();
     let started = std::time::SystemTime::now();
-    let out = tokio::task::spawn_blocking(move || run_ytdlp_download(&path, &full, &ctrl2))
+    let out = tokio::task::spawn_blocking(move || run_ytdlp_download(&path2, &full, &ctrl2))
         .await
         .map_err(|e| e.to_string())?;
     match out {
@@ -842,6 +923,22 @@ pub async fn download_with_ytdlp(
             t.status = TaskStatus::Paused;
             t.downloaded = ctrl.downloaded.load(Ordering::Relaxed);
             return Ok(t);
+        }
+        Err(e) if should_retry_anon(&task.url, &task, &e) => {
+            let ctrl2 = ctrl.clone();
+            match tokio::task::spawn_blocking(move || run_ytdlp_download(&path, &full2, &ctrl2))
+                .await
+                .map_err(|e2| e2.to_string())?
+            {
+                Ok(()) => {}
+                Err(e2) if e2 == "cancelled" => {
+                    let mut t2 = task.clone();
+                    t2.status = TaskStatus::Paused;
+                    t2.downloaded = ctrl.downloaded.load(Ordering::Relaxed);
+                    return Ok(t2);
+                }
+                Err(e2) => return Err(e2),
+            }
         }
         Err(e) => return Err(e),
     }
@@ -1126,6 +1223,53 @@ pub fn is_video_page(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn youtube_url_cases() {
+        for u in [
+            "https://youtube.com/watch?v=x",
+            "https://www.youtube.com/watch?v=x",
+            "https://m.youtube.com/watch?v=x",
+            "https://music.youtube.com/watch?v=x",
+            "https://youtu.be/x",
+        ] {
+            assert!(is_youtube_url(u), "{u}");
+        }
+        for u in [
+            "https://evil-youtube.com/watch?v=x",
+            "https://youtube.com.evil.com/watch?v=x",
+            "https://notyoutu.be/x",
+            "https://example.com/",
+            "not a url",
+        ] {
+            assert!(!is_youtube_url(u), "{u}");
+        }
+    }
+    #[test]
+    fn retry_anon_cases() {
+        let mut t = DownloadTask {
+            cookies: "a=b".into(),
+            ..Default::default()
+        };
+        let err = "ERROR [youtube]: page needs to be reloaded";
+        assert!(should_retry_anon("https://www.youtube.com/watch?v=x", &t, err));
+        assert!(should_retry_anon("https://youtu.be/x", &t, "Sign in to confirm you're not a bot"));
+        assert!(should_retry_anon("https://www.youtube.com/watch?v=x", &t, "page needs be reloaded"));
+        t.cookies.clear();
+        t.cookies_json = r#"[{"name":"a"}]"#.into();
+        assert!(should_retry_anon("https://m.youtube.com/watch?v=x", &t, err));
+        t.cookies_json.clear();
+        assert!(!should_retry_anon("https://www.youtube.com/watch?v=x", &t, err));
+        t.cookies = "a=b".into();
+        assert!(!should_retry_anon("https://example.com/", &t, err));
+        assert!(!should_retry_anon("https://www.youtube.com/watch?v=x", &t, "Video unavailable"));
+    }
+    #[test]
+    fn base_args_js_runtimes_node() {
+        let t = DownloadTask::default();
+        let a = base_args("https://example.com/v", &t, None);
+        let has = a.windows(2).any(|w| w == ["--js-runtimes", "node"]);
+        assert_eq!(has, has_node(), "args {a:?}");
+    }
     #[test]
     fn video_page_detection() {
         assert!(is_video_page("https://www.youtube.com/watch?v=aqz-KE-bpKQ"));

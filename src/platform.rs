@@ -688,10 +688,29 @@ pub fn open_path(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 pub fn reveal_path(path: &Path) -> std::io::Result<()> {
+    // File moved/deleted after completion: open parent dir instead of
+    // letting explorer fall back to Documents on nonexistent path.
+    let target;
+    let path = if path.exists() {
+        path
+    } else {
+        target = path
+            .parent()
+            .filter(|p| p.is_dir())
+            .map(|p| p.to_path_buf());
+        match &target {
+            Some(p) => p.as_path(),
+            None => return open_path(path),
+        }
+    };
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        // raw_arg: quotes must wrap path only. Command::arg would quote whole
+        // "/select,<path>" arg when path has spaces; explorer rejects that
+        // form and opens Documents instead.
         Command::new("explorer")
-            .arg(format!("/select,{}", path.display()))
+            .raw_arg(format!("/select,\"{}\"", path.display()))
             .spawn()?;
     }
     #[cfg(target_os = "macos")]

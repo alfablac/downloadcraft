@@ -387,7 +387,9 @@ fn is_sharepoint_page(url: &Url) -> bool {
     }
     let p = url.path().to_ascii_lowercase();
     let has_id = url.query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("id"));
-    (p.contains("onedrive.aspx") || p.ends_with("/allitems.aspx") || p.ends_with("/forms/allitems.aspx"))
+    (p.contains("onedrive.aspx")
+        || p.ends_with("/allitems.aspx")
+        || p.ends_with("/forms/allitems.aspx"))
         && has_id
 }
 
@@ -592,7 +594,12 @@ impl Crawler {
                     }
                     if kind == "Folders" {
                         // Skip only SP system folder; `_`-prefixed user folders legit.
-                        if !p.rsplit('/').next().unwrap_or("").eq_ignore_ascii_case("forms") {
+                        if !p
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("")
+                            .eq_ignore_ascii_case("forms")
+                        {
                             folders.push_back(p.to_string());
                         }
                         continue;
@@ -627,7 +634,13 @@ impl Crawler {
                     });
                 }
             }
-            self.publish(std::slice::from_ref(&page_url), folders.len(), 0, &files, &folder);
+            self.publish(
+                std::slice::from_ref(&page_url),
+                folders.len(),
+                0,
+                &files,
+                &folder,
+            );
         }
         if files.is_empty() {
             let detail = if errors.is_empty() {
@@ -1290,27 +1303,46 @@ mod tests {
         let u = Url::parse("https://stievano-my.sharepoint.com/personal/yatogam1_stievano_onmicrosoft_com/_layouts/15/onedrive.aspx?id=%2Fpersonal%2Fyatogam1%5Fstievano%5Fonmicrosoft%5Fcom%2FDocuments%2FAnimes%2FDragon%20Ball%20Super&ga=1").unwrap();
         assert!(is_sharepoint_page(&u));
         let (web, folder) = sharepoint_root(&u).unwrap();
-        assert_eq!(web, "https://stievano-my.sharepoint.com/personal/yatogam1_stievano_onmicrosoft_com");
-        assert_eq!(folder, "/personal/yatogam1_stievano_onmicrosoft_com/Documents/Animes/Dragon Ball Super");
+        assert_eq!(
+            web,
+            "https://stievano-my.sharepoint.com/personal/yatogam1_stievano_onmicrosoft_com"
+        );
+        assert_eq!(
+            folder,
+            "/personal/yatogam1_stievano_onmicrosoft_com/Documents/Animes/Dragon Ball Super"
+        );
         assert_eq!(
             sp_download_url(&web, "/personal/x/Documents/Dragon Ball/e 1.mkv"),
             "https://stievano-my.sharepoint.com/personal/yatogam1_stievano_onmicrosoft_com/_layouts/15/download.aspx?SourceUrl=/personal/x/Documents/Dragon%20Ball/e%201.mkv"
         );
-        let (items, next) = sp_page(&serde_json::json!({"value":[{"Name":"a.mkv"}],"@odata.nextLink":"https://x/next"}));
+        let (items, next) = sp_page(
+            &serde_json::json!({"value":[{"Name":"a.mkv"}],"@odata.nextLink":"https://x/next"}),
+        );
         assert_eq!(items.len(), 1);
         assert_eq!(next.as_deref(), Some("https://x/next"));
-        let (items, next) = sp_page(&serde_json::json!({"d":{"results":[{"Name":"b"}],"__next":"https://x/n2"}}));
+        let (items, next) =
+            sp_page(&serde_json::json!({"d":{"results":[{"Name":"b"}],"__next":"https://x/n2"}}));
         assert_eq!(items.len(), 1);
         assert_eq!(next.as_deref(), Some("https://x/n2"));
-        assert!(!is_sharepoint_page(&Url::parse("https://example.com/_layouts/15/onedrive.aspx?id=/x").unwrap()));
+        assert!(!is_sharepoint_page(
+            &Url::parse("https://example.com/_layouts/15/onedrive.aspx?id=/x").unwrap()
+        ));
         // Widened: modern library view also routes to REST listing.
         assert!(is_sharepoint_page(&Url::parse("https://t.sharepoint.com/sites/x/Docs/Forms/AllItems.aspx?id=%2Fsites%2Fx%2FDocs%2Fa").unwrap()));
         // OData literal: apostrophe doubled, space/#/% encoded, cannot break URL.
         let b = sp_folder_base("https://t.sharepoint.com/p", "/p/Documents/A #1/it's 100%");
         assert_eq!(b, "https://t.sharepoint.com/p/_api/web/GetFolderByServerRelativeUrl('/p/Documents/A%20%231/it''s%20100%25')");
         // Newer item shape fallback.
-        assert_eq!(sp_item_path(&serde_json::json!({"ServerRelativePath":{"DecodedUrl":"/p/Docs/a.mkv"}})), "/p/Docs/a.mkv");
-        assert_eq!(sp_item_path(&serde_json::json!({"ServerRelativeUrl":"/p/Docs/b.mkv","ServerRelativePath":{"DecodedUrl":"/ignored"}})), "/p/Docs/b.mkv");
+        assert_eq!(
+            sp_item_path(&serde_json::json!({"ServerRelativePath":{"DecodedUrl":"/p/Docs/a.mkv"}})),
+            "/p/Docs/a.mkv"
+        );
+        assert_eq!(
+            sp_item_path(
+                &serde_json::json!({"ServerRelativeUrl":"/p/Docs/b.mkv","ServerRelativePath":{"DecodedUrl":"/ignored"}})
+            ),
+            "/p/Docs/b.mkv"
+        );
     }
 
     #[test]
