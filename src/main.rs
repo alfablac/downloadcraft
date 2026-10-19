@@ -291,7 +291,6 @@ fn main() {
         if let Ok(txt) = std::fs::read_to_string(&lock) {
             if let Ok(pid) = txt.trim().parse::<u32>() {
                 if pid != std::process::id() && process_alive(pid) {
-                    let _ = std::fs::write(platform::config_dir().join("show.request"), "show");
                     for a in &args[1..] {
                         if a.starts_with("http://")
                             || a.starts_with("https://")
@@ -302,6 +301,8 @@ fn main() {
                             let _ = std::fs::write(f, format!("url={a}\n"));
                         }
                     }
+                    // After inbox: watcher must not wake app before URL lands.
+                    let _ = std::fs::write(platform::config_dir().join("show.request"), "show");
                     println!("already running (pid {pid}); forwarded args");
                     return;
                 }
@@ -309,6 +310,9 @@ fn main() {
         }
         let _ = std::fs::write(&lock, std::process::id().to_string());
     }
+    // --show: browser host spawned app for a link -> must land visible on
+    // capture modal, overriding start_minimized (autostart stays hidden).
+    let force_show = args.iter().any(|a| a == "--show");
     let autostart = args.iter().any(|a| a == "--autostart");
     // Inbox: files dropped by native host
     let mut initial_urls: Vec<String> = Vec::new();
@@ -320,7 +324,7 @@ fn main() {
             initial_urls.push(a.clone());
         }
     }
-    let hidden = autostart || load_state().settings.start_minimized;
+    let hidden = !force_show && (autostart || load_state().settings.start_minimized);
     run_gui(initial_urls, hidden);
 }
 
@@ -371,26 +375,61 @@ pub fn run_host_handshake(host: &std::path::Path) -> Result<(), String> {
     }
 }
 
+/// Cold-start URL arg -> pending capture task (same IDM confirm modal as
+/// browser inbox captures), instead of silent add_url task. `grab` keeps
+/// inbox side-channel (cookies-less: pending-grab.txt Grabber reads).
+/// Returns None for grab (handled) and empty decodes.
+fn cold_start_capture(arg: &str) -> Option<DownloadTask> {
+    for scheme in ["webcraft", "downloadcraft"] {
+        if let Some(enc) = arg.strip_prefix(&format!("{scheme}://grab?url=")) {
+            let _ = std::fs::write(
+                platform::config_dir().join("pending-grab.txt"),
+                url_decode(enc),
+            );
+            return None;
+        }
+    }
+    let mut t = DownloadTask::default();
+    for scheme in ["webcraft", "downloadcraft"] {
+        if let Some(enc) = arg.strip_prefix(&format!("{scheme}://add?url=")) {
+            t.url = url_decode(enc);
+            return (!t.url.is_empty()).then_some(t);
+        }
+    }
+    t.url = arg.to_string();
+    (!t.url.is_empty()).then_some(t)
+}
+
 fn run_gui(initial_urls: Vec<String>, hidden: bool) {
+    platform::trace(&format!("run_gui hidden={hidden} urls={}", initial_urls.len()));
     platform::WINDOW_VISIBLE.store(!hidden, std::sync::atomic::Ordering::Relaxed);
     platform::spawn_show_watcher();
+    platform::trace("watcher spawned");
     // Register native messaging hosts on every launch: host exe path can move (portable/update), stale manifest = dead extension.
     let _ = platform::register_native_hosts(&sibling_host_path());
     let _ = platform::register_protocol();
+    platform::trace("hosts+protocol registered");
     let rt = Arc::new(Mutex::new(Runtime::load()));
+    platform::trace("runtime loaded");
     // Emit capture filter at startup: deleted/restored filter file must not
     // silently disable filtering until user edits Options.
     platform::write_capture_filter(&crate::lock_unpoison(&rt).state.settings);
-    for u in &initial_urls {
-        let clean = u
-            .strip_prefix("webcraft://add?url=")
-            .or_else(|| u.strip_prefix("downloadcraft://add?url="))
-            .map(url_decode)
-            .unwrap_or_else(|| u.clone());
-        crate::lock_unpoison(&rt).add_url(&clean, "main", "", "");
-    }
+    platform::trace("capture filter written");
+    // CLI/protocol URL = user clicked link: capture modal, not silent task.
+    // finalize_capture_tasks applies filename/queue/naming funnel.
+    let mut caps: Vec<DownloadTask> = initial_urls
+        .iter()
+        .filter_map(|u| cold_start_capture(u))
+        .collect();
+    // Bin crate == lib crate's Runtime owner; helper defined in this file.
+    finalize_capture_tasks(&rt, &mut caps);
+    crate::lock_unpoison(&rt).pending_captures.extend(caps);
     // drain inbox into pending captures (confirm dialog shows on first frame)
-    crate::lock_unpoison(&rt).pending_captures = take_inbox_tasks(&rt);
+    platform::trace("cold-start caps finalized");
+    crate::lock_unpoison(&rt)
+        .pending_captures
+        .extend(take_inbox_tasks(&rt));
+    platform::trace("inbox drained");
     let rt_clone = rt.clone();
     // Window/taskbar icon: same artwork as .exe resource (assets/webcraft.png -> .ico).
     // Without this eframe/winit falls back to a default blue square.
@@ -405,6 +444,7 @@ fn run_gui(initial_urls: Vec<String>, hidden: bool) {
             .with_visible(!hidden),
         ..Default::default()
     };
+    platform::trace("run_native start");
     if let Err(e) = eframe::run_native(
         "webcraft",
         options,
@@ -515,6 +555,39 @@ fn apply_page_title_naming(t: &mut DownloadTask) {
     });
 }
 
+/// Finalize capture tasks in place: id/filename/queue/naming funnel/order/log.
+/// Shared by inbox drain and cold-start CLI/protocol args. Caller holds no lock.
+fn finalize_capture_tasks(rt: &Arc<Mutex<Runtime>>, tasks: &mut [DownloadTask]) {
+    for t in tasks.iter_mut() {
+        let mut g = crate::lock_unpoison(rt);
+        if t.id.is_empty() {
+            t.id = new_id();
+        }
+        if t.filename.is_empty() {
+            t.filename = filename_from_url(&t.url);
+        }
+        apply_page_title_naming(t);
+        if t.queue_id.is_empty() {
+            t.queue_id = "main".into();
+        }
+        let explicit_dir = !t.dest_dir.as_os_str().is_empty();
+        if !explicit_dir {
+            apply_task_naming(&g.state.settings.clone(), t);
+        } else {
+            let tpl = g.state.settings.folder_template.clone();
+            t.filename = model::apply_folder_template(&tpl, &t.filename, &t.url);
+            t.category = category_for(&t.filename).into();
+        }
+        t.order = g.state.tasks.len() as i64 + 1;
+        g.log(format!("Inbox: {}", t.url));
+    }
+    // Distinct order within batch.
+    let base = crate::lock_unpoison(rt).state.tasks.len() as i64;
+    for (i, t) in tasks.iter_mut().enumerate() {
+        t.order = base + 1 + i as i64;
+    }
+}
+
 fn apply_task_naming(s: &Settings, t: &mut DownloadTask) {
     t.filename = model::apply_folder_template(&s.folder_template, &t.filename, &t.url);
     t.category = category_for(&t.filename).into();
@@ -522,6 +595,7 @@ fn apply_task_naming(s: &Settings, t: &mut DownloadTask) {
 }
 
 pub fn take_inbox_tasks(rt: &Arc<Mutex<Runtime>>) -> Vec<DownloadTask> {
+    platform::trace("take_inbox start");
     let dir = platform::inbox_dir();
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&dir) {
@@ -566,36 +640,14 @@ pub fn take_inbox_tasks(rt: &Arc<Mutex<Runtime>>) -> Vec<DownloadTask> {
                     // Manifest intent: no promotion; yt-dlp-first in stream dispatch.
                     // (should_promote already returns false for non-video pageUrl.)
                 }
-                let mut g = crate::lock_unpoison(rt);
-                if t.id.is_empty() {
-                    t.id = new_id();
-                }
-                if t.filename.is_empty() {
-                    t.filename = filename_from_url(&t.url);
-                }
-                apply_page_title_naming(&mut t);
-                if t.queue_id.is_empty() {
-                    t.queue_id = "main".into();
-                }
-                // Honor explicit savePath; empty gets settings dir, then
-                // naming funnel applies template + category subfolder.
-                let explicit_dir = !t.dest_dir.as_os_str().is_empty();
-                if !explicit_dir {
-                    apply_task_naming(&g.state.settings.clone(), &mut t);
-                } else {
-                    // Explicit dir from browser: still rename, keep dir.
-                    let tpl = g.state.settings.folder_template.clone();
-                    t.filename = model::apply_folder_template(&tpl, &t.filename, &t.url);
-                    t.category = category_for(&t.filename).into();
-                }
-                t.order = g.state.tasks.len() as i64 + 1 + out.len() as i64;
-                g.log(format!("Inbox: {}", t.url));
-                drop(g);
                 out.push(t);
             }
             let _ = std::fs::remove_file(p);
         }
     }
+    platform::trace("take_inbox parsed");
+    finalize_capture_tasks(rt, &mut out);
+    platform::trace("take_inbox finalized");
     out
 }
 
@@ -609,6 +661,22 @@ pub fn drain_inbox(rt: &Arc<Mutex<Runtime>>) {
 #[cfg(test)]
 mod state_tests {
     use super::*;
+
+    #[test]
+    fn cold_start_urls_become_captures() {
+        let t = cold_start_capture("webcraft://add?url=https%3A%2F%2Fex.com%2Ff.zip%3Fx%3D1")
+            .expect("add url");
+        assert_eq!(t.url, "https://ex.com/f.zip?x=1");
+        let t =
+            cold_start_capture("downloadcraft://add?url=https://ex.com/a.bin").expect("legacy");
+        assert_eq!(t.url, "https://ex.com/a.bin");
+        let t = cold_start_capture("https://ex.com/direct.mp4").expect("bare url");
+        assert_eq!(t.url, "https://ex.com/direct.mp4");
+        assert!(cold_start_capture("webcraft://add?url=").is_none());
+        let _ = std::fs::remove_file(platform::config_dir().join("pending-grab.txt"));
+        assert!(cold_start_capture("webcraft://grab?url=https%3A%2F%2Fex.com").is_none());
+        let _ = std::fs::remove_file(platform::config_dir().join("pending-grab.txt"));
+    }
 
     #[test]
     fn promote_rules() {

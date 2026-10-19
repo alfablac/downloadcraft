@@ -13,6 +13,99 @@ fn inbox_dir() -> PathBuf {
     config_dir().join("inbox")
 }
 
+/// Live GUI instance? Mirrors app's single-instance check: lock pid alive.
+/// Host is same-OS standalone binary, so liveness check duplicates per-OS
+/// (app's `process_alive` lives in GUI binary, not a shared lib).
+fn app_running() -> bool {
+    let Ok(txt) = std::fs::read_to_string(config_dir().join("instance.lock")) else {
+        return false;
+    };
+    let Ok(pid) = txt.trim().parse::<u32>() else {
+        return false;
+    };
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(windows)]
+    unsafe {
+        type Handle = *mut core::ffi::c_void;
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+            fn GetExitCodeProcess(h: Handle, code: *mut u32) -> i32;
+            fn CloseHandle(h: Handle) -> i32;
+        }
+        let h = OpenProcess(0x1000, 0, pid); // PROCESS_QUERY_LIMITED_INFORMATION
+        if h.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(h, &mut code);
+        CloseHandle(h);
+        ok != 0 && code == 259 // STILL_ACTIVE
+    }
+    #[cfg(unix)]
+    unsafe {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // kill(pid,0) succeeds for zombies too; app exits fully on quit,
+            // and launch is de-duped by app's own single-instance forward.
+        }
+        return kill(pid as i32, 0) == 0;
+    }
+    #[cfg(not(any(windows, unix)))]
+    false
+}
+
+/// Spawn sibling GUI (`webcraft[.exe]` next to this host exe), detached.
+/// No URL arg: app drains inbox on start -> capture modal. Browser-triggered
+/// start must be visible even when start_minimized is set, so pass --show
+/// (ignored by older builds).
+/// ponytail: sibling-exe convention only; fallback = user starts app manually.
+fn launch_app() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(dir) = exe.parent() else { return };
+    let app = dir.join(if cfg!(windows) {
+        "webcraft.exe"
+    } else {
+        "webcraft"
+    });
+    if !app.exists() {
+        return;
+    }
+    let mut cmd = std::process::Command::new(app);
+    cmd.arg("--show")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: no console inherit,
+        // survives host/browser exit.
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                // New session: detach from host's controlling terminal/group.
+                extern "C" {
+                    fn setsid() -> i32;
+                }
+                setsid();
+                Ok(())
+            });
+        }
+    }
+    let _ = cmd.spawn();
+}
+
 fn ext_of(filename: &str, url: &str) -> String {
     let seg = filename
         .rsplit(['/', '\\'])
@@ -224,7 +317,18 @@ fn handle(msg: &serde_json::Value) -> serde_json::Value {
             }
             // headers object flattened as header lines are ignored by parser except known keys; store referrer/cookies above
             match std::fs::write(dir.join(name), body) {
-                Ok(()) => with_id(serde_json::json!({"type":"ok"})),
+                Ok(()) => {
+                    // Inbox first, signal second: running app's watcher wakes
+                    // hidden (tray) viewport to drain inbox + show capture modal.
+                    // App quit: nothing consumes inbox, so launch app (drains
+                    // inbox on start -> modal, focused). show.request covers
+                    // zombie-lock/stale-pid race: spawned app forwards to it.
+                    if !app_running() {
+                        launch_app();
+                    }
+                    let _ = std::fs::write(config_dir().join("show.request"), "show");
+                    with_id(serde_json::json!({"type":"ok"}))
+                }
                 Err(e) => with_id(serde_json::json!({"type":"error","error":e.to_string()})),
             }
         }

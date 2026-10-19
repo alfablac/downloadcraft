@@ -2,7 +2,7 @@
 
 webcraft is a download manager written in Rust with egui. It reimplements the observable parts of Internet Download Manager: segmented downloads, queues, schedules, DASH and HLS, a site grabber, and browser integration. The code was written from scratch. It has no IDM code, binaries, icons, or activation logic, and it is not affiliated with Tonec.
 
-Current version: 0.12.0. Changelog lives in GitHub Releases.
+Current version: 0.12.1. Changelog lives in GitHub Releases.
 
 Runs on Windows 10/11 x86_64, macOS 13 or later (Intel and Apple Silicon), and Linux x86_64 (Ubuntu 22.04 or later, X11 and Wayland).
 

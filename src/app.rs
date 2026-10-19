@@ -81,6 +81,8 @@ struct YtProbeState {
     dump: Option<ytdlp::YtDump>,
     /// "" = Auto (best), format_id, or "audio:<id>".
     format: String,
+    /// "" = Auto (best), else max height tier e.g. "1080". Exact format wins.
+    quality: String,
     /// "" = auto, "best", "none", or audio format_id.
     audio: String,
     /// "" = keep, "mp3", "m4a".
@@ -514,6 +516,8 @@ pub struct DownloadApp {
     last_dl_total: u64,
     /// Per-task rate samples (drives Transfer rate column + ETA per row).
     rate_map: std::collections::HashMap<String, Vec<(std::time::Instant, u64)>>,
+    /// Live yt-dlp phase per task id (engine::phase_name); snapshot in poll.
+    phase_map: std::collections::HashMap<String, u8>,
     /// Live segment/part snapshot per task (Controls.parts, fallback part-dir scan).
     seg_info: std::collections::HashMap<String, SegView>,
     /// Smoothed displayed rate per task (bytes/s), EMA over 5s window rate.
@@ -541,6 +545,8 @@ pub struct DownloadApp {
     capture_just_opened: bool,
     /// Raise capture viewport once on pop (like progress_raise).
     capture_raise: bool,
+    /// Startup trace: first update() reached (window/event loop live).
+    first_update_traced: bool,
     yt_probe_add: YtProbeState,
     yt_probe_cap: YtProbeState,
     add_vp_sent: Option<egui::Vec2>,
@@ -579,6 +585,7 @@ struct TrayNav {
 
 impl DownloadApp {
     pub fn new(cc: &eframe::CreationContext<'_>, rt: Arc<Mutex<Runtime>>, hidden: bool) -> Self {
+        crate::platform::trace("app::new start");
         theme::apply(&cc.egui_ctx);
         let saved_settings: Option<Settings> = rt.lock().ok().map(|g| g.state.settings.clone());
         // Seed before first poll(): restored Complete tasks are history, not news.
@@ -613,7 +620,9 @@ impl DownloadApp {
                 .build()
                 .expect("tokio rt"),
         );
+        crate::platform::trace("app::new rt+tokio built");
         let tray = Self::make_tray(!hidden);
+        crate::platform::trace("app::new tray built");
         // Tray actions must not depend on egui poll: hidden viewport stops update(),
         // so poll-drained Quit starved and process needed Task Manager. Handler runs
         // on muda event delivery; Quit saves + exits directly. Toggle/Add write
@@ -779,6 +788,7 @@ impl DownloadApp {
             speed_hist: Vec::new(),
             last_dl_total: 0,
             rate_map: std::collections::HashMap::new(),
+            phase_map: std::collections::HashMap::new(),
             seg_info: std::collections::HashMap::new(),
             rate_smooth: std::collections::HashMap::new(),
             task_hist: std::collections::HashMap::new(),
@@ -798,6 +808,7 @@ impl DownloadApp {
             capture_name: String::new(),
             capture_just_opened: false,
             capture_raise: false,
+            first_update_traced: false,
             yt_probe_add: YtProbeState::default(),
             yt_probe_cap: YtProbeState::default(),
             add_vp_sent: None,
@@ -1226,6 +1237,14 @@ impl DownloadApp {
                     },
                 );
             }
+        }
+        {
+            let g = crate::lock_unpoison(&self.rt);
+            self.phase_map = g
+                .controls
+                .iter()
+                .map(|(k, c)| (k.clone(), c.phase.load(Ordering::Relaxed)))
+                .collect();
         }
         self.rate_map.retain(|id, _| {
             let g = crate::lock_unpoison(&self.rt);
@@ -2272,6 +2291,10 @@ impl eframe::App for DownloadApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.first_update_traced {
+            self.first_update_traced = true;
+            crate::platform::trace("app::update first frame");
+        }
         self.poll_debrid_add(ctx);
         // Paint full viewport first: panel gaps otherwise show OS black (#09) as a vertical bar.
         ctx.layer_painter(egui::LayerId::background()).rect_filled(
@@ -3988,6 +4011,7 @@ fn start_yt_probe(
     st.error.clear();
     st.dump = None;
     st.format.clear();
+    st.quality.clear();
     st.audio.clear();
     st.extract.clear();
     st.subs.clear();
@@ -4024,6 +4048,7 @@ fn yt_probe_poll(st: &mut YtProbeState, url: &str) -> bool {
             st.error.clear();
             st.slot = None;
             st.format.clear();
+            st.quality.clear();
             st.audio.clear();
             st.extract.clear();
             st.subs.clear();
@@ -4101,6 +4126,7 @@ fn yt_choice_from_state(st: &YtProbeState) -> ytdlp::YtChoice {
         subs,
         auto_subs: auto,
         sub_embed: st.sub_embed,
+        quality_height: st.quality.parse().ok().filter(|q: &u32| *q > 0),
     }
 }
 
@@ -4234,6 +4260,37 @@ fn ui_yt_probe_section(
                     }
                 }
             });
+        // Max-height tier; backend precedence: exact format > tier > auto.
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Max")
+                    .color(theme::TEXT_MUTED)
+                    .small(),
+            );
+            egui::ComboBox::from_id_salt(format!("{id}-yt-max"))
+                .selected_text(if st.quality.is_empty() {
+                    "Auto (best)".to_string()
+                } else {
+                    format!("{}p", st.quality)
+                })
+                .show_ui(ui, |ui| {
+                    for (v, lbl) in [
+                        ("", "Auto (best)"),
+                        ("2160", "2160p"),
+                        ("1440", "1440p"),
+                        ("1080", "1080p"),
+                        ("720", "720p"),
+                        ("480", "480p"),
+                        ("360", "360p"),
+                    ] {
+                        if ui.selectable_label(st.quality == v, lbl).clicked() {
+                            st.quality = v.to_string();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Max quality tier. Ignored if an exact format is picked above.");
+        });
         ui.end_row();
         if !is_audio_sel {
             form_label(ui, "Audio track");
@@ -4737,7 +4794,8 @@ impl DownloadApp {
                         if !compact_table { let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(if t.queue_id.is_empty() { "main" } else { &t.queue_id }).color(theme::TEXT_MUTED).small()).truncate().selectable(false)).on_hover_text(if t.queue_id.is_empty() { "main".to_string() } else { t.queue_id.clone() })); }
                         let w = nw(); cell_r(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(match t.total { Some(n) => fmt_bytes(n), None => "—".into() }).color(theme::TEXT_MUTED).small()).truncate().selectable(false)).on_hover_text(match t.total { Some(n) => fmt_bytes(n), None => "unknown size".to_string() }));
                         let sc = theme::status_color(t.status);
-                        let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(format!("{:?}", t.status)).color(sc).small().strong()).truncate().selectable(false)).on_hover_text(format!("{:?}", t.status)));
+                        let phase_lbl = if t.status == TaskStatus::Downloading && (t.headers.contains_key("x-ytdlp") || ytdlp::is_video_page(&t.url)) { crate::engine::phase_name(self.phase_map.get(&t.id).copied().unwrap_or(0)) } else { "" };
+                        let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(if phase_lbl.is_empty() { format!("{:?}", t.status) } else { phase_lbl.to_string() }).color(sc).small().strong()).truncate().selectable(false)).on_hover_text(if phase_lbl.is_empty() { format!("{:?}", t.status) } else { phase_lbl.to_string() }));
                         if !compact_table {
                             // ETA from THIS task's own rate (was global rate for all rows)
                             let eta_txt = if t.status == TaskStatus::Downloading { if let Some(total) = t.total { if task_rate > 1.0 && total > t.downloaded { eta((total - t.downloaded) as f64 / task_rate) } else { "—".into() } } else { "—".into() } } else { "—".into() };
@@ -5177,12 +5235,17 @@ impl DownloadApp {
                 t.filename = crate::model::sanitize_filename(&name_input);
                 // Persist picker choice only when yt-dlp engine still enabled
                 // (respects user unchecking it after probing).
-                if t.headers.contains_key("x-ytdlp")
+                if (t.headers.contains_key("x-ytdlp") || ytdlp::is_video_page(&t.url))
                     && self.yt_probe_cap.url == t.url
                     && self.yt_probe_cap.dump.is_some()
                 {
                     let ch = yt_choice_from_state(&self.yt_probe_cap);
                     ch.write_headers(&mut t.headers);
+                    // write_headers sets x-ytdlp only for explicit choices; route
+                    // probed video pages through yt-dlp even for Auto (probe shown).
+                    if !t.headers.contains_key("x-ytdlp") {
+                        t.headers.insert("x-ytdlp".into(), "1".into());
+                    }
                     // Only extract forces ext here; native audio ext resolved in ytdlp.rs from format.
                     if let Some(want) = &ch.extract {
                         let stem = crate::model::split_stem_ext(&t.filename).0.to_string();
@@ -6034,7 +6097,8 @@ impl DownloadApp {
                 } else {
                     theme::status_color(t.status)
                 };
-                theme::badge(ui, &format!("{:?}", t.status), sc);
+                let status_lbl = if t.status == TaskStatus::Downloading && (t.headers.contains_key("x-ytdlp") || ytdlp::is_video_page(&t.url)) { crate::engine::phase_name(app.phase_map.get(&t.id).copied().unwrap_or(0)).to_string() } else { format!("{:?}", t.status) };
+                theme::badge(ui, &status_lbl, sc);
                 theme::badge(ui, kind.label(), theme::proto_color(kind));
                 theme::badge(
                     ui,
@@ -8671,6 +8735,21 @@ mod progress_tests {
         assert!(!yt_probe_eligible("magnet:?xt=urn:btih:abc"));
         assert!(!yt_probe_eligible("ftp://example.com/page"));
         assert!(!yt_probe_eligible("not a url"));
+    }
+
+    #[test]
+    fn yt_choice_quality_tier_mapping() {
+        let mut st = YtProbeState::default();
+        assert_eq!(yt_choice_from_state(&st).quality_height, None);
+        st.quality = "1080".into();
+        assert_eq!(yt_choice_from_state(&st).quality_height, Some(1080));
+        // Exact format coexists; backend precedence exact > tier.
+        st.format = "137".into();
+        let ch = yt_choice_from_state(&st);
+        assert_eq!(ch.format.as_deref(), Some("137"));
+        assert_eq!(ch.quality_height, Some(1080));
+        st.quality = "bogus".into();
+        assert_eq!(yt_choice_from_state(&st).quality_height, None);
     }
 
     #[test]

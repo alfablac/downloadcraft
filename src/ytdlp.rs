@@ -1,5 +1,7 @@
 //! yt-dlp sidecar: resolve/download binary, list formats, download video pages.
-use crate::engine::Controls;
+use crate::engine::{
+    Controls, PHASE_DOWNLOADING, PHASE_EXTRACTING, PHASE_FINALIZING, PHASE_PROCESSING,
+};
 use crate::model::*;
 use serde::Deserialize;
 use std::io::{BufRead, BufReader};
@@ -240,13 +242,13 @@ impl YtFormat {
     }
 }
 
-/// Best: max height with both codecs; else max-height video-only (download adds +bestaudio).
+/// Best: max height video-only wins over lower muxed; else tallest muxed.
+/// ponytail: kept for label/tests only; download selectors use yt-dlp
+/// sort order (`bv*+ba/b` + `-S`), not this pin.
 pub fn pick_best(formats: &[YtFormat]) -> Option<YtFormat> {
     let real: Vec<&YtFormat> = formats.iter().filter(|f| f.has_video()).collect();
     real.iter()
-        .filter(|f| f.has_audio())
         .max_by_key(|f| f.height.unwrap_or(0))
-        .or_else(|| real.iter().max_by_key(|f| f.height.unwrap_or(0)))
         .map(|f| (*f).clone())
 }
 
@@ -576,7 +578,9 @@ impl YtDump {
 /// Per-task yt-dlp choice, persisted as pseudo-headers (stripped in base_args,
 /// never sent as HTTP headers): x-yt-format (format_id | audio:<id>),
 /// x-yt-audio (format_id | best | none), x-yt-extract (mp3|m4a),
+/// x-yt-quality (max height, e.g. 1080; absent = best),
 /// x-yt-subs / x-yt-auto-subs (CSV langs), x-yt-sub-embed (1).
+/// Precedence: exact `format` > quality tier > auto.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct YtChoice {
     pub format: Option<String>,
@@ -585,9 +589,11 @@ pub struct YtChoice {
     pub subs: Vec<String>,
     pub auto_subs: Vec<String>,
     pub sub_embed: bool,
+    /// Max video height for tiered selection; None = best.
+    pub quality_height: Option<u32>,
 }
 
-pub const YT_HEADER_KEYS: [&str; 7] = [
+pub const YT_HEADER_KEYS: [&str; 8] = [
     "x-ytdlp",
     "x-yt-format",
     "x-yt-audio",
@@ -595,6 +601,7 @@ pub const YT_HEADER_KEYS: [&str; 7] = [
     "x-yt-subs",
     "x-yt-auto-subs",
     "x-yt-sub-embed",
+    "x-yt-quality",
 ];
 
 impl YtChoice {
@@ -622,6 +629,7 @@ impl YtChoice {
             subs: csv("x-yt-subs"),
             auto_subs: csv("x-yt-auto-subs"),
             sub_embed: get("x-yt-sub-embed").is_some(),
+            quality_height: get("x-yt-quality").and_then(|v| v.parse().ok()),
         }
     }
     pub fn is_audio_only(&self) -> bool {
@@ -656,7 +664,13 @@ impl YtChoice {
         if self.sub_embed {
             h.insert("x-yt-sub-embed".into(), "1".into());
         }
+        if let Some(q) = self.quality_height {
+            if q > 0 {
+                h.insert("x-yt-quality".into(), q.to_string());
+            }
+        }
         if self.format.is_some()
+            || self.quality_height.map(|q| q > 0).unwrap_or(false)
             || self.extract.is_some()
             || !self.subs.is_empty()
             || !self.auto_subs.is_empty()
@@ -671,6 +685,12 @@ impl YtChoice {
 pub fn build_selector(choice: &YtChoice, dump: Option<&YtDump>) -> (String, Vec<String>, bool) {
     let mut extra: Vec<String> = Vec::new();
     let audio_mode = choice.is_audio_only();
+    let exact = choice.format.is_some();
+    // Format sort for auto/tier picks only; explicit ids already pin order.
+    if !exact && !audio_mode {
+        extra.push("-S".into());
+        extra.push("res,fps,vcodec:avc,acodec:aac".into());
+    }
     // Plain format_id only valid for muxed formats. Video-only / unknown ids
     // need +bestaudio, else yt-dlp silently downloads video without sound.
     // Muxed-ness known only with dump; without dump fall back via / chain.
@@ -693,6 +713,20 @@ pub fn build_selector(choice: &YtChoice, dump: Option<&YtDump>) -> (String, Vec<
             None => unreachable!("audio None handled above"),
         },
         None if audio_mode => "ba/b".to_string(),
+        // Quality tier: cap height, fall back to uncapped then muxed.
+        // [height>0] excludes height-less formats (yt-dlp drops None
+        // heights from <= anyway; guard makes tier intent explicit).
+        // No exact format pinned; -S sort picks best within tier.
+        // Specific audio id replaces ba in first arm only.
+        None if choice.quality_height.map(|q| q > 0).unwrap_or(false) => {
+            let h = choice.quality_height.unwrap_or(0);
+            match choice.audio.as_deref() {
+                Some(a) if a != "best" && a != "none" => format!(
+                    "bv*[height<={h}][height>0]+{a}/b[height<={h}][height>0]/bv*+ba/b"
+                ),
+                _ => format!("bv*[height<={h}][height>0]+ba/b[height<={h}][height>0]/bv*+ba/b"),
+            }
+        }
         // Auto video + specific audio track picked.
         None if choice
             .audio
@@ -704,11 +738,9 @@ pub fn build_selector(choice: &YtChoice, dump: Option<&YtDump>) -> (String, Vec<
             format!("bv*+{a}/bv*+ba/b")
         }
         None if choice.audio.as_deref() == Some("none") => "bv*[acodec=none]/b".to_string(),
-        None => match dump.and_then(|d| pick_best(&d.formats)) {
-            Some(f) if f.is_video_only() => format!("{}+bestaudio/bv*+ba/best", f.format_id),
-            Some(f) => format!("{}/bv*+ba/best", f.format_id),
-            None => "bv*+ba/b".to_string(),
-        },
+        // Auto: yt-dlp picks tallest video + best audio (muxed only if no
+        // separate streams); no probe-based pinning.
+        None => "bv*+ba/b".to_string(),
     };
     if let Some(ex) = &choice.extract {
         extra.push("-x".into());
@@ -786,18 +818,22 @@ fn parse_progress(
     ctrl: &Controls,
     video_done_base: &Arc<std::sync::atomic::AtomicU64>,
 ) {
-    // Template: download:<downloaded>|<total>|<speed>; total may be "NA".
     let Some(rest) = line.strip_prefix("download:") else {
         return;
     };
+    // Template: download:<downloaded>|<total>|<estimate>|<speed>; total/estimate may be "NA".
+    // ponytail: 4th field (speed) kept in template for slot stability, intentionally unparsed.
     let mut it = rest.split('|');
     let dl: u64 = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     let tot: Option<u64> = it.next().and_then(|s| s.trim().parse().ok());
+    let est: Option<u64> = it.next().and_then(|s| s.trim().parse().ok());
+    // Estimate fills total only when real total NA/0; real total wins, never shrink.
+    let effective = tot.filter(|t| *t > 0).or(est.filter(|e| *e > 0));
     // yt-dlp restarts counter per file (video then audio); keep monotonic total progress.
     let base = video_done_base.load(Ordering::Relaxed);
     ctrl.downloaded
         .store(base.saturating_add(dl), Ordering::Relaxed);
-    if let Some(t) = tot {
+    if let Some(t) = effective {
         let cur = ctrl.total.load(Ordering::Relaxed);
         if base + t > cur {
             ctrl.total.store(base + t, Ordering::Relaxed);
@@ -805,11 +841,51 @@ fn parse_progress(
     }
 }
 
+/// Handle one yt-dlp stdout line: progress, postprocess, bracket phases.
+/// `base` = per-file downloaded base (video_done_base shared with parse_progress).
+pub fn handle_stdout_line(
+    line: &str,
+    ctrl: &Controls,
+    base: &Arc<std::sync::atomic::AtomicU64>,
+) {
+    if line.starts_with("download:") {
+        ctrl.phase.store(PHASE_DOWNLOADING, Ordering::Relaxed);
+        parse_progress(line, ctrl, base);
+    } else if let Some(status) = line.strip_prefix("postprocess:") {
+        match status.trim() {
+            "started" => ctrl.phase.store(PHASE_PROCESSING, Ordering::Relaxed),
+            "finished" => ctrl.phase.store(PHASE_FINALIZING, Ordering::Relaxed),
+            _ => {}
+        }
+    } else if line.starts_with("[Merger]")
+        || line.starts_with("[VideoRemuxer]")
+        || line.starts_with("[ExtractAudio]")
+        || line.starts_with("[VideoConvertor]")
+        || line.starts_with("[EmbedSubtitle]")
+    {
+        ctrl.phase.store(PHASE_PROCESSING, Ordering::Relaxed);
+    }
+}
+
+/// Reader filter: which stdout lines reach handle_stdout_line. Kept pure
+/// so forwarding set testable without spawning yt-dlp.
+fn stdout_line_forwarded(line: &str) -> bool {
+    line.starts_with("download:")
+        || line.starts_with("postprocess:")
+        || line.starts_with("[Merger]")
+        || line.starts_with("[VideoRemuxer]")
+        || line.starts_with("[ExtractAudio]")
+        || line.starts_with("[VideoConvertor]")
+        || line.starts_with("[EmbedSubtitle]")
+        || line.starts_with("[download] Destination:")
+}
+
 /// Download via yt-dlp. On success returns completed task; caller falls back to native on Err.
 pub async fn download_with_ytdlp(
     task: DownloadTask,
     ctrl: Arc<Controls>,
 ) -> Result<DownloadTask, String> {
+    ctrl.phase.store(PHASE_EXTRACTING, Ordering::Relaxed);
     let path = ensure_ytdlp().await?;
     std::fs::create_dir_all(&task.dest_dir).map_err(|e| e.to_string())?;
     // Format choice: -J first; fallback selector lets yt-dlp decide.
@@ -820,7 +896,7 @@ pub async fn download_with_ytdlp(
         .await
         .ok();
     let mut task = task;
-    // Explicit x-yt-* choice (picker) wins over auto pick_best.
+    // Explicit x-yt-* choice (picker) wins over auto selector.
     let choice = YtChoice::from_headers(&task.headers);
     let (fmt_arg, extra_args, audio_mode) = build_selector(&choice, dump.as_ref());
     if let Some(d) = &dump {
@@ -880,7 +956,9 @@ pub async fn download_with_ytdlp(
         "--encoding".into(),
         "utf-8".into(),
         "--progress-template".into(),
-        "download:%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.speed)s".into(),
+        "download:%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s".into(),
+        "--progress-template".into(),
+        "postprocess:postprocess:%(progress.status)s".into(),
         "-f".into(),
         fmt_arg,
         "--concurrent-fragments".into(),
@@ -1025,6 +1103,7 @@ pub async fn download_with_ytdlp(
             }
         }
     }
+    ctrl.phase.store(PHASE_FINALIZING, Ordering::Relaxed);
     // Zero-byte or wrong-magic output must not Complete.
     if !dest.is_file() {
         return Err("yt-dlp produced empty file".into());
@@ -1145,8 +1224,8 @@ fn run_ytdlp_download(
                     base2.store(cur, Ordering::Relaxed);
                 }
             }
-            if line.starts_with("download:") {
-                parse_progress(line, &ctrl_c, &base2);
+            if stdout_line_forwarded(line) {
+                handle_stdout_line(line, &ctrl_c, &base2);
             }
         }
     });
@@ -1224,6 +1303,37 @@ pub fn is_video_page(url: &str) -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn stdout_line_phases_and_estimate() {
+        let ctrl = Controls::new(0);
+        let base = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Estimate fills total when real total NA.
+        handle_stdout_line("download:500|NA|1000|123", &ctrl, &base);
+        assert_eq!(ctrl.phase.load(Ordering::Relaxed), PHASE_DOWNLOADING);
+        assert_eq!(ctrl.total.load(Ordering::Relaxed), 1000);
+        assert_eq!(ctrl.downloaded.load(Ordering::Relaxed), 500);
+        // Real total wins over estimate, never shrink.
+        handle_stdout_line("download:600|2000|900|123", &ctrl, &base);
+        assert_eq!(ctrl.total.load(Ordering::Relaxed), 2000);
+        handle_stdout_line("download:700|1500|900|123", &ctrl, &base);
+        assert_eq!(ctrl.total.load(Ordering::Relaxed), 2000);
+        // NA estimate + NA total: total unchanged.
+        handle_stdout_line("download:700|NA|NA|NA", &ctrl, &base);
+        assert_eq!(ctrl.total.load(Ordering::Relaxed), 2000);
+        // Postprocess + bracket phases.
+        handle_stdout_line("postprocess:started", &ctrl, &base);
+        assert_eq!(ctrl.phase.load(Ordering::Relaxed), PHASE_PROCESSING);
+        handle_stdout_line("[Merger] Merging formats", &ctrl, &base);
+        assert_eq!(ctrl.phase.load(Ordering::Relaxed), PHASE_PROCESSING);
+        handle_stdout_line("postprocess:finished", &ctrl, &base);
+        assert_eq!(ctrl.phase.load(Ordering::Relaxed), PHASE_FINALIZING);
+        // phase_name mapping.
+        assert_eq!(crate::engine::phase_name(0), "Downloading");
+        assert_eq!(crate::engine::phase_name(1), "Extracting video");
+        assert_eq!(crate::engine::phase_name(2), "Merging & processing");
+        assert_eq!(crate::engine::phase_name(3), "Finalizing");
+        assert_eq!(crate::engine::phase_name(99), "Downloading");
+    }
+    #[test]
     fn youtube_url_cases() {
         for u in [
             "https://youtube.com/watch?v=x",
@@ -1251,17 +1361,41 @@ mod tests {
             ..Default::default()
         };
         let err = "ERROR [youtube]: page needs to be reloaded";
-        assert!(should_retry_anon("https://www.youtube.com/watch?v=x", &t, err));
-        assert!(should_retry_anon("https://youtu.be/x", &t, "Sign in to confirm you're not a bot"));
-        assert!(should_retry_anon("https://www.youtube.com/watch?v=x", &t, "page needs be reloaded"));
+        assert!(should_retry_anon(
+            "https://www.youtube.com/watch?v=x",
+            &t,
+            err
+        ));
+        assert!(should_retry_anon(
+            "https://youtu.be/x",
+            &t,
+            "Sign in to confirm you're not a bot"
+        ));
+        assert!(should_retry_anon(
+            "https://www.youtube.com/watch?v=x",
+            &t,
+            "page needs be reloaded"
+        ));
         t.cookies.clear();
         t.cookies_json = r#"[{"name":"a"}]"#.into();
-        assert!(should_retry_anon("https://m.youtube.com/watch?v=x", &t, err));
+        assert!(should_retry_anon(
+            "https://m.youtube.com/watch?v=x",
+            &t,
+            err
+        ));
         t.cookies_json.clear();
-        assert!(!should_retry_anon("https://www.youtube.com/watch?v=x", &t, err));
+        assert!(!should_retry_anon(
+            "https://www.youtube.com/watch?v=x",
+            &t,
+            err
+        ));
         t.cookies = "a=b".into();
         assert!(!should_retry_anon("https://example.com/", &t, err));
-        assert!(!should_retry_anon("https://www.youtube.com/watch?v=x", &t, "Video unavailable"));
+        assert!(!should_retry_anon(
+            "https://www.youtube.com/watch?v=x",
+            &t,
+            "Video unavailable"
+        ));
     }
     #[test]
     fn base_args_js_runtimes_node() {
@@ -1282,7 +1416,7 @@ mod tests {
         assert!(!is_video_page("not a url"));
     }
     #[test]
-    fn pick_best_prefers_muxed_then_height() {
+    fn pick_best_prefers_height_over_muxed() {
         let fs = vec![
             YtFormat {
                 format_id: "a".into(),
@@ -1330,7 +1464,7 @@ mod tests {
                 filesize_approx: None,
             },
         ];
-        assert_eq!(pick_best(&fs).unwrap().format_id, "b");
+        assert_eq!(pick_best(&fs).unwrap().format_id, "a");
         let fs2 = vec![YtFormat {
             format_id: "a".into(),
             ext: "mp4".into(),
@@ -1347,6 +1481,86 @@ mod tests {
             filesize_approx: None,
         }];
         assert_eq!(pick_best(&fs2).unwrap().format_id, "a");
+    }
+
+    #[test]
+    fn selector_quality_tier_and_auto_sort() {
+        // Auto: no pinning even with probe dump; -S sort in extra.
+        let c = YtChoice::default();
+        let (s, extra, _) = build_selector(&c, None);
+        assert_eq!(s, "bv*+ba/b");
+        assert!(extra.contains(&"-S".to_string()));
+        assert!(extra.contains(&"res,fps,vcodec:avc,acodec:aac".to_string()));
+        // Tier 1080: capped, generic fallback, sort applied.
+        let c = YtChoice {
+            quality_height: Some(1080),
+            ..Default::default()
+        };
+        let (s, extra, _) = build_selector(&c, None);
+        assert_eq!(
+            s,
+            "bv*[height<=1080][height>0]+ba/b[height<=1080][height>0]/bv*+ba/b"
+        );
+        assert!(extra.contains(&"-S".to_string()));
+        // Tier round-trips through headers; exact format beats tier, no sort.
+        let mut h = std::collections::BTreeMap::new();
+        c.write_headers(&mut h);
+        assert_eq!(YtChoice::from_headers(&h), c);
+        assert_eq!(h.get("x-yt-quality").map(|s| s.as_str()), Some("1080"));
+        let c2 = YtChoice {
+            format: Some("137".into()),
+            quality_height: Some(1080),
+            ..Default::default()
+        };
+        let (s, extra, _) = build_selector(&c2, None);
+        assert_eq!(s, "137+bestaudio/137/bv*+ba/b");
+        assert!(!extra.contains(&"-S".to_string()));
+        // Audio-only unchanged, no sort.
+        let c3 = YtChoice {
+            format: Some("audio:ba".into()),
+            ..Default::default()
+        };
+        let (s, extra, audio) = build_selector(&c3, None);
+        assert_eq!(s, "ba/b");
+        assert!(audio && !extra.contains(&"-S".to_string()));
+        // Tier + specific audio: id replaces ba in first arm only.
+        let c = YtChoice {
+            quality_height: Some(720),
+            audio: Some("140".into()),
+            ..Default::default()
+        };
+        let (s, extra, _) = build_selector(&c, None);
+        assert_eq!(
+            s,
+            "bv*[height<=720][height>0]+140/b[height<=720][height>0]/bv*+ba/b"
+        );
+        assert!(extra.contains(&"-S".to_string()));
+        // Tier + best/none audio: generic selector unchanged.
+        for a in ["best", "none"] {
+            let c = YtChoice {
+                quality_height: Some(720),
+                audio: Some(a.into()),
+                ..Default::default()
+            };
+            let (s, _, _) = build_selector(&c, None);
+            assert_eq!(
+                s,
+                "bv*[height<=720][height>0]+ba/b[height<=720][height>0]/bv*+ba/b",
+                "audio={a}"
+            );
+        }
+        // Reader filter forwards postprocess bracket lines, not noise.
+        assert!(stdout_line_forwarded("[Merger] Merging formats into \"x.mp4\""));
+        assert!(stdout_line_forwarded("[VideoRemuxer] Not remuxing"));
+        assert!(stdout_line_forwarded("[ExtractAudio] Destination: x.mp3"));
+        assert!(stdout_line_forwarded("[VideoConvertor] Converting video"));
+        assert!(stdout_line_forwarded("[EmbedSubtitle] Embedding subtitles in x.mkv"));
+        assert!(stdout_line_forwarded("[download] Destination: x.f137.mp4"));
+        assert!(stdout_line_forwarded("download:1|2|3|4"));
+        assert!(stdout_line_forwarded("postprocess:started"));
+        assert!(!stdout_line_forwarded("[youtube] Extracting URL"));
+        assert!(!stdout_line_forwarded("[download] 12.3% of 10MiB"));
+        assert!(!stdout_line_forwarded("[info] Writing video metadata"));
     }
 
     #[test]

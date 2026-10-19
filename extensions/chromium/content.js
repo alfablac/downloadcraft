@@ -47,8 +47,8 @@
     if (panel) return panel;
     panel = document.createElement("div");
     panel.id = "downloadcraft-panel";
-    panel.style.cssText = "position:absolute;z-index:2147483647;background:#161616;color:#eee;font:12px sans-serif;border:1px solid #555;padding:6px;box-shadow:0 2px 10px rgba(0,0,0,.5);max-width:480px;min-width:260px;";
-    panel.innerHTML = '<div style="display:flex;justify-content:flex-end;align-items:center;margin-bottom:4px;"><button class="dc-close" style="cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #555;padding:0 6px;">×</button></div><div class="downloadcraft-items"></div>';
+    panel.style.cssText = "position:absolute;z-index:2147483647;background:#222222;color:#E8E8E8;font-family:\"Inter\",system-ui,-apple-system,\"Segoe UI\",sans-serif;font-size:11px;border:1px solid #3D3D3D;border-radius:6px;padding:8px;max-width:480px;min-width:260px;box-sizing:border-box;";
+    panel.innerHTML = '<div style="display:flex;justify-content:flex-end;align-items:center;margin-bottom:4px;"><button class="dc-close" style="background:#2A2A2A;color:#E8E8E8;border:1px solid #3D3D3D;border-radius:6px;padding:0 8px;height:24px;cursor:pointer;font:inherit;">×</button></div><div class="downloadcraft-items"></div>';
     panel.querySelector(".dc-close").addEventListener("click", () => panel.remove());
     document.documentElement.appendChild(panel);
     return panel;
@@ -68,18 +68,26 @@
     const panel = ensurePanel();
     const box = panel.querySelector(".downloadcraft-items");
     box.innerHTML = "";
-    if (note) { const hd = document.createElement("div"); hd.textContent = note; hd.style.cssText = "padding:2px 6px 4px;color:#9ec1ff;font-weight:600;"; box.appendChild(hd); }
+    if (note) { const hd = document.createElement("div"); hd.textContent = note; hd.style.cssText = "padding:2px 6px 4px;color:#7FB3AA;font-weight:600;"; box.appendChild(hd); }
     items.forEach((it, i) => {
       const b = document.createElement("button");
       b.textContent = it.label;
       if (i === 0) { b.setAttribute("aria-selected", "true"); b.dataset.selected = "1"; }
-      b.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #555;padding:4px 6px;" + (i === 0 ? "outline:2px solid #8ab4f8;" : "");
+      b.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;background:#2A2A2A;color:#E8E8E8;border:1px solid #3D3D3D;border-radius:6px;padding:4px 8px;min-height:24px;font:inherit;box-sizing:border-box;" + (i === 0 ? "background:#2A3C38;border-color:#7FB3AA;" : "");
+      b.addEventListener("mouseenter", () => { b.style.background = b.dataset.selected ? "#2A3C38" : "#333333"; b.style.borderColor = b.dataset.selected ? "#7FB3AA" : "#555555"; });
+      b.addEventListener("mouseleave", () => { b.style.background = b.dataset.selected ? "#2A3C38" : "#2A2A2A"; b.style.borderColor = b.dataset.selected ? "#7FB3AA" : "#3D3D3D"; });
       b.addEventListener("click", () => { api.runtime.sendMessage({ type: "downloadcraft-video-panel", url: it.url, intent: it.intent || "stream", pageUrl: it.pageUrl || pageUrl(), pageTitle: document.title, filename: it.filename || filenameFromUrl(it.url), mime: it.mime || it.type || "" }); panel.remove(); });
       box.appendChild(b);
     });
-    const r = anchor.getBoundingClientRect();
-    panel.style.left = (window.scrollX + r.left) + "px";
-    panel.style.top = (window.scrollY + r.bottom + 4) + "px";
+    // Anchor under video's download button when VIDEO anchor; else anchor rect.
+    const btnAnchor = (() => { const v = btnFor.get(anchor); return v && v !== anchor ? v : null; })();
+    const br = (btnAnchor || anchor).getBoundingClientRect();
+    let left = window.scrollX + br.left;
+    let top = window.scrollY + br.bottom + 4;
+    if (anchor === document.body) { left = window.scrollX + 8; top = window.scrollY + 8; }
+    const maxLeft = window.scrollX + document.documentElement.clientWidth - panel.offsetWidth - 4;
+    panel.style.left = (Math.max(window.scrollX + 4, Math.min(left, maxLeft))) + "px";
+    panel.style.top = top + "px";
   }
   
   // Page-declared media invisible to <video> scan: og:/twitter: meta,
@@ -222,8 +230,8 @@
     if (r.width < 120 || r.height < 68) { btn.style.display = "none"; return; }
     btn.style.display = "";
     if (btn.dataset.dragged) return;
-    btn.style.left = (window.scrollX + r.right - btn.offsetWidth - 8) + "px";
-    btn.style.top = (window.scrollY + r.top + 8) + "px";
+    btn.style.left = (window.scrollX + r.left - 10) + "px";
+    btn.style.top = (window.scrollY + r.top - 10) + "px";
   }
   function attachBtn(video) {
     let btn = btnFor.get(video);
@@ -232,8 +240,8 @@
     btn.title = "Download video";
     btn.setAttribute("aria-label", "Download video");
     btn.setAttribute("data-downloadcraft-btn", "1");
-    btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:5px auto;pointer-events:none"><path d="M12 3v11"/><path d="m7 10 5 5 5-5"/><path d="M4 20h16"/></svg>';
-    btn.style.cssText = "position:absolute;z-index:2147483646;width:24px;height:24px;border-radius:50%;background:rgba(17,17,17,.45);color:#fff;border:1px solid rgba(255,255,255,.15);padding:0;cursor:grab;text-align:center;opacity:0;pointer-events:none;display:none;touch-action:none;user-select:none;-webkit-user-select:none;";
+    btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:7px auto;pointer-events:none"><path d="M12 3v11"/><path d="m7 10 5 5 5-5"/><path d="M4 20h16"/></svg>';
+    btn.style.cssText = "position:absolute;z-index:2147483646;width:32px;height:32px;border-radius:50%;background:#4E7A74;color:#fff;border:1px solid #7FB3AA;padding:0;cursor:grab;text-align:center;opacity:0;pointer-events:none;display:none;touch-action:none;user-select:none;-webkit-user-select:none;font-family:\"Inter\",system-ui,sans-serif;";
     btn.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); if (btn.dataset.suppressClick) { delete btn.dataset.suppressClick; return; } pickStream(video); });
 
     // Draggable: press-move >4px drags (persisted offset per video via dataset),

@@ -47,6 +47,23 @@ pub fn write_capture_filter(settings: &crate::model::Settings) {
     );
 }
 
+/// Startup trace step: always appended (cheap, bounded growth by rotation
+/// at 64KB) so "no window" reports carry last reached step in crash.log.
+pub fn trace(step: &str) {
+    let path = config_dir().join("startup.log");
+    if std::fs::metadata(&path).map(|m| m.len() > 65536).unwrap_or(false) {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(f, "{ms} pid={} {step}", std::process::id());
+    }
+}
+
 pub fn config_dir() -> PathBuf {
     directories::ProjectDirs::from("", "", "webcraft")
         .map(|d| d.config_dir().to_path_buf())
@@ -137,10 +154,48 @@ pub fn spawn_show_watcher() {
             fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
             fn ShowWindow(hwnd: Hwnd, cmd: i32) -> Bool;
             fn SetForegroundWindow(hwnd: Hwnd) -> Bool;
+            fn BringWindowToTop(hwnd: Hwnd) -> Bool;
+            fn SetWindowPos(
+                hwnd: Hwnd,
+                after: Hwnd,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32,
+                flags: u32,
+            ) -> Bool;
+            fn GetForegroundWindow() -> Hwnd;
+            fn GetCurrentThreadId() -> u32;
+            fn AttachThreadInput(a: u32, b: u32, attach: Bool) -> Bool;
             fn PostMessageW(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> Bool;
             fn IsWindowVisible(hwnd: Hwnd) -> Bool;
             fn IsIconic(hwnd: Hwnd) -> Bool;
             fn GetWindowTextW(hwnd: Hwnd, text: *mut u16, max: i32) -> i32;
+        }
+        // Windows denies SetForegroundWindow from non-foreground processes
+        // (tray/host-triggered restore): attach to foreground thread so
+        // restore actually takes keyboard focus, not just taskbar flash.
+        // ponytail: no AllowSetForegroundWindow on tray thread; attach covers tray+host paths.
+        unsafe fn force_foreground(hwnd: Hwnd) {
+            ShowWindow(hwnd, 9); // SW_RESTORE
+            let fg = GetForegroundWindow();
+            let mut pid = 0;
+            let fg_tid = if fg.is_null() {
+                0
+            } else {
+                GetWindowThreadProcessId(fg, &mut pid)
+            };
+            let our_tid = GetCurrentThreadId();
+            let attached =
+                fg_tid != 0 && fg_tid != our_tid && AttachThreadInput(our_tid, fg_tid, 1) != 0;
+            BringWindowToTop(hwnd);
+            // HWND_TOPMOST then NOTOPMOST: raises above foreground app without staying always-on-top.
+            SetWindowPos(hwnd, -1isize as Hwnd, 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0040);
+            SetWindowPos(hwnd, -2isize as Hwnd, 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0040);
+            SetForegroundWindow(hwnd);
+            if attached {
+                AttachThreadInput(our_tid, fg_tid, 0);
+            }
         }
         extern "system" fn find(hwnd: *mut core::ffi::c_void, p: isize) -> i32 {
             unsafe {
@@ -188,8 +243,7 @@ pub fn spawn_show_watcher() {
                             if shown(hwnd) {
                                 ShowWindow(hwnd, 0);
                             } else {
-                                ShowWindow(hwnd, 9);
-                                SetForegroundWindow(hwnd);
+                                force_foreground(hwnd);
                             }
                             PostMessageW(hwnd, 0x8001, 0, 0);
                         }
@@ -198,10 +252,9 @@ pub fn spawn_show_watcher() {
                     // Do not claim show/add: app poll consumes it to clear
                     // hidden state / open Add dialog. Just show + wake.
                     unsafe {
-                        if !shown(hwnd) {
-                            ShowWindow(hwnd, 9);
-                            SetForegroundWindow(hwnd);
-                        }
+                        // Always force: browser window holds foreground, plain
+                        // ShowWindow on visible-but-background app won't focus.
+                        force_foreground(hwnd);
                         PostMessageW(hwnd, 0x8001, 0, 0);
                     }
                 }

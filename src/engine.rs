@@ -2,7 +2,7 @@ use crate::model::*;
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
@@ -84,10 +84,26 @@ fn headers_for(task: &DownloadTask) -> reqwest::header::HeaderMap {
     h
 }
 
+/// Download progress phases (Controls::phase).
+pub const PHASE_DOWNLOADING: u8 = 0;
+pub const PHASE_EXTRACTING: u8 = 1;
+pub const PHASE_PROCESSING: u8 = 2;
+pub const PHASE_FINALIZING: u8 = 3;
+
+pub fn phase_name(phase: u8) -> &'static str {
+    match phase {
+        PHASE_EXTRACTING => "Extracting video",
+        PHASE_PROCESSING => "Merging & processing",
+        PHASE_FINALIZING => "Finalizing",
+        _ => "Downloading",
+    }
+}
+
 pub struct Controls {
     pub paused: AtomicBool,
     pub cancelled: AtomicBool,
     pub downloaded: AtomicU64,
+    pub phase: AtomicU8,
     pub limit_kbps: AtomicU64,
     pub rate: std::sync::Mutex<(
         std::time::Instant,
@@ -136,6 +152,7 @@ impl Controls {
             paused: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             downloaded: AtomicU64::new(0),
+            phase: AtomicU8::new(0),
             limit_kbps: AtomicU64::new(limit),
             rate: std::sync::Mutex::new((std::time::Instant::now(), 0, None, 0, 0.0)),
             total: AtomicU64::new(0),
