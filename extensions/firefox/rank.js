@@ -14,8 +14,15 @@
 
   function isSegmentUrl(u) {
     var base = String(u || "").split(/[?#]/)[0];
-    return /(\.ts|\.m4s|\.cmfv|\.cmfa)$/i.test(base)
-      || /\/chunklist|\/seg-|sequence/i.test(base);
+    if (/(\.ts|\.m4s|\.cmfv|\.cmfa)$/i.test(base)
+      || /\/chunklist|\/seg-|sequence/i.test(base)) return true;
+    if (String(u || "").indexOf("$RepresentationID$") !== -1) return true;
+    // .mp4/.cmfv/.cmfa only when basename carries seg/init token or trailing
+    // index: plain movie.mp4/vid.mp4 stay files.
+    var name = base.split("/").pop() || "";
+    return /^(init|init\d*|initialization|header|segment|seg|chunk|frag)[-_]?\d*\./i.test(name)
+      || /[-_]\d+\.(mp4|cmfv|cmfa)$/i.test(name)
+      || /-init\./i.test(name) || /init-\d/i.test(name);
   }
 
   function isJunkUrl(u) {
@@ -65,7 +72,10 @@
   // fetches itself, never offer parts when whole available.
   function scoreOf(kind, hasPlaylist) {
     if (kind === "segment" && hasPlaylist) return -1;
-    return kind === "file" ? 300 : kind === "playlist" ? 200 : 50;
+    if (kind === "playlist") return hasPlaylist ? 300 : 200;
+    // file 300 bare / 200 under playlist; sort tiebreaks on size/dur/index.
+    if (kind === "file") return hasPlaylist ? 200 : 300;
+    return 50;
   }
 
   function rankCandidates(list) {

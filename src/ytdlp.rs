@@ -246,22 +246,142 @@ pub fn pick_best(formats: &[YtFormat]) -> Option<YtFormat> {
         .map(|f| (*f).clone())
 }
 
-fn base_args(url: &str, task: &DownloadTask) -> Vec<String> {
+#[derive(Clone, Debug, Default, Deserialize)]
+struct CookieEntry {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    value: String,
+    #[serde(default)]
+    domain: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default, rename = "expirationDate")]
+    expiration_date: Option<f64>,
+    #[serde(default)]
+    secure: bool,
+    #[serde(default, rename = "httpOnly")]
+    http_only: bool,
+    #[serde(default, rename = "hostOnly")]
+    host_only: bool,
+}
+
+fn clean_field(s: &str) -> String {
+    s.chars().filter(|c| !matches!(c, '\t' | '\r' | '\n')).collect()
+}
+
+/// Write task cookies_json as Netscape cookie jar for yt-dlp --cookies.
+/// String Cookie header cannot carry httpOnly/domain/expiry; jar keeps them.
+/// None when missing/empty/invalid (caller falls back to Cookie header).
+/// RAII cookie jar: file removed on drop (all callers' child processes have
+/// finished by then). Derefs to Path for --cookies args.
+pub struct CookieJar(PathBuf);
+impl std::ops::Deref for CookieJar {
+    type Target = std::path::Path;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl AsRef<std::path::Path> for CookieJar {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+impl Drop for CookieJar {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Sweep stale jars (killed-process leftovers) older than 24h. Cheap, errors ignored.
+fn sweep_cookie_jars(dir: &std::path::Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(24 * 3600)) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with("cookies-")
+            && name.ends_with(".txt")
+            && e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t < cutoff)
+        {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+pub fn write_cookie_jar(task: &DownloadTask) -> Option<CookieJar> {
+    if task.cookies_json.trim().is_empty() {
+        return None;
+    }
+    let entries: Vec<CookieEntry> = serde_json::from_str(&task.cookies_json).ok()?;
+    if entries.is_empty() {
+        return None;
+    }
+    let dir = crate::platform::config_dir().join("cookies");
+    std::fs::create_dir_all(&dir).ok()?;
+    sweep_cookie_jars(&dir);
+    let path = dir.join(format!("cookies-{}-{}.txt", std::process::id(), crate::model::new_id()));
+    let mut out = String::from("# Netscape HTTP Cookie File\n");
+    let mut written = 0usize;
+    for c in &entries {
+        let mut domain = clean_field(&c.domain);
+        if domain.is_empty() {
+            continue;
+        }
+        if !c.host_only && !domain.starts_with('.') {
+            domain = format!(".{domain}");
+        }
+        let path_s = {
+            let p = clean_field(&c.path);
+            if p.is_empty() { "/".to_string() } else { p }
+        };
+        let expires = c.expiration_date.map(|e| if e > 0.0 { e as u64 } else { 0 }).unwrap_or(0);
+        out.push_str(&format!(
+            "{}{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            if c.http_only { "#HttpOnly_" } else { "" },
+            domain,
+            if c.host_only { "FALSE" } else { "TRUE" },
+            path_s,
+            if c.secure { "TRUE" } else { "FALSE" },
+            expires,
+            clean_field(&c.name),
+            clean_field(&c.value),
+        ));
+        written += 1;
+    }
+    // Zero usable lines: jar would be header-only, yt-dlp --cookies suppresses
+    // legacy Cookie-header fallback (base_args drops it when jar present).
+    if written == 0 {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    std::fs::write(&path, out).ok()?;
+    Some(CookieJar(path))
+}
+
+fn base_args(url: &str, task: &DownloadTask, cookie_jar: Option<&std::path::Path>) -> Vec<String> {
     let mut a: Vec<String> = vec!["--no-playlist".into(), "--no-warnings".into()];
     if !task.referrer.is_empty() {
         a.push("--referer".into());
         a.push(task.referrer.clone());
     }
-    if !task.cookies.is_empty() {
+    if let Some(jar) = cookie_jar {
+        a.push("--cookies".into());
+        a.push(jar.to_string_lossy().into_owned());
+    } else if !task.cookies.is_empty() {
         a.push("--add-header".into());
         a.push(format!("Cookie:{}", task.cookies));
     }
     for (k, v) in &task.headers {
         // Pseudo-headers are task config, never HTTP headers.
+        // With a jar, Cookie comes from file; user Cookie header would duplicate/override.
         if YT_HEADER_KEYS.iter().any(|x| k.eq_ignore_ascii_case(x))
             || k.eq_ignore_ascii_case("x-page-url")
             || k.eq_ignore_ascii_case("x-page-stream")
             || k.eq_ignore_ascii_case("x-page-intent")
+            || (cookie_jar.is_some() && k.eq_ignore_ascii_case("cookie"))
         {
             continue;
         }
@@ -485,9 +605,14 @@ pub fn build_selector(choice: &YtChoice, dump: Option<&YtDump>) -> (String, Vec<
 }
 
 pub async fn fetch_formats(url: &str, task: &DownloadTask) -> Result<YtDump, String> {
+    let jar = write_cookie_jar(task);
+    fetch_formats_jar(url, task, jar.as_deref()).await
+}
+
+async fn fetch_formats_jar(url: &str, task: &DownloadTask, jar: Option<&std::path::Path>) -> Result<YtDump, String> {
     let path = ytdlp_path().ok_or("yt-dlp not found")?;
     let mut args = vec!["-J".to_string()];
-    args.extend(base_args(url, task));
+    args.extend(base_args(url, task, jar));
     let out = tokio::task::spawn_blocking(move || {
         // Bounded probe: hung extractor must not orphan forever (120s cap).
         let o = run_timeout(&path, &args, 120)?;
@@ -535,7 +660,9 @@ pub async fn download_with_ytdlp(
     std::fs::create_dir_all(&task.dest_dir).map_err(|e| e.to_string())?;
     // Format choice: -J first; fallback selector lets yt-dlp decide.
     // Also adopt video title as filename when seeded name is extensionless ID.
-    let dump = fetch_formats(&task.url, &task).await.ok();
+    // One jar for probe + download (yt-dlp may rewrite jar between calls).
+    let jar = write_cookie_jar(&task);
+    let dump = fetch_formats_jar(&task.url, &task, jar.as_deref()).await.ok();
     let mut task = task;
     // Explicit x-yt-* choice (picker) wins over auto pick_best.
     let choice = YtChoice::from_headers(&task.headers);
@@ -611,7 +738,7 @@ pub async fn download_with_ytdlp(
     args.push("-o".into());
     args.push(dest.to_string_lossy().into_owned());
     // URL last (base_args appends it); insert flags before it.
-    let mut full = base_args(&task.url, &task);
+    let mut full = base_args(&task.url, &task, jar.as_deref());
     let url = full.pop().expect("url");
     full.extend(args);
     full.push(url);
@@ -976,8 +1103,59 @@ mod tests {
         c.write_headers(&mut h);
         assert_eq!(YtChoice::from_headers(&h), c);
         let t = crate::model::DownloadTask { headers: h, ..Default::default() };
-        let a = base_args("https://x/watch", &t);
+        let a = base_args("https://x/watch", &t, None);
         assert!(!a.iter().any(|x| x.starts_with("x-yt") || x.starts_with("x-ytdlp")));
+    }
+
+    #[test]
+    fn cookie_jar_netscape_format() {
+        let t = crate::model::DownloadTask {
+            cookies_json: r#"[{"name":"a","value":"1","domain":"example.com","path":"/","expirationDate":1893456000.0,"secure":true,"httpOnly":true,"hostOnly":false},{"name":"b","value":"2","domain":".example.com","path":"/x","secure":false,"httpOnly":false,"hostOnly":true}]"#.into(),
+            ..Default::default()
+        };
+        let jar = write_cookie_jar(&t).expect("jar");
+        let s = std::fs::read_to_string(&jar).unwrap();
+        assert!(s.contains("#HttpOnly_.example.com\tTRUE\t/\tTRUE\t1893456000\ta\t1"), "{s}");
+        assert!(s.contains(".example.com\tFALSE\t/x\tFALSE\t0\tb\t2"), "{s}");
+        // sweep: stale jar removed, fresh jar + non-jar files kept
+        let dir = std::env::temp_dir().join(format!("wc-sweep-{}", crate::model::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (old, new, other) = (dir.join("cookies-1-old.txt"), dir.join("cookies-1-new.txt"), dir.join("keep.txt"));
+        for p in [&old, &new, &other] { std::fs::write(p, "x").unwrap(); }
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 3600);
+        for p in [&old, &other] {
+            std::fs::OpenOptions::new().write(true).open(p).unwrap().set_times(std::fs::FileTimes::new().set_modified(past)).unwrap();
+        }
+        sweep_cookie_jars(&dir);
+        assert!(!old.exists() && new.exists() && other.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        // RAII: drop removes the jar file (no manual remove_file needed).
+        assert!(std::path::Path::new(&*jar).exists(), "jar alive while guard alive");
+        let jar_path = jar.to_path_buf();
+        drop(jar);
+        assert!(!jar_path.exists(), "guard drop removes jar");
+        // Jar present: --cookies used, Cookie header suppressed.
+        let mut h = std::collections::BTreeMap::new();
+        h.insert("Cookie".to_string(), "a=1".to_string());
+        let t2 = crate::model::DownloadTask { cookies: "a=1".into(), headers: h, ..Default::default() };
+        let a = base_args("https://x/watch", &t2, Some(std::path::Path::new("jar.txt")));
+        assert!(a.iter().any(|x| x == "--cookies"));
+        assert!(!a.iter().any(|x| x.starts_with("Cookie:")));
+    }
+
+    #[test]
+    fn cookie_jar_all_filtered_returns_none() {
+        // Empty domains filtered -> zero lines -> None (legacy header fallback).
+        let t = crate::model::DownloadTask {
+            cookies_json: r#"[{"name":"a","value":"1","domain":"","path":"/"},{"name":"b","value":"2"}]"#.into(),
+            ..Default::default()
+        };
+        assert!(write_cookie_jar(&t).is_none());
+        let t = crate::model::DownloadTask {
+            cookies_json: r#"[]"#.into(),
+            ..Default::default()
+        };
+        assert!(write_cookie_jar(&t).is_none());
     }
 
     #[test]

@@ -112,7 +112,8 @@ async function loadCandidates() {
   candidatesLoaded = true;
   try {
     const s = await chrome.storage.session.get(["wcCandidates"]);
-    if (s && s.wcCandidates) for (const [u, c] of Object.entries(s.wcCandidates)) candidates.set(u, c);
+    // ponytail: entries lacking numeric status predate status tracking (incl. pre-206 filter); drop, TTL re-sniff rediscovers live ones.
+    if (s && s.wcCandidates) for (const [u, c] of Object.entries(s.wcCandidates)) if (c && typeof c.status === "number") candidates.set(u, c);
     pruneCandidates();
   } catch (e) {}
 }
@@ -164,7 +165,7 @@ if (chrome.webRequest && chrome.webRequest.onHeadersReceived) {
     if (!isSniff(details, type)) return;
     const lenH = (details.responseHeaders || []).find((h) => h.name.toLowerCase() === "content-length");
     const rec = requestRecords.get(details.requestId);
-    candidates.set(details.url, { url: details.url, type, tabId: details.tabId, frameId: details.frameId != null ? details.frameId : null, redirectFrom: (rec && rec.redirectFrom) || "", hops: (rec && rec.hops) || [], time: (rec && rec.time) || Date.now(), size: lenH ? parseInt(lenH.value, 10) || 0 : 0 });
+    candidates.set(details.url, { url: details.url, type, status: details.statusCode || 0, tabId: details.tabId, frameId: details.frameId != null ? details.frameId : null, redirectFrom: (rec && rec.redirectFrom) || "", hops: (rec && rec.hops) || [], time: (rec && rec.time) || Date.now(), size: lenH ? parseInt(lenH.value, 10) || 0 : 0 });
     persistCandidates();
     pruneCandidates();
   }, { urls: ["<all_urls>"], types: ["main_frame", "sub_frame", "media", "object", "xmlhttprequest", "other"] }, ["responseHeaders"]);
@@ -174,16 +175,19 @@ function basename(name) {
 }
 async function sendDownload(url, tab, extra = {}) {
   let cookies = "";
+  let cookiesJson = "";
   try {
     // Cookies match page host (X/YouTube/Reddit session), not CDN host.
     // Page intent: pageUrl promotes to yt-dlp target app-side. Stream intent:
     // cookieUrl scopes cookies only, no promotion field sent.
     const cs = await chrome.cookies.getAll({ url: extra.pageUrl || extra.cookieUrl || url });
     cookies = cs.map(c => `${c.name}=${c.value}`).join("; ");
+    // Structured form for yt-dlp cookie jar (httpOnly/domain/expiry lost in string form).
+    cookiesJson = JSON.stringify(cs.map(c => ({ name: c.name, value: c.value, domain: c.domain, path: c.path, expirationDate: c.expirationDate, secure: c.secure, httpOnly: c.httpOnly, hostOnly: c.hostOnly })));
   } catch (e) {}
   // Referrer = video page (permalink), not feed tab URL (x.com/home).
   const referrer = extra.referrer != null ? extra.referrer : (extra.pageUrl || extra.cookieUrl || (tab ? tab.url : ""));
-  const msg = { type: "download", url, referrer, referer: referrer, cookies, filename: extra.filename ? basename(extra.filename) : filenameFromUrl(url) };
+  const msg = { type: "download", url, referrer, referer: referrer, cookies, cookiesJson, filename: extra.filename ? basename(extra.filename) : filenameFromUrl(url) };
   if (extra.pageUrl) msg.pageUrl = extra.pageUrl;
   if (extra.intent) msg.intent = extra.intent;
   if (extra.mime) msg.mime = extra.mime;
@@ -270,7 +274,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // candidates carry same fields (frameId/redirectFrom/hops) and survive
         // SW/record cleanup, so match over union deduped by url.
         const byUrl = new Map();
-        [...requestRecords.values(), ...candidates.values()].forEach((r) => { if (r && r.url) byUrl.set(r.url, r); });
+        // status 206 = partial byte slice, not standalone file: never panel.
+        [...requestRecords.values(), ...candidates.values()].forEach((r) => { if (r && r.url && r.status !== 206) byUrl.set(r.url, r); });
         const senderFrame = sender.frameId != null ? sender.frameId : null;
         const el = { tabId: sender.tab ? sender.tab.id : tabId, frameId: senderFrame, srcs: msg.element.srcs || [], srcKey: msg.element.srcKey || "", postId: msg.element.postId || "", since: msg.element.since || 0, now: Date.now() };
         pool = typeof matchRecordsForElement === "function" ? matchRecordsForElement([...byUrl.values()], el, Date.now()) : [];
@@ -278,7 +283,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // tolerant filter) before returning empty.
         if (!pool.length && senderFrame != null && typeof matchRecordsForElement === "function") pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null }, Date.now());
       } else {
-        pool = [...candidates.values()].filter((c) => tabId == null || c.tabId === tabId);
+        pool = [...candidates.values()].filter((c) => c.status !== 206 && (tabId == null || c.tabId === tabId));
       }
       const list = (typeof rankCandidates === "function" ? rankCandidates : (x) => x)(pool);
       sendResponse({ type: "candidates", candidates: list });

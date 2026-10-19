@@ -420,6 +420,8 @@ pub struct DownloadApp {
     capture_name: String,
     /// True only for first frame after capture dialog opens: focus filename field.
     capture_just_opened: bool,
+    /// Raise capture viewport once on pop (like progress_raise).
+    capture_raise: bool,
     yt_probe_add: YtProbeState,
     yt_probe_cap: YtProbeState,
 }
@@ -653,6 +655,7 @@ impl DownloadApp {
             capture_revealed: false,
             capture_name: String::new(),
             capture_just_opened: false,
+            capture_raise: false,
             yt_probe_add: YtProbeState::default(),
             yt_probe_cap: YtProbeState::default(),
         }
@@ -1331,9 +1334,7 @@ impl DownloadApp {
         // sit in rt.pending_captures until confirmed, so no auto-start here.
         let has_capture =
             self.capture_task.is_some() || !crate::lock_unpoison(&self.rt).pending_captures.is_empty();
-        if has_capture && !self.capture_revealed
-            && (self.hidden || ctx.input(|i| i.viewport().minimized.unwrap_or(false)))
-        {
+        if has_capture && !self.capture_revealed {
             self.show_window(ctx);
         }
         self.capture_revealed = has_capture;
@@ -3570,7 +3571,7 @@ fn section(ui: &mut egui::Ui, title: &str) {
 
 /// Start silent yt-dlp -J probe (thread + slot, torrent-picker pattern).
 /// Probe task carries referrer/cookies so gated pages (X/Reddit) resolve.
-fn start_yt_probe(st: &mut YtProbeState, rt: &tokio::runtime::Runtime, url: &str, referrer: &str, cookies: &str) {
+fn start_yt_probe(st: &mut YtProbeState, rt: &tokio::runtime::Runtime, url: &str, referrer: &str, cookies: &str, cookies_json: &str) {
     let slot: YtProbeSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
     st.slot = Some(slot.clone());
     st.url = url.to_string();
@@ -3587,6 +3588,7 @@ fn start_yt_probe(st: &mut YtProbeState, rt: &tokio::runtime::Runtime, url: &str
         url: url.to_string(),
         referrer: referrer.to_string(),
         cookies: cookies.to_string(),
+        cookies_json: cookies_json.to_string(),
         ..Default::default()
     };
     let url_owned = url.to_string();
@@ -3658,6 +3660,7 @@ fn yt_choice_from_state(st: &YtProbeState) -> ytdlp::YtChoice {
 }
 
 /// Quality/audio/subtitle picker. `id` prefixes egui ids per dialog.
+#[allow(clippy::too_many_arguments)]
 fn ui_yt_probe_section(
     ui: &mut egui::Ui,
     st: &mut YtProbeState,
@@ -3665,6 +3668,7 @@ fn ui_yt_probe_section(
     url: &str,
     referrer: &str,
     cookies: &str,
+    cookies_json: &str,
     rt: &tokio::runtime::Runtime,
 ) {
     yt_probe_poll(st, url);
@@ -3683,13 +3687,13 @@ fn ui_yt_probe_section(
                 .small(),
         );
         if ghost_btn_w(ui, "Retry probe").clicked() {
-            start_yt_probe(st, rt, url, referrer, cookies);
+            start_yt_probe(st, rt, url, referrer, cookies, cookies_json);
         }
         return;
     }
     let Some(dump) = st.dump.clone() else {
         if ghost_btn_w(ui, "Probe formats (quality / audio / subtitles)").clicked() {
-            start_yt_probe(st, rt, url, referrer, cookies);
+            start_yt_probe(st, rt, url, referrer, cookies, cookies_json);
         }
         return;
     };
@@ -4333,7 +4337,7 @@ impl DownloadApp {
                     self.capture_name = t.filename.clone();
                     self.capture_task = Some(t);
                     self.capture_just_opened = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.capture_raise = true;
                 }
                 None => return,
             }
@@ -4483,12 +4487,12 @@ impl DownloadApp {
                             && app.yt_probe_cap.dump.is_none();
                         if virgin {
                             let rt = app.tokio_rt.clone();
-                            start_yt_probe(&mut app.yt_probe_cap, &rt, &t.url, &t.referrer, &t.cookies);
+                            start_yt_probe(&mut app.yt_probe_cap, &rt, &t.url, &t.referrer, &t.cookies, &t.cookies_json);
                         }
                         let (u, r, c) = (t.url.clone(), t.referrer.clone(), t.cookies.clone());
                         let rt = app.tokio_rt.clone();
                         ui.add_space(6.0);
-                        ui_yt_probe_section(ui, &mut app.yt_probe_cap, "cap", &u, &r, &c, &rt);
+                        ui_yt_probe_section(ui, &mut app.yt_probe_cap, "cap", &u, &r, &c, &t.cookies_json, &rt);
                         // Probe title fills filename while user kept funnel name.
                         if let Some(d) = &app.yt_probe_cap.dump {
                             if !d.title.is_empty() && (app.capture_name.is_empty() || !app.capture_name.contains('.')) {
@@ -4530,6 +4534,10 @@ impl DownloadApp {
                     );
                 }
         };
+        if self.capture_raise {
+            self.capture_raise = false;
+            ctx.send_viewport_cmd_to(vp_id("webcraft-capture"), egui::ViewportCommand::Focus);
+        }
         let mut cap_body = Some(cap_body);
         ctx.show_viewport_immediate(vp_id("webcraft-capture"), builder, |ctx, class| {
             if ctx.input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape)) {
@@ -4947,6 +4955,9 @@ impl DownloadApp {
             .with_resizable(true);
         let mut start: Option<bool> = None; // Some(true)=now, Some(false)=later
         let mut cancel = false;
+        if self.add_just_opened {
+            ctx.send_viewport_cmd_to(vp_id("webcraft-add"), egui::ViewportCommand::Focus);
+        }
         ctx.show_viewport_immediate(vp_id("webcraft-add"), builder, |ctx, class| {
             if ctx.input(|i| i.viewport().close_requested()) {
                 cancel = true;
@@ -5061,7 +5072,7 @@ impl DownloadApp {
                         ui.add_space(theme::SP_SM);
                         let (u, r, c) = (app.add_url.trim().to_string(), app.add_referrer.clone(), app.add_cookies.clone());
                         let rt = app.tokio_rt.clone();
-                        ui_yt_probe_section(ui, &mut app.yt_probe_add, "add", &u, &r, &c, &rt);
+                        ui_yt_probe_section(ui, &mut app.yt_probe_add, "add", &u, &r, &c, "", &rt);
                     }
                     ui.add_space(theme::SP_SM);
                     section(ui, "Transfer");

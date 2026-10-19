@@ -83,6 +83,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/package-firefox.ps1; Copy-Item extensions/webcraft-firefox.xpi dist/ -ErrorAction SilentlyContinue
+      - name: Package Chromium zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Force -Path extensions/chromium/* -DestinationPath dist/webcraft-chromium.zip
       - name: Package macOS
         if: runner.os == 'macOS'
         run: bash scripts/package-macos.sh ${{ github.ref_name }}
@@ -119,6 +123,8 @@ jobs:
           mkdir -p dist
           for d in artifacts/*/; do for f in "$d"*; do b=$(basename "$f"); case "$b" in SHA256SUMS*) cp "$f" "dist/$(basename "$d")-SHA256SUMS.txt";; *) cp "$f" "dist/$b";; esac; done; done
           ls -la dist
+          V="${{ github.ref_name }}"
+          for f in "dist/webcraft-${V}-windows-x86_64.zip" "dist/webcraft-${V}-windows-setup.exe" "dist/webcraft-${V}-universal.dmg" "dist/webcraft-${V}-linux-x86_64.tar.gz" "dist/webcraft-${V}-x86_64.AppImage" "dist/webcraft_${V#v}_amd64.deb" dist/webcraft-chromium.zip dist/webcraft-firefox.xpi; do test -f "$f" || { echo "MISSING expected asset: $f"; ls -la dist; exit 1; }; done
           cd dist && sha256sum $(ls | grep -v SHA256SUMS || true) > SHA256SUMS.txt && cat SHA256SUMS.txt
       - name: Create release + upload
         shell: bash

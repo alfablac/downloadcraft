@@ -174,7 +174,7 @@ fn handle(msg: &serde_json::Value) -> serde_json::Value {
                 }
             }
             for k in [
-                "filename", "referrer", "cookies", "referer", "cookie", "queue", "mime", "type",
+                "filename", "referrer", "cookies", "cookiesJson", "referer", "cookie", "queue", "mime", "type",
                 "pageUrl", "intent", "size",
             ] {
                 if k == "size" {

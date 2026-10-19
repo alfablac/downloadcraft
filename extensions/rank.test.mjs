@@ -22,11 +22,12 @@ const input = [
 const out = rankCandidates(input);
 const urls = out.map((e) => e.url);
 assert.equal(urls.length, 5, "dedupe + byte-range collapse + segments filtered under playlist; got " + urls.join(","));
-assert.equal(urls[0], "https://x/big.mp4", "biggest file first");
-assert.equal(urls[1], "https://x/v.mp4?bytestart=500&byteend=999", "largest byte-range variant kept");
-assert.equal(urls[2], "https://x/long.mp4", "duration beats equal-size file");
-assert.equal(urls[3], "https://x/small.mp4");
-assert.equal(urls[4], "https://x/movie.m3u8", "playlist below files");
+assert.equal(urls[0], "https://x/movie.m3u8", "playlist first when present");
+assert.equal(urls[1], "https://x/big.mp4", "biggest file first among files");
+assert.equal(rankCandidates([{ url: "https://x/movie.mp4", size: 100 }, { url: "https://x/big.mp4", size: 999999 }])[0].url, "https://x/big.mp4", "biggest file first without playlist");
+assert.equal(urls[2], "https://x/v.mp4?bytestart=500&byteend=999", "largest byte-range variant kept");
+assert.equal(urls[3], "https://x/long.mp4", "duration beats equal-size file");
+assert.equal(urls[4], "https://x/small.mp4");
 assert.ok(!urls.some((u) => u.endsWith(".ts")), "segments filtered when playlist known, got " + urls.join(","));
 // playlist present: segments filtered out entirely
 const bare = rankCandidates([{ url: "https://x/a.ts" }, { url: "https://x/a.m3u8" }]);
@@ -35,6 +36,13 @@ assert.deepEqual(bare.map((e) => e.url), ["https://x/a.m3u8"]);
 assert.ok(rankCandidates([{ url: "https://x/a.ts" }]).length === 1);
 // junk schemes + DRM endpoints never offered
 assert.deepEqual(rankCandidates([{ url: "blob:https://x/abc" }, { url: "data:video/mp4;base64,AA" }, { url: "https://x/widevine/license" }]), []);
+// segment-ish .mp4 filtered when playlist present; plain movie.mp4 kept
+assert.deepEqual(rankCandidates([{ url: "https://x/seg-1.mp4" }, { url: "https://x/a.m3u8" }]).map((e) => e.url), ["https://x/a.m3u8"], "seg-1.mp4 filtered under playlist");
+assert.deepEqual(rankCandidates([{ url: "https://x/movie.mp4" }, { url: "https://x/a.m3u8" }]).map((e) => e.url), ["https://x/a.m3u8", "https://x/movie.mp4"], "movie.mp4 kept below playlist");
+assert.ok(rankCandidates([{ url: "https://x/movie.mp4" }]).length === 1, "movie.mp4 kept bare");
+assert.ok(rankCandidates([{ url: "https://x/video-2.cmfv" }, { url: "https://x/a.m3u8" }]).every((e) => !e.url.endsWith(".cmfv")), "indexed .cmfv filtered under playlist");
+assert.ok(rankCandidates([{ url: "https://x/init-1.mp4" }, { url: "https://x/a.m3u8" }]).every((e) => !e.url.endsWith(".mp4")), "init-1.mp4 filtered under playlist");
+assert.ok(rankCandidates([{ url: "https://x/$RepresentationID$-init.mp4" }, { url: "https://x/a.m3u8" }]).every((e) => !e.url.endsWith(".mp4")), "$RepresentationID$ filtered under playlist");
 // both copies behave identically
 assert.deepEqual(also.rankCandidates(input).map((e) => e.url), urls, "firefox parity");
 // empty

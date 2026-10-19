@@ -1781,6 +1781,59 @@ fn is_mp4_ext(ext: &str) -> bool {
     matches!(ext, "mp4" | "m4v" | "mov" | "m4a")
 }
 
+#[derive(Debug, PartialEq)]
+enum Mp4Scan {
+    HasMedia,
+    NoMedia,
+    MoofWithoutMoov,
+}
+
+/// Walk top-level MP4 boxes in `head`. HasMedia: mdat seen, or moof seen
+/// after moov (fMP4). MoofWithoutMoov: fragment init (moov) missing.
+fn mp4_scan(head: &[u8]) -> Mp4Scan {
+    let mut off = 0usize;
+    let mut seen_moov = false;
+    while off + 8 <= head.len() {
+        let size32 = u32::from_be_bytes(head[off..off + 4].try_into().unwrap());
+        let typ = &head[off + 4..off + 8];
+        let (hdr, box_size): (usize, u64) = match size32 {
+            1 => {
+                if off + 16 > head.len() {
+                    break;
+                }
+                (16, u64::from_be_bytes(head[off + 8..off + 16].try_into().unwrap()))
+            }
+            0 => (8, (head.len() - off) as u64), // extends to EOF
+            s => (8, s as u64),
+        };
+        if box_size < hdr as u64 {
+            break;
+        }
+        match typ {
+            b"mdat" => return Mp4Scan::HasMedia,
+            b"moof" => {
+                return if seen_moov {
+                    Mp4Scan::HasMedia
+                } else {
+                    Mp4Scan::MoofWithoutMoov
+                }
+            }
+            b"moov" => seen_moov = true,
+            _ => {}
+        }
+        if box_size > (head.len() - off) as u64 {
+            break; // box payload extends beyond scanned buffer
+        }
+        off += box_size as usize;
+    }
+    Mp4Scan::NoMedia
+}
+
+#[cfg(test)]
+fn mp4_has_media(head: &[u8]) -> bool {
+    mp4_scan(head) == Mp4Scan::HasMedia
+}
+
 const MEDIA_EXTS: &[&str] = &[
     "mp4", "m4a", "m4v", "mov", "mkv", "webm", "mp3", "ts", "m4s", "opus", "ogg", "flac", "wav",
     "aac",
@@ -1886,8 +1939,12 @@ fn validate_output_impl(
         return Err(ValidateFail::TsInMp4);
     }
     let ok = match ext.as_str() {
-        // mov/m4a excluded: legacy QuickTime has no ftyp, ADTS-.m4a neither.
-        "mp4" | "m4v" => head.len() >= 8 && &head[4..8] == b"ftyp",
+        // mov legacy: permissive (no ftyp, e.g. legacy QuickTime). mp4/m4v:
+        // ftyp OR styp start; styp files still subject to box walk below.
+        // m4a excluded: ADTS-.m4a has no ftyp.
+        "mp4" | "m4v" => {
+            head.len() >= 8 && (&head[4..8] == b"ftyp" || &head[4..8] == b"styp")
+        }
         "webm" | "mkv" => head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]),
         "mp3" => head.starts_with(b"ID3") || (head.len() >= 2 && head[0] == 0xFF && head[1] & 0xE0 == 0xE0),
         "ts" => is_ts(head),
@@ -1898,6 +1955,41 @@ fn validate_output_impl(
     let ok = ok && !(force_media && !is_media_ext(&ext));
     if !ok {
         return Err(msg("output magic bytes do not match extension"));
+    }
+    // mp4/m4v/mov box-walk when head starts ftyp OR styp (fragmented files
+    // start with styp, no ftyp). Legacy mov without ftyp/styp keeps passing
+    // above (no walk). Require mdat, or moof after moov (fMP4). Scan cap
+    // 4MB: no mdat/moof within 4MB of larger file accepted (media may
+    // start later); fully-scanned small file without media = fragment.
+    if matches!(ext.as_str(), "mp4" | "m4v" | "mov")
+        && head.len() >= 8
+        && (&head[4..8] == b"ftyp" || &head[4..8] == b"styp")
+    {
+        const SCAN_CAP: u64 = 4 * 1024 * 1024;
+        let mut f = std::fs::File::open(dest).map_err(|e| msg(&format!("output read: {e}")))?;
+        let mut buf = vec![0u8; SCAN_CAP.min(size.max(1)) as usize];
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            match f.read(&mut buf[filled..]) {
+                Ok(0) | Err(_) => break,
+                Ok(m) => filled += m,
+            }
+        }
+        buf.truncate(filled);
+        match mp4_scan(&buf) {
+            Mp4Scan::HasMedia => {}
+            Mp4Scan::MoofWithoutMoov => {
+                return Err(msg(
+                    "mp4 moof without preceding moov — likely init segment fragment",
+                ));
+            }
+            Mp4Scan::NoMedia if size <= SCAN_CAP => {
+                return Err(msg(
+                    "mp4 has no media data (mdat/moof missing) — likely init segment fragment",
+                ));
+            }
+            Mp4Scan::NoMedia => {}
+        }
     }
     Ok(size)
 }
@@ -2007,10 +2099,91 @@ mod tests {
         p
     }
     #[test]
+    fn mp4_box_walk() {
+        fn bx(typ: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut v = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+            v.extend_from_slice(typ);
+            v.extend_from_slice(payload);
+            v
+        }
+        let ftyp = bx(b"ftyp", b"isom");
+        let moov = bx(b"moov", b"meta");
+        let mdat = bx(b"mdat", b"data");
+        let moof = bx(b"moof", b"frag");
+        let styp = bx(b"styp", b"msdh");
+        let cat = |parts: &[&Vec<u8>]| {
+            parts.iter().flat_map(|p| p.iter().copied()).collect::<Vec<u8>>()
+        };
+        // init segment only (ftyp+moov): no media -> reject
+        assert!(!mp4_has_media(&cat(&[&ftyp, &moov])));
+        assert!(!mp4_has_media(&cat(&[&ftyp])));
+        // progressive moov+mdat, and mdat-first (non-faststart): ok
+        assert!(mp4_has_media(&cat(&[&ftyp, &moov, &mdat])));
+        assert!(mp4_has_media(&cat(&[&ftyp, &mdat])));
+        assert!(mp4_has_media(&cat(&[&ftyp, &mdat, &moov])));
+        // fMP4: moov before moof ok; moof without preceding moov reject
+        assert!(mp4_has_media(&cat(&[&ftyp, &moov, &moof, &mdat])));
+        assert!(!mp4_has_media(&cat(&[&styp, &moof, &mdat])));
+        assert!(!mp4_has_media(&cat(&[&ftyp, &moof])));
+        // largesize (size==1) and to-EOF (size==0) boxes walk correctly
+        let mut large_mdat = 1u32.to_be_bytes().to_vec();
+        large_mdat.extend_from_slice(b"mdat");
+        large_mdat.extend_from_slice(&24u64.to_be_bytes());
+        large_mdat.extend_from_slice(b"12345678");
+        assert!(mp4_has_media(&cat(&[&ftyp, &moov, &large_mdat])));
+        let mut eof_mdat = 0u32.to_be_bytes().to_vec();
+        eof_mdat.extend_from_slice(b"mdat");
+        eof_mdat.extend_from_slice(b"data");
+        assert!(mp4_has_media(&cat(&[&ftyp, &eof_mdat])));
+        // end-to-end via validate_output
+        let p = tmp_file("bw1", "v.mp4", &cat(&[&ftyp, &moov]));
+        assert!(
+            matches!(validate_output(&p, "v.mp4"), Err(ValidateFail::Msg(m)) if m.contains("mdat/moof missing")),
+            "init-only mp4 rejected"
+        );
+        let p = tmp_file("bw2", "v.mp4", &cat(&[&ftyp, &moov, &mdat]));
+        assert!(validate_output(&p, "v.mp4").is_ok());
+        let p = tmp_file("bw3", "v.mp4", &cat(&[&ftyp, &mdat]));
+        assert!(validate_output(&p, "v.mp4").is_ok());
+        let p = tmp_file("bw4", "v.mp4", &cat(&[&styp, &moof]));
+        assert!(
+            matches!(validate_output(&p, "v.mp4"), Err(ValidateFail::Msg(m)) if m.contains("moof without preceding moov")),
+            "styp+moof rejected via walk (moof without moov)"
+        );
+        let p = tmp_file("bw5", "v.mp4", &cat(&[&ftyp, &moof, &mdat]));
+        assert!(
+            matches!(validate_output(&p, "v.mp4"), Err(ValidateFail::Msg(m)) if m.contains("moof without preceding moov")),
+            "moof-without-moov rejected even with later mdat"
+        );
+        // styp fragmented start: walk decides, magic alone insufficient.
+        let p = tmp_file("bw6", "v.mp4", &cat(&[&styp, &moof, &mdat]));
+        assert!(
+            matches!(validate_output(&p, "v.mp4"), Err(ValidateFail::Msg(m)) if m.contains("moof without preceding moov")),
+            "mp4 styp+moof+mdat without moov rejected"
+        );
+        let p = tmp_file("bw7", "v.mp4", &cat(&[&styp, &moov, &moof, &mdat]));
+        assert!(validate_output(&p, "v.mp4").is_ok(), "styp+moov+moof accepted");
+        let p = tmp_file("bw8", "v.mp4", &cat(&[&styp, &moov, &moof]));
+        assert!(validate_output(&p, "v.mp4").is_ok(), "styp+moov+moof (no mdat) accepted");
+        // .mov: walk runs when ftyp/styp present; legacy no-ftyp/no-styp stays permissive.
+        let p = tmp_file("bw9", "v.mov", &cat(&[&ftyp, &moof]));
+        assert!(
+            matches!(validate_output(&p, "v.mov"), Err(ValidateFail::Msg(m)) if m.contains("moof without preceding moov")),
+            "mov ftyp+moof without moov rejected"
+        );
+        let p = tmp_file("bw10", "v.mov", &cat(&[&styp, &moov, &moof, &mdat]));
+        assert!(validate_output(&p, "v.mov").is_ok(), "mov styp+moov+moof accepted");
+    }
+
+    #[test]
     fn validate_output_magic_table() {
-        let mut mp4 = vec![0u8; 4];
-        mp4.extend_from_slice(b"ftypisom");
-        mp4.extend_from_slice(&[0u8; 16]);
+        // Real boxes: ftyp + moov + mdat (24-byte total also used sub-size below).
+        let mut mp4 = Vec::new();
+        for (typ, payload) in [(b"ftyp", &b"isom"[..]), (b"moov", &b"meta"[..]), (b"mdat", &[0u8; 16][..])] {
+            mp4.extend_from_slice(&((payload.len() + 8) as u32).to_be_bytes());
+            mp4.extend_from_slice(typ);
+            mp4.extend_from_slice(payload);
+        }
         let p = tmp_file("mp4", "a.mp4", &mp4);
         assert!(validate_output(&p, "a.mp4").is_ok(), "valid ftyp mp4 ok");
         let p = tmp_file("m3u", "b.mp4", b"#EXTM3U\n#EXT-X-VERSION:3\n");

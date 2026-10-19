@@ -44,6 +44,9 @@ pub struct DownloadTask {
     pub referrer: String,
     #[serde(default)]
     pub cookies: String,
+    /// Structured browser cookies (JSON array from extension getAll) for yt-dlp cookie jar.
+    #[serde(default)]
+    pub cookies_json: String,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     #[serde(default)]

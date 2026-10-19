@@ -186,7 +186,7 @@ if (browser.webRequest && browser.webRequest.onHeadersReceived) {
     // XHR/other: observe-only. Cancelling them kills site API calls.
     if (d.kind === "download" && (details.type === "xmlhttprequest" || details.type === "other")) return {};
     if (d.kind === "panel") {
-      candidates.set(d.url, { url: d.url, type: d.type, tabId: d.tabId, frameId: details.frameId != null ? details.frameId : null, redirectFrom: rec ? rec.redirectFrom : "", hops: rec ? (rec.hops || []) : [], time: rec ? rec.time : Date.now(), size: parseInt(headerOf(details.responseHeaders, "content-length"), 10) || 0 });
+      candidates.set(d.url, { url: d.url, type: d.type, status: details.statusCode || 0, tabId: d.tabId, frameId: details.frameId != null ? details.frameId : null, redirectFrom: rec ? rec.redirectFrom : "", hops: rec ? (rec.hops || []) : [], time: rec ? rec.time : Date.now(), size: parseInt(headerOf(details.responseHeaders, "content-length"), 10) || 0 });
       pruneCandidates();
       return {};
     }
@@ -209,10 +209,11 @@ if (browser.webRequest && browser.webRequest.onHeadersReceived) {
 }
 async function sendDownload(url, tab, extra = {}) {
   let cookies = "";
+  let cookiesJson = "";
   // Cookies for page host, not sniffed CDN host (see Chromium).
-  try { const cs = await browser.cookies.getAll({ url: extra.pageUrl || extra.cookieUrl || url }); cookies = cs.map(c => `${c.name}=${c.value}`).join("; "); } catch (e) {}
+  try { const cs = await browser.cookies.getAll({ url: extra.pageUrl || extra.cookieUrl || url }); cookies = cs.map(c => `${c.name}=${c.value}`).join("; "); cookiesJson = JSON.stringify(cs.map(c => ({ name: c.name, value: c.value, domain: c.domain, path: c.path, expirationDate: c.expirationDate, secure: c.secure, httpOnly: c.httpOnly, hostOnly: c.hostOnly }))); } catch (e) {}
   const referrer = extra.referrer != null ? extra.referrer : (extra.pageUrl || extra.cookieUrl || (tab ? tab.url : ""));
-  const msg = { type: "download", url, referrer, referer: referrer, cookies, filename: extra.filename ? basename(extra.filename) : filenameFromUrl(url) };
+  const msg = { type: "download", url, referrer, referer: referrer, cookies, cookiesJson, filename: extra.filename ? basename(extra.filename) : filenameFromUrl(url) };
   if (extra.pageUrl) msg.pageUrl = extra.pageUrl;
   if (extra.intent) msg.intent = extra.intent;
   if (extra.mime) msg.mime = extra.mime;
@@ -276,7 +277,8 @@ browser.runtime.onMessage.addListener((msg, sender) => {
     if (msg.element) {
       // Element-scoped (IDM): same tab+frame only, never other-frame/tab.
       const byUrl = new Map();
-      [...requestRecords.values(), ...candidates.values()].forEach((r) => { if (r && r.url) byUrl.set(r.url, r); });
+      // status 206 = partial byte slice, not standalone file: never panel.
+      [...requestRecords.values(), ...candidates.values()].forEach((r) => { if (r && r.url && r.status !== 206) byUrl.set(r.url, r); });
       const senderFrame = sender.frameId != null ? sender.frameId : null;
       const el = { tabId: sender.tab ? sender.tab.id : tabId, frameId: senderFrame, srcs: msg.element.srcs || [], srcKey: msg.element.srcKey || "", postId: msg.element.postId || "", since: msg.element.since || 0, now: Date.now() };
       pool = typeof matchRecordsForElement === "function" ? matchRecordsForElement([...byUrl.values()], el, Date.now()) : [];
@@ -285,7 +287,7 @@ browser.runtime.onMessage.addListener((msg, sender) => {
       if (!pool.length && senderFrame != null && typeof matchRecordsForElement === "function") pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null }, Date.now());
     } else {
       // No frame filter: player frame != sniffer frame on embeds drops all.
-      pool = [...candidates.values()].filter((c) => tabId == null || c.tabId === tabId);
+      pool = [...candidates.values()].filter((c) => c.status !== 206 && (tabId == null || c.tabId === tabId));
     }
     const list = (typeof rankCandidates === "function" ? rankCandidates : (x) => x)(pool);
     return Promise.resolve({ type: "candidates", candidates: list });

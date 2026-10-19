@@ -204,6 +204,7 @@ fn parse_kv_file(path: &std::path::Path) -> Option<DownloadTask> {
                 }
                 "referrer" | "referer" => t.referrer = v.trim().to_string(),
                 "cookies" | "cookie" => t.cookies = v.trim().to_string(),
+                "cookiesJson" => t.cookies_json = v.trim().to_string(),
                 // Extension video-panel sends page URL alongside sniffed stream.
                 "pageUrl" => {
                     t.headers.insert("x-page-url".into(), v.trim().to_string());
