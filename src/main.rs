@@ -6,7 +6,9 @@ mod app;
 #[allow(dead_code)]
 mod icons;
 mod theme;
-use downloadcraft_lib::{engine, grabber, model, platform, queue, scheduler, stream, torrent};
+use downloadcraft_lib::{
+    engine, grabber, model, nntp, platform, queue, scheduler, stream, torrent, ytdlp,
+};
 use model::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -170,6 +172,21 @@ pub fn save_state(state: &AppState) {
     }
 }
 
+/// Promote extension pageUrl to task URL? stream intent never; page intent
+/// always (off-allowlist yt-dlp sites included); no intent = allowlist only.
+pub fn should_promote(task_url: &str, page_url: &str, intent: &str) -> bool {
+    if intent == "stream" {
+        return false;
+    }
+    if ytdlp::is_video_page(task_url) {
+        return false; // already page target
+    }
+    if intent == "page" {
+        return page_url.starts_with("http://") || page_url.starts_with("https://");
+    }
+    ytdlp::is_video_page(page_url)
+}
+
 fn parse_kv_file(path: &std::path::Path) -> Option<DownloadTask> {
     let txt = std::fs::read_to_string(path).ok()?;
     let mut t = DownloadTask::default();
@@ -187,7 +204,17 @@ fn parse_kv_file(path: &std::path::Path) -> Option<DownloadTask> {
                 }
                 "referrer" | "referer" => t.referrer = v.trim().to_string(),
                 "cookies" | "cookie" => t.cookies = v.trim().to_string(),
+                // Extension video-panel sends page URL alongside sniffed stream.
+                "pageUrl" => {
+                    t.headers.insert("x-page-url".into(), v.trim().to_string());
+                }
+                // intent=page: user picked "this video" row — promote even off
+                // host allowlist. intent=stream: never promote (manifest pick).
+                "intent" => {
+                    t.headers.insert("x-page-intent".into(), v.trim().to_string());
+                }
                 "queue" => t.queue_id = v.trim().to_string(),
+                "size" => t.total = v.trim().parse::<u64>().ok().filter(|n| *n > 0),
                 _ => {}
             }
         }
@@ -200,6 +227,7 @@ fn parse_kv_file(path: &std::path::Path) -> Option<DownloadTask> {
 }
 
 fn main() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     platform::install_crash_hook();
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -307,11 +335,11 @@ pub fn run_host_handshake(host: &std::path::Path) -> Result<(), String> {
     if !host.exists() {
         return Err(format!("host not found at {}", host.display()));
     }
-    let mut child = std::process::Command::new(host)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    let mut hcmd = std::process::Command::new(host);
+    hcmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    platform::no_window(&mut hcmd);
+    let mut child = hcmd.spawn().map_err(|e| e.to_string())?;
     let msg = serde_json::json!({"type":"ping"});
     let body = msg.to_string();
     let mut stdin = child.stdin.take().ok_or("no stdin")?;
@@ -345,6 +373,9 @@ fn run_gui(initial_urls: Vec<String>, hidden: bool) {
     let _ = platform::register_native_hosts(&sibling_host_path());
     let _ = platform::register_protocol();
     let rt = Arc::new(Mutex::new(Runtime::load()));
+    // Emit capture filter at startup: deleted/restored filter file must not
+    // silently disable filtering until user edits Options.
+    platform::write_capture_filter(&crate::lock_unpoison(&rt).state.settings);
     for u in &initial_urls {
         let clean = u
             .strip_prefix("webcraft://add?url=")
@@ -381,9 +412,10 @@ fn run_gui(initial_urls: Vec<String>, hidden: bool) {
 fn process_alive(pid: u32) -> bool {
     #[cfg(windows)]
     {
-        std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-            .output()
+        let mut tcmd = std::process::Command::new("tasklist");
+        tcmd.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
+        platform::no_window(&mut tcmd);
+        tcmd.output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
             .unwrap_or(false)
     }
@@ -466,6 +498,24 @@ pub fn take_inbox_tasks(rt: &Arc<Mutex<Runtime>>) -> Vec<DownloadTask> {
                 {
                     t.url = url_decode(enc);
                 }
+                // Video page: promote page URL to task URL so yt-dlp extractor
+                // runs; sniffed stream kept as fallback. intent=page promotes
+                // even off allowlist (any yt-dlp site); intent=stream never.
+                // Absent intent = legacy heuristic (allowlist only).
+                if let Some(pu) = t.headers.get("x-page-url").cloned() {
+                    let intent = t.headers.get("x-page-intent").cloned().unwrap_or_default();
+                    let promote = should_promote(&t.url, &pu, &intent);
+                    if promote {
+                        let stream = std::mem::replace(&mut t.url, pu.clone());
+                        t.headers.insert("x-page-stream".into(), stream);
+                        t.headers.insert("x-ytdlp".into(), "1".into());
+                    }
+                    if intent.as_str() == "page" && t.url == pu {
+                        t.headers.insert("x-ytdlp".into(), "1".into());
+                    }
+                    // Manifest intent: no promotion; yt-dlp-first in stream dispatch.
+                    // (should_promote already returns false for non-video pageUrl.)
+                }
                 let mut g = crate::lock_unpoison(rt);
                 if t.id.is_empty() {
                     t.id = new_id();
@@ -508,6 +558,17 @@ pub fn drain_inbox(rt: &Arc<Mutex<Runtime>>) {
 #[cfg(test)]
 mod state_tests {
     use super::*;
+
+    #[test]
+    fn promote_rules() {
+        let page = "https://x.com/u/status/123";
+        let stream = "https://video.twimg.com/amplify_video/123/vid/x.mp4";
+        assert!(should_promote(stream, page, ""));
+        assert!(!should_promote(stream, page, "stream"), "manifest pick never hijacked");
+        assert!(should_promote(stream, "https://unknown-site.example/watch/1", "page"), "page intent off-allowlist");
+        assert!(!should_promote(page, page, "page"), "already page target");
+        assert!(!should_promote(stream, "https://example.com/file.mp4", ""));
+    }
 
     #[test]
     fn parse_state_accepts_valid_rejects_corrupt() {

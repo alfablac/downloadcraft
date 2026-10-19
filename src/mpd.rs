@@ -63,9 +63,27 @@ pub fn parse_duration(s: &str) -> Option<f64> {
 }
 
 fn resolve(base: &Url, rel: &str) -> String {
-    base.join(rel)
-        .map(|u| u.to_string())
-        .unwrap_or_else(|_| rel.to_string())
+    match base.join(rel) {
+        Ok(mut u) => {
+            // Signed sibling files (Reddit packaged-media): join drops auth
+            // query. Re-attach minus manifest-select m= when sibling has none.
+            if u.query().is_none() && u.path() != base.path() {
+                let keep: Vec<(String, String)> = base
+                    .query_pairs()
+                    .filter(|(k, _)| k != "m")
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+                if !keep.is_empty() {
+                    let mut qp = u.query_pairs_mut();
+                    for (k, v) in &keep {
+                        qp.append_pair(k, v);
+                    }
+                }
+            }
+            u.to_string()
+        }
+        Err(_) => rel.to_string(),
+    }
 }
 
 /// Join chained BaseURLs: each BaseURL resolves against previous.
@@ -378,7 +396,23 @@ pub fn parse_mpd(xml: &str, base_url: &Url) -> Result<Mpd, String> {
                     // again as init (bug). stream layer emits (None, file) — one download.
                     rep.init_url = None;
                     if rep.segment_urls.is_empty() {
-                        rep.segment_urls.push(base.to_string());
+                        // No rep BaseURL: file = manifest URL minus manifest-select
+                        // params (Reddit ?m=DASHPlaylist.mpd serves manifest at the
+                        // variant file URL; keeping query re-fetches XML as media).
+                        let mut u = base.clone();
+                        let keep: Vec<(String, String)> = u
+                            .query_pairs()
+                            .filter(|(k, _)| k != "m")
+                            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                            .collect();
+                        u.set_query(None);
+                        if !keep.is_empty() {
+                            let mut qp = u.query_pairs_mut();
+                            for (k, v) in &keep {
+                                qp.append_pair(k, v);
+                            }
+                        }
+                        rep.segment_urls.push(u.to_string());
                     }
                     handled = true;
                 }

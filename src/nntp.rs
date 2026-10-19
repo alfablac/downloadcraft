@@ -1,10 +1,12 @@
 // NNTP/NZB download backend (v1). NZB (HTTP URL or local path) -> segments
-// fetched sequentially per file over one NNTP connection (plain or TLS),
-// yEnc-decoded, assembled to sanitized NZB file names in dest_dir.
-// ponytail: no PAR2/repair, no archive unpack, no per-segment resume (pause
-// restarts current file; completed files skipped via nzbstate sidecar),
-// one connection. Add when real providers require them: par2 crate +
-// segment cache in .downloadcraft-{task.id} workdir.
+// fetched per file over N parallel NNTP connections (plain or TLS; N = task
+// segments else global connections setting), yEnc-decoded, assembled in
+// NZB order by single writer to sanitized NZB file names in out dir
+// (dest_dir/<output_name> for multi-file NZB, else dest_dir).
+// PAR2 repair in-process via crate::par2 after download when set includes
+// .par2. ponytail: no archive unpack, no per-segment resume (pause restarts
+// current file; completed files skipped via nzbstate sidecar). Add segment
+// cache in .downloadcraft-{task.id} workdir when needed.
 use crate::engine::Controls;
 use crate::model::{DownloadTask, Settings, TaskStatus};
 use std::sync::atomic::Ordering;
@@ -37,6 +39,8 @@ pub struct NzbFile {
 pub struct Nzb {
     pub files: Vec<NzbFile>,
     pub total_bytes: u64,
+    /// `<head><meta type=..>text</meta>` pairs: key lowercased.
+    pub meta: std::collections::BTreeMap<String, String>,
 }
 
 /// Filename from NZB subject: text inside first pair of quotes wins
@@ -58,6 +62,15 @@ pub fn parse_nzb(xml: &str) -> Result<Nzb, String> {
     let doc = roxmltree::Document::parse_with_options(xml, opts).map_err(|e| e.to_string())?;
     if doc.root_element().tag_name().name() != "nzb" {
         return Err("not an NZB document".into());
+    }
+    let mut meta = std::collections::BTreeMap::new();
+    for m in doc.descendants().filter(|n| n.has_tag_name("meta")) {
+        if let Some(k) = m.attribute("type") {
+            let text = m.text().unwrap_or("").trim().to_string();
+            if !text.is_empty() {
+                meta.insert(k.to_ascii_lowercase(), text);
+            }
+        }
     }
     let mut files = Vec::new();
     for file in doc.descendants().filter(|n| n.has_tag_name("file")) {
@@ -105,7 +118,93 @@ pub fn parse_nzb(xml: &str) -> Result<Nzb, String> {
         return Err("NZB has no <file> entries".into());
     }
     let total_bytes = files.iter().map(|f| f.total_bytes).sum();
-    Ok(Nzb { files, total_bytes })
+    Ok(Nzb {
+        files,
+        total_bytes,
+        meta,
+    })
+}
+
+/// Sanitized meta value usable as output name; None if sanitizes to
+/// placeholder "download.bin".
+fn meta_name(nzb: &Nzb, key: &str) -> Option<String> {
+    let raw = nzb.meta.get(key)?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let s = crate::model::sanitize_filename(raw);
+    (!s.is_empty() && s != "download.bin").then_some(s)
+}
+
+/// Stem from NZB source URL: `filename_from_url` minus trailing `.nzb`
+/// (else its extension). Skip-list: empty/"nzb-files"/"download" (covers
+/// bare ".../download" giving "download.bin"; "https://x/get?id=1" gives
+/// "get" — no path stem, skip as generic too).
+fn source_stem(source_url: &str) -> Option<String> {
+    let name = crate::model::filename_from_url(source_url);
+    let lower = name.to_ascii_lowercase();
+    let stem = if lower.ends_with(".nzb") {
+        &name[..name.len() - 4]
+    } else {
+        crate::model::split_stem_ext(&name).0
+    };
+    let s = crate::model::sanitize_filename(stem);
+    let sl = s.to_ascii_lowercase();
+    if s.is_empty() || sl == "nzb-files" || sl == "download" || sl == "get" || s == "download.bin" {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Longest common byte prefix of file names, cut at last separator
+/// boundary before it ("Release.Name.2024.part1/2.rar" -> "Release.Name.2024").
+/// Requires >=4 chars after cut+strip.
+fn common_prefix(files: &[NzbFile]) -> Option<String> {
+    let first = files.first()?.name.as_bytes();
+    let mut len = first.len();
+    for f in &files[1..] {
+        len = first
+            .iter()
+            .zip(f.name.as_bytes())
+            .take(len)
+            .take_while(|(a, b)| a == b)
+            .count();
+        if len == 0 {
+            return None;
+        }
+    }
+    let prefix = std::str::from_utf8(&first[..len]).ok()?;
+    let boundary = prefix.rfind(['.', '_', '-', ' ', '[', '(']).unwrap_or(0);
+    let cut = prefix[..boundary].trim_end_matches(['.', '_', '-', ' ']).trim();
+    if cut.chars().count() < 4 {
+        return None;
+    }
+    let s = crate::model::sanitize_filename(cut);
+    (!s.is_empty() && s != "download.bin").then_some(s)
+}
+
+/// Output name for an NZB: single file -> file name; multi -> folder name
+/// from meta title/name, else NZB source stem, else file-name common
+/// prefix, else first file stem, else "nzb-files". Always sanitized.
+pub fn output_name(nzb: &Nzb, source_url: &str) -> String {
+    if nzb.files.len() == 1 {
+        return nzb.files[0].name.clone();
+    }
+    if let Some(n) = meta_name(nzb, "title").or_else(|| meta_name(nzb, "name")) {
+        return n;
+    }
+    if let Some(n) = source_stem(source_url) {
+        return n;
+    }
+    if let Some(n) = common_prefix(&nzb.files) {
+        return n;
+    }
+    nzb.files
+        .first()
+        .map(|f| crate::model::sanitize_filename(crate::model::split_stem_ext(&f.name).0))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "nzb-files".into())
 }
 
 // ---------- CRC32 (IEEE, table-free bitwise) ----------
@@ -130,6 +229,7 @@ pub fn crc32(data: &[u8]) -> u32 {
 #[derive(Clone, Debug, PartialEq)]
 pub struct YencPart {
     pub name: Option<String>,
+    pub file_size: Option<u64>,
     pub part: Option<u32>,
     pub begin: Option<u64>,
     pub end: Option<u64>,
@@ -151,6 +251,7 @@ pub fn yenc_decode(input: &[u8]) -> Result<YencPart, String> {
     // replacement chars would corrupt them.
     let mut part = YencPart {
         name: None,
+        file_size: None,
         part: None,
         begin: None,
         end: None,
@@ -165,6 +266,7 @@ pub fn yenc_decode(input: &[u8]) -> Result<YencPart, String> {
             saw_yenc = true;
             in_data = true;
             part.part = kv_u64(&rest, "part").map(|v| v as u32);
+            part.file_size = kv_u64(&rest, "size");
             if let Some(i) = rest.find("name=") {
                 part.name = Some(rest[i + 5..].trim().to_string());
             }
@@ -222,12 +324,20 @@ pub fn yenc_decode(input: &[u8]) -> Result<YencPart, String> {
 
 // ---------- NNTP client ----------
 
+#[derive(Debug, Clone)]
 pub struct NntpConfig {
     pub host: String,
     pub port: u16,
     pub tls: bool,
     pub user: String,
     pub pass: String,
+    /// NNTP connections for whole NZB (shared pool across files):
+    /// task.segments (Add-dialog snapshot of nntp_connections) wins, else
+    /// live nntp_connections setting, separate from HTTP max_connections.
+    /// Clamped 1..=64.
+    /// ponytail: per-task cap only; N tasks x N conns possible. Strict
+    /// provider-account cap = global semaphore, add when needed.
+    pub connections: u32,
 }
 
 impl NntpConfig {
@@ -237,6 +347,12 @@ impl NntpConfig {
             host: s.nntp_host.clone(),
             port: s.nntp_port,
             tls: s.nntp_tls,
+            connections: if task.segments > 0 {
+                task.segments
+            } else {
+                s.nntp_connections
+            }
+            .clamp(1, 64),
             user: if task.username.is_empty() {
                 s.nntp_user.clone()
             } else {
@@ -515,8 +631,15 @@ async fn fetch_nzb_text(client: &reqwest::Client, task: &DownloadTask) -> Result
     }
 }
 
+pub async fn probe_nzb(client: reqwest::Client, task: &DownloadTask) -> Result<Nzb, String> {
+    let xml = fetch_nzb_text(&client, task).await?;
+    parse_nzb(&xml)
+}
+
 /// Download an NZB task: fetch/parse NZB, then per file fetch segments in
-/// `number` order, yEnc-decode, append to dest_dir/<sanitized NZB name>.
+/// `number` order, yEnc-decode, append to out dir/<sanitized NZB name>
+/// (out dir = dest_dir/<output_name> for multi-file, else dest_dir;
+/// task.filename/category/dest_dir updated in place for multi-file).
 pub async fn download_nzb(
     client: reqwest::Client,
     mut task: DownloadTask,
@@ -525,7 +648,19 @@ pub async fn download_nzb(
 ) -> Result<DownloadTask, String> {
     let xml = fetch_nzb_text(&client, &task).await?;
     let nzb = parse_nzb(&xml)?;
-    tokio::fs::create_dir_all(&task.dest_dir)
+    let multi_pre = nzb.files.len() > 1;
+    let out_name = output_name(&nzb, &task.url);
+    task.filename = out_name.clone();
+    task.category = crate::model::category_for(&out_name).to_string();
+    // Multi-file: files live under dest_dir/<out_name> folder. task.dest_dir
+    // stays parent (torrent root convention): app dest_dir.join(filename)
+    // resolves folder for open/reveal/delete(remove_dir_all).
+    let out_dir = if multi_pre {
+        task.dest_dir.join(&out_name)
+    } else {
+        task.dest_dir.clone()
+    };
+    tokio::fs::create_dir_all(&out_dir)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -543,18 +678,45 @@ pub async fn download_nzb(
     } else {
         vec![(0, total_segs)]
     };
+    if multi {
+        *ctrl.part_files.lock().unwrap_or_else(|e| e.into_inner()) =
+            nzb.files.iter().enumerate().map(|(i, f)| (i, f.name.clone())).collect();
+    }
     task.status = TaskStatus::Downloading;
 
-    let mut conn = Nntp::connect(cfg).await?;
+    // ---- Whole-NZB shared connection pool ----
+    // Upfront: sidecar-skip every file, then N connections (cfg.connections)
+    // shared across ALL files' segments. Coordinator alone writes files in
+    // per-file NZB order; files finalize independently (sidecar on complete,
+    // 430-fail isolated). ponytail: fetched-but-unwritten segments buffer in
+    // RAM (~2*N channel + pending); spool to part files if huge NZBs matter.
+    enum SegOut {
+        Ok(Vec<u8>),
+        Missing,
+        Err(String),
+    }
+    struct FileSt {
+        out: Option<tokio::fs::File>,
+        dest: std::path::PathBuf,
+        state_path: std::path::PathBuf,
+        pending: std::collections::BTreeMap<usize, SegOut>,
+        next_write: usize,
+        written: u64,
+        missing: u64,
+        max_end: u64,
+        pending_hole: bool,
+        unrepairable_offset: bool,
+        done: bool,
+    }
     let mut downloaded: u64 = 0;
     let mut segs_done: u64 = 0;
-    let mut failed: Vec<String> = Vec::new();
+    let mut failed: Vec<(usize, String)> = Vec::new();
+    let mut states: Vec<Option<FileSt>> = Vec::new();
+    let mut groups: Vec<String> = Vec::new();
+    let mut file_jobs: Vec<Vec<(usize, usize)>> = Vec::new();
     for (file_idx, file) in nzb.files.iter().enumerate() {
-        let dest = task.dest_dir.join(&file.name);
-        // File-level resume: sidecar written on file completion records
-        // decoded bytes. Dest with exactly that size is skipped whole;
-        // mid-file partials carry no sidecar and restart from scratch.
-        let state_path = task.dest_dir.join(format!("{}.nzbstate", file.name));
+        let dest = out_dir.join(&file.name);
+        let state_path = out_dir.join(format!("{}.nzbstate", file.name));
         let skip = std::fs::read_to_string(&state_path)
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
@@ -565,10 +727,14 @@ pub async fn download_nzb(
             })
             .and_then(|v| v.get("bytes").and_then(|x| x.as_u64()))
             .filter(|&b| std::fs::metadata(&dest).map(|m| m.len()).ok() == Some(b));
+        groups.push(
+            file.groups
+                .first()
+                .ok_or_else(|| format!("NZB file '{}' has no <group>", file.name))?
+                .clone(),
+        );
         if let Some(b) = skip {
             downloaded += b;
-            ctrl.downloaded.store(downloaded, Ordering::Relaxed);
-            task.downloaded = downloaded;
             segs_done += file.segments.len() as u64;
             if multi {
                 if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).get_mut(file_idx) {
@@ -577,131 +743,432 @@ pub async fn download_nzb(
             } else if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
                 p.0 = segs_done;
             }
+            states.push(Some(FileSt {
+                out: None,
+                dest,
+                state_path,
+                pending: Default::default(),
+                next_write: file.segments.len(),
+                written: b,
+                missing: 0,
+                max_end: 0,
+                pending_hole: false,
+                unrepairable_offset: false,
+                done: true,
+            }));
+            file_jobs.push(Vec::new());
             continue;
         }
-        let group = file
-            .groups
-            .first()
-            .ok_or_else(|| format!("NZB file '{}' has no <group>", file.name))?;
-        let mut out = tokio::fs::File::create(&dest)
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut written: u64 = 0;
-        let mut missing: u64 = 0;
-        for seg in &file.segments {
-            if let Err(e) = crate::engine::wait_not_paused(&ctrl).await {
-                return paused(task, downloaded, e);
-            }
-            // One reconnect+retry on transport errors; 430/cancel stay fatal.
-            let mut attempt = 0;
-            let mut seg_missing = false;
-            let body = loop {
-                attempt += 1;
-                let r = async {
-                    conn.ensure_group(group).await?;
-                    conn.body(&seg.id, &ctrl).await
+        let out = tokio::fs::File::create(&dest).await.map_err(|e| e.to_string())?;
+        let empty = file.segments.is_empty();
+        if empty {
+            let _ = std::fs::write(
+                &state_path,
+                serde_json::json!({"file_idx": file_idx, "seg_idx": 0, "bytes": 0}).to_string(),
+            );
+        }
+        states.push(Some(FileSt {
+            out: Some(out),
+            dest,
+            state_path,
+            pending: Default::default(),
+            next_write: 0,
+            written: 0,
+            missing: 0,
+            max_end: 0,
+            pending_hole: false,
+            unrepairable_offset: false,
+            done: empty,
+        }));
+        file_jobs.push((0..file.segments.len()).map(|s| (file_idx, s)).collect());
+    }
+    ctrl.downloaded.store(downloaded, Ordering::Relaxed);
+    task.downloaded = downloaded;
+    let total_jobs: usize = file_jobs.iter().map(|j| j.len()).sum();
+    if total_jobs > 0 {
+        use std::sync::atomic::AtomicBool;
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::<(usize, usize)>::new(),
+        ));
+        let pool_done = std::sync::Arc::new(AtomicBool::new(false));
+        let dead = std::sync::Arc::new(
+            (0..nzb.files.len()).map(|_| AtomicBool::new(false)).collect::<Vec<_>>(),
+        );
+        let mut active_dests: std::collections::HashSet<std::path::PathBuf> = Default::default();
+        let mut queued_files: std::collections::HashSet<usize> = Default::default();
+        {
+            let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+            for (fi, jobs) in file_jobs.iter().enumerate() {
+                let st = states[fi].as_ref().expect("state");
+                if st.done || active_dests.contains(&st.dest) {
+                    continue;
                 }
-                .await;
-                match r {
-                    Ok(b) => break b,
-                    Err(e) if attempt == 1 && !e.contains("430") && e != "cancelled" => {
-                        conn = Nntp::connect(cfg).await?;
+                active_dests.insert(st.dest.clone());
+                queued_files.insert(fi);
+                q.extend(jobs.iter().copied());
+            }
+        }
+        let nworkers = (cfg.connections as usize).clamp(1, total_jobs);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, usize, SegOut)>(nworkers * 2);
+        let segs_all = std::sync::Arc::new(
+            nzb.files.iter().map(|f| f.segments.clone()).collect::<Vec<_>>(),
+        );
+        let groups_a = std::sync::Arc::new(groups.clone());
+        let mut handles = Vec::new();
+        for _ in 0..nworkers {
+            let (tx, queue, pool_done, dead, segs_all, groups_a, wctrl, wcfg) = (
+                tx.clone(),
+                queue.clone(),
+                pool_done.clone(),
+                dead.clone(),
+                segs_all.clone(),
+                groups_a.clone(),
+                ctrl.clone(),
+                cfg.clone(),
+            );
+            handles.push(tokio::spawn(async move {
+                let mut conn: Option<Nntp> = None;
+                loop {
+                    let job = {
+                        let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+                        q.pop_front()
+                    };
+                    let Some((fi, si)) = job else {
+                        if pool_done.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        continue;
+                    };
+                    if dead[fi].load(Ordering::Relaxed) {
                         continue;
                     }
-                    Err(e) => {
-                        if e == "cancelled" {
-                            drop(out);
-                            let _ = tokio::fs::remove_file(&dest).await;
-                            return paused(task, downloaded, e);
+                    if conn.is_none() {
+                        match Nntp::connect(&wcfg).await {
+                            Ok(c) => conn = Some(c),
+                            Err(e) => {
+                                let _ = tx.send((usize::MAX, usize::MAX, SegOut::Err(e))).await;
+                                return;
+                            }
                         }
-                        // 430 missing article: tolerate per segment, mark
-                        // file failed below, continue other files.
-                        if e.contains("430") {
-                            seg_missing = true;
-                            break Vec::new();
+                    }
+                    let seg = &segs_all[fi][si];
+                    let mut attempt = 0;
+                    let out = loop {
+                        attempt += 1;
+                        let c = conn.as_mut().expect("conn alive");
+                        let r = async {
+                            c.ensure_group(&groups_a[fi]).await?;
+                            c.body(&seg.id, &wctrl).await
                         }
-                        return Err(format!("NZB file '{}': {e}", file.name));
+                        .await;
+                        match r {
+                            Ok(b) => break SegOut::Ok(b),
+                            Err(e) if attempt == 1 && !e.contains("430") && e != "cancelled" => {
+                                conn = None;
+                                match Nntp::connect(&wcfg).await {
+                                    Ok(c) => conn = Some(c),
+                                    Err(e) => break SegOut::Err(e),
+                                }
+                            }
+                            Err(e) if e.contains("430") => break SegOut::Missing,
+                            Err(e) => break SegOut::Err(e),
+                        }
+                    };
+                    let fatal = matches!(out, SegOut::Err(_));
+                    if tx.send((fi, si, out)).await.is_err() || fatal {
+                        return;
                     }
                 }
+                if let Some(mut c) = conn {
+                    let _ = c.cmd("QUIT").await;
+                }
+            }));
+        }
+        drop(tx);
+        let mut fatal: Option<String> = None;
+        loop {
+            let remaining = states.iter().flatten().filter(|st| !st.done).count();
+            if remaining == 0 {
+                break;
+            }
+            let Some((fi, si, out)) = rx.recv().await else {
+                fatal = Some("segment workers stopped".into());
+                break;
             };
-            if seg_missing {
-                missing += 1;
-                continue;
+            if fi == usize::MAX {
+                if let SegOut::Err(e) = out {
+                    fatal = Some(e);
+                }
+                break;
             }
-            let part = yenc_decode(&body)
-                .map_err(|e| format!("NZB file '{}' segment {}: {e}", file.name, seg.number))?;
-            if missing == 0 {
-                if let Some(begin) = part.begin {
-                    if begin != written + 1 {
-                        return Err(format!(
-                            "NZB file '{}' segment {}: yEnc offset {begin} != {}",
-                            file.name,
-                            seg.number,
-                            written + 1
-                        ));
+            {
+                let file = &nzb.files[fi];
+                let st = states[fi].as_mut().expect("state");
+                if st.done {
+                    continue;
+                }
+                st.pending.insert(si, out);
+                while let Some(seg_out) = st.pending.remove(&st.next_write) {
+                    let seg = &file.segments[st.next_write];
+                    st.next_write += 1;
+                    if let Err(e) = crate::engine::wait_not_paused(&ctrl).await {
+                        pool_done.store(true, Ordering::Relaxed);
+                        for h in &handles {
+                            h.abort();
+                        }
+                        return paused(task, downloaded, e);
+                    }
+                    match seg_out {
+                        SegOut::Missing => {
+                            // Retain damaged file for PAR2 repair
+                            // (crate::par2). Record hole, write nothing;
+                            // workers keep fetching later segments. Next
+                            // Ok segment zero-pads to its =ypart begin
+                            // (physical bytes only: padding is not added
+                            // to `downloaded`); without begin, append
+                            // best-effort and flag offset (PAR2 rebuilds
+                            // shifted/missing blocks, or verify fails).
+                            st.missing += 1;
+                            st.pending_hole = true;
+                        }
+                        SegOut::Err(e) => {
+                            pool_done.store(true, Ordering::Relaxed);
+                            for h in &handles {
+                                h.abort();
+                            }
+                            if e == "cancelled" {
+                                if let Some(o) = states[fi].as_mut().expect("state").out.take() {
+                                    drop(o);
+                                }
+                                let dest = states[fi].as_ref().expect("state").dest.clone();
+                                let _ = tokio::fs::remove_file(&dest).await;
+                                return paused(task, downloaded, e);
+                            }
+                            return Err(format!("NZB file '{}': {e}", file.name));
+                        }
+                        SegOut::Ok(body) => {
+                            let part = match yenc_decode(&body) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    pool_done.store(true, Ordering::Relaxed);
+                                    for h in &handles {
+                                        h.abort();
+                                    }
+                                    return Err(format!(
+                                        "NZB file '{}' segment {}: {e}",
+                                        file.name, seg.number
+                                    ));
+                                }
+                            };
+                            if let Some(e) = part.end {
+                                st.max_end = st.max_end.max(e);
+                            }
+                            if let Some(fs) = part.file_size {
+                                st.max_end = st.max_end.max(fs);
+                            }
+                            // Zero-pad hole left by missing segment(s):
+                            // physical bytes only, not added to `downloaded`.
+                            if let Some(begin) = part.begin {
+                                let want = begin.saturating_sub(1);
+                                if want > st.written {
+                                    let o = st.out.as_mut().expect("file open");
+                                    let zeros = [0u8; 8192];
+                                    let mut pad = want - st.written;
+                                    while pad > 0 {
+                                        let n = pad.min(zeros.len() as u64) as usize;
+                                        o.write_all(&zeros[..n]).await.map_err(|e| e.to_string())?;
+                                        pad -= n as u64;
+                                    }
+                                    st.written = want;
+                                } else if want < st.written && st.missing == 0 {
+                                    pool_done.store(true, Ordering::Relaxed);
+                                    for h in &handles {
+                                        h.abort();
+                                    }
+                                    return Err(format!(
+                                        "NZB file '{}' segment {}: yEnc offset {begin} != {}",
+                                        file.name,
+                                        seg.number,
+                                        st.written + 1
+                                    ));
+                                } else if want < st.written {
+                                    // Shifted by unknown hole: append
+                                    // best-effort; PAR2 decides.
+                                    st.unrepairable_offset = true;
+                                }
+                                st.pending_hole = false;
+                            } else if st.pending_hole {
+                                st.unrepairable_offset = true;
+                                st.pending_hole = false;
+                            }
+                            let o = st.out.as_mut().expect("file open");
+                            o.write_all(&part.data).await.map_err(|e| e.to_string())?;
+                            st.written += part.data.len() as u64;
+                            downloaded += part.data.len() as u64;
+                            segs_done += 1;
+                            ctrl.downloaded.store(downloaded, Ordering::Relaxed);
+                            if multi {
+                                if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).get_mut(fi) {
+                                    p.0 = st.written.min(p.1);
+                                }
+                            } else if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
+                                p.0 = segs_done;
+                            }
+                            task.downloaded = downloaded;
+                        }
                     }
                 }
-            }
-            out.write_all(&part.data).await.map_err(|e| e.to_string())?;
-            written += part.data.len() as u64;
-            downloaded += part.data.len() as u64;
-            segs_done += 1;
-            ctrl.downloaded.store(downloaded, Ordering::Relaxed);
-            if multi {
-                if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).get_mut(file_idx) {
-                    p.0 = written.min(p.1);
+                if !st.done && st.next_write >= file.segments.len() && st.missing > 0 {
+                    // Damaged file: PAR2 candidate. Pad trailing hole to
+                    // known end, flush, retain file, no sidecar.
+                    if st.max_end > st.written {
+                        let o = st.out.as_mut().expect("file open");
+                        let zeros = [0u8; 8192];
+                        let mut pad = st.max_end - st.written;
+                        while pad > 0 {
+                            let n = pad.min(zeros.len() as u64) as usize;
+                            o.write_all(&zeros[..n]).await.map_err(|e| e.to_string())?;
+                            pad -= n as u64;
+                        }
+                        st.written = st.max_end;
+                    }
+                    if let Some(mut o) = st.out.take() {
+                        o.flush().await.map_err(|e| e.to_string())?;
+                        drop(o);
+                    }
+                    failed.push((fi, format!("{} (missing segment(s), 430)", file.name)));
+                    st.done = true;
                 }
-            } else if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).first_mut() {
-                p.0 = segs_done;
-            }
-            task.downloaded = downloaded;
-        }
-        out.flush().await.map_err(|e| e.to_string())?;
-        drop(out);
-        if missing > 0 {
-            // Incomplete file must not masquerade as output; fetched bytes discarded.
-            let _ = tokio::fs::remove_file(&dest).await;
-            downloaded -= written;
-            ctrl.downloaded.store(downloaded, Ordering::Relaxed);
-            task.downloaded = downloaded;
-            if multi {
-                if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).get_mut(file_idx) {
-                    p.0 = 0;
+                if !st.done && st.next_write >= file.segments.len() {
+                    if st.written == 0 && !file.segments.is_empty() {
+                        pool_done.store(true, Ordering::Relaxed);
+                        for h in &handles {
+                            h.abort();
+                        }
+                        return Err(format!("NZB file '{}' assembled empty", file.name));
+                    }
+                    if let Some(mut o) = st.out.take() {
+                        o.flush().await.map_err(|e| e.to_string())?;
+                        drop(o);
+                    }
+                    if multi {
+                        if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).get_mut(fi) {
+                            *p = (file.total_bytes, file.total_bytes);
+                        }
+                    }
+                    let _ = tokio::fs::write(
+                        &st.state_path,
+                        serde_json::json!({"file_idx": fi, "seg_idx": file.segments.len(), "bytes": st.written}).to_string(),
+                    )
+                    .await;
+                    st.done = true;
                 }
             }
-            failed.push(format!(
-                "{} ({missing} missing segment(s), 430)",
-                file.name
-            ));
-            continue;
-        }
-        if written == 0 && !file.segments.is_empty() {
-            return Err(format!("NZB file '{}' assembled empty", file.name));
-        }
-        if multi {
-            if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).get_mut(file_idx) {
-                *p = (file.total_bytes, file.total_bytes);
+            {
+                let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+                for (nfi, jobs) in file_jobs.iter().enumerate() {
+                    if queued_files.contains(&nfi) {
+                        continue;
+                    }
+                    let st = states[nfi].as_ref().expect("state");
+                    if st.done {
+                        queued_files.insert(nfi);
+                        continue;
+                    }
+                    let blocked = states.iter().flatten().any(|s| !std::ptr::eq(s, st) && !s.done && s.dest == st.dest);
+                    if blocked {
+                        continue;
+                    }
+                    queued_files.insert(nfi);
+                    q.extend(jobs.iter().copied());
+                }
             }
         }
-        // Sidecar marks file complete for file-level resume (see top of loop).
-        let _ = tokio::fs::write(
-            &state_path,
-            serde_json::json!({"file_idx": file_idx, "seg_idx": file.segments.len(), "bytes": written}).to_string(),
-        )
-        .await;
+        pool_done.store(true, Ordering::Relaxed);
+        for h in &handles {
+            h.abort();
+        }
+        if let Some(e) = fatal {
+            if e == "cancelled" {
+                return paused(task, downloaded, e);
+            }
+            return Err(e);
+        }
     }
-    let _ = conn.cmd("QUIT").await;
+    failed.sort_by_key(|(i, _)| *i);
+    // PAR2 repair: set ships a completed .par2 (out_dir also = dest_dir
+    // for single-file NZB), so try in-process repair of retained
+    // damaged files before failing.
+    let mut repair_note: Option<String> = None;
     if !failed.is_empty() {
-        return Err(format!(
+        let par2_ready = nzb.files.iter().any(|f| {
+            f.name.to_ascii_lowercase().ends_with(".par2") && out_dir.join(&f.name).exists()
+        });
+        if par2_ready {
+            let before: Vec<(usize, u64)> = failed
+                .iter()
+                .map(|(i, _)| {
+                    (
+                        *i,
+                        std::fs::metadata(out_dir.join(&nzb.files[*i].name))
+                            .map(|m| m.len())
+                            .unwrap_or(0),
+                    )
+                })
+                .collect();
+            let dir = out_dir.clone();
+            let repair = tokio::task::spawn_blocking(move || crate::par2::repair_dir(&dir)).await;
+            match repair {
+                Ok(Ok(rep)) if rep.already_ok || rep.files_repaired > 0 => {
+                    let mut still: Vec<(usize, String)> = Vec::new();
+                    for (fi, msg) in failed.drain(..) {
+                        let name = nzb.files[fi].name.clone();
+                        let dest = out_dir.join(&name);
+                        let Ok(meta) = std::fs::metadata(&dest) else {
+                            still.push((fi, msg));
+                            continue;
+                        };
+                        let after = meta.len();
+                        let b = before.iter().find(|(i, _)| *i == fi).map(|(_, v)| *v).unwrap_or(0);
+                        downloaded = downloaded.saturating_sub(b).saturating_add(after);
+                        ctrl.downloaded.store(downloaded, Ordering::Relaxed);
+                        task.downloaded = downloaded;
+                        if multi {
+                            if let Some(p) = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner()).get_mut(fi) {
+                                p.0 = p.1;
+                            }
+                        }
+                        let segs = nzb.files[fi].segments.len();
+                        let _ = tokio::fs::write(
+                            out_dir.join(format!("{name}.nzbstate")),
+                            format!("{{\"file_idx\":{fi},\"seg_idx\":{segs},\"bytes\":{after}}}"),
+                        )
+                        .await;
+                    }
+                    failed = still;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => repair_note = Some(format!("PAR2 repair failed: {e}")),
+                Err(e) => repair_note = Some(format!("PAR2 repair failed: {e}")),
+            }
+        }
+    }
+    if !failed.is_empty() {
+        let mut msg = format!(
             "NZB: {} file(s) failed: {}",
             failed.len(),
-            failed.join("; ")
-        ));
+            failed.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>().join("; ")
+        );
+        if let Some(n) = repair_note {
+            msg.push_str("; ");
+            msg.push_str(&n);
+        }
+        return Err(msg);
     }
     for file in &nzb.files {
-        let _ = tokio::fs::remove_file(task.dest_dir.join(format!("{}.nzbstate", file.name))).await;
+        let _ = tokio::fs::remove_file(out_dir.join(format!("{}.nzbstate", file.name))).await;
     }
-    // NZB totals are on-wire sizes; report decoded bytes actually written.
     task.total = Some(downloaded);
     ctrl.total.store(downloaded, Ordering::Relaxed);
     task.downloaded = downloaded;
@@ -766,6 +1233,112 @@ mod tests {
         assert!(parse_nzb("<MPD/>").is_err());
         assert!(parse_nzb("<nzb").is_err());
         assert!(parse_nzb("<nzb/>").is_err(), "no files");
+    }
+
+    fn nzb_for(names: &[&str], meta: &[(&str, &str)]) -> Nzb {
+        Nzb {
+            files: names
+                .iter()
+                .map(|n| NzbFile {
+                    name: n.to_string(),
+                    poster: String::new(),
+                    date: 0,
+                    groups: Vec::new(),
+                    segments: Vec::new(),
+                    total_bytes: 0,
+                })
+                .collect(),
+            total_bytes: 0,
+            meta: meta
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn output_name_derivation() {
+        // Single file: file name verbatim (source/meta ignored).
+        assert_eq!(
+            output_name(&nzb_for(&["solo.mkv"], &[]), "https://x/movie.nzb"),
+            "solo.mkv"
+        );
+        // Meta title beats name, source stem, common prefix.
+        assert_eq!(
+            output_name(
+                &nzb_for(
+                    &["Release.Name.2024.part1.rar", "Release.Name.2024.part2.rar"],
+                    &[("title", "My: Release?"), ("name", "Other")]
+                ),
+                "https://x/Other.nzb"
+            ),
+            "My_ Release_",
+            "meta title wins, sanitized"
+        );
+        // Meta name (no title) beats source stem.
+        assert_eq!(
+            output_name(
+                &nzb_for(
+                    &["Release.Name.2024.part1.rar", "Release.Name.2024.part2.rar"],
+                    &[("name", "From Meta")]
+                ),
+                "https://x/Other.nzb"
+            ),
+            "From Meta"
+        );
+        // Source stem: trailing .nzb stripped case-insens.
+        assert_eq!(
+            output_name(
+                &nzb_for(
+                    &["Release.Name.2024.part1.rar", "Release.Name.2024.part2.rar"],
+                    &[]
+                ),
+                "https://x/Movie.Pack.NZB?dl=1"
+            ),
+            "Movie.Pack"
+        );
+        // Skip-listed stems fall through to common prefix.
+        for url in [
+            "https://x/get?id=1",
+            "https://x/download",
+            "https://x/nzb-files.nzb",
+            "https://x/",
+        ] {
+            assert_eq!(
+                output_name(
+                    &nzb_for(
+                        &["Release.Name.2024.part1.rar", "Release.Name.2024.part2.rar"],
+                        &[]
+                    ),
+                    url
+                ),
+                "Release.Name.2024",
+                "url={url} prefix fallback"
+            );
+        }
+        // No usable prefix (<4 after boundary cut): first file stem.
+        assert_eq!(
+            output_name(&nzb_for(&["ab.rar", "cd.rar"], &[]), "https://x/get?id=1"),
+            "ab"
+        );
+    }
+
+    #[test]
+    fn parse_nzb_meta_head() {
+        let x = concat!(
+            "<nzb><head><meta type=\"Title\">  My Release </meta>",
+            "<meta type=\"name\">ignored</meta><meta>NoType</meta>",
+            "<meta type=\"empty\">   </meta></head>",
+            "<file subject=\"p &quot;a.rar&quot;\"><segments><segment bytes=\"10\" number=\"1\">a@b</segment></segments></file>",
+            "<file subject=\"p &quot;b.rar&quot;\"><segments><segment bytes=\"5\" number=\"1\">c@b</segment></segments></file></nzb>"
+        );
+        let n = parse_nzb(x).unwrap();
+        assert_eq!(n.meta.get("title").map(String::as_str), Some("My Release"));
+        assert_eq!(n.meta.get("name").map(String::as_str), Some("ignored"));
+        assert!(!n.meta.contains_key("empty"));
+        assert_eq!(n.meta.len(), 2, "meta without type skipped: {:?}", n.meta);
+        // Title meta (case-insens key) wins as output name.
+        assert_eq!(output_name(&n, "https://x/get?id=1"), "My Release");
     }
 
     #[test]

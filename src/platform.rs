@@ -2,6 +2,27 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// CREATE_NO_WINDOW: console-subsystem children (yt-dlp, ffmpeg, tasklist)
+/// of this GUI-subsystem app otherwise flash a console window on Windows,
+/// even with piped stdio. Grandchildren inherit hidden console.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+pub fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+pub fn no_window_tokio(cmd: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 pub const HOST_NAME: &str = "com.webcraft.host";
 /// ponytail: legacy host/protocol kept one rename cycle for installed extensions.
 pub const LEGACY_HOST_NAME: &str = "com.downloadcraft.host";
@@ -9,6 +30,22 @@ pub const PROTOCOL: &str = "webcraft";
 pub const LEGACY_PROTOCOL: &str = "downloadcraft";
 pub const FIREFOX_EXT_ID: &str = "downloadcraft@downloadcraft.local";
 pub const CHROME_EXT_ID: &str = "ajkokpbgjajmkenllekaokjbglbcingk";
+
+/// Write capture-filter.json from Settings: native host reads it per
+/// captured download; extension never stores filter (reflects app).
+pub fn write_capture_filter(settings: &crate::model::Settings) {
+    let exts: Vec<String> = settings
+        .capture_exts
+        .split(',')
+        .map(|s| s.trim().trim_start_matches('.').to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let _ = std::fs::create_dir_all(config_dir());
+    let _ = std::fs::write(
+        config_dir().join("capture-filter.json"),
+        serde_json::json!({"exts": exts, "minBytes": settings.capture_min_mb.saturating_mul(1024 * 1024)}).to_string(),
+    );
+}
 
 pub fn config_dir() -> PathBuf {
     directories::ProjectDirs::from("", "", "webcraft")
@@ -636,9 +673,9 @@ pub fn register_protocol() -> std::io::Result<()> {
 pub fn open_path(path: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        Command::new("cmd")
-            .args(["/C", "start", "", &path.to_string_lossy()])
-            .spawn()?;
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "start", "", &path.to_string_lossy()]);
+        no_window(&mut cmd).spawn()?;
     }
     #[cfg(target_os = "macos")]
     {
@@ -722,7 +759,9 @@ pub fn power_command(action: PowerAction) -> (String, Vec<String>) {
 }
 pub fn execute_power(action: PowerAction) -> std::io::Result<()> {
     let (p, a) = power_command(action);
-    Command::new(p).args(a).spawn()?;
+    let mut cmd = Command::new(p);
+    cmd.args(a);
+    no_window(&mut cmd).spawn()?;
     Ok(())
 }
 

@@ -4,6 +4,7 @@ use crate::model::*;
 use crate::mpd::*;
 use std::sync::Arc;
 
+#[derive(Debug, PartialEq, Eq)]
 enum Manifest {
     Dash,
     Hls,
@@ -20,8 +21,59 @@ fn is_metalink_url(url: &str) -> bool {
     path.ends_with(".meta4") || path.ends_with(".metalink")
 }
 
+/// Path portion (before `?`/`#`) ends with any suffix, case-insensitive.
+/// Query tokens never count: `watch?f=.mpd` is not a manifest.
+fn url_path_ends(url: &str, suffixes: &[&str]) -> bool {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    suffixes.iter().any(|s| path.ends_with(s))
+}
+
+/// Manifest kind implied by URL alone: path ends `.mpd`/`.m3u8`, or query
+/// names a packaged playlist (Reddit `.../x.mp4?m=DASHPlaylist.mpd`, whose
+/// path ends `.mp4`). Substring-in-query (`.mpd` as a token value) is not
+/// enough.
+fn manifest_kind_from_url(url: &str) -> Option<Manifest> {
+    let lower = url.to_ascii_lowercase();
+    let query = lower
+        .split_once('?')
+        .map(|(_, q)| q.split('#').next().unwrap_or(q))
+        .unwrap_or("");
+    if url_path_ends(url, &[".mpd"]) || query.contains("dashplaylist") {
+        Some(Manifest::Dash)
+    } else if url_path_ends(url, &[".m3u8"]) || query.contains("hlsplaylist") {
+        Some(Manifest::Hls)
+    } else {
+        None
+    }
+}
+
+/// Segment-only URL (single `.ts`/`.m4s` part, no manifest) must not plain-
+/// download into an orphan "complete" file. Only context that rescues it:
+/// `x-page-url` pointing at a manifest itself. Returns rejection reason.
+fn segment_only_reject(task: &DownloadTask) -> Option<String> {
+    if !url_path_ends(&task.url, &[".ts", ".m4s"]) {
+        return None;
+    }
+    let has_manifest_ctx = task
+        .headers
+        .get("x-page-url")
+        .map(|pu| manifest_kind_from_url(pu).is_some())
+        .unwrap_or(false);
+    if has_manifest_ctx {
+        return None;
+    }
+    Some(format!(
+        "segment-only URL has no manifest context (single .ts/.m4s part is not a complete file); download the parent manifest (.m3u8/.mpd) or page instead; url={}",
+        task.url
+    ))
+}
+
 /// `.nzb` URL/local path, `nzb://` wrapper, or explicit `x-nzb` header marker.
-fn is_nzb_url(task: &DownloadTask) -> bool {
+pub fn is_nzb_url(task: &DownloadTask) -> bool {
     if task.headers.contains_key("x-nzb") {
         return true;
     }
@@ -39,6 +91,13 @@ fn is_nzb_url(task: &DownloadTask) -> bool {
         .unwrap_or(url)
         .to_ascii_lowercase()
         .ends_with(".nzb")
+}
+
+pub fn is_nzb_url_str(url: &str) -> bool {
+    is_nzb_url(&DownloadTask {
+        url: url.trim().to_string(),
+        ..Default::default()
+    })
 }
 
 /// Download protocol, derived from task URL/headers. Label source for list UI:
@@ -94,6 +153,18 @@ impl ProtoKind {
     }
 }
 
+/// Pseudo-headers (task config) must never go on wire. headers_for in
+/// engine.rs strips for HTTP path; stream fetches copy headers manually.
+fn is_pseudo_header(k: &str) -> bool {
+    crate::ytdlp::YT_HEADER_KEYS.iter().any(|x| k.eq_ignore_ascii_case(x))
+        || k.eq_ignore_ascii_case("x-page-url")
+        || k.eq_ignore_ascii_case("x-page-stream")
+        || k.eq_ignore_ascii_case("x-page-intent")
+        || k.eq_ignore_ascii_case("x-rep-id")
+        || k.eq_ignore_ascii_case("x-variant-index")
+        || k.eq_ignore_ascii_case("x-nzb")
+}
+
 pub fn proto_kind(task: &DownloadTask) -> ProtoKind {
     let lower = task.url.trim().to_ascii_lowercase();
     if crate::torrent::is_torrent_task(task) {
@@ -114,10 +185,10 @@ pub fn proto_kind(task: &DownloadTask) -> ProtoKind {
     if is_metalink_url(&task.url) {
         return ProtoKind::Metalink;
     }
-    if lower.contains(".mpd") {
+    if manifest_kind_from_url(&task.url) == Some(Manifest::Dash) {
         return ProtoKind::Dash;
     }
-    if lower.contains(".m3u8") {
+    if manifest_kind_from_url(&task.url) == Some(Manifest::Hls) {
         return ProtoKind::Hls;
     }
     if task.headers.contains_key("x-ytdlp") || crate::ytdlp::is_video_page(&task.url) {
@@ -140,6 +211,9 @@ async fn probe_manifest(client: &reqwest::Client, task: &DownloadTask) -> Manife
         req = req.header("Cookie", &task.cookies);
     }
     for (k, v) in &task.headers {
+        if is_pseudo_header(k) {
+            continue;
+        }
         req = req.header(k.as_str(), v.as_str());
     }
     let Ok(resp) = req.send().await else {
@@ -157,14 +231,67 @@ async fn probe_manifest(client: &reqwest::Client, task: &DownloadTask) -> Manife
     let ct = ct.split(';').next().unwrap_or("").trim();
     // IDM MIME map (REA round 6): video/vnd.mpeg.dash.mpd, application/vnd.apple.mpegurl.
     if ct.contains("application/metalink+xml") {
-        Manifest::Metalink
+        return Manifest::Metalink;
     } else if ct.contains("dash") || ct.contains("mpd") {
-        Manifest::Dash
+        return Manifest::Dash;
     } else if ct.contains("mpegurl") || ct.contains("m3u") {
-        Manifest::Hls
-    } else {
-        Manifest::File
+        return Manifest::Hls;
     }
+    // Body sniff: manifests served as video/mp4/octet-stream/text (Reddit
+    // packaged-media, signed CDNs). Peek first bytes; body dropped here,
+    // download path re-fetches (signed URLs tolerate re-GET; probe already
+    // consumed one anyway).
+    use futures_util::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut peek: Vec<u8> = Vec::new();
+    while peek.len() < 1024 {
+        match stream.next().await {
+            Some(Ok(chunk)) => peek.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    classify_body(&peek).unwrap_or(Manifest::File)
+}
+
+/// Classify by body magic: HLS playlist, MPD/metalink XML, else None.
+fn classify_body(bytes: &[u8]) -> Option<Manifest> {
+    let t = String::from_utf8_lossy(bytes);
+    let t = t.trim_start_matches('\u{feff}').trim_start();
+    if t.starts_with("#EXTM3U") {
+        return Some(Manifest::Hls);
+    }
+    if t.starts_with('<') {
+        let head = &t[..t.len().min(512)].to_ascii_lowercase();
+        if head.contains("<mpd") {
+            return Some(Manifest::Dash);
+        }
+        if head.contains("<metalink") {
+            return Some(Manifest::Metalink);
+        }
+    }
+    None
+}
+
+/// Manifest-kind bytes (playlist/XML text) must never complete as media file.
+fn looks_like_manifest_bytes(bytes: &[u8]) -> bool {
+    classify_body(bytes).is_some()
+}
+
+/// Pub wrapper so engine segment fetch can reuse manifest guard.
+pub fn looks_like_manifest_bytes_pub(bytes: &[u8]) -> bool {
+    looks_like_manifest_bytes(bytes)
+}
+
+/// Normalize captured filename for media path: manifest-named tasks
+/// (.m3u8/.mpd) produce merged media, never playlist file.
+fn media_filename(filename: &str) -> String {
+    let lower = filename.to_ascii_lowercase();
+    for ext in [".m3u8", ".mpd", ".m3u"] {
+        if lower.ends_with(ext) {
+            return format!("{}.mp4", &filename[..filename.len() - ext.len()]);
+        }
+    }
+    filename.to_string()
 }
 
 /// Resolve URL to download task(s): URL .mpd/.m3u8 hint first, else probe Content-Type, else plain HTTP.
@@ -208,17 +335,47 @@ pub async fn download_url_with_settings(
     if is_metalink_url(&task.url) {
         return download_metalink(client, task, ctrl).await;
     }
-    // Explicit yt-dlp choice (x-ytdlp header from dialog) beats manifest dispatch:
-    // without this, manifest URLs never reach yt-dlp. Explicit choice fails loud
-    // (no silent native fallback: user picked engine deliberately).
-    if task.headers.contains_key("x-ytdlp") {
+    // yt-dlp for manifests: sniffed signed manifests are where native pipeline
+    // corrupts (playlist saved as media file). Picker choice (x-yt-*) fails
+    // loud (selection never discarded); plain x-ytdlp toggle / manifest
+    // intent: yt-dlp first, native fallback on error (not on cancel).
+    let has_picker = task
+        .headers
+        .keys()
+        .any(|k| k.to_ascii_lowercase().starts_with("x-yt-"));
+    let manifest_intent = task
+        .headers
+        .get("x-page-intent")
+        .map(|s| s == "manifest")
+        .unwrap_or(false);
+    if task.headers.contains_key("x-ytdlp") && has_picker {
         return crate::ytdlp::download_with_ytdlp(task, ctrl).await;
     }
-    if lower.contains(".mpd") {
+    if task.headers.contains_key("x-ytdlp") || manifest_intent {
+        match crate::ytdlp::download_with_ytdlp(task.clone(), ctrl.clone()).await {
+            Ok(t) => return Ok(t),
+            Err(e) => {
+                if ctrl.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(e);
+                }
+                // fall through to native dispatch
+            }
+        }
+        if task.headers.contains_key("x-ytdlp") && !manifest_intent {
+            // x-ytdlp on non-manifest URL with yt-dlp failed: native would
+            // likely also fail, but plain-file fallback is safe. Continue.
+        }
+    }
+    if manifest_kind_from_url(&task.url) == Some(Manifest::Dash) {
         return download_dash(client, task, ctrl, false).await;
     }
-    if lower.contains(".m3u8") {
+    if manifest_kind_from_url(&task.url) == Some(Manifest::Hls) {
         return download_hls(client, task, ctrl).await;
+    }
+    // Segment-only probe/file fallback: never plain-download one part. Runs
+    // before probe so Content-Type sniffing cannot rescue it either.
+    if let Some(reason) = segment_only_reject(&task) {
+        return Err(reason);
     }
     // Video-page URLs (YouTube etc): yt-dlp extracts formats; native probe would
     // download HTML page. Fall through to native flow on any yt-dlp failure.
@@ -233,6 +390,24 @@ pub async fn download_url_with_settings(
         Manifest::Dash => download_dash(client, task, ctrl, false).await,
         Manifest::Hls => download_hls(client, task, ctrl).await,
         Manifest::File => engine::download_http(client, task, ctrl).await,
+    }
+}
+
+#[cfg(test)]
+mod manifest_classify_tests {
+    use super::*;
+
+    #[test]
+    fn body_sniff_classifies() {
+        assert_eq!(classify_body(b"#EXTM3U\n#EXT-X-VERSION:3\n"), Some(Manifest::Hls));
+        assert_eq!(
+            classify_body(b"<?xml version=\"1.0\"?><MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\">"),
+            Some(Manifest::Dash)
+        );
+        assert_eq!(classify_body(b"\x00\x00\x00\x18ftypisom...."), None);
+        assert_eq!(media_filename("movie.m3u8"), "movie.mp4");
+        assert_eq!(media_filename("movie.MPD"), "movie.mp4");
+        assert_eq!(media_filename("movie.mp4"), "movie.mp4");
     }
 }
 
@@ -282,6 +457,9 @@ async fn fetch_text(
         req = req.header("Cookie", &task.cookies);
     }
     for (k, v) in &task.headers {
+        if is_pseudo_header(k) {
+            continue;
+        }
         req = req.header(k.as_str(), v.as_str());
     }
     let resp = req.send().await.map_err(|e| e.to_string())?;
@@ -300,12 +478,25 @@ pub async fn download_dash(
 ) -> Result<DownloadTask, String> {
     let base = url::Url::parse(&task.url).map_err(|e| e.to_string())?;
     let xml = fetch_text(&client, &task, &task.url).await?;
+    task.filename = media_filename(&task.filename);
+    // URL pattern lied: body is HLS or plain media (Reddit packaged-media
+    // variant MP4 at manifest-pattern URL). Route by content, not suffix.
+    {
+        let head = xml.trim_start_matches('\u{feff}').trim_start();
+        if head.starts_with("#EXTM3U") {
+            return Box::pin(download_hls(client, task, ctrl)).await;
+        }
+        if !head.starts_with('<') {
+            return crate::engine::download_http(client, task, ctrl).await;
+        }
+    }
     if is_protected(&xml) {
         task.status = TaskStatus::Protected;
         task.error = "Protected content (DRM) is not supported".into();
         return Ok(task);
     }
-    let mut parsed = parse_mpd(&xml, &base)?;
+    let mut parsed = parse_mpd(&xml, &base)
+        .map_err(|e| format!("DASH manifest parse failed ({e}); url={}", task.url))?;
     if parsed.mpd_type == "dynamic" {
         // Live DASH: poll until stop condition (cancel) or END via repeated fetch collecting new segments.
         // ponytail: IDM live behavior unverified without live fixture against IDM; clone polls minimumUpdatePeriod and accumulates unique segments until cancelled.
@@ -477,7 +668,13 @@ pub async fn download_hls(
             return Ok(video_task);
         }
         // Audio to hidden temp file, then mux into final dest. Mirror DASH: mux fail -> Error, keep video.
+        // Mux/audio temps live in workdir, never dest root (.mux-*.ts litter).
+        let work = task
+            .dest_dir
+            .join(format!(".downloadcraft-hls-mux-{}", task.id));
+        let _ = tokio::fs::create_dir_all(&work).await;
         let mut at = task.clone();
+        at.dest_dir = work.clone();
         at.url = au.clone();
         at.filename = format!(".{}-audio", task.filename);
         match download_hls_media(client.clone(), at, ctrl.clone()).await {
@@ -495,16 +692,17 @@ pub async fn download_hls(
             }
             Ok(_) => {}
         }
-        let audio_file = task.dest_dir.join(format!(".{}-audio", task.filename));
+        let audio_file = work.join(format!(".{}-audio", task.filename));
         let video_file = task.dest_dir.join(&task.filename);
         // ffmpeg cannot mux in-place (input == output) and picks muxer by extension:
         // temp name must keep real extension or it cannot choose output format.
-        let mux_out = task.dest_dir.join(format!(".mux-{}", task.filename));
+        let mux_out = work.join(format!(".mux-{}", task.filename));
         let result = engine::mux_tracks(&[video_file.clone(), audio_file.clone()], &mux_out)
             .await
             .and_then(|()| std::fs::rename(&mux_out, &video_file).map_err(|e| e.to_string()));
         let _ = std::fs::remove_file(&mux_out);
         let _ = std::fs::remove_file(&audio_file);
+        let _ = tokio::fs::remove_dir_all(&work).await;
         match result {
             Ok(()) => return Ok(video_task),
             Err(e) => {
@@ -531,6 +729,9 @@ async fn fetch_key(
         req = req.header("Cookie", &task.cookies);
     }
     for (k, v) in &task.headers {
+        if is_pseudo_header(k) {
+            continue;
+        }
         req = req.header(k.as_str(), v.as_str());
     }
     let resp = req.send().await.map_err(|e| e.to_string())?;
@@ -549,6 +750,23 @@ async fn download_hls_media(
 ) -> Result<DownloadTask, String> {
     let base = url::Url::parse(&task.url).map_err(|e| e.to_string())?;
     let text = fetch_text(&client, &task, &task.url).await?;
+    let mut task = task;
+    task.filename = media_filename(&task.filename);
+    {
+        let head = text.trim_start_matches('\u{feff}').trim_start();
+        if head.starts_with('<') && head.to_ascii_lowercase().contains("<mpd") {
+            return Box::pin(download_dash(client, task, ctrl, false)).await;
+        }
+        if !head.starts_with("#EXTM3U") && !head.starts_with('<') {
+            return crate::engine::download_http(client, task, ctrl).await;
+        }
+        if !head.starts_with("#EXTM3U") {
+            return Err(format!(
+                "Expected HLS playlist, got non-playlist body; url={}",
+                task.url
+            ));
+        }
+    }
     if let Some(m) = hls::key_method(&text) {
         if m != "AES-128" && m != "NONE" {
             let mut t = task.clone();
@@ -698,7 +916,29 @@ async fn download_hls_media(
             out.flush().await.map_err(|e| e.to_string())?;
         }
         let _ = tokio::fs::remove_dir_all(&work).await;
+        // HLS concat is raw TS mostly: validate, remux mp4 or rename .ts.
         let mut t = task;
+        let final_dest = match engine::validate_output(&dest, &t.filename) {
+            Ok(_) => dest.clone(),
+            Err(engine::ValidateFail::TsInMp4) => {
+                let fixed = engine::ensure_mp4_or_ts(&dest).await?;
+                if let Some(name) = fixed.file_name().map(|s| s.to_string_lossy().into_owned()) {
+                    t.filename = name;
+                }
+                fixed
+            }
+            Err(e @ engine::ValidateFail::Msg(_))
+                if e.to_string().contains("empty") || e.to_string().contains("playlist/HTML") =>
+            {
+                return Err(engine::quarantine_bad(&dest, &e))
+            }
+            // Other magic mismatch (e.g. decrypted non-TS payload in .ts):
+            // tolerate — segments already fetched/decrypted, magic is advisory here.
+            Err(_) => dest.clone(),
+        };
+        let total_bytes = std::fs::metadata(&final_dest)
+            .map(|m| m.len())
+            .unwrap_or(total_bytes);
         t.status = TaskStatus::Complete;
         t.downloaded = total_bytes;
         t.total = Some(total_bytes);
@@ -745,5 +985,64 @@ mod tests {
         assert_eq!(kind_of("https://x.org/a.zip"), ProtoKind::Http);
         assert_eq!(kind_of("file.zip"), ProtoKind::File);
         assert_eq!(ProtoKind::Torrent.label(), "TORRENT");
+    }
+
+    #[test]
+    fn manifest_kind_path_not_query_token() {
+        // Query token value `.mpd`/`.m3u8` alone must not route as manifest.
+        assert_eq!(kind_of("https://x.org/watch?f=.mpd"), ProtoKind::Http);
+        assert_eq!(kind_of("https://x.org/watch?f=.m3u8"), ProtoKind::Http);
+        assert_eq!(manifest_kind_from_url("https://x.org/watch?f=.mpd"), None);
+        // Real manifest path (query noise ok) still routes.
+        assert_eq!(manifest_kind_from_url("https://x.org/m.mpd?token=1"), Some(Manifest::Dash));
+        assert_eq!(manifest_kind_from_url("https://x.org/m.m3u8#frag"), Some(Manifest::Hls));
+        assert!(url_path_ends("https://x.org/M.MPD?token=1", &[".mpd"]));
+        assert!(!url_path_ends("https://x.org/watch?f=.mpd", &[".mpd"]));
+        // Reddit packaged: path .mp4, query m=DASHPlaylist.mpd.
+        let reddit = "https://v.redd.it/abc123/m2-vp9-res_854p.mp4?m=DASHPlaylist.mpd";
+        assert_eq!(manifest_kind_from_url(reddit), Some(Manifest::Dash));
+        assert_eq!(kind_of(reddit), ProtoKind::Dash);
+        assert_eq!(
+            manifest_kind_from_url("https://x.org/v.mp4?m=HLSPlaylist.m3u8"),
+            Some(Manifest::Hls)
+        );
+    }
+
+    #[test]
+    fn segment_only_reject_rules() {
+        let bare = DownloadTask {
+            url: "https://cdn.example.com/v/seg-00001.m4s".into(),
+            ..Default::default()
+        };
+        assert!(segment_only_reject(&bare).is_some());
+        let bare_ts = DownloadTask {
+            url: "https://cdn.example.com/v/seg1.ts?tok=1".into(),
+            filename: "seg1.ts".into(),
+            ..Default::default()
+        };
+        assert!(segment_only_reject(&bare_ts).is_some());
+        // Page URL is a video page, not a manifest: still rejected.
+        let mut page_ctx = bare_ts.clone();
+        page_ctx
+            .headers
+            .insert("x-page-url".into(), "https://x.org/watch?v=abc123".into());
+        assert!(segment_only_reject(&page_ctx).is_some());
+        // Page URL is the parent manifest: allowed (manifest context).
+        let mut man_ctx = bare_ts.clone();
+        man_ctx
+            .headers
+            .insert("x-page-url".into(), "https://cdn.example.com/v/pl.m3u8".into());
+        assert!(segment_only_reject(&man_ctx).is_none());
+        let mut dash_ctx = bare.clone();
+        dash_ctx
+            .headers
+            .insert("x-page-url".into(), "https://cdn.example.com/v/pl.mpd".into());
+        assert!(segment_only_reject(&dash_ctx).is_none());
+        // Non-segment URL never rejected.
+        let file = DownloadTask {
+            url: "https://x.org/a.mp4".into(),
+            ..Default::default()
+        };
+        assert!(segment_only_reject(&file).is_none());
     }
 }

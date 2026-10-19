@@ -77,6 +77,9 @@ pub struct DownloadTask {
     /// SFTP private-key file (empty = password auth, else ~/.ssh/id_* probe).
     #[serde(default)]
     pub ssh_key_path: String,
+    /// Torrent file indices to download (empty = all files).
+    #[serde(default)]
+    pub torrent_files: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -236,6 +239,9 @@ pub struct Settings {
     pub nntp_user: String,
     #[serde(default)]
     pub nntp_pass: String,
+    /// NNTP provider connections per NZB, independent of HTTP max_connections.
+    #[serde(default = "def_nntp_connections")]
+    pub nntp_connections: u32,
     /// BitTorrent listen port. 0 = librqbit default (random).
     #[serde(default)]
     pub torrent_listen_port: u16,
@@ -249,9 +255,39 @@ pub struct Settings {
     /// Route new downloads into download_dir/<Category>/ (except General).
     #[serde(default)]
     pub category_subfolders: bool,
+    /// Downloads-table sort column (app sort_col encoding). Default 0 = File Name.
+    #[serde(default)]
+    pub dl_sort_col: u8,
+    /// Downloads-table sort ascending. Absent in old state = true.
+    #[serde(default = "def_true")]
+    pub dl_sort_asc: bool,
+    /// User-dragged downloads-table column widths, full layout (empty = defaults).
+    #[serde(default)]
+    pub dl_col_widths: Vec<f32>,
+    /// User-dragged downloads-table column widths, compact layout (<760px).
+    #[serde(default)]
+    pub dl_col_widths_compact: Vec<f32>,
+    /// User-dragged grabber-table column widths (empty = defaults).
+    #[serde(default)]
+    pub grab_col_widths: Vec<f32>,
+    /// Sidebar rail counts rendered colored badges. Off = plain faint text.
+    #[serde(default = "def_true")]
+    pub nav_count_badges: bool,
+    /// Per-category rail badge colors [r,g,b], keyed by category name
+    /// ("Video", "Audio", ...). Empty/missing key = theme::category_color default.
+    #[serde(default)]
+    pub category_colors: Vec<(String, [u8; 3])>,
+    /// Per-type rail badge colors [r,g,b], keyed by TypeSel key
+    /// ("Torrent","Nntp","Ftp","Stream","YtDlp","Metalink","Http","File").
+    /// Empty/missing key = theme::type_key_color default.
+    #[serde(default)]
+    pub type_colors: Vec<(String, [u8; 3])>,
 }
 fn def_nntp_port() -> u16 {
     563
+}
+fn def_nntp_connections() -> u32 {
+    30
 }
 fn def_conn() -> u32 {
     8
@@ -281,10 +317,19 @@ impl Default for Settings {
             nntp_tls: true,
             nntp_user: String::new(),
             nntp_pass: String::new(),
+            nntp_connections: 30,
             torrent_listen_port: 0,
             torrent_seed_after_complete: false,
             folder_template: String::new(),
             category_subfolders: false,
+            dl_sort_col: 0,
+            dl_sort_asc: true,
+            dl_col_widths: Vec::new(),
+            dl_col_widths_compact: Vec::new(),
+            grab_col_widths: Vec::new(),
+            nav_count_badges: true,
+            category_colors: Vec::new(),
+            type_colors: Vec::new(),
         }
     }
 }
@@ -583,6 +628,81 @@ mod tests {
         let s: Settings = serde_json::from_value(v).unwrap();
         assert_eq!(s.folder_template, "");
         assert!(!s.category_subfolders);
+    }
+
+    #[test]
+    fn torrent_files_selection_persists_and_defaults() {
+        let mut t = DownloadTask {
+            id: "1".into(),
+            torrent_files: vec![0, 2],
+            ..Default::default()
+        };
+        let back: DownloadTask =
+            serde_json::from_value(serde_json::to_value(&t).unwrap()).unwrap();
+        assert_eq!(back.torrent_files, vec![0, 2]);
+        // Old state.json without field -> empty (all files).
+        t.torrent_files.clear();
+        let mut v = serde_json::to_value(&t).unwrap();
+        v.as_object_mut().unwrap().remove("torrent_files");
+        let old: DownloadTask = serde_json::from_value(v).unwrap();
+        assert!(old.torrent_files.is_empty());
+    }
+
+    #[test]
+    fn table_layout_persists_and_defaults_when_absent() {
+        let s = Settings {
+            dl_sort_col: 5,
+            dl_sort_asc: false,
+            dl_col_widths: vec![200.0, 90.0],
+            dl_col_widths_compact: vec![140.0, 70.0],
+            grab_col_widths: vec![300.0, 80.0, 90.0],
+            ..Default::default()
+        };
+        let back: Settings = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(back.dl_sort_col, 5);
+        assert!(!back.dl_sort_asc);
+        assert_eq!(back.dl_col_widths, vec![200.0, 90.0]);
+        assert_eq!(back.dl_col_widths_compact, vec![140.0, 70.0]);
+        assert_eq!(back.grab_col_widths, vec![300.0, 80.0, 90.0]);
+        // Old state without table fields deserializes to defaults.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        for k in ["dl_sort_col", "dl_sort_asc", "dl_col_widths", "dl_col_widths_compact", "grab_col_widths"] {
+            v.as_object_mut().unwrap().remove(k);
+        }
+        let old: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(old.dl_sort_col, 0);
+        assert!(old.dl_sort_asc);
+        assert!(old.dl_col_widths.is_empty() && old.dl_col_widths_compact.is_empty() && old.grab_col_widths.is_empty());
+    }
+
+    #[test]
+    fn badge_colors_persist_and_default_when_absent() {
+        let s = Settings {
+            category_colors: vec![("Video".into(), [196, 138, 216])],
+            type_colors: vec![("Ftp".into(), [127, 179, 170])],
+            ..Default::default()
+        };
+        let back: Settings = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert!(back.nav_count_badges);
+        assert_eq!(back.category_colors, s.category_colors);
+        assert_eq!(back.type_colors, s.type_colors);
+        // Old state without badge fields: badges on, theme default colors.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        for k in ["nav_count_badges", "category_colors", "type_colors"] {
+            v.as_object_mut().unwrap().remove(k);
+        }
+        let old: Settings = serde_json::from_value(v).unwrap();
+        assert!(old.nav_count_badges);
+        assert!(old.category_colors.is_empty() && old.type_colors.is_empty());
+    }
+
+    #[test]
+    fn nntp_connections_defaults_30_when_absent() {
+        assert_eq!(Settings::default().nntp_connections, 30);
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("nntp_connections");
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(s.nntp_connections, 30, "old state without field defaults 30");
     }
 
     #[test]

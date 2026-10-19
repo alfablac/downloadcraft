@@ -6,6 +6,7 @@ pub mod metalink;
 pub mod model;
 pub mod mpd;
 pub mod nntp;
+pub mod par2;
 pub mod platform;
 pub mod queue;
 pub mod scheduler;

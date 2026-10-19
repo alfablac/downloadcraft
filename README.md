@@ -2,7 +2,7 @@
 
 webcraft is a download manager written in Rust with egui. It reimplements the observable parts of Internet Download Manager: segmented downloads, queues, schedules, DASH and HLS, a site grabber, and browser integration. The code was written from scratch. It has no IDM code, binaries, icons, or activation logic, and it is not affiliated with Tonec.
 
-Current version: 0.9.0.
+Current version: 0.10.0.
 
 Runs on Windows 10/11 x86_64, macOS 13 or later (Intel and Apple Silicon), and Linux x86_64 (Ubuntu 22.04 or later, X11 and Wayland).
 
@@ -12,7 +12,7 @@ Runs on Windows 10/11 x86_64, macOS 13 or later (Intel and Apple Silicon), and L
 - FTP downloads with PASV and REST resume, plus FTPS (explicit ftps:// and implicit ftpsi://) over TLS
 - SFTP over SSH, with password or key login, trust on first use host keys, and seek resume
 - BitTorrent from magnet links or .torrent files, with per-file progress and optional seeding after the download finishes
-- NNTP and NZB downloads, with yEnc decoding, CRC32 checks, and TLS. PAR2 repair and archive unpacking are not done
+- NNTP and NZB downloads, with yEnc decoding, CRC32 checks, TLS, and in-process PAR2 repair (when the NZB includes .par2 files). Archive unpacking is not done
 - Metalink v3 and v4 files, which bring their own mirrors and SHA-256 checksum
 - WebDAV through webdav:// and webdavs:// URLs, mapped to plain HTTP or HTTPS
 - Video pages on YouTube, Vimeo, TikTok, Twitch, Dailymotion, Instagram, X, Facebook, Reddit, SoundCloud, Bilibili, and a few short link hosts, handled by a yt-dlp sidecar when one is available and by the built in DASH and HLS code when it is not
@@ -38,6 +38,7 @@ Multi-track downloads are muxed with ffmpeg when ffmpeg is on PATH or beside the
 
 ## Recent versions
 
+- 0.10.0: NZB downloads in parallel over several NNTP connections (1-64 in Options) with in-process PAR2 repair and a file list preview before starting; pick files inside torrents before and during download; video pages probe formats first (quality, audio track, audio-only MP3/M4A, subtitles); extension matches streams to the clicked video only and adds a "This video" quality entry; downloads list gains multi-select, search shortcut, time-left/rate/progress sorting, and delete confirmation with delete-from-disk; colored count badges in the side bar; finished files validated (bad output quarantined as `.bad`) and resumed HLS/DASH cache poisoning fixed. See git history for full list
 - 0.9.0: crash fixes (tray menu pointer, progress bar NaN, poisoned locks, worker panics turned into task errors, duplicate magnets), protocol labels and a type filter in the downloads table, Progress, Add, and Capture as separate windows, per-file torrent parts and swarm figures, and a browser extension that only picks up real downloads and leaves JSON, scripts, and stylesheets alone
 - 0.8.0: per-task speed graph, part status words, and a resume row in the progress dialog; extension starts ranking stream candidates (files before playlists before segments) and preselecting the top one. Scheduler catch up for missed runs, an optional confirmation before power actions, and NNTP tolerance fixes landed after this tag, on the way to 0.9.0
 - 0.7.0: spacing and form layout pass over the dialogs, torrent options in Settings (listen port, seed after complete), and desktop notifications
@@ -92,4 +93,4 @@ Options save as soon as a setting changes. Site Grabber fields use the full pane
 
 ## Limits
 
-DRM-protected streams are refused on purpose. NNTP downloads do not repair with PAR2 or unpack archives yet. There is no Safari extension because that needs Xcode signing. `docs/parity.md` lists the partial items.
+DRM-protected streams are refused on purpose. NNTP downloads repair with included PAR2 files in-process; archive unpacking is not done yet. There is no Safari extension because that needs Xcode signing. `docs/parity.md` lists the partial items.

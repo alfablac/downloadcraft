@@ -198,10 +198,18 @@ async fn dash_subtitle_sidecar_and_media_cache_resume() {
         false,
     );
     let dir = tmpdir("subsidecar");
-    // Pre-seed media cache: replay must need no segment fetch (would still hit server; content proves cache use via distinct preseeded bytes).
+    // Pre-seed media cache + tracks.json seg-length snapshot (fix batch 2:
+    // size-validated replay only; length-less cache is distrusted/refetched).
+    // Replay must need no segment fetch (would still hit server; content
+    // proves cache use via distinct preseeded bytes).
     let work = dir.join(".downloadcraft-media-sub1");
     std::fs::create_dir_all(&work).unwrap();
     std::fs::write(work.join("seg-video-0.bin"), b"CACHED").unwrap();
+    std::fs::write(
+        work.join("tracks.json"),
+        r#"{"tracks":[["video",1],["text",1]],"seg_lens":[["seg-video-0",6]]}"#,
+    )
+    .unwrap();
     let task = DownloadTask {
         id: "sub1".into(),
         url: format!("{base}/withsub.mpd"),

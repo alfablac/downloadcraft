@@ -95,7 +95,62 @@
       .map(function (r) { return r.item; });
   }
 
+  // ---- request<->element correlation (IDM model) ----
+  // Records: {url, redirectFrom, hops:[origin..final], tabId, frameId, time,
+  // type, size, status}. el: {tabId, frameId, srcs:[..], srcKey, postId:"",
+  // since:ms, now:ms}. Returns matched records narrowed to {url,type,size,time}.
+  // Tiers EXCLUSIVE: src/hops hit wins; else bounded postId hit; else timing
+  // (only when element has no real srcs, else timing leaks other videos).
+  // ponytail: timing cannot disambiguate two concurrent no-id/no-src videos;
+  // both are returned (see rank.test.mjs ceiling case). Upgrade:
+  // performance-timeline resource naming if that proves too loose.
+  function boundedHit(u, pid) {
+    if (!pid || !u) return false;
+    var esc = String(pid).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp("[/=?&._-]" + esc + "([/?&#._-]|$)").test(String(u));
+  }
+  function matchRecordsForElement(records, el, now) {
+    var e = el || {};
+    var srcs = {};
+    (e.srcs || []).forEach(function (s) { if (s && !/^(blob|data):/.test(s)) srcs[s] = 1; });
+    if (e.srcKey && !/^(blob|data):/.test(e.srcKey)) srcs[e.srcKey] = 1;
+    var srcKeys = Object.keys(srcs);
+    var since = e.since || 0;
+    var pool = [];
+    (records || []).forEach(function (r) {
+      if (!r || !r.url || /^(blob|data):/.test(r.url)) return;
+      if (!(r.tabId >= 0)) return; // non-tab: not an element request
+      if (e.tabId != null && r.tabId !== e.tabId) return;
+      // Frame filter tolerant: reject only when both frameIds are numbers
+      // and differ. Record with null/undefined frameId passes.
+      if (typeof e.frameId === "number" && typeof r.frameId === "number" && r.frameId !== e.frameId) return;
+      pool.push(r);
+    });
+    function out(list) { return list.map(function (r) { return { url: r.url, type: r.type || "", size: r.size || 0, time: r.time || 0 }; }); }
+    function hopsOf(r) { return Array.isArray(r.hops) ? r.hops : []; }
+    if (srcKeys.length) {
+      var srcHits = pool.filter(function (r) {
+        return !!(srcs[r.url] || (r.redirectFrom && srcs[r.redirectFrom]) || hopsOf(r).some(function (h) { return !!srcs[h]; }));
+      });
+      if (srcHits.length) return out(srcHits);
+    }
+    if (e.postId) {
+      var postHits = pool.filter(function (r) {
+        return boundedHit(r.url, e.postId) || boundedHit(r.redirectFrom, e.postId)
+          || hopsOf(r).some(function (h) { return boundedHit(h, e.postId); });
+      });
+      if (postHits.length) return out(postHits);
+    }
+    // Timing anchored at firstPlay (since), never at click time (now):
+    // late click must not widen window. No since -> no timing hits.
+    if (!srcKeys.length && since) {
+      return out(pool.filter(function (r) { return !!(r.time && r.time >= since - 2000 && r.time <= since + 45000); }));
+    }
+    return [];
+  }
+
   g.rankCandidates = rankCandidates;
-  g.DCRank = { rankCandidates: rankCandidates, kindOf: kindOf, canonicalUrl: canonicalUrl };
+  g.matchRecordsForElement = matchRecordsForElement;
+  g.DCRank = { rankCandidates: rankCandidates, kindOf: kindOf, canonicalUrl: canonicalUrl, matchRecordsForElement: matchRecordsForElement };
   if (typeof module !== "undefined" && module.exports) module.exports = g.DCRank;
 })(typeof globalThis !== "undefined" ? globalThis : this);

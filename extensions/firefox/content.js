@@ -5,18 +5,39 @@
 (function () {
   const api = typeof browser !== "undefined" ? browser : chrome;
   const wired = new WeakSet();
+  // Stable per-element id (IDM model): WeakMap video -> "wc1", "wc2"...
+  const elIds = new WeakMap();
+  let elSeq = 0;
+  function elementId(video) { let id = elIds.get(video); if (!id) { id = "wc" + (++elSeq); elIds.set(video, id); } return id; }
+  function anchorFor(video) {
+    // Captured at firstPlay (scan/playing handlers set fields). srcKey =
+    // non-blob currentSrc at anchor time; survives later src swaps.
+    if (!video._wcAnchor) {
+      const srcs = directUrls(video);
+      video._wcAnchor = { since: video._wcFirstPlay || video._wcSeen || 0, postId: idFromUrl(permalinkFor(video)) || idFromUrl(location.href), srcKey: srcs[0] || "" };
+    }
+    return video._wcAnchor;
+  }
+  function elementFor(video) {
+    const a = anchorFor(video);
+    return { id: elementId(video), srcs: directUrls(video), srcKey: a.srcKey, postId: a.postId, since: a.since, now: Date.now() };
+  }
   function filenameFromUrl(u) {
     try { const p = new URL(u).pathname; const last = p.split("/").pop(); return last ? decodeURIComponent(last) : u; } catch (e) { return u.split("/").pop() || u; }
   }
   function candidateLabel(c) { return `${filenameFromUrl(c.url)} (${c.type || "media"})`; }
-  function fetchCandidates(cb) {
+  function fetchCandidates(cb, video) {
     let done = false;
     const finish = (list) => { if (!done) { done = true; cb(list || []); } };
+    setTimeout(() => finish([]), 900);
     try {
-      const maybe = api.runtime.sendMessage({ type: "getCandidates" }, (r) => finish(r && r.candidates));
+      const msg = { type: "getCandidates" };
+      if (video) msg.element = elementFor(video);
+      const maybe = api.runtime.sendMessage(msg, (r) => finish(r && r.candidates));
       if (maybe && maybe.then) maybe.then((r) => finish(r && r.candidates), () => finish([]));
     } catch (e) { finish([]); }
   }
+  function pageUrl() { return location.href; }
   function labelFor(el, url) {
     const q = el.getAttribute && (el.getAttribute("data-quality") || el.getAttribute("label") || el.getAttribute("title"));
     return q ? `${q} — ${url.split("/").pop()}` : url.split("/").pop();
@@ -28,57 +49,26 @@
     panel.id = "downloadcraft-panel";
     panel.style.cssText = "position:absolute;z-index:2147483647;background:#161616;color:#eee;font:12px sans-serif;border:1px solid #555;padding:6px;box-shadow:0 2px 10px rgba(0,0,0,.5);max-width:480px;min-width:260px;";
     panel.innerHTML = '<div style="display:flex;justify-content:flex-end;align-items:center;margin-bottom:4px;"><button class="dc-close" style="cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #555;padding:0 6px;">×</button></div><div class="downloadcraft-items"></div>';
-    panel.querySelector(".dc-close").addEventListener("click", () => { if (panel.dataset.confirmId) { api.runtime.sendMessage({ type: "downloadcraft-confirm-result", id: Number(panel.dataset.confirmId), action: "browser" }); } panel.remove(); });
+    panel.querySelector(".dc-close").addEventListener("click", () => panel.remove());
     document.documentElement.appendChild(panel);
     return panel;
   }
   function fmtSize(n) { if (!n) return ""; if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB"; if (n >= 1024) return (n / 1024).toFixed(1) + " KB"; return n + " B"; }
-  function ensureConfirm(msg) {
-    let panel = ensurePanel();
-    panel.id = "downloadcraft-panel";
-    panel.dataset.confirmId = String(msg.id);
-    const box = panel.querySelector(".downloadcraft-items");
-    box.innerHTML = "";
-    const close = panel.querySelector(".dc-close");
-    const finish = (action) => { clearTimeout(timer); if (panel.dataset.confirmId) delete panel.dataset.confirmId; api.runtime.sendMessage({ type: "downloadcraft-confirm-result", id: msg.id, action }); panel.remove(); };
-    const name = document.createElement("div");
-    name.textContent = msg.filename || filenameFromUrl(msg.url);
-    name.style.cssText = "font-weight:bold;word-break:break-all;margin:2px 0 4px;";
-    const meta = document.createElement("div");
-    meta.textContent = [fmtSize(msg.size), msg.mime].filter(Boolean).join("  ");
-    meta.style.cssText = "color:#bbb;word-break:break-all;";
-    const link = document.createElement("div");
-    link.textContent = msg.url.length > 120 ? msg.url.slice(0, 117) + "..." : msg.url;
-    link.style.cssText = "color:#8ab4f8;word-break:break-all;margin:2px 0 6px;";
-    const row = document.createElement("div");
-    row.style.cssText = "display:flex;gap:6px;";
-    const mk = (text, action, primary) => {
-      const b = document.createElement("button");
-      b.textContent = text;
-      b.style.cssText = "flex:1;text-align:center;margin:2px 0;padding:6px;cursor:pointer;border:1px solid #555;color:#eee;background:" + (primary ? "#1d65d8" : "#2a2a2a") + ";";
-      b.addEventListener("click", () => finish(action));
-      return b;
-    };
-    row.appendChild(mk("Download", "downloadcraft", true));
-    row.appendChild(mk("Browser download", "browser", false));
-    box.appendChild(name); box.appendChild(meta); box.appendChild(link); box.appendChild(row);
-    // No answer (panel orphaned?) -> default browser download: file not lost.
-    const timer = setTimeout(() => finish("browser"), 120000);
-    panel.style.left = (window.scrollX + Math.max(8, (window.innerWidth - 480) / 2)) + "px";
-    panel.style.top = (window.scrollY + 16) + "px";
-  }
-  function showPanel(anchor, items) {
-    if (!items.length) return;
+  // Ask box removed: captured downloads go straight to webcraft modal.
+  function ensureConfirm(msg) { /* legacy no-op */ }
+  function showPanel(anchor, items, note) {
+    // Empty: note-only panel, no fake clickable item, no silent return.
+    if (!items.length && !note) note = "No streams detected for this video";
     const panel = ensurePanel();
-    if (panel.dataset.confirmId) return; // confirm pending: picker must not overwrite it
     const box = panel.querySelector(".downloadcraft-items");
     box.innerHTML = "";
+    if (note) { const hd = document.createElement("div"); hd.textContent = note; hd.style.cssText = "padding:2px 6px 4px;color:#9ec1ff;font-weight:600;"; box.appendChild(hd); }
     items.forEach((it, i) => {
       const b = document.createElement("button");
       b.textContent = it.label;
       if (i === 0) { b.setAttribute("aria-selected", "true"); b.dataset.selected = "1"; }
       b.style.cssText = "display:block;width:100%;text-align:left;margin:2px 0;cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #555;padding:4px 6px;" + (i === 0 ? "outline:2px solid #8ab4f8;" : "");
-      b.addEventListener("click", () => { api.runtime.sendMessage({ type: "downloadcraft-video-panel", url: it.url, filename: it.filename || filenameFromUrl(it.url), mime: it.mime || it.type || "" }); panel.remove(); });
+      b.addEventListener("click", () => { api.runtime.sendMessage({ type: "downloadcraft-video-panel", url: it.url, intent: it.intent || "stream", pageUrl: it.pageUrl || pageUrl(), filename: it.filename || filenameFromUrl(it.url), mime: it.mime || it.type || "" }); panel.remove(); });
       box.appendChild(b);
     });
     const r = anchor.getBoundingClientRect();
@@ -110,28 +100,112 @@
     if (video.currentSrc) urls.push(video.currentSrc);
     if (video.src) urls.push(video.src);
     video.querySelectorAll("source").forEach((s) => { if (s.src) urls.push(s.src); });
-    return [...new Set(urls)].filter((u) => u && !u.startsWith("blob:"));
+    return [...new Set(urls)].filter((u) => u && !u.startsWith("blob:") && !u.startsWith("data:"));
+  }
+  function idFromUrl(u) {
+    const m = String(u || "").match(/\/status\/(\d+)|\/comments\/([a-z0-9]+)|[?&]v=([A-Za-z0-9_-]{6,})|youtu\.be\/([A-Za-z0-9_-]{6,})|\/shorts\/([A-Za-z0-9_-]{6,})/i);
+    return m ? (m[1] || m[2] || m[3] || m[4] || m[5]) : "";
+  }
+  function streamIdFromUrl(u) {
+    const m = String(u || "").match(/amplify_video\/(\d+)|ext_tw_video\/(\d+)|v\.redd\.it\/([a-z0-9]+)/i);
+    return m ? (m[1] || m[2] || m[3]) : "";
+  }
+  const CARD_SEL = "article,[data-testid='tweet'],shreddit-post,ytd-rich-item-renderer,ytd-video-renderer,ytd-compact-video-renderer";
+  function cardScope(video) {
+    let el = video;
+    for (let i = 0; i < 4 && el; i++) {
+      if (el.closest) { const s = el.closest(CARD_SEL); if (s) return s; }
+      const root = el.getRootNode && el.getRootNode();
+      el = root && root.host ? root.host : (el.parentElement || null);
+      if (el && el.closest) { const s = el.closest(CARD_SEL); if (s) return s; }
+    }
+    return null;
+  }
+  function cleanPermalink(u) {
+    try {
+      const x = new URL(u, location.href);
+      x.hash = "";
+      let m = x.pathname.match(/\/status\/(\d+)/);
+      if (m) return x.origin + x.pathname.slice(0, x.pathname.indexOf(m[0]) + m[0].length);
+      m = x.pathname.match(/\/comments\/([a-z0-9]+)/i);
+      if (m) return x.origin + x.pathname.slice(0, x.pathname.indexOf(m[0]) + m[0].length);
+      if (x.pathname === "/watch") return x.origin + "/watch?v=" + (x.searchParams.get("v") || "");
+      [...x.searchParams.keys()].forEach((k) => x.searchParams.delete(k));
+      return x.toString();
+    } catch (e) { return String(u || location.href); }
+  }
+  function isVideoPageUrl(u) {
+    return /\/status\/\d+|\/comments\/[a-z0-9]+|\/watch\?v=|\/shorts\/|youtu\.be\/|\/videos\/|\/reel\/|\/video\//i.test(String(u || ""));
+  }
+  function permalinkFor(video) {
+    try {
+      const scope = video ? cardScope(video) : null;
+      if (scope) {
+        const links = [...scope.querySelectorAll('a[href*="/status/"],a[href*="/comments/"],a[href*="/watch?v="],a[href*="/shorts/"],a[href*="youtu.be/"]')];
+        const own = links.filter((a) => cardScope(a) === scope);
+        const timed = own.find((a) => a.querySelector("time"));
+        if (timed) return cleanPermalink(timed.href);
+        if (own.length) return cleanPermalink(own[0].href);
+      }
+    } catch (e) {}
+    return cleanPermalink(location.href);
+  }
+  function boundedIdHit(url, pid) {
+    if (!pid) return false;
+    const esc = pid.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp("[/=?&._-]" + esc + "([/?&#._-]|$)").test(url);
+  }
+  function scopedCandidates(video, candidates) {
+    const pid = idFromUrl(permalinkFor(video)) || idFromUrl(location.href);
+    const since = video._wcFirstPlay || video._wcSeen || 0;
+    const reddit = /(^|\.)reddit\.com$/.test(location.hostname);
+    return candidates.filter((c) => {
+      if (!c || !c.url || c.url.startsWith("blob:")) return false;
+      const sid = streamIdFromUrl(c.url);
+      const xSid = sid && !/v\.redd\.it/.test(c.url) ? sid : "";
+      if (xSid && pid) return xSid === pid;
+      if (pid && boundedIdHit(c.url, pid)) return true;
+      if (xSid && !pid) return false;
+      if (reddit && pid) return false;
+      if (since && c.time) return c.time >= since - 2000 && c.time <= since + 45000;
+      return false;
+    });
+  }
+  function playerRoot(video) {
+    try {
+      const vr = video.getBoundingClientRect();
+      let host = video;
+      let el = video.parentElement;
+      for (let i = 0; i < 4 && el; i++) {
+        const r = el.getBoundingClientRect();
+        if (Math.abs(r.width - vr.width) <= 12 && Math.abs(r.height - vr.height) <= 12 && r.width >= 40) { host = el; el = el.parentElement; } else break;
+      }
+      return host;
+    } catch (e) { return video; }
   }
   function showForVideo(video) {
     // Rescan at click time: manifests/page media declared after load.
     scanManifests();
-    const direct = [...new Set([...directUrls(video), ...pageMediaUrls()])];
-    fetchCandidates((candidates) => {
-      if (!direct.length && !candidates.length && !manifestUrls.length) {
-        const panel = ensurePanel();
-        const box = panel.querySelector(".downloadcraft-items");
-        box.innerHTML = '<div style="color:#bbb;padding:4px 2px;">No stream captured yet. Press play on the video, then click again.</div>';
-        const r = video.getBoundingClientRect();
-        panel.style.left = (window.scrollX + Math.max(8, r.left)) + "px";
-        panel.style.top = (window.scrollY + r.bottom + 4) + "px";
-        return;
-      }
+    const pid = idFromUrl(permalinkFor(video));
+    const scopedGlobal = /(^|\.)reddit\.com$/.test(location.hostname) ? [] : [...manifestUrls, ...pageMediaUrls()].filter((u) => pid && boundedIdHit(u, pid));
+    const direct = [...new Set([...directUrls(video), ...scopedGlobal])];
+    fetchCandidates(((candidates) => {
+      // Bg element scoping primary; scopedCandidates second-pass safety.
+      // If client rules empty bg's src/id hits, trust bg (same tab+frame).
+      const clientScoped = scopedCandidates(video, candidates);
+      const scoped = clientScoped.length ? clientScoped : candidates;
       const byUrl = new Map();
       direct.forEach((u) => byUrl.set(u, { url: u, label: labelFor(video, u), filename: filenameFromUrl(u) }));
-      manifestUrls.forEach((u) => { if (!byUrl.has(u)) byUrl.set(u, { url: u, label: filenameFromUrl(u), filename: filenameFromUrl(u) }); });
-      candidates.forEach((c) => { if (c && c.url && !c.url.startsWith("blob:")) byUrl.set(c.url, { url: c.url, label: candidateLabel(c), filename: filenameFromUrl(c.url), type: c.type, mime: c.type }); });
-      showPanel(video, (typeof rankCandidates === "function" ? rankCandidates : (x) => x)([...byUrl.values()]));
-    });
+      scoped.forEach((c) => { if (c && c.url && !c.url.startsWith("blob:")) byUrl.set(c.url, { url: c.url, label: candidateLabel(c), filename: filenameFromUrl(c.url), type: c.type, mime: c.type }); });
+      const streams = (typeof rankCandidates === "function" ? rankCandidates : (x) => x)([...byUrl.values()]);
+      // IDM box for THIS video: page send first (formats in webcraft),
+      // then this video's own streams only — never tab-global list.
+      const pu = permalinkFor(video);
+      const items = [];
+      if (isVideoPageUrl(pu)) items.push({ url: pu, pageUrl: pu, intent: "page", label: "⬇ This video — webcraft (choose quality / audio / subs)", filename: filenameFromUrl(pu), type: "page" });
+      streams.forEach((it) => { const isMan = /mpd|m3u8|dash|mpegurl|DASHPlaylist|HLSPlaylist/i.test(it.url || "") || /mpegurl|dash/i.test(it.type || ""); items.push({ ...it, intent: isMan ? "manifest" : "stream", pageUrl: pu, label: (isMan ? "Playlist (yt-dlp/native) · " : "") + (it.label || it.url) }); });
+      showPanel(video, items);
+    }), video);
   }
   const btnFor = new WeakMap();
   function positionBtn(video) {
@@ -184,28 +258,34 @@
     // hidden state must not swallow clicks meant for video controls.
     const showBtn = () => { btn.style.opacity = ".9"; btn.style.pointerEvents = "auto"; };
     const hideBtn = () => { btn.style.opacity = "0"; btn.style.pointerEvents = "none"; };
-    video.addEventListener("mouseenter", showBtn);
-    video.addEventListener("mouseleave", hideBtn);
+    // Hover on player wrapper: overlays cover <video> (X/YouTube).
+    const hoverHost = playerRoot(video);
+    hoverHost.addEventListener("mouseenter", showBtn);
+    hoverHost.addEventListener("mouseleave", hideBtn);
     btn.addEventListener("mouseenter", showBtn);
     btn.addEventListener("mouseleave", hideBtn);
     btn.addEventListener("focus", showBtn);
     btn.addEventListener("blur", hideBtn);
 
     btnFor.set(video, btn);
+    btnForEntries.push([video, btn]);
+    if (!video._wcSeen) video._wcSeen = Date.now();
     (document.body || document.documentElement).appendChild(btn);
     positionBtn(video);
     return btn;
   }
   function scanVideo(video) {
-    // Decorative hero/background loops: muted+loop+autoplay short clips get no button.
-    if (video.loop && video.muted && video.autoplay) return;
     if (wired.has(video)) { attachBtn(video); return; }
     wired.add(video);
-    // Blob/MSE players (Reddit etc): button must exist before any direct URL
-    // is knowable; streams resolve from sniffed requests at click time.
-    const show = () => attachBtn(video);
-    // Play-latch: button only once video actually plays (or already playing at wire time).
-    if (!video.paused && !video.ended) show(); else video.addEventListener("playing", show, { once: true });
+    // Button on poster/metadata too: paused X/Reddit videos never fire
+    // `playing`, and loop+muted+autoplay IS the X feed video shape.
+    const isBig = () => { const r = video.getBoundingClientRect(); return r.width >= 120 && r.height >= 68; };
+    const show = () => { if (isBig()) attachBtn(video); };
+    if (isBig() || video.poster || video.readyState >= 1 || video.currentSrc || !video.paused) attachBtn(video);
+    video.addEventListener("loadstart", () => { video._wcFirstPlay = 0; video._wcSeen = Date.now(); video._wcAnchor = null; });
+    video.addEventListener("playing", () => { if (!video._wcFirstPlay) { video._wcFirstPlay = Date.now(); anchorFor(video); } show(); });
+    video.addEventListener("loadedmetadata", show);
+    video.addEventListener("canplay", show);
   }
   let manifestUrls = [];
   function scanManifests() {
@@ -218,17 +298,42 @@
     rel.forEach((m) => { try { out.push(new URL(m.replace(/^["'(=]\s*/, ""), location.href).href); } catch (e) {} });
     manifestUrls = [...new Set(out)];
   }
-  function scan() { document.querySelectorAll("video").forEach(scanVideo); } // video only: audio via context menu // scanManifests only at click: full innerHTML regex per observer scan = biggest page cost
+  const btnForEntries = [];
+  function allVideos(root) {
+    const out = [];
+    const walk = (r) => {
+      r.querySelectorAll("video").forEach((v) => out.push(v));
+      r.querySelectorAll("*").forEach((el) => { if (el.shadowRoot) walk(el.shadowRoot); });
+    };
+    walk(root || document);
+    return out;
+  }
+  function scan() { allVideos().forEach(scanVideo); } // video only: audio via context menu // scanManifests only at click: full innerHTML regex per observer scan = biggest page cost
   // Debounced: full-page rescan on every DOM mutation is too expensive.
   let pending = null;
-  const mo = new MutationObserver(() => { if (pending) return; pending = setTimeout(() => { pending = null; scan(); document.querySelectorAll("video, audio").forEach(positionBtn); }, 400); });
+  const mo = new MutationObserver(() => { if (pending) return; pending = setTimeout(() => { pending = null; scan(); for (let i = btnForEntries.length - 1; i >= 0; i--) { const [v, b] = btnForEntries[i]; if (!v.isConnected) { b.remove(); btnForEntries.splice(i, 1); } } document.querySelectorAll("video, audio").forEach(positionBtn); }, 400); });
   window.addEventListener("resize", () => document.querySelectorAll("video, audio").forEach(positionBtn), { passive: true });
+  window.addEventListener("scroll", () => document.querySelectorAll("video, audio").forEach(positionBtn), { passive: true });
   mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "poster"] });
   scan();
   api.runtime.onMessage.addListener((msg) => {
     // Sniffed candidates never touch UI: panel opens only on user click.
     if (msg.type === "downloadcraft-confirm" && self === top) ensureConfirm(msg);
-    // scan handler removed: toolbar click is no-op
+    if (msg.type === "downloadcraft-scan") {
+      let anchor = null, best = 0;
+      allVideos().forEach((v) => {
+        const r = v.getBoundingClientRect();
+        const a = r.width * r.height;
+        if (r.width >= 120 && r.height >= 68 && a > best) { best = a; anchor = v; }
+      });
+      if (anchor) { attachBtn(anchor); showForVideo(anchor); }
+      else {
+        // No video element: send page itself (yt-dlp probes it app-side).
+        const pu = location.href;
+        api.runtime.sendMessage({ type: "downloadcraft-video-panel", url: pu, intent: "page", pageUrl: pu, filename: filenameFromUrl(pu), mime: "" });
+      }
+      return;
+    }
     if (msg.type === "downloadcraft-grab-all") {
       // IDM "Download all links": <a href> with downloadable extension, deduped.
       const seenUrls = new Set();

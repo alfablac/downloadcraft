@@ -33,23 +33,35 @@ fn yenc(data: &[u8], name: &str) -> Vec<u8> {
 
 struct Fake {
     cmds: Arc<Mutex<Vec<String>>>,
+    peak_body: Arc<std::sync::atomic::AtomicUsize>,
     port: u16,
 }
 
 fn fake_nntp(articles: Vec<(String, Vec<u8>)>) -> Fake {
+    fake_nntp_delay(articles, 0)
+}
+
+fn fake_nntp_delay(articles: Vec<(String, Vec<u8>)>, delay_ms: u64) -> Fake {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let cmds: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let cmds2 = cmds.clone();
+    let peak_body = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peak2 = peak_body.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { continue };
             let articles = articles.clone();
             let cmds = cmds2.clone();
-            std::thread::spawn(move || serve_conn(&mut s, &articles, &cmds));
+            let peak = peak2.clone();
+            std::thread::spawn(move || serve_conn(&mut s, &articles, &cmds, delay_ms, &peak));
         }
     });
-    Fake { cmds, port }
+    Fake {
+        cmds,
+        peak_body,
+        port,
+    }
 }
 
 fn read_cmd(s: &mut TcpStream) -> Option<String> {
@@ -68,7 +80,15 @@ fn read_cmd(s: &mut TcpStream) -> Option<String> {
     }
 }
 
-fn serve_conn(s: &mut TcpStream, articles: &[(String, Vec<u8>)], cmds: &Arc<Mutex<Vec<String>>>) {
+fn serve_conn(
+    s: &mut TcpStream,
+    articles: &[(String, Vec<u8>)],
+    cmds: &Arc<Mutex<Vec<String>>>,
+    delay_ms: u64,
+    peak_body: &Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::atomic::Ordering::SeqCst;
+    static CUR_BODY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let _ = s.write_all(b"200 fake NNTP ready\r\n");
     while let Some(line) = read_cmd(s) {
         cmds.lock().unwrap().push(line.clone());
@@ -84,6 +104,12 @@ fn serve_conn(s: &mut TcpStream, articles: &[(String, Vec<u8>)], cmds: &Arc<Mute
             match articles.iter().find(|(k, _)| k == id) {
                 Some((_, body)) => {
                     let _ = s.write_all(format!("222 0 <{id}> article retrieved\r\n").as_bytes());
+                    let cur = CUR_BODY.fetch_add(1, SeqCst) + 1;
+                    peak_body.fetch_max(cur, SeqCst);
+                    if delay_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
+                    CUR_BODY.fetch_sub(1, SeqCst);
                     // Dot-stuff lines starting with '.' per NNTP.
                     for l in body.split(|&b| b == b'\n') {
                         if l.starts_with(b".") {
@@ -194,8 +220,12 @@ async fn nntp_downloads_nzb_files_via_fake_server() {
     let settings = settings_for(&fake);
     let (done, ctrl) = run_nzb(&dir, &nzb_path, &settings).await;
     assert_eq!(done.status, TaskStatus::Complete, "{}", done.error);
-    assert_eq!(std::fs::read(dir.join("file1.bin")).unwrap(), data1);
-    assert_eq!(std::fs::read(dir.join("file2.bin")).unwrap(), data2);
+    // Multi-file NZB: folder named from NZB source stem (test.nzb -> test).
+    assert_eq!(done.filename, "test");
+    assert_eq!(done.dest_dir, dir);
+    let out = dir.join("test");
+    assert_eq!(std::fs::read(out.join("file1.bin")).unwrap(), data1);
+    assert_eq!(std::fs::read(out.join("file2.bin")).unwrap(), data2);
     assert_eq!(done.downloaded, (data1.len() + data2.len()) as u64);
     assert_eq!(done.total, Some((data1.len() + data2.len()) as u64));
     assert_eq!(
@@ -211,7 +241,7 @@ async fn nntp_downloads_nzb_files_via_fake_server() {
         vec![(640, 640), (320, 320)]
     );
     // Sidecars cleaned up on full success.
-    assert!(!dir.join("file1.bin.nzbstate").exists());
+    assert!(!out.join("file1.bin.nzbstate").exists());
     let cmds = fake.cmds.lock().unwrap().clone();
     assert!(cmds.iter().any(|c| c == "AUTHINFO USER alice"), "{cmds:?}");
     assert!(cmds.iter().any(|c| c == "AUTHINFO PASS secret"), "{cmds:?}");
@@ -248,7 +278,8 @@ async fn nntp_missing_article_430_errors() {
     assert!(r.is_err(), "430 must error, got {r:?}");
     let e = r.unwrap_err();
     assert!(e.contains("430") && e.contains("gone.bin"), "{e}");
-    assert!(!dir.join("gone.bin").exists(), "incomplete file removed");
+    // Damaged file retained (padded) for PAR2 attempt; no par2 set here.
+    assert!(dir.join("gone.bin").exists(), "incomplete file retained");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -287,9 +318,12 @@ async fn nntp_missing_file_fails_others_continue_resume_skips_done() {
         .await;
     let e = r.unwrap_err();
     assert!(e.contains("file2.bin") && e.contains("430"), "{e}");
-    assert_eq!(std::fs::read(dir.join("file1.bin")).unwrap(), data1);
-    assert!(!dir.join("file2.bin").exists(), "failed file dest removed");
-    assert!(dir.join("file1.bin.nzbstate").exists(), "done file sidecar kept");
+    let out1 = dir.join("test");
+    assert_eq!(std::fs::read(out1.join("file1.bin")).unwrap(), data1);
+    // Failed file retained partial (padded hole candidate for PAR2).
+    assert!(out1.join("file2.bin").exists(), "failed file dest retained");
+    assert!(out1.join("file1.bin.nzbstate").exists(), "done file sidecar kept");
+    assert!(!out1.join("file2.bin.nzbstate").exists(), "failed file no sidecar");
     assert!(!ctrl
         .parts_are_segments
         .load(std::sync::atomic::Ordering::Relaxed));
@@ -307,8 +341,8 @@ async fn nntp_missing_file_fails_others_continue_resume_skips_done() {
         .unwrap();
     assert_eq!(done.status, TaskStatus::Complete, "{}", done.error);
     assert_eq!(done.downloaded, 900);
-    assert_eq!(std::fs::read(dir.join("file1.bin")).unwrap(), data1);
-    assert_eq!(std::fs::read(dir.join("file2.bin")).unwrap(), data2);
+    assert_eq!(std::fs::read(out1.join("file1.bin")).unwrap(), data1);
+    assert_eq!(std::fs::read(out1.join("file2.bin")).unwrap(), data2);
     assert_eq!(
         ctrl2.parts.lock().unwrap().clone(),
         vec![(640, 640), (320, 320)]
@@ -320,6 +354,101 @@ async fn nntp_missing_file_fails_others_continue_resume_skips_done() {
     );
     assert!(cmds.iter().any(|c| c == "BODY <s3@news>"), "{cmds:?}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// yEnc with `=ypart begin/end` (1-based inclusive): NNTP writer zero-pads
+/// holes to `begin-1` before appending, so a missing middle segment leaves
+/// an aligned hole PAR2 can rebuild.
+fn yenc_part(data: &[u8], name: &str, total: usize, begin: usize) -> Vec<u8> {
+    // begin is 1-based offset of data[0].
+    let mut out = format!(
+        "=ybegin part={} size={total} name={name}\r\n=ypart begin={begin} end={}\r\n",
+        1,
+        begin + data.len() - 1
+    )
+    .into_bytes();
+    for &b in data {
+        let c = b.wrapping_add(42);
+        if matches!(c, 0 | 9 | 10 | 13 | 61) {
+            out.push(b'=');
+            out.push(c.wrapping_add(64));
+        } else {
+            out.push(c);
+        }
+    }
+    out.extend_from_slice(
+        format!(
+            "\r\n=yend size={} part=1 pcrc32={:08x}\r\n",
+            data.len(),
+            crc32(data)
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+#[tokio::test]
+async fn nntp_par2_repairs_missing_segment() {
+    use downloadcraft_lib::par2;
+    // Scratch dir: source bytes + PAR2 set built there. NZB must NOT be in
+    // scratch (create_set scans it); dest separate so NZB/par2 arrive via fake.
+    let root = tmpdir("par2e2e");
+    let scratch = root.join("scratch");
+    let dest = root.join("dest");
+    std::fs::create_dir_all(&scratch).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+    let data: Vec<u8> = (0u32..200).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+    std::fs::write(scratch.join("movie.bin"), &data).unwrap();
+    let names = par2::test_support::create_set(&scratch, 64, 2).unwrap();
+    assert_eq!(names.len(), 2, "{names:?}");
+    let (index_name, vol_name) = (names[0].clone(), names[1].clone());
+    let index_bytes = std::fs::read(scratch.join(&index_name)).unwrap();
+    let vol_bytes = std::fs::read(scratch.join(&vol_name)).unwrap();
+    // Segments: movie.bin in 3 chunks 64/64/72, middle omitted (430).
+    // yEnc parts carry begin so writer pads hole 64..128 with zeros.
+    let chunk = |a: &[u8], b: usize| yenc_part(a, "movie.bin", data.len(), b);
+    let fake = fake_nntp(vec![
+        ("pm1@news".into(), chunk(&data[0..64], 1)),
+        ("pm3@news".into(), chunk(&data[128..200], 129)),
+        ("pi1@news".into(), yenc(&index_bytes, &index_name)),
+        ("pv1@news".into(), yenc(&vol_bytes, &vol_name)),
+    ]);
+    // NZB multi-file "movie.nzb" -> out dir dest/movie (source stem).
+    let nzb = nzb_xml(&[
+        (
+            "p &quot;movie.bin&quot;",
+            vec![("pm1@news", 320, 1), ("pm2@news", 320, 2), ("pm3@news", 320, 3)],
+        ),
+        ("p &quot;set.par2&quot;", vec![("pi1@news", 4096, 1)]),
+        (
+            &format!("p &quot;{vol_name}&quot;"),
+            vec![("pv1@news", 8192, 1)],
+        ),
+    ]);
+    // create_set names index <stem>.par2 with stem=movie, but NZB contract
+    // above uses literal "set.par2"; rename index to set.par2 in NZB only
+    // if create_set stem differs — stem is movie, so use movie.par2.
+    let nzb = nzb.replace("set.par2", "movie.par2");
+    let nzb_path = root.join("movie.nzb");
+    std::fs::write(&nzb_path, &nzb).unwrap();
+    let settings = settings_for(&fake);
+    let task = DownloadTask {
+        id: "npar2".into(),
+        url: nzb_path.to_string_lossy().into_owned(),
+        filename: "movie.nzb".into(),
+        dest_dir: dest.clone(),
+        ..Default::default()
+    };
+    let ctrl = Arc::new(Controls::new(0));
+    let done = download_url_with_settings(build_client(""), task, ctrl.clone(), &settings)
+        .await
+        .unwrap();
+    assert_eq!(done.status, TaskStatus::Complete, "{}", done.error);
+    let out = dest.join("movie");
+    assert_eq!(std::fs::read(out.join("movie.bin")).unwrap(), data);
+    assert!(out.join("movie.par2").exists());
+    assert!(out.join(&vol_name).exists());
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[tokio::test]
@@ -346,5 +475,112 @@ async fn nntp_unconfigured_host_errors() {
     )
     .await;
     assert!(r.is_err() && r.unwrap_err().contains("not configured"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn nntp_parallel_connections_bounded_and_ordered() {
+    let data: Vec<u8> = (0..600u32).map(|i| (i % 251) as u8).collect();
+    let articles: Vec<(String, Vec<u8>)> = data
+        .chunks(100)
+        .enumerate()
+        .map(|(i, c)| (format!("p{i}@news"), yenc(c, &format!("s{i}"))))
+        .collect();
+    let fake = fake_nntp_delay(articles, 60);
+    let mut settings = settings_for(&fake);
+    settings.nntp_connections = 2;
+    let dir = tmpdir("par");
+    let seg_refs: Vec<(&str, u64, u32)> = vec![
+        ("p0@news", 100, 1),
+        ("p1@news", 100, 2),
+        ("p2@news", 100, 3),
+        ("p3@news", 100, 4),
+        ("p4@news", 100, 5),
+        ("p5@news", 100, 6),
+    ];
+    let nzb_path = dir.join("multi.nzb");
+    std::fs::write(
+        &nzb_path,
+        nzb_xml(&[("a &quot;multi.bin&quot; (1/1)", seg_refs)]),
+    )
+    .unwrap();
+    let task = DownloadTask {
+        id: "npar".into(),
+        url: nzb_path.to_string_lossy().into_owned(),
+        filename: "multi.nzb".into(),
+        dest_dir: dir.clone(),
+        ..Default::default()
+    };
+    let ctrl = Arc::new(Controls::new(0));
+    let done = download_url_with_settings(build_client(""), task, ctrl, &settings)
+        .await
+        .unwrap();
+    assert_eq!(done.status, TaskStatus::Complete, "{}", done.error);
+    // Single file in NZB: real filename with extension, flat in dest_dir.
+    assert_eq!(done.filename, "multi.bin");
+    assert_eq!(std::fs::read(dir.join("multi.bin")).unwrap(), data);
+    // Exactly 2 server connections opened for whole NZB (shared pool).
+    let auths = fake
+        .cmds
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.starts_with("AUTHINFO PASS"))
+        .count();
+    assert_eq!(auths, 2, "expected 2 NNTP connections, cmds: {:?}", fake.cmds.lock().unwrap());
+    let peak = fake.peak_body.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(peak >= 2, "BODY fetches never overlapped (peak {peak})");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn nntp_files_share_one_connection_pool() {
+    let data1: Vec<u8> = (0u32..300).map(|i| (i % 256) as u8).collect();
+    let data2: Vec<u8> = (0u32..300).map(|i| (200 - (i % 200)) as u8).collect();
+    let fake = fake_nntp_delay(
+        vec![
+            ("a1@news".into(), yenc(&data1[..100], "f1.bin")),
+            ("a2@news".into(), yenc(&data1[100..200], "f1.bin")),
+            ("a3@news".into(), yenc(&data1[200..], "f1.bin")),
+            ("b1@news".into(), yenc(&data2[..100], "f2.bin")),
+            ("b2@news".into(), yenc(&data2[100..200], "f2.bin")),
+            ("b3@news".into(), yenc(&data2[200..], "f2.bin")),
+        ],
+        50,
+    );
+    let mut settings = settings_for(&fake);
+    settings.nntp_connections = 2;
+    let dir = tmpdir("sharedpool");
+    let nzb = nzb_xml(&[
+        (
+            "p &quot;f1.bin&quot; (1/1)",
+            vec![("a1@news", 320, 1), ("a2@news", 320, 2), ("a3@news", 320, 3)],
+        ),
+        (
+            "p &quot;f2.bin&quot; (1/1)",
+            vec![("b1@news", 320, 1), ("b2@news", 320, 2), ("b3@news", 320, 3)],
+        ),
+    ]);
+    let nzb_path = dir.join("pack.nzb");
+    std::fs::write(&nzb_path, &nzb).unwrap();
+    let task = DownloadTask {
+        id: "nshared".into(),
+        url: nzb_path.to_string_lossy().into_owned(),
+        filename: "pack.nzb".into(),
+        dest_dir: dir.clone(),
+        ..Default::default()
+    };
+    let ctrl = Arc::new(Controls::new(0));
+    let done = download_url_with_settings(build_client(""), task, ctrl.clone(), &settings)
+        .await
+        .unwrap();
+    assert_eq!(done.status, TaskStatus::Complete, "{}", done.error);
+    let out = dir.join("pack");
+    assert_eq!(std::fs::read(out.join("f1.bin")).unwrap(), data1);
+    assert_eq!(std::fs::read(out.join("f2.bin")).unwrap(), data2);
+    let cmds = fake.cmds.lock().unwrap().clone();
+    let auths = cmds.iter().filter(|c| c.starts_with("AUTHINFO PASS")).count();
+    assert_eq!(auths, 2, "pool must span files, not per-file pools: {cmds:?}");
+    assert_eq!(ctrl.parts.lock().unwrap().clone(), vec![(960, 960), (960, 960)]);
     let _ = std::fs::remove_dir_all(&dir);
 }

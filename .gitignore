@@ -19,3 +19,7 @@ webcraft.app/
 /host.json
 /host-firefox.json
 check.txt
+/.agents/
+/.opencode/
+skills-lock.json
+RELEASE-SPEC.md

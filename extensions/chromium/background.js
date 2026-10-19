@@ -57,33 +57,115 @@ function pumpNative() {
 // --- Media sniffing (observing webRequest only; no webRequestBlocking) ---
 const CANDIDATE_TTL_MS = 5 * 60 * 1000;
 const CANDIDATE_MAX = 50;
-const candidates = new Map(); // url -> {url, type, tabId, time}
+const candidates = new Map(); // url -> {url, type, tabId, frameId, redirectFrom, time, size}
+// IDM model: every in-flight request keyed by requestId. Transient (not
+// persisted); on completion/error record dies, candidate (URL index) stays.
+// storage.session persists derived candidates only, so SW restart loses
+// requestId correlation but keeps toolbar-scan list.
+const requestRecords = new Map(); // requestId -> {url, redirectFrom, hops, tabId, frameId, time, type, size, status}
+const RECORD_TTL_MS = 10 * 60 * 1000;
+const RECORD_MAX = 500;
+const MEDIA_PATH = /\.(mpd|m3u8|mp4|webm|ts|m4s)($|[?#])/i;
+const MEDIA_TYPES = new Set(["media", "xmlhttprequest", "other", "object"]);
+function isMediaIsh(details) {
+  // Record only media-ish requests; full <all_urls> recording bloats TTL map
+  // with page/API traffic element matcher never needs.
+  if (details.type && MEDIA_TYPES.has(details.type)) return true;
+  try { return MEDIA_PATH.test(new URL(details.url || "").pathname); } catch (e) { return MEDIA_PATH.test(String(details.url || "")); }
+}
+function sweepRecords(now = Date.now()) {
+  for (const [k, r] of requestRecords) if (r.time && now - r.time > RECORD_TTL_MS) requestRecords.delete(k);
+  while (requestRecords.size > RECORD_MAX) requestRecords.delete(requestRecords.keys().next().value); // ponytail: FIFO cap
+}
+function recordRequest(details) {
+  try {
+    if (!details || !details.requestId || !(details.tabId >= 0)) return;
+    if (!isMediaIsh(details)) return;
+    sweepRecords();
+    const prev = requestRecords.get(details.requestId);
+    if (prev) {
+      // Redirect: same requestId re-fires with new url. hops keeps every hop
+      // (origin first, cap 8); redirectFrom stays first origin for back-compat.
+      if (details.url && details.url !== prev.url) {
+        if (!prev.redirectFrom) prev.redirectFrom = prev.url;
+        if (!Array.isArray(prev.hops)) prev.hops = prev.redirectFrom ? [prev.redirectFrom, prev.url] : [prev.url];
+        if (!prev.hops.includes(details.url) && prev.hops.length < 8) prev.hops.push(details.url);
+        prev.url = details.url;
+      }
+    } else {
+      requestRecords.set(details.requestId, { url: details.url || "", redirectFrom: "", hops: details.url ? [details.url] : [], tabId: details.tabId, frameId: details.frameId != null ? details.frameId : null, time: details.timeStamp || Date.now(), type: "", size: 0, status: 0 });
+    }
+  } catch (e) {}
+}
+// MV3 service worker dies idle: persist candidates in storage.session
+// (per tab) or played-then-clicked-later finds empty list.
+function persistCandidates() {
+  try {
+    const o = {};
+    for (const [u, c] of candidates) o[u] = c;
+    chrome.storage.session.set({ wcCandidates: o });
+  } catch (e) {}
+}
+let candidatesLoaded = false;
+async function loadCandidates() {
+  if (candidatesLoaded) return;
+  candidatesLoaded = true;
+  try {
+    const s = await chrome.storage.session.get(["wcCandidates"]);
+    if (s && s.wcCandidates) for (const [u, c] of Object.entries(s.wcCandidates)) candidates.set(u, c);
+    pruneCandidates();
+  } catch (e) {}
+}
 const SNIFF_TYPES = new Set(["application/dash+xml", "application/x-mpegurl", "application/vnd.apple.mpegurl", "application/x-mpegurl", "video/vnd.mpeg.dash.mpd", "video/mpegurl", "video/x-mpegurl", "application/mpegurl"]);
 function isSniff(details, type) {
-  if (!type) return false;
-  if (/\.(json|js|mjs|css|html?|map)($|[?#])/i.test(details.url || "")) return false; // page assets, whatever MIME claims
+  const url = details.url || "";
+  if (/\.(json|js|mjs|css|html?|map)($|[?#])/i.test(url)) return false; // page assets, whatever MIME claims
+  let path = "";
+  try { path = new URL(url).pathname.toLowerCase(); } catch (e) {}
+  // Extension fallback: DASH/HLS/full mp4 served without usable Content-Type.
+  if (!type || type === "application/octet-stream") {
+    return path.endsWith(".mpd") || path.endsWith(".m3u8") || path.endsWith(".mp4");
+  }
   if (SNIFF_TYPES.has(type)) return true;
   if (type.startsWith("video/") || type.startsWith("audio/")) {
     // Segments (seg-1.ts, chunk_00001.m4s, -0002.ts) pollute panel; only
     // manifests/full media belong there.
-    try { const seg = new URL(details.url).pathname.split("/").pop() || ""; if (/^(seg|segment|chunk|frag)[-_]?\d|\.m4s$|[-_]\d+\.(ts|m4s)$/i.test(seg)) return false; } catch (e) {}
+    try { const seg = new URL(url).pathname.split("/").pop() || ""; if (/^(seg|segment|chunk|frag)[-_]?\d|\.m4s$|[-_]\d+\.(ts|m4s)$/i.test(seg)) return false; } catch (e) {}
     return true;
   }
-  try { const path = new URL(details.url).pathname.toLowerCase(); return path.endsWith(".mpd") || path.endsWith(".m3u8"); } catch (e) { return false; }
+  return path.endsWith(".mpd") || path.endsWith(".m3u8");
 }
 function pruneCandidates(now = Date.now()) {
-  for (const [url, c] of candidates) if (now - c.time > CANDIDATE_TTL_MS) candidates.delete(url);
-  while (candidates.size > CANDIDATE_MAX) candidates.delete(candidates.keys().next().value);
+  let changed = false;
+  for (const [url, c] of candidates) if (now - c.time > CANDIDATE_TTL_MS) { candidates.delete(url); changed = true; }
+  while (candidates.size > CANDIDATE_MAX) { candidates.delete(candidates.keys().next().value); changed = true; }
+  if (changed) persistCandidates();
+}
+if (chrome.webRequest) {
+  try {
+    const F = { urls: ["<all_urls>"] };
+    const kill = (d) => { try { requestRecords.delete(d.requestId); } catch (e) {} };
+    if (chrome.webRequest.onBeforeRequest) chrome.webRequest.onBeforeRequest.addListener(recordRequest, F);
+    if (chrome.webRequest.onBeforeSendHeaders) chrome.webRequest.onBeforeSendHeaders.addListener(recordRequest, F);
+    if (chrome.webRequest.onCompleted) chrome.webRequest.onCompleted.addListener(kill, F);
+    if (chrome.webRequest.onErrorOccurred) chrome.webRequest.onErrorOccurred.addListener(kill, F);
+  } catch (e) {}
 }
 if (chrome.webRequest && chrome.webRequest.onHeadersReceived) {
-  chrome.webRequest.onHeadersReceived.addListener((details) => {
+  chrome.webRequest.onHeadersReceived.addListener(async (details) => {
+    recordRequest(details);
+    const rec2 = requestRecords.get(details.requestId);
+    if (rec2) { rec2.status = details.statusCode || 0; const lh = (details.responseHeaders || []).find((h) => h.name.toLowerCase() === "content-length"); if (lh) rec2.size = parseInt(lh.value, 10) || 0; const ch = (details.responseHeaders || []).find((h) => h.name.toLowerCase() === "content-type"); if (ch && ch.value) rec2.type = ch.value.split(";")[0].trim().toLowerCase(); }
+    await loadCandidates();
     if (details.statusCode && ![200, 206].includes(details.statusCode)) return; // 404/redirect bodies poison panel
+    if (!(details.tabId >= 0)) return; // non-tab leaks into every tab list
     const header = (details.responseHeaders || []).find((h) => h.name.toLowerCase() === "content-type");
-    if (!header || !header.value) return;
-    const type = header.value.split(";")[0].trim().toLowerCase();
+    const type = header && header.value ? header.value.split(";")[0].trim().toLowerCase() : "";
     if (!isSniff(details, type)) return;
     const lenH = (details.responseHeaders || []).find((h) => h.name.toLowerCase() === "content-length");
-    candidates.set(details.url, { url: details.url, type, tabId: details.tabId, time: Date.now(), size: lenH ? parseInt(lenH.value, 10) || 0 : 0 });
+    const rec = requestRecords.get(details.requestId);
+    candidates.set(details.url, { url: details.url, type, tabId: details.tabId, frameId: details.frameId != null ? details.frameId : null, redirectFrom: (rec && rec.redirectFrom) || "", hops: (rec && rec.hops) || [], time: (rec && rec.time) || Date.now(), size: lenH ? parseInt(lenH.value, 10) || 0 : 0 });
+    persistCandidates();
     pruneCandidates();
   }, { urls: ["<all_urls>"], types: ["main_frame", "sub_frame", "media", "object", "xmlhttprequest", "other"] }, ["responseHeaders"]);
 }
@@ -93,11 +175,17 @@ function basename(name) {
 async function sendDownload(url, tab, extra = {}) {
   let cookies = "";
   try {
-    const cs = await chrome.cookies.getAll({ url });
+    // Cookies match page host (X/YouTube/Reddit session), not CDN host.
+    // Page intent: pageUrl promotes to yt-dlp target app-side. Stream intent:
+    // cookieUrl scopes cookies only, no promotion field sent.
+    const cs = await chrome.cookies.getAll({ url: extra.pageUrl || extra.cookieUrl || url });
     cookies = cs.map(c => `${c.name}=${c.value}`).join("; ");
   } catch (e) {}
-  const referrer = extra.referrer != null ? extra.referrer : (tab ? tab.url : "");
+  // Referrer = video page (permalink), not feed tab URL (x.com/home).
+  const referrer = extra.referrer != null ? extra.referrer : (extra.pageUrl || extra.cookieUrl || (tab ? tab.url : ""));
   const msg = { type: "download", url, referrer, referer: referrer, cookies, filename: extra.filename ? basename(extra.filename) : filenameFromUrl(url) };
+  if (extra.pageUrl) msg.pageUrl = extra.pageUrl;
+  if (extra.intent) msg.intent = extra.intent;
   if (extra.mime) msg.mime = extra.mime;
   // Captured (intercepted) downloads pass host-side capture filter (extension
   // allowlist + min size from capture-filter.json). Explicit sends (context
@@ -117,13 +205,14 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === "downloadcraft-link" && info.linkUrl) sendDownload(info.linkUrl, tab);
-  // blob:/data: srcUrl dies in native host; MSE video needs panel manifests.
-  else if (info.menuItemId === "downloadcraft-media" && info.srcUrl && !/^(blob|data):/.test(info.srcUrl)) sendDownload(info.srcUrl, tab);
+  // blob:/data: srcUrl dies in native host; open panel (page yt-dlp row works).
+  else if (info.menuItemId === "downloadcraft-media" && info.srcUrl && /^(blob|data):/.test(info.srcUrl)) { if (tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "downloadcraft-scan" }); }
+  else if (info.menuItemId === "downloadcraft-media" && info.srcUrl) sendDownload(info.srcUrl, tab);
   else if (info.menuItemId === "downloadcraft-page" && tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "downloadcraft-grab-all" });
 });
-// Ask-first intercept: stash pending, confirm in originating tab, then
-// send to webcraft or resume browser-native download.
-const pending = new Map(); // download id -> {id, url, filename, mime, referrer}
+// Captured downloads go DIRECTLY to webcraft (its modal is the config box,
+// like IDM). No browser ask box. Filter = webcraft Settings, decided by
+// native host (captureCheck) BEFORE cancel: filtered -> browser keeps file.
 const bypass = new Map(); // url -> timestamp, one-shot for resumed native downloads
 const BYPASS_TTL_MS = 30 * 1000;
 function takeBypass(url) {
@@ -132,7 +221,10 @@ function takeBypass(url) {
   bypass.delete(url);
   return Date.now() - t < BYPASS_TTL_MS;
 }
-// Intercept browser downloads and ask before redirecting to webcraft
+function resumeBrowser(url, filename) {
+  bypass.set(url, Date.now());
+  try { const p = chrome.downloads.download({ url, filename: filename || undefined }); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+}
 // Never intercept page-asset downloads (json/js/css) even with download attr.
 function isAssetDownload(item) {
   const m = String((item && item.mime) || "").toLowerCase();
@@ -140,56 +232,65 @@ function isAssetDownload(item) {
   const f = String((item && item.filename) || (item && item.url) || "").split(/[?#]/)[0];
   return /\.(json|js|mjs|css)$/i.test(f);
 }
+async function captureCheck(entry) {
+  try {
+    const r = await nativeSend({ type: "captureCheck", url: entry.url, filename: entry.filename, mime: entry.mime, size: entry.size });
+    return !!(r && r.allow === true); // fail-closed: garbage/down -> browser keeps file
+  } catch (e) { return false; }
+}
 chrome.downloads.onCreated.addListener(async (item) => {
   if (isAssetDownload(item)) return;
   if (!item.url || item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
   const url = item.finalUrl || item.url;
   if (takeBypass(url) || takeBypass(item.url)) return;
-  // ponytail: chrome.downloads in MV3 requires user gesture in some builds; context menu + panel are primary paths.
   try {
-    const stored = await chrome.storage.local.get(["intercept", "askBeforeDownload"]);
-    if (stored.intercept === false) return;
+    const entry = { id: item.id, url, filename: basename(item.filename), mime: item.mime || "", referrer: item.referrer || "", size: item.totalBytes > 0 ? item.totalBytes : 0 };
+    // Host filter decides (webcraft Settings). Deny/unreachable: do not
+    // cancel — browser download proceeds untouched, no resume needed.
+    if (!(await captureCheck(entry))) return;
     await chrome.downloads.cancel(item.id).catch(() => {});
-    const entry = { id: item.id, url, filename: basename(item.filename), mime: item.mime || "", referrer: item.referrer || "", size: item.fileSize > 0 ? item.fileSize : 0 };
-    const extra = { referrer: entry.referrer, filename: entry.filename, mime: entry.mime, size: entry.size, captured: true };
-    if (stored.askBeforeDownload === false) { await sendDownload(entry.url, null, extra); return; }
-    pending.set(item.id, entry);
-    let tabId = typeof item.tabId === "number" && item.tabId >= 0 ? item.tabId : null;
-    if (tabId == null) {
-      try { const tabs = await chrome.tabs.query({ active: true, currentWindow: true }); tabId = tabs && tabs[0] ? tabs[0].id : null; } catch (e) {}
-    }
-    let delivered = false;
-    if (tabId != null) {
-      try { await chrome.tabs.sendMessage(tabId, { type: "downloadcraft-confirm", id: entry.id, url: entry.url, filename: entry.filename, mime: entry.mime }); delivered = true; } catch (e) {}
-    }
-    if (!delivered) { pending.delete(item.id); await sendDownload(entry.url, null, extra); }
+    try {
+      const resp = await sendDownload(entry.url, null, { referrer: entry.referrer, filename: entry.filename, mime: entry.mime, size: entry.size, captured: true });
+      // Race filter change / host write error — never lose file.
+      if (!resp || resp.skipped || resp.type === "error") resumeBrowser(entry.url, entry.filename);
+    } catch (e) { resumeBrowser(entry.url, entry.filename); }
   } catch (e) {}
 });
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg && msg.type === "downloadcraft-confirm-result") {
-    const entry = pending.get(msg.id);
-    if (entry) {
-      pending.delete(msg.id);
-      if (msg.accept) {
-        sendDownload(entry.url, null, { referrer: entry.referrer, filename: entry.filename, mime: entry.mime, size: entry.size, captured: true }).catch(() => {});
-      } else {
-        // Resume browser-native. Bypass keyed by URL so onCreated skips re-intercept.
-        bypass.set(entry.url, Date.now());
-        try { const p = chrome.downloads.download({ url: entry.url, filename: entry.filename || undefined }); if (p && p.catch) p.catch(() => {}); } catch (e) {}
-      }
-    }
-    return;
-  }
+  // Legacy stale content scripts may still answer removed ask box: ignore.
+  if (msg && msg.type === "downloadcraft-confirm-result") return;
   if (msg && msg.type === "getCandidates") {
-    pruneCandidates();
-    const tabId = sender.tab && sender.tab.id;
-    const list = (typeof rankCandidates === "function" ? rankCandidates : (x) => x)([...candidates.values()].filter((c) => tabId == null || c.tabId === tabId || c.tabId === -1));
-    sendResponse({ type: "candidates", candidates: list });
-    return false;
+    loadCandidates().then(() => {
+      pruneCandidates();
+      sweepRecords();
+      const tabId = sender.tab && sender.tab.id;
+      let pool;
+      if (msg.element) {
+        // Element-scoped (IDM): same tab+frame only. Prefer live records;
+        // candidates carry same fields (frameId/redirectFrom/hops) and survive
+        // SW/record cleanup, so match over union deduped by url.
+        const byUrl = new Map();
+        [...requestRecords.values(), ...candidates.values()].forEach((r) => { if (r && r.url) byUrl.set(r.url, r); });
+        const senderFrame = sender.frameId != null ? sender.frameId : null;
+        const el = { tabId: sender.tab ? sender.tab.id : tabId, frameId: senderFrame, srcs: msg.element.srcs || [], srcKey: msg.element.srcKey || "", postId: msg.element.postId || "", since: msg.element.since || 0, now: Date.now() };
+        pool = typeof matchRecordsForElement === "function" ? matchRecordsForElement([...byUrl.values()], el, Date.now()) : [];
+        // Element-frame match empty: retry frame-agnostic (frameId=null passes
+        // tolerant filter) before returning empty.
+        if (!pool.length && senderFrame != null && typeof matchRecordsForElement === "function") pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null }, Date.now());
+      } else {
+        pool = [...candidates.values()].filter((c) => tabId == null || c.tabId === tabId);
+      }
+      const list = (typeof rankCandidates === "function" ? rankCandidates : (x) => x)(pool);
+      sendResponse({ type: "candidates", candidates: list });
+    });
+    return true;
   }
   if (msg && msg.type === "downloadcraft-download") { sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer }).then(sendResponse, (e) => sendResponse({ type: "error", error: String((e && e.message) || e) })); return true; }
-  if (msg && msg.type === "downloadcraft-video-panel") { sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer }).then(sendResponse, (e) => sendResponse({ type: "error", error: String((e && e.message) || e) })); return true; }
+  // intent=stream: picked manifest/file is target; pageUrl must NOT promote
+  // to yt-dlp page (else manifest choice lost). Only cookies scope passes.
+  if (msg && msg.type === "downloadcraft-video-panel") { sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer || msg.pageUrl, pageUrl: msg.intent === "page" ? msg.pageUrl : undefined, cookieUrl: msg.pageUrl, intent: msg.intent }).then(sendResponse, (e) => sendResponse({ type: "error", error: String((e && e.message) || e) })); return true; }
 });
-chrome.action.onClicked.addListener((tab) => { if (tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "downloadcraft-scan" }); });
-// SPA/new-page navigation: drop tab's stale sniffed streams.
-if (chrome.tabs && chrome.tabs.onUpdated) chrome.tabs.onUpdated.addListener((tabId, info) => { if (info.status === "loading" && info.url) { for (const [u, c] of [...candidates]) if (c.tabId === tabId) candidates.delete(u); } });
+chrome.action.onClicked.addListener((tab) => { if (tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "downloadcraft-scan" }).catch(() => {}); });
+// SPA pushState nav fires url change without status=loading: drop stale streams then too.
+if (chrome.tabs && chrome.tabs.onUpdated) chrome.tabs.onUpdated.addListener((tabId, info) => { if ((info.status === "loading" || info.url) && info.url) { let n = false; for (const [u, c] of [...candidates]) if (c.tabId === tabId) { candidates.delete(u); n = true; } for (const [k, r] of [...requestRecords]) if (r.tabId === tabId) requestRecords.delete(k); if (n) persistCandidates(); } });
+if (chrome.tabs && chrome.tabs.onRemoved) chrome.tabs.onRemoved.addListener((tabId) => { for (const [k, r] of [...requestRecords]) if (r.tabId === tabId) requestRecords.delete(k); for (const [u, c] of [...candidates]) if (c.tabId === tabId) candidates.delete(u); persistCandidates(); });

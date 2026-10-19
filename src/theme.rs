@@ -182,7 +182,7 @@ pub fn apply(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-/// Primary action button: STEEL fill (white text 9.3:1 on it), global hover/pressed.
+/// Primary action button: STEEL fill (white text 4.8:1 on it), global hover/pressed.
 pub fn primary_btn(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
         egui::Button::new(egui::RichText::new(label).color(Color32::WHITE).strong())
@@ -201,12 +201,19 @@ pub fn ghost_btn(ui: &mut egui::Ui, label: &str) -> egui::Response {
 }
 /// Darken base toward BG for badge fill. Text-safe hues stay legible on tint:
 /// fill ~20% base over BG, border ~55% base. No new palette entries.
-fn badge_tint(base: Color32) -> (Color32, Color32) {
-    let mix = |a: Color32, b: Color32, t: f32| {
-        let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
-        Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
-    };
-    (mix(BG, base, 0.22), mix(BG, base, 0.55))
+fn mixc(a: Color32, b: Color32, t: f32) -> Color32 {
+    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+}
+
+pub fn badge_tint(base: Color32) -> (Color32, Color32) {
+    (mixc(BG, base, 0.16), mixc(BG, base, 0.55))
+}
+
+/// Badge label color: base lightened toward white so 9px text clears
+/// 4.5:1 on the tinted fill (raw hues measured 2.8-4.4:1).
+pub fn badge_text(base: Color32) -> Color32 {
+    mixc(base, Color32::WHITE, 0.38)
 }
 
 /// Small non-interactive badge: tinted fill + colored border/text, 4px radius.
@@ -225,7 +232,7 @@ pub fn badge(ui: &mut egui::Ui, label: &str, color: Color32) {
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(label)
-                        .color(color)
+                        .color(badge_text(color))
                         .size(BADGE_FONT)
                         .strong(),
                 )
@@ -273,6 +280,38 @@ pub fn proto_color(k: crate::stream::ProtoKind) -> Color32 {
         File => TEXT_FAINT,
     }
 }
+/// Stored [r,g,b] override lookup.
+pub fn color_override(overrides: &[(String, [u8; 3])], key: &str) -> Option<Color32> {
+    overrides
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, [r, g, b])| Color32::from_rgb(*r, *g, *b))
+}
+
+/// Category badge hue: user override falling back to category_color.
+pub fn category_color_or(category: &str, overrides: &[(String, [u8; 3])]) -> Color32 {
+    color_override(overrides, category).unwrap_or_else(|| category_color(category))
+}
+
+/// Rail TYPE bucket default hue, keyed by TypeSel key string.
+pub fn type_key_color(key: &str) -> Color32 {
+    match key {
+        "Torrent" => WARN,
+        "Nntp" => Color32::from_rgb(0x6E, 0xA8, 0xD8),
+        "Ftp" => STEEL_TEXT,
+        "Stream" => Color32::from_rgb(0xC4, 0x8A, 0xD8),
+        "YtDlp" => Color32::from_rgb(0xD8, 0x7A, 0x6E),
+        "Metalink" => Color32::from_rgb(0xC9, 0xB4, 0x58),
+        "Http" => TEXT_MUTED,
+        _ => TEXT_FAINT, // File/unknown
+    }
+}
+
+/// TypeSel-bucket badge hue: user override falling back to type_key_color.
+pub fn type_color_or(key: &str, overrides: &[(String, [u8; 3])]) -> Color32 {
+    color_override(overrides, key).unwrap_or_else(|| type_key_color(key))
+}
+
 /// Panel frame (desktop group box), 8px radius.
 #[allow(dead_code)]
 pub fn panel() -> egui::Frame {

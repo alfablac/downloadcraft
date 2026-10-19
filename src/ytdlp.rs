@@ -109,16 +109,29 @@ fn run_timeout(
     args: &[String],
     secs: u64,
 ) -> Result<std::process::Output, String> {
-    let mut child = Command::new(path)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    let mut cmd = Command::new(path);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    crate::platform::no_window(&mut cmd);
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    // Drain pipes on threads: -J dumps exceed 64KB pipe buffer; undrained
+    // child blocks on write and never exits (wait-then-read deadlocks).
+    fn drain<R: std::io::Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = r.read_to_end(&mut v);
+            v
+        })
+    }
+    let out_th = child.stdout.take().map(drain);
+    let err_th = child.stderr.take().map(drain);
     let start = std::time::Instant::now();
     loop {
         match child.try_wait().map_err(|e| e.to_string())? {
-            Some(_) => return child.wait_with_output().map_err(|e| e.to_string()),
+            Some(status) => {
+                let stdout = out_th.and_then(|h| h.join().ok()).unwrap_or_default();
+                let stderr = err_th.and_then(|h| h.join().ok()).unwrap_or_default();
+                return Ok(std::process::Output { status, stdout, stderr });
+            }
             None if start.elapsed().as_secs() >= secs => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -129,17 +142,29 @@ fn run_timeout(
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct YtFormat {
     pub format_id: String,
     #[serde(default)]
     pub ext: String,
     #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
     pub height: Option<u32>,
+    #[serde(default)]
+    pub fps: Option<f64>,
     #[serde(default)]
     pub vcodec: Option<String>,
     #[serde(default)]
     pub acodec: Option<String>,
+    #[serde(default)]
+    pub tbr: Option<f64>,
+    #[serde(default)]
+    pub abr: Option<f64>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub format_note: Option<String>,
     #[serde(default)]
     pub filesize: Option<u64>,
     #[serde(default)]
@@ -150,15 +175,64 @@ impl YtFormat {
     pub fn size(&self) -> Option<u64> {
         self.filesize.or(self.filesize_approx)
     }
-    fn has_video(&self) -> bool {
+    pub fn has_video(&self) -> bool {
         // vcodec null = progressive format with unknown codec (X http-*): treat as video.
         match self.vcodec.as_deref() {
             None => true,
             Some(c) => c != "none",
         }
     }
-    fn has_audio(&self) -> bool {
+    pub fn has_audio(&self) -> bool {
         self.acodec.as_deref().is_some_and(|c| c != "none")
+    }
+    pub fn is_audio_only(&self) -> bool {
+        !self.has_video() && self.has_audio()
+    }
+    pub fn is_video_only(&self) -> bool {
+        self.has_video() && !self.has_audio()
+    }
+    /// Picker label: "137 · 1080p 30fps · mp4 avc1 · ~812 MB".
+    pub fn label(&self) -> String {
+        let mut p: Vec<String> = vec![self.format_id.clone()];
+        if let Some(h) = self.height {
+            p.push(format!("{h}p"));
+        } else if let Some(w) = self.width {
+            p.push(format!("{w}w"));
+        }
+        if let Some(f) = self.fps {
+            if f > 0.0 {
+                p.push(format!("{}fps", f.round() as u32));
+            }
+        }
+        if !self.ext.is_empty() {
+            p.push(self.ext.clone());
+        }
+        let codec = if self.is_audio_only() {
+            self.acodec.as_deref()
+        } else {
+            self.vcodec.as_deref()
+        };
+        if let Some(c) = codec {
+            if c != "none" {
+                p.push(c.split('.').next().unwrap_or(c).to_string());
+            }
+        }
+        if let Some(l) = &self.language {
+            p.push(format!("[{l}]"));
+        }
+        if let Some(s) = self.size() {
+            p.push(format!("~{:.1} MB", s as f64 / 1_048_576.0));
+        } else if let Some(t) = self.tbr {
+            if t > 0.0 {
+                p.push(format!("{:.0} kbps", t));
+            }
+        }
+        if let Some(n) = &self.format_note {
+            if !n.is_empty() {
+                p.push(n.clone());
+            }
+        }
+        p.join(" · ")
     }
 }
 
@@ -183,7 +257,12 @@ fn base_args(url: &str, task: &DownloadTask) -> Vec<String> {
         a.push(format!("Cookie:{}", task.cookies));
     }
     for (k, v) in &task.headers {
-        if k.eq_ignore_ascii_case("x-ytdlp") {
+        // Pseudo-headers are task config, never HTTP headers.
+        if YT_HEADER_KEYS.iter().any(|x| k.eq_ignore_ascii_case(x))
+            || k.eq_ignore_ascii_case("x-page-url")
+            || k.eq_ignore_ascii_case("x-page-stream")
+            || k.eq_ignore_ascii_case("x-page-intent")
+        {
             continue;
         }
         a.push("--add-header".into());
@@ -193,12 +272,216 @@ fn base_args(url: &str, task: &DownloadTask) -> Vec<String> {
     a
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct YtSubTrack {
+    #[serde(default)]
+    pub ext: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct YtDump {
     #[serde(default)]
     pub formats: Vec<YtFormat>,
     #[serde(default)]
     pub title: String,
+    #[serde(default)]
+    pub duration: Option<f64>,
+    #[serde(default)]
+    pub uploader: Option<String>,
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub thumbnail: Option<String>,
+    #[serde(default)]
+    pub subtitles: std::collections::BTreeMap<String, Vec<YtSubTrack>>,
+    #[serde(default)]
+    pub automatic_captions: std::collections::BTreeMap<String, Vec<YtSubTrack>>,
+}
+
+impl YtDump {
+    pub fn uploader(&self) -> &str {
+        self.uploader.as_deref().or(self.channel.as_deref()).unwrap_or("")
+    }
+    /// Video-bearing formats, tallest then highest bitrate first.
+    pub fn video_formats(&self) -> Vec<&YtFormat> {
+        let mut v: Vec<&YtFormat> = self.formats.iter().filter(|f| f.has_video()).collect();
+        v.sort_by(|a, b| {
+            (b.height.unwrap_or(0), b.tbr.unwrap_or(0.0) as u64)
+                .cmp(&(a.height.unwrap_or(0), a.tbr.unwrap_or(0.0) as u64))
+        });
+        v
+    }
+    pub fn audio_formats(&self) -> Vec<&YtFormat> {
+        let mut v: Vec<&YtFormat> = self.formats.iter().filter(|f| f.is_audio_only()).collect();
+        v.sort_by_key(|f| std::cmp::Reverse(f.abr.unwrap_or(0.0) as u64));
+        v
+    }
+    pub fn sub_langs(&self) -> Vec<String> {
+        self.subtitles.keys().cloned().collect()
+    }
+    pub fn auto_langs(&self) -> Vec<String> {
+        self.automatic_captions
+            .keys()
+            .filter(|k| !self.subtitles.contains_key(*k))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Per-task yt-dlp choice, persisted as pseudo-headers (stripped in base_args,
+/// never sent as HTTP headers): x-yt-format (format_id | audio:<id>),
+/// x-yt-audio (format_id | best | none), x-yt-extract (mp3|m4a),
+/// x-yt-subs / x-yt-auto-subs (CSV langs), x-yt-sub-embed (1).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct YtChoice {
+    pub format: Option<String>,
+    pub audio: Option<String>,
+    pub extract: Option<String>,
+    pub subs: Vec<String>,
+    pub auto_subs: Vec<String>,
+    pub sub_embed: bool,
+}
+
+pub const YT_HEADER_KEYS: [&str; 7] = [
+    "x-ytdlp",
+    "x-yt-format",
+    "x-yt-audio",
+    "x-yt-extract",
+    "x-yt-subs",
+    "x-yt-auto-subs",
+    "x-yt-sub-embed",
+];
+
+impl YtChoice {
+    pub fn from_headers(h: &std::collections::BTreeMap<String, String>) -> Self {
+        let get = |k: &str| {
+            h.iter()
+                .find(|(hk, _)| hk.eq_ignore_ascii_case(k))
+                .map(|(_, v)| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let csv = |k: &str| {
+            get(k)
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Self {
+            format: get("x-yt-format"),
+            audio: get("x-yt-audio"),
+            extract: get("x-yt-extract"),
+            subs: csv("x-yt-subs"),
+            auto_subs: csv("x-yt-auto-subs"),
+            sub_embed: get("x-yt-sub-embed").is_some(),
+        }
+    }
+    pub fn is_audio_only(&self) -> bool {
+        self.format.as_deref().map(|f| f.starts_with("audio:")).unwrap_or(false)
+            || self.extract.is_some()
+    }
+    pub fn write_headers(&self, h: &mut std::collections::BTreeMap<String, String>) {
+        for k in YT_HEADER_KEYS {
+            if k != "x-ytdlp" {
+                h.remove(k);
+            }
+        }
+        let mut set = |k: &str, v: &Option<String>| {
+            if let Some(v) = v {
+                if !v.is_empty() {
+                    h.insert(k.into(), v.clone());
+                }
+            }
+        };
+        set("x-yt-format", &self.format);
+        set("x-yt-audio", &self.audio);
+        set("x-yt-extract", &self.extract);
+        if !self.subs.is_empty() {
+            h.insert("x-yt-subs".into(), self.subs.join(","));
+        }
+        if !self.auto_subs.is_empty() {
+            h.insert("x-yt-auto-subs".into(), self.auto_subs.join(","));
+        }
+        if self.sub_embed {
+            h.insert("x-yt-sub-embed".into(), "1".into());
+        }
+        if self.format.is_some() || self.extract.is_some() || !self.subs.is_empty() || !self.auto_subs.is_empty() {
+            h.insert("x-ytdlp".into(), "1".into());
+        }
+    }
+}
+
+/// Build (-f selector, extra args, audio_mode). Every explicit selector keeps
+/// /bv*+ba/b tail: chosen ids can vanish between probe and download.
+pub fn build_selector(choice: &YtChoice, dump: Option<&YtDump>) -> (String, Vec<String>, bool) {
+    let mut extra: Vec<String> = Vec::new();
+    let audio_mode = choice.is_audio_only();
+    // Plain format_id only valid for muxed formats. Video-only / unknown ids
+    // need +bestaudio, else yt-dlp silently downloads video without sound.
+    // Muxed-ness known only with dump; without dump fall back via / chain.
+    let known = |id: &str| dump.and_then(|d| d.formats.iter().find(|f| f.format_id == id));
+    let sel = match choice.format.as_deref() {
+        Some("audio:ba") => "ba/b".to_string(),
+        Some(f) if f.starts_with("audio:") => format!("{}/ba/b", &f[6..]),
+        // Muxed known format: audio choice meaningless, ignore it.
+        Some(f) if known(f).map(|x| x.has_audio() && x.has_video()) == Some(true) => {
+            format!("{f}/bv*+ba/b")
+        }
+        Some(f) if choice.audio.is_none() => {
+            format!("{f}+bestaudio/{f}/bv*+ba/b")
+        }
+        Some(f) => match choice.audio.as_deref() {
+            // Explicit silent: no audio-bearing fallback.
+            Some("none") => format!("{f}/bv*[acodec=none]/b[acodec=none]"),
+            Some("best") => format!("{f}+bestaudio/bv*+ba/b"),
+            Some(a) => format!("{f}+{a}/{f}+bestaudio/bv*+ba/b"),
+            None => unreachable!("audio None handled above"),
+        },
+        None if audio_mode => "ba/b".to_string(),
+        // Auto video + specific audio track picked.
+        None if choice.audio.as_deref().map(|a| a != "best" && a != "none").unwrap_or(false) => {
+            let a = choice.audio.as_deref().unwrap_or("");
+            format!("bv*+{a}/bv*+ba/b")
+        }
+        None if choice.audio.as_deref() == Some("none") => "bv*[acodec=none]/b".to_string(),
+        None => match dump.and_then(|d| pick_best(&d.formats)) {
+            Some(f) if f.is_video_only() => format!("{}+bestaudio/bv*+ba/best", f.format_id),
+            Some(f) => format!("{}/bv*+ba/best", f.format_id),
+            None => "bv*+ba/b".to_string(),
+        },
+    };
+    if let Some(ex) = &choice.extract {
+        extra.push("-x".into());
+        extra.push("--audio-format".into());
+        extra.push(ex.clone());
+        extra.push("--audio-quality".into());
+        extra.push("0".into());
+    }
+    let mut langs: Vec<String> = choice.subs.clone();
+    langs.extend(choice.auto_subs.iter().cloned());
+    if !langs.is_empty() {
+        if !choice.subs.is_empty() {
+            extra.push("--write-subs".into());
+        }
+        if !choice.auto_subs.is_empty() {
+            extra.push("--write-auto-subs".into());
+        }
+        extra.push("--sub-langs".into());
+        extra.push(langs.join(","));
+        extra.push("--sub-format".into());
+        extra.push("srt/best".into());
+        extra.push("--convert-subs".into());
+        extra.push("srt".into());
+        if choice.sub_embed && !audio_mode {
+            extra.push("--embed-subs".into());
+        }
+    }
+    (sel, extra, audio_mode)
 }
 
 pub async fn fetch_formats(url: &str, task: &DownloadTask) -> Result<YtDump, String> {
@@ -206,10 +489,8 @@ pub async fn fetch_formats(url: &str, task: &DownloadTask) -> Result<YtDump, Str
     let mut args = vec!["-J".to_string()];
     args.extend(base_args(url, task));
     let out = tokio::task::spawn_blocking(move || {
-        let o = Command::new(&path)
-            .args(&args)
-            .output()
-            .map_err(|e| e.to_string())?;
+        // Bounded probe: hung extractor must not orphan forever (120s cap).
+        let o = run_timeout(&path, &args, 120)?;
         if !o.status.success() {
             return Err(tail(&String::from_utf8_lossy(&o.stderr)));
         }
@@ -252,34 +533,77 @@ pub async fn download_with_ytdlp(
 ) -> Result<DownloadTask, String> {
     let path = ensure_ytdlp().await?;
     std::fs::create_dir_all(&task.dest_dir).map_err(|e| e.to_string())?;
-    let dest = task.dest_dir.join(&task.filename);
     // Format choice: -J first; fallback selector lets yt-dlp decide.
     // Also adopt video title as filename when seeded name is extensionless ID.
     let dump = fetch_formats(&task.url, &task).await.ok();
     let mut task = task;
+    // Explicit x-yt-* choice (picker) wins over auto pick_best.
+    let choice = YtChoice::from_headers(&task.headers);
+    let (fmt_arg, extra_args, audio_mode) = build_selector(&choice, dump.as_ref());
     if let Some(d) = &dump {
         if !d.title.trim().is_empty() && !task.filename.contains('.') {
-            task.filename = crate::model::sanitize_filename(&format!("{}.mp4", d.title));
+            let ext = if audio_mode {
+                choice.extract.as_deref().unwrap_or("m4a")
+            } else {
+                "mp4"
+            };
+            task.filename = crate::model::sanitize_filename(&format!("{}.{}", d.title, ext));
         }
     }
-    let chosen = dump.and_then(|d| pick_best(&d.formats));
-    let fmt_arg = match &chosen {
-        Some(f) if f.has_audio() => f.format_id.clone(),
-        // Fallbacks mandatory: chosen id can vanish between -J and download (client/format rotation).
-        Some(f) => format!("{}+bestaudio/bv*+ba/best", f.format_id),
-        None => "bv*+ba/b".to_string(),
-    };
+    if audio_mode {
+        // Dest must carry audio ext or post-dl stem rename hunts wrong file.
+        // No extract: keep user audio ext, else chosen format ext, else m4a.
+        let audio_exts = ["mp3", "m4a", "opus", "webm", "ogg", "flac", "wav"];
+        let cur0 = std::path::Path::new(&task.filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let want = if let Some(ex) = &choice.extract {
+            ex.clone()
+        } else if audio_exts.contains(&cur0.as_str()) {
+            cur0.clone()
+        } else if let Some(fid) = choice.format.as_deref().and_then(|f| f.strip_prefix("audio:")) {
+            dump.as_ref()
+                .and_then(|d| d.formats.iter().find(|x| x.format_id == fid))
+                .map(|x| x.ext.clone())
+                .unwrap_or_else(|| "m4a".into())
+        } else {
+            "m4a".into()
+        };
+        if cur0 != want {
+            let stem = std::path::Path::new(&task.filename)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("audio")
+                .to_string();
+            task.filename = format!("{stem}.{want}");
+        }
+    }
+    // Video dest must carry .mp4: extensionless -o breaks --embed-subs
+    // (ffmpeg cannot infer muxer for '<dest>.temp'). Covers probe-failed
+    // path where title rename never ran.
+    if !audio_mode && std::path::Path::new(&task.filename).extension().is_none() {
+        task.filename = format!("{}.mp4", task.filename);
+    }
+    // dest AFTER filename mutation: -o target and returned task must agree.
+    let dest = task.dest_dir.join(&task.filename);
     let mut args: Vec<String> = vec![
         "--newline".into(),
+        "--encoding".into(),
+        "utf-8".into(),
         "--progress-template".into(),
         "download:%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.speed)s".into(),
         "-f".into(),
         fmt_arg,
-        "--merge-output-format".into(),
-        "mp4".into(),
         "--concurrent-fragments".into(),
         "4".into(),
     ];
+    if !audio_mode {
+        args.push("--merge-output-format".into());
+        args.push("mp4".into());
+    }
+    args.extend(extra_args);
     if let Some(ff) = ffmpeg_location() {
         args.push("--ffmpeg-location".into());
         args.push(ff);
@@ -390,12 +714,38 @@ pub async fn download_with_ytdlp(
             }
         }
     }
-    let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
-    ctrl.downloaded.store(size, Ordering::Relaxed);
-    if size > 0 {
-        ctrl.total.store(size, Ordering::Relaxed);
+    // Zero-byte or wrong-magic output must not Complete.
+    if !dest.is_file() {
+        return Err("yt-dlp produced empty file".into());
     }
+    let mut dest = dest;
+    match crate::engine::validate_output(&dest, &task.filename) {
+        Ok(_) => {}
+        Err(crate::engine::ValidateFail::TsInMp4) => {
+            dest = crate::engine::ensure_mp4_or_ts(&dest)
+                .await
+                .map_err(|e| format!("yt-dlp output not valid mp4: {e}"))?;
+        }
+        Err(e) => {
+            return Err(
+                if std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0) == 0 {
+                    "yt-dlp produced empty file".into()
+                } else {
+                    format!("yt-dlp output not valid: {e}")
+                },
+            );
+        }
+    }
+    let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+    if size == 0 {
+        return Err("yt-dlp produced empty file".into());
+    }
+    ctrl.downloaded.store(size, Ordering::Relaxed);
+    ctrl.total.store(size, Ordering::Relaxed);
     let mut t = task;
+    if let Some(name) = dest.file_name().map(|s| s.to_string_lossy().into_owned()) {
+        t.filename = name;
+    }
     t.status = TaskStatus::Complete;
     t.downloaded = size;
     t.total = Some(size);
@@ -438,6 +788,7 @@ fn run_ytdlp_download(
 ) -> Result<(), String> {
     let mut cmd = Command::new(path);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    crate::platform::no_window(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
     let stdout = child.stdout.take().ok_or("yt-dlp: no stdout")?;
     let stderr = child.stderr.take().ok_or("yt-dlp: no stderr")?;
@@ -445,9 +796,15 @@ fn run_ytdlp_download(
     let err_tail = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let err_tail2 = err_tail.clone();
     let _err_thread = std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        // Lossy read: yt-dlp stdout/stderr is cp1252 on Windows; strict
+        // UTF-8 lines() errors, dropping pipe -> child broken-pipe crash.
+        let mut r = BufReader::new(stderr);
+        let mut raw: Vec<u8> = Vec::new();
+        use std::io::Read;
+        let _ = r.read_to_end(&mut raw);
+        for line in String::from_utf8_lossy(&raw).lines() {
             let mut g = err_tail2.lock().unwrap_or_else(|e| e.into_inner());
-            g.push(line);
+            g.push(line.to_string());
             if g.len() > 20 {
                 g.remove(0);
             }
@@ -458,10 +815,19 @@ fn run_ytdlp_download(
     // Reader thread: progress lines. New Destination folds prior file bytes into base (counters restart per file).
     let base2 = video_base.clone();
     let reader = std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            let Ok(line) = line else {
-                break;
-            };
+        // read_until + lossy: strict lines() dies on cp1252 title bytes
+        // (Flávio), drops stdout pipe, yt-dlp crashes broken-pipe Errno 22
+        // while printing subtitle path. Must drain to EOF regardless.
+        let mut r = BufReader::new(stdout);
+        let mut raw: Vec<u8> = Vec::new();
+        loop {
+            raw.clear();
+            match r.read_until(b'\n', &mut raw) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let line = String::from_utf8_lossy(&raw);
+            let line = line.trim_end_matches(['\r', '\n']);
             if line.contains("[download] Destination:") {
                 let cur = ctrl_c.downloaded.load(Ordering::Relaxed);
                 if cur > base2.load(Ordering::Relaxed) {
@@ -469,7 +835,7 @@ fn run_ytdlp_download(
                 }
             }
             if line.starts_with("download:") {
-                parse_progress(&line, &ctrl_c, &base2);
+                parse_progress(line, &ctrl_c, &base2);
             }
         }
     });
@@ -557,44 +923,71 @@ mod tests {
     #[test]
     fn pick_best_prefers_muxed_then_height() {
         let fs = vec![
-            YtFormat {
-                format_id: "a".into(),
-                ext: "mp4".into(),
-                height: Some(720),
-                vcodec: Some("avc".into()),
-                acodec: Some("none".into()),
-                filesize: None,
-                filesize_approx: None,
-            },
-            YtFormat {
-                format_id: "b".into(),
-                ext: "mp4".into(),
-                height: Some(360),
-                vcodec: Some("avc".into()),
-                acodec: Some("aac".into()),
-                filesize: None,
-                filesize_approx: None,
-            },
-            YtFormat {
-                format_id: "sb".into(),
-                ext: "mhtml".into(),
-                height: None,
-                vcodec: Some("none".into()),
-                acodec: Some("none".into()),
-                filesize: None,
-                filesize_approx: None,
-            },
+            YtFormat { format_id: "a".into(), ext: "mp4".into(), width: None, height: Some(720), fps: None, vcodec: Some("avc".into()), acodec: Some("none".into()), tbr: None, abr: None, language: None, format_note: None, filesize: None, filesize_approx: None },
+            YtFormat { format_id: "b".into(), ext: "mp4".into(), width: None, height: Some(360), fps: None, vcodec: Some("avc".into()), acodec: Some("aac".into()), tbr: None, abr: None, language: None, format_note: None, filesize: None, filesize_approx: None },
+            YtFormat { format_id: "sb".into(), ext: "mhtml".into(), width: None, height: None, fps: None, vcodec: Some("none".into()), acodec: Some("none".into()), tbr: None, abr: None, language: None, format_note: None, filesize: None, filesize_approx: None },
         ];
         assert_eq!(pick_best(&fs).unwrap().format_id, "b");
-        let fs2 = vec![YtFormat {
-            format_id: "a".into(),
-            ext: "mp4".into(),
-            height: Some(720),
-            vcodec: Some("avc".into()),
-            acodec: Some("none".into()),
-            filesize: None,
-            filesize_approx: None,
-        }];
+        let fs2 = vec![YtFormat { format_id: "a".into(), ext: "mp4".into(), width: None, height: Some(720), fps: None, vcodec: Some("avc".into()), acodec: Some("none".into()), tbr: None, abr: None, language: None, format_note: None, filesize: None, filesize_approx: None }];
         assert_eq!(pick_best(&fs2).unwrap().format_id, "a");
+    }
+
+    #[test]
+    fn selector_video_only_without_audio_choice_adds_bestaudio() {
+        // No dump: format 18 unknown -> must not emit bare "18" (silent video risk).
+        let c = YtChoice { format: Some("18".into()), ..Default::default() };
+        let (s, _, _) = build_selector(&c, None);
+        assert_eq!(s, "18+bestaudio/18/bv*+ba/b");
+        // With dump proving muxed, id + generic fallback (id can rotate away).
+        let d: YtDump = serde_json::from_str(
+            r#"{"title":"t","formats":[{"format_id":"18","ext":"mp4","vcodec":"avc","acodec":"aac"}]}"#,
+        )
+        .unwrap();
+        let (s, _, _) = build_selector(&c, Some(&d));
+        assert_eq!(s, "18/bv*+ba/b");
+        // Muxed + stale audio choice: audio ignored.
+        let c2 = YtChoice { format: Some("18".into()), audio: Some("251".into()), ..Default::default() };
+        let (s, _, _) = build_selector(&c2, Some(&d));
+        assert_eq!(s, "18/bv*+ba/b");
+        // Auto + specific audio.
+        let c3 = YtChoice { audio: Some("251".into()), ..Default::default() };
+        let (s, _, _) = build_selector(&c3, None);
+        assert_eq!(s, "bv*+251/bv*+ba/b");
+    }
+
+    #[test]
+    fn selector_from_choice() {
+        let c = YtChoice { format: Some("137".into()), audio: Some("251".into()), ..Default::default() };
+        let (s, extra, audio) = build_selector(&c, None);
+        assert_eq!(s, "137+251/137+bestaudio/bv*+ba/b");
+        assert!(extra.is_empty() && !audio);
+        let c = YtChoice { format: Some("audio:251".into()), extract: Some("mp3".into()), ..Default::default() };
+        let (s, extra, audio) = build_selector(&c, None);
+        assert_eq!(s, "251/ba/b");
+        assert!(audio && extra.contains(&"-x".to_string()));
+        let c = YtChoice { subs: vec!["en".into()], auto_subs: vec!["vi".into()], sub_embed: true, ..Default::default() };
+        let (_, extra, _) = build_selector(&c, None);
+        assert!(extra.contains(&"--write-subs".to_string()));
+        assert!(extra.contains(&"--write-auto-subs".to_string()));
+        assert!(extra.contains(&"en,vi".to_string()));
+        assert!(extra.contains(&"--embed-subs".to_string()));
+        // Round-trip through headers; pseudo-headers stripped from base_args.
+        let mut h = std::collections::BTreeMap::new();
+        c.write_headers(&mut h);
+        assert_eq!(YtChoice::from_headers(&h), c);
+        let t = crate::model::DownloadTask { headers: h, ..Default::default() };
+        let a = base_args("https://x/watch", &t);
+        assert!(!a.iter().any(|x| x.starts_with("x-yt") || x.starts_with("x-ytdlp")));
+    }
+
+    #[test]
+    fn dump_parses_subs_and_meta() {
+        let j = r#"{"title":"T","duration":61.5,"uploader":"U","formats":[{"format_id":"137","ext":"mp4","width":1920,"height":1080,"fps":30.0,"vcodec":"avc1","acodec":"none","tbr":2400.0}],"subtitles":{"en":[{"ext":"srt"}]},"automatic_captions":{"vi":[{"ext":"json3"}],"en":[{"ext":"json3"}]}}"#;
+        let d: YtDump = serde_json::from_str(j).unwrap();
+        assert_eq!(d.uploader(), "U");
+        assert_eq!(d.video_formats().len(), 1);
+        assert_eq!(d.sub_langs(), vec!["en".to_string()]);
+        assert_eq!(d.auto_langs(), vec!["vi".to_string()]);
+        assert!(d.video_formats()[0].is_video_only());
     }
 }

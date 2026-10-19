@@ -88,6 +88,98 @@ fn frame(ctx: &Context, pos: egui::Pos2, pressed: bool) {
     });
 }
 
+/// Regression: topbar search after menu::bar claimed full row width.
+/// Search must render inside bar closure as RTL tail; asserts non-zero
+/// rect, right edge inside panel (12px frame margin + 8px gap), empty+busy.
+#[test]
+fn topbar_search_visible() {
+    use std::cell::RefCell;
+    for width in [1180.0f32, 760.0] {
+        for busy in [false, true] {
+            let ctx = Context::default();
+            let search_rect: std::rc::Rc<RefCell<Option<egui::Rect>>> =
+                std::rc::Rc::new(RefCell::new(None));
+            for _ in 0..3 {
+                let cell = search_rect.clone();
+                let mut search = if busy { "zip".to_string() } else { String::new() };
+                let input = RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 720.0),
+                    )),
+                    ..Default::default()
+                };
+                let _ = ctx.run(input, |ctx| {
+                    egui::TopBottomPanel::top("topbar")
+                        .frame(
+                            egui::Frame::none().inner_margin(egui::Margin {
+                                left: 12.0,
+                                right: 12.0,
+                                top: 4.0,
+                                bottom: 4.0,
+                            }),
+                        )
+                        .show(ctx, |ui| {
+                            ui.horizontal_centered(|ui| {
+                                egui::menu::bar(ui, |ui| {
+                                    for name in ["Tasks", "File", "Downloads", "View", "Help"] {
+                                        ui.menu_button(name, |ui| {
+                                            let _ = ui.button("item");
+                                        });
+                                    }
+                                    ui.add_space(12.0);
+                                    ui.label("0 active · 0 B/s");
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let avail_w = ui.available_width();
+                                            let busy2 = !search.is_empty();
+                                            let reserve = if busy2 {
+                                                8.0 + 52.0 + 8.0 + 56.0 + 4.0 + 8.0
+                                            } else {
+                                                8.0
+                                            };
+                                            let w = (avail_w - reserve).clamp(96.0, 320.0);
+                                            if avail_w >= 96.0 {
+                                                ui.add_space(8.0);
+                                                if busy2 {
+                                                    let _ = ui.button("Clear");
+                                                }
+                                                let resp = ui.add_sized(
+                                                    [w, 24.0],
+                                                    egui::TextEdit::singleline(&mut search)
+                                                        .id(egui::Id::new("main-search"))
+                                                        .hint_text("Search downloads…")
+                                                        .desired_width(w),
+                                                );
+                                                *cell.borrow_mut() = Some(resp.rect);
+                                                if busy2 {
+                                                    ui.label("3 of 9");
+                                                    ui.add_space(4.0);
+                                                }
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                        });
+                });
+            }
+            let rect = search_rect
+                .borrow()
+                .expect("search TextEdit was never allocated (evaporated)");
+            assert!(rect.width() >= 96.0, "w={} rect {rect:?}", rect.width());
+            // TextEdit under menu style renders ~20px tall inside 24px slot.
+            assert!(rect.height() >= 20.0, "height {rect:?}");
+            assert!(
+                rect.right() <= width - 12.0 - 8.0 + 0.5,
+                "right clipped: {rect:?} width={width}"
+            );
+            assert!(rect.left() >= 0.0, "left offscreen: {rect:?}");
+        }
+    }
+}
+
 #[test]
 fn dialog_clicks_no_panic() {
     let ctx = Context::default();

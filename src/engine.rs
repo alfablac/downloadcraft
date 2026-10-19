@@ -57,6 +57,17 @@ fn headers_for(task: &DownloadTask) -> reqwest::header::HeaderMap {
         }
     }
     for (k, v) in &task.headers {
+        // Pseudo-headers are task config, never sent on wire.
+        if crate::ytdlp::YT_HEADER_KEYS.iter().any(|x| k.eq_ignore_ascii_case(x))
+            || k.eq_ignore_ascii_case("x-page-url")
+            || k.eq_ignore_ascii_case("x-page-stream")
+            || k.eq_ignore_ascii_case("x-page-intent")
+            || k.eq_ignore_ascii_case("x-rep-id")
+            || k.eq_ignore_ascii_case("x-variant-index")
+            || k.eq_ignore_ascii_case("x-nzb")
+        {
+            continue;
+        }
         if let (Ok(n), Ok(vv)) = (k.parse::<reqwest::header::HeaderName>(), v.parse()) {
             h.insert(n, vv);
         }
@@ -89,6 +100,13 @@ pub struct Controls {
     /// Multi-file NZB: one entry per file (bytes, flag false); single-file
     /// NZB keeps segment-count convention (flag true).
     pub parts: std::sync::Mutex<Vec<(u64, u64)>>,
+    /// Torrent files aligned 1:1 with `parts`: (librqbit index, relative path).
+    /// All torrent files published, unselected included (progress checkboxes);
+    /// empty for non-torrent downloads (generic Part/File label fallback).
+    pub part_files: std::sync::Mutex<Vec<(usize, String)>>,
+    /// Pending live reselection: GUI writes Some(normalized selection, empty=all),
+    /// torrent poll loop consumes + applies. None = no request.
+    pub desired_files: std::sync::Mutex<Option<Vec<usize>>>,
     pub parts_are_segments: AtomicBool,
     /// Torrent swarm snapshot (only torrent worker writes). Live-only:
     /// never persisted, GUI renders last known for Complete tasks.
@@ -119,6 +137,8 @@ impl Controls {
             rate: std::sync::Mutex::new((std::time::Instant::now(), 0, None, 0, 0.0)),
             total: AtomicU64::new(0),
             parts: std::sync::Mutex::new(Vec::new()),
+            part_files: std::sync::Mutex::new(Vec::new()),
+            desired_files: std::sync::Mutex::new(None),
             parts_are_segments: AtomicBool::new(false),
             torrent: std::sync::Mutex::new(None),
         }
@@ -671,6 +691,24 @@ pub async fn download_http(
         tokio::fs::rename(&tmp, &dest)
             .await
             .map_err(|e| e.to_string())?;
+        // Validate before Complete: manifest/HTML/magic mismatch quarantined.
+        match validate_output(&dest, &task.filename) {
+            Ok(_) => {}
+            Err(ValidateFail::TsInMp4) => {
+                let final_path = ensure_mp4_or_ts(&dest).await?;
+                if let Some(name) = final_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                {
+                    task.filename = name;
+                }
+                finish_check(&final_path, &task).await?;
+                task.status = TaskStatus::Complete;
+                task.downloaded = n;
+                return Ok(task);
+            }
+            Err(e) => return Err(quarantine_bad(&dest, &e)),
+        }
         finish_check(&dest, &task).await?;
         task.status = TaskStatus::Complete;
         task.downloaded = n;
@@ -859,6 +897,23 @@ pub async fn download_http(
         .await
         .map_err(|e| e.to_string())?;
     let _ = tokio::fs::remove_dir_all(&part_dir).await;
+    match validate_output(&dest, &task.filename) {
+        Ok(_) => {}
+        Err(ValidateFail::TsInMp4) => {
+            let final_path = ensure_mp4_or_ts(&dest).await?;
+            if let Some(name) = final_path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+            {
+                task.filename = name;
+            }
+            finish_check(&final_path, &task).await?;
+            task.status = TaskStatus::Complete;
+            task.downloaded = total;
+            return Ok(task);
+        }
+        Err(e) => return Err(quarantine_bad(&dest, &e)),
+    }
     finish_check(&dest, &task).await?;
     task.status = TaskStatus::Complete;
     task.downloaded = total;
@@ -1157,6 +1212,76 @@ async fn finish_check(dest: &Path, task: &DownloadTask) -> Result<(), String> {
 
 pub type MediaTracks = Vec<(String, Vec<(Option<String>, String)>)>;
 /// Download list of media segments (DASH/HLS) and concatenate. Separate tracks muxed via ffmpeg if available.
+/// Prior-run segment lengths recorded in `tracks.json` (beside `seg-*.bin`
+/// caches). Legacy snapshots stored only `(kind, count)` per track; those
+/// parse to counts-only and yield no lengths (distrust cache, refetch).
+/// Fresh snapshots append per-segment on-disk lengths as a third tuple
+/// element, keyed `seg-{kind}-{i}`.
+type SegLenSnapshot = std::collections::BTreeMap<String, u64>;
+
+fn seg_len_key(kind: &str, i: usize) -> String {
+    format!("seg-{kind}-{i}")
+}
+
+/// Load recorded segment length, if snapshot has one for this segment.
+/// Missing entry / missing / unparsable snapshot = no recorded length.
+fn recorded_seg_len(snapshot: &SegLenSnapshot, kind: &str, i: usize) -> Option<u64> {
+    snapshot.get(&seg_len_key(kind, i)).copied()
+}
+
+/// Cache trustworthy only when it exists, is non-empty, and (when snapshot
+/// recorded a length) matches it exactly. Length-less legacy cache = poison
+/// risk (partial write from killed run), so caller refetches.
+fn cache_trusted(cache: &Path, recorded: Option<u64>) -> bool {
+    let Ok(md) = std::fs::metadata(cache) else {
+        return false;
+    };
+    let len = md.len();
+    if len == 0 {
+        return false;
+    }
+    match recorded {
+        Some(want) => len == want,
+        None => false,
+    }
+}
+
+/// Serialize tracks.json: `{"tracks": [[kind, count]], "seg_lens":
+/// [[seg_key, len]]}`. `parse_seg_snapshot` also accepts legacy bare
+/// `[[kind, count]]` (no lengths -> caches distrusted).
+fn snapshot_json(tracks: &MediaTracks, lens: &SegLenSnapshot) -> String {
+    let tracks_v: Vec<serde_json::Value> = tracks
+        .iter()
+        .map(|(k, s)| serde_json::json!([k, s.len()]))
+        .collect();
+    let lens_v: Vec<serde_json::Value> = lens
+        .iter()
+        .map(|(k, v)| serde_json::json!([k, v]))
+        .collect();
+    serde_json::json!({"tracks": tracks_v, "seg_lens": lens_v}).to_string()
+}
+
+/// Parse tracks.json in either form: legacy bare array `[[kind, count]]`
+/// (no lengths) or object `{"tracks": [...], "seg_lens": [[key, len]]}`.
+fn parse_seg_snapshot(text: &str) -> SegLenSnapshot {
+    let mut out = SegLenSnapshot::new();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return out;
+    };
+    let Some(arr) = v.get("seg_lens").and_then(|x| x.as_array()) else {
+        return out;
+    };
+    for e in arr {
+        if let (Some(k), Some(n)) = (
+            e.get(0).and_then(|x| x.as_str()),
+            e.get(1).and_then(|x| x.as_u64()),
+        ) {
+            out.insert(k.to_string(), n);
+        }
+    }
+    out
+}
+
 pub async fn download_media(
     client: reqwest::Client,
     task: DownloadTask,
@@ -1171,15 +1296,14 @@ pub async fn download_media(
         .join(format!(".downloadcraft-media-{}", task.id));
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     // Manifest snapshot BEFORE fetch: kill-resume reuses seg caches below.
+    // Record prior completed segment lengths first (cache-size validation);
+    // snapshot rewritten with fresh lengths after each segment completes.
+    let mut known_lens: SegLenSnapshot = std::fs::read_to_string(work.join("tracks.json"))
+        .map(|t| parse_seg_snapshot(&t))
+        .unwrap_or_default();
     let _ = std::fs::write(
         work.join("tracks.json"),
-        serde_json::to_string(
-            &tracks
-                .iter()
-                .map(|(k, s)| (k.clone(), s.len()))
-                .collect::<Vec<_>>(),
-        )
-        .unwrap_or_default(),
+        snapshot_json(&tracks, &known_lens),
     );
     let mut track_files: Vec<PathBuf> = Vec::new();
     let mut subtitle_files: Vec<PathBuf> = Vec::new();
@@ -1212,7 +1336,11 @@ pub async fn download_media(
                                 fetch_into_inner(&client, &task, init, &mut file, &ctrl).await?;
                         }
                     }
-                    if !cache.exists() {
+                    // Replay only size-validated cache: missing/empty/length-
+                    // mismatch (partial write from killed run) refetches instead
+                    // of poisoning output. No recorded length = untrusted.
+                    let recorded = recorded_seg_len(&known_lens, kind, i);
+                    if !cache_trusted(&cache, recorded) {
                         let mut cf = tokio::fs::File::create(&cache)
                             .await
                             .map_err(|e| e.to_string())?;
@@ -1221,8 +1349,20 @@ pub async fn download_media(
                         let n = fetch_into_inner(&client, &task, seg_url, &mut cf, &ctrl).await?;
                         ctrl.downloaded.fetch_sub(n, Ordering::Relaxed);
                         cf.flush().await.map_err(|e| e.to_string())?;
+                        drop(cf);
+                        // Record fresh length for next kill-resume validation.
+                        if n > 0 {
+                            known_lens.insert(seg_len_key(kind, i), n);
+                            let _ = std::fs::write(
+                                work.join("tracks.json"),
+                                snapshot_json(&tracks, &known_lens),
+                            );
+                        }
                     }
                     let bytes = tokio::fs::read(&cache).await.map_err(|e| e.to_string())?;
+                    if bytes.is_empty() {
+                        return Err(format!("empty segment fetched: {seg_url}"));
+                    }
                     done_bytes += bytes.len() as u64;
                     ctrl.downloaded
                         .fetch_add(bytes.len() as u64, Ordering::Relaxed);
@@ -1300,19 +1440,78 @@ pub async fn download_media(
             .await
             .map_err(|e| e.to_string())?;
     } else if track_files.len() == 1 {
-        tokio::fs::rename(&track_files[0], &dest)
-            .await
-            .map_err(|e| e.to_string())?;
+        // Single track: raw concat renamed dest may be TS bytes under .mp4
+        // name (unplayable). Remux to mp4 or rename .ts before Complete.
+        match validate_output(&track_files[0], &task.filename) {
+            Err(ValidateFail::TsInMp4) => {
+                // Remux track file in place; if ffmpeg absent it becomes .ts.
+                let fixed = ensure_mp4_or_ts(&track_files[0]).await?;
+                let is_ts = fixed.extension().and_then(|e| e.to_str()) == Some("ts");
+                let target = if is_ts {
+                    dest.with_extension("ts")
+                } else {
+                    dest.clone()
+                };
+                tokio::fs::rename(&fixed, &target)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if let Some(name) = target.file_name().map(|s| s.to_string_lossy().into_owned()) {
+                    task.filename = name;
+                }
+                let _ = tokio::fs::remove_dir_all(&work).await;
+                finish_check(&target, &task).await?;
+                task.status = TaskStatus::Complete;
+                task.downloaded = done_bytes;
+                task.total = None;
+                return Ok(task);
+            }
+            Err(e) => {
+                // Assembled segments: empty/manifest hard-fail; generic magic
+                // mismatch tolerated (fMP4 concat not standalone container,
+                // per-segment manifest guard already ran).
+                let hard =
+                    e.to_string().contains("empty") || e.to_string().contains("playlist/HTML");
+                if hard {
+                    let _ = tokio::fs::remove_dir_all(&work).await;
+                    task.status = TaskStatus::Error;
+                    task.error = format!("invalid output: {e}");
+                    return Ok(task);
+                }
+                tokio::fs::rename(&track_files[0], &dest)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(_) => {
+                tokio::fs::rename(&track_files[0], &dest)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
     } else {
         // Try ffmpeg mux; fallback: keep first track and note error (muxer missing handled by caller docs)
         match mux_tracks(&track_files, &dest).await {
             Ok(()) => {}
             Err(e) => {
-                // Fallback: rename video/first track so file exists, record error
+                // Fallback: rename video/first track so file exists, record error.
+                // TS bytes must not stay under .mp4 name: rename dest to .ts.
                 tokio::fs::copy(&track_files[0], &dest)
                     .await
                     .map_err(|e| e.to_string())?;
                 let _ = tokio::fs::remove_dir_all(&work).await;
+                if matches!(
+                    validate_output(&dest, &task.filename),
+                    Err(ValidateFail::TsInMp4)
+                ) {
+                    let ts_dest = dest.with_extension("ts");
+                    if tokio::fs::rename(&dest, &ts_dest).await.is_ok() {
+                        if let Some(name) = ts_dest
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                        {
+                            task.filename = name;
+                        }
+                    }
+                }
                 task.status = TaskStatus::Error;
                 task.error = format!("mux failed ({e}); kept first track only");
                 task.downloaded = done_bytes;
@@ -1322,6 +1521,42 @@ pub async fn download_media(
         }
     }
     let _ = tokio::fs::remove_dir_all(&work).await;
+    // Final gate: muxed/multi-track output must not be manifest/empty/wrong magic.
+    // Subtitle-only dest is text sidecar copy: skip media magic there.
+    if track_files.is_empty() && !subtitle_files.is_empty() {
+        // subtitle-only: only non-empty check applies
+        if matches!(validate_output(&dest, "x.bin"), Err(ValidateFail::Msg(_))) {
+            task.status = TaskStatus::Error;
+            task.error = "invalid output: subtitle file empty/missing".into();
+            return Ok(task);
+        }
+    } else {
+        match validate_output(&dest, &task.filename) {
+            Ok(_) => {}
+            Err(ValidateFail::TsInMp4) => {
+                let fixed = ensure_mp4_or_ts(&dest).await?;
+                if let Some(name) = fixed.file_name().map(|s| s.to_string_lossy().into_owned()) {
+                    task.filename = name;
+                }
+                let final_dest = task.dest_dir.join(&task.filename);
+                finish_check(&final_dest, &task).await?;
+                task.status = TaskStatus::Complete;
+                task.downloaded = done_bytes;
+                task.total = None;
+                return Ok(task);
+            }
+            Err(e) => {
+                // See single-track note: only empty/manifest hard-fail for assembled media.
+                let hard =
+                    e.to_string().contains("empty") || e.to_string().contains("playlist/HTML");
+                if hard {
+                    task.status = TaskStatus::Error;
+                    task.error = format!("invalid output: {e}");
+                    return Ok(task);
+                }
+            }
+        }
+    }
     finish_check(&dest, &task).await?;
     task.status = TaskStatus::Complete;
     task.downloaded = done_bytes;
@@ -1377,6 +1612,8 @@ async fn fetch_once_counted_impl(
     }
     let mut stream = resp.bytes_stream();
     let mut n = 0u64;
+    // First-chunk guard: manifest/HTML bytes must never become media segments.
+    let mut first = true;
     loop {
         let Some(chunk) = (match next_chunk(&mut stream, ctrl).await {
             Ok(v) => v,
@@ -1394,6 +1631,12 @@ async fn fetch_once_counted_impl(
                 return Err(e.to_string());
             }
         };
+        if first {
+            first = false;
+            if crate::stream::looks_like_manifest_bytes_pub(&chunk) {
+                return Err(format!("segment is manifest/HTML, not media: {url}"));
+            }
+        }
         throttle(ctrl, chunk.len() as u64).await;
         if let Err(e) = file.write_all(&chunk).await {
             ctrl.downloaded.fetch_sub(n, Ordering::Relaxed);
@@ -1440,11 +1683,191 @@ pub async fn fetch_bytes_counted(
         return Err(format!("HTTP {}", resp.status()));
     }
     let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    if crate::stream::looks_like_manifest_bytes_pub(&bytes) {
+        return Err(format!("segment is manifest/HTML, not media: {url}"));
+    }
     let n = bytes.len() as u64;
     tokio::fs::write(dest, &bytes)
         .await
         .map_err(|e| e.to_string())?;
     Ok(n)
+}
+
+/// Output validation failure. `TsInMp4`: dest name is mp4-family but bytes
+/// are MPEG-TS (first byte 0x47) — caller remuxes or renames to .ts.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValidateFail {
+    Msg(String),
+    TsInMp4,
+    Empty,
+    Playlist,
+}
+impl std::fmt::Display for ValidateFail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ValidateFail::Msg(m) => write!(f, "{m}"),
+            ValidateFail::TsInMp4 => write!(f, "output is TS, not mp4"),
+            ValidateFail::Empty => write!(f, "output empty/missing"),
+            ValidateFail::Playlist => write!(f, "output is playlist/HTML, not media"),
+        }
+    }
+}
+
+/// TS stream: 188-byte packets each start 0x47. Single leading 0x47 is not
+/// enough: 'G' (GIF, text) also equals 0x47. Require a full packet plus a
+/// sync byte at the next packet boundary when present.
+pub fn is_ts(bytes: &[u8]) -> bool {
+    bytes.len() >= 188
+        && bytes[0] == 0x47
+        && (bytes.len() == 188 || bytes[188] == 0x47)
+        && (bytes.len() < 377 || bytes[376] == 0x47)
+}
+
+fn is_mp4_ext(ext: &str) -> bool {
+    matches!(ext, "mp4" | "m4v" | "mov" | "m4a")
+}
+
+const MEDIA_EXTS: &[&str] = &[
+    "mp4", "m4a", "m4v", "mov", "mkv", "webm", "mp3", "ts", "m4s", "opus", "ogg", "flac", "wav",
+    "aac",
+];
+
+fn is_media_ext(ext: &str) -> bool {
+    MEDIA_EXTS.contains(&ext)
+}
+
+fn ext_of_str(name: &str) -> String {
+    Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// Validate finished output. Strict checks (empty, playlist/HTML body,
+/// magic) ONLY for media-family dest (mp4,m4a,mov,mkv,webm,mp3,ts,m4s,
+/// opus,ogg,flac,wav,aac) by dest or context filename extension. Generic
+/// downloads always pass (Ok(len), missing file still errors) — legit
+/// 0-byte/.html/legacy-.mov/ADTS-.aac files must not false-reject.
+/// Pure: never renames. Returns file size.
+pub fn validate_output(dest: &Path, filename_for_error_context: &str) -> Result<u64, ValidateFail> {
+    validate_output_impl(dest, filename_for_error_context, false)
+}
+
+/// `strict=true`: force media checks regardless of extension. Post-mux
+/// gate uses this — ffmpeg output under any name must be valid media,
+/// any validate error there is a hard failure (corrupt output).
+pub fn validate_output_strict(
+    dest: &Path,
+    filename_for_error_context: &str,
+    strict: bool,
+) -> Result<u64, ValidateFail> {
+    if strict {
+        validate_output_impl(dest, filename_for_error_context, true)
+    } else {
+        validate_output(dest, filename_for_error_context)
+    }
+}
+
+fn validate_output_impl(
+    dest: &Path,
+    filename_for_error_context: &str,
+    force_media: bool,
+) -> Result<u64, ValidateFail> {
+    let msg = |m: &str| ValidateFail::Msg(format!("{m} ({filename_for_error_context})"));
+    // First 64KB is plenty for magic; whole-file read would be wasteful on
+    // multi-GB outputs, size comes from metadata.
+    use std::io::Read as _;
+    let size = std::fs::metadata(dest).map_err(|_| ValidateFail::Empty)?.len();
+    let ctx_ext = ext_of_str(filename_for_error_context);
+    let dest_ext = dest
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !force_media && !is_media_ext(&ctx_ext) && !is_media_ext(&dest_ext) {
+        return Ok(size);
+    }
+    if size == 0 {
+        return Err(ValidateFail::Empty);
+    }
+    let mut head = vec![0u8; 64 * 1024];
+    let n = {
+        let mut f = std::fs::File::open(dest)
+            .map_err(|e| ValidateFail::Msg(format!("output empty/missing: {e}")))?;
+        f.read(&mut head)
+            .map_err(|e| ValidateFail::Msg(format!("output read: {e}")))?
+    };
+    head.truncate(n);
+    let head = &head[..];
+    let text = {
+        let t = String::from_utf8_lossy(head);
+        let t = t.trim_start_matches('\u{feff}');
+        t.trim_start().to_string()
+    };
+    if text.starts_with("#EXTM3U")
+        || text.starts_with("<MPD")
+        || text.to_ascii_lowercase().starts_with("<metalink")
+        || text.to_ascii_lowercase().starts_with("<!doctype html")
+        || text.to_ascii_lowercase().starts_with("<html")
+    {
+        return Err(msg("output is playlist/HTML, not media"));
+    }
+    // Extension from filename context first: media track temp files are
+    // `.bin` on disk but must validate against final dest extension.
+    let ext = Path::new(filename_for_error_context)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .filter(|e| !e.is_empty())
+        .unwrap_or_else(|| {
+            dest.extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase()
+        });
+    // TS-in-mp4 checked before generic magic: TS bytes are valid media,
+    // just wrong container name — caller decides remux vs .ts rename.
+    if is_mp4_ext(&ext) && is_ts(head) {
+        return Err(ValidateFail::TsInMp4);
+    }
+    let ok = match ext.as_str() {
+        "mp4" | "m4v" | "mov" | "m4a" => head.len() >= 8 && &head[4..8] == b"ftyp",
+        "webm" | "mkv" => head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]),
+        "mp3" => head.starts_with(b"ID3") || (head.len() >= 2 && head[0] == 0xFF && head[1] & 0xE0 == 0xE0),
+        "ts" => is_ts(head),
+        _ => true,
+    };
+    if !ok {
+        return Err(msg("output magic bytes do not match extension"));
+    }
+    Ok(size)
+}
+
+/// Remux TS-in-mp4 dest to real mp4 via ffmpeg; on failure/absent ffmpeg,
+/// rename dest to .ts (honest extension). Returns final path. Only called
+/// after validate_output returned TsInMp4 (or dest known TS).
+pub async fn ensure_mp4_or_ts(dest: &Path) -> Result<PathBuf, String> {
+    let tmp = dest.with_extension("remux.mp4");
+    match mux_tracks(&[dest.to_path_buf()], &tmp).await {
+        Ok(()) => {
+            std::fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
+            Ok(dest.to_path_buf())
+        }
+        Err(_) => {
+            let ts = dest.with_extension("ts");
+            std::fs::rename(dest, &ts).map_err(|e| e.to_string())?;
+            Ok(ts)
+        }
+    }
+}
+
+/// Quarantine bad output as `<name>.bad` (overwrite prior) then report Err.
+pub fn quarantine_bad(dest: &Path, why: &ValidateFail) -> String {
+    let bad = PathBuf::from(format!("{}.bad", dest.display()));
+    let _ = std::fs::remove_file(&bad);
+    let _ = std::fs::rename(dest, &bad);
+    format!("invalid output: {why} (quarantined as {})", bad.display())
 }
 
 pub async fn mux_tracks(tracks: &[PathBuf], dest: &Path) -> Result<(), String> {
@@ -1465,6 +1888,7 @@ pub async fn mux_tracks(tracks: &[PathBuf], dest: &Path) -> Result<(), String> {
     let mut last_err = String::new();
     for cand in &candidates {
         let mut cmd = tokio::process::Command::new(cand);
+        crate::platform::no_window_tokio(&mut cmd);
         cmd.arg("-y");
         for t in tracks {
             cmd.args(["-i"]).arg(t);
@@ -1490,6 +1914,88 @@ pub async fn mux_tracks(tracks: &[PathBuf], dest: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn tmp_file(tag: &str, name: &str, bytes: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wc-validate-{}-{}", std::process::id(), tag));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+    #[test]
+    fn validate_output_magic_table() {
+        let mut mp4 = vec![0u8; 4];
+        mp4.extend_from_slice(b"ftypisom");
+        mp4.extend_from_slice(&[0u8; 16]);
+        let p = tmp_file("mp4", "a.mp4", &mp4);
+        assert!(validate_output(&p, "a.mp4").is_ok(), "valid ftyp mp4 ok");
+        let p = tmp_file("m3u", "b.mp4", b"#EXTM3U\n#EXT-X-VERSION:3\n");
+        assert!(
+            matches!(validate_output(&p, "b.mp4"), Err(ValidateFail::Msg(_))),
+            "playlist in mp4 err"
+        );
+        let mut ts = vec![0x47u8];
+        ts.extend_from_slice(&[0u8; 187]);
+        let p = tmp_file("ts", "c.mp4", &ts);
+        assert_eq!(
+            validate_output(&p, "c.mp4"),
+            Err(ValidateFail::TsInMp4),
+            "TS in mp4 sentinel"
+        );
+        let p = tmp_file("empty", "d.mp4", b"");
+        assert!(
+            matches!(validate_output(&p, "d.mp4"), Err(ValidateFail::Msg(_))),
+            "empty err"
+        );
+        let p = tmp_file("webm", "e.webm", &[0x1A, 0x45, 0xDF, 0xA3, 1, 2]);
+        assert!(validate_output(&p, "e.webm").is_ok(), "webm magic ok");
+        let p = tmp_file("mp3", "f.mp3", b"ID3xxxx");
+        assert!(validate_output(&p, "f.mp3").is_ok(), "mp3 ID3 ok");
+        let p = tmp_file("badmp4", "g.mp4", b"not-media-at-all......");
+        assert!(
+            matches!(validate_output(&p, "g.mp4"), Err(ValidateFail::Msg(_))),
+            "bad mp4 magic err"
+        );
+        let p = tmp_file("html", "h.mp4", b"<html><body>x</body></html>");
+        assert!(
+            matches!(validate_output(&p, "h.mp4"), Err(ValidateFail::Msg(_))),
+            "HTML err"
+        );
+    }
+    #[test]
+    fn seg_snapshot_and_cache_trust() {
+        // Legacy [[kind,count]] snapshot: parses, yields no lengths.
+        let legacy = parse_seg_snapshot(r#"[["video",2],["audio",1]]"#);
+        assert!(legacy.is_empty());
+        assert_eq!(recorded_seg_len(&legacy, "video", 0), None);
+        // Fresh object snapshot round-trips per-segment lengths.
+        let tracks: MediaTracks = vec![
+            ("video".into(), vec![(None, "s0".into()), (None, "s1".into())]),
+            ("audio".into(), vec![(None, "a0".into())]),
+        ];
+        let mut lens = SegLenSnapshot::new();
+        lens.insert(seg_len_key("video", 0), 100);
+        lens.insert(seg_len_key("video", 1), 50);
+        let back = parse_seg_snapshot(&snapshot_json(&tracks, &lens));
+        assert_eq!(recorded_seg_len(&back, "video", 0), Some(100));
+        assert_eq!(recorded_seg_len(&back, "video", 1), Some(50));
+        assert_eq!(recorded_seg_len(&back, "audio", 0), None);
+        // Garbage snapshot = no lengths, never panics.
+        assert!(parse_seg_snapshot("not json").is_empty());
+        // Trust: exact recorded len ok; mismatch / empty / missing /
+        // no-recorded-length all untrusted.
+        let dir = std::env::temp_dir().join(format!("wc-segtrust-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let good = dir.join("seg-video-0.bin");
+        std::fs::write(&good, vec![7u8; 100]).unwrap();
+        assert!(cache_trusted(&good, Some(100)));
+        assert!(!cache_trusted(&good, Some(99)), "partial cache rejected");
+        assert!(!cache_trusted(&good, None), "legacy cache untrusted");
+        let empty = dir.join("seg-video-1.bin");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(!cache_trusted(&empty, Some(0)));
+        assert!(!cache_trusted(&empty, None));
+        assert!(!cache_trusted(&dir.join("nope.bin"), Some(10)));
+    }
     #[test]
     fn plan_segments_unchanged() {
         assert_eq!(plan_segments(0, 8), vec![]);

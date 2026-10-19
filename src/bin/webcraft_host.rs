@@ -1,3 +1,4 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
@@ -120,16 +121,29 @@ fn handle(msg: &serde_json::Value) -> serde_json::Value {
     };
     match ty {
         "ping" => with_id(serde_json::json!({"type":"pong"})),
+        // Pre-flight for captured downloads: extension asks BEFORE cancelling
+        // browser download. allow=false -> browser keeps file (filter is
+        // webcraft Settings via capture-filter.json, host is sole decider).
+        // No inbox write here; actual send is separate "download" msg.
+        "captureCheck" => {
+            let (exts, min_bytes) = load_capture_filter();
+            let filename = msg.get("filename").and_then(|f| f.as_str()).unwrap_or("");
+            let url = msg.get("url").and_then(|f| f.as_str()).unwrap_or("");
+            let mime = msg.get("mime").and_then(|f| f.as_str()).unwrap_or("");
+            let size = msg.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+            let allow = capture_allowed(&exts, min_bytes, filename, url, mime, size);
+            with_id(serde_json::json!({"type":"captureCheck","allow":allow}))
+        }
         "download" | "add" => {
             let url = msg.get("url").and_then(|v| v.as_str()).unwrap_or("");
             if url.is_empty() {
                 return with_id(serde_json::json!({"type":"error","error":"missing url"}));
             }
-            // Captured downloads (browser intercept/takeover) pass capture filter.
-            // Explicit sends omit `captured` (or false) and always go: user intent.
-            // ponytail: reply ok on filtered — contents.js deletes queue item on any
-            // reply; error would leave zombie row. Browser fallback for filtered
-            // capture inside extension deliberately skipped: skip means skip.
+            // Captured downloads pass capture filter (webcraft Settings).
+            // Explicit sends omit `captured` and always go: user intent.
+            // Extension pre-checks via captureCheck before cancelling, so
+            // filtered normally never reaches here; skipped reply = raced
+            // filter change, extension resumes browser download on it.
             if msg
                 .get("captured")
                 .and_then(|c| c.as_bool())
@@ -153,9 +167,19 @@ fn handle(msg: &serde_json::Value) -> serde_json::Value {
                     .unwrap_or(0)
             );
             let mut body = format!("url={url}\n");
+            // size arrives as JSON number: write explicitly or KV drops it.
+            if let Some(sz) = msg.get("size").and_then(|v| v.as_u64()) {
+                if sz > 0 {
+                    body.push_str(&format!("size={sz}\n"));
+                }
+            }
             for k in [
                 "filename", "referrer", "cookies", "referer", "cookie", "queue", "mime", "type",
+                "pageUrl", "intent", "size",
             ] {
+                if k == "size" {
+                    continue;
+                }
                 if let Some(v) = msg.get(k).and_then(|v| v.as_str()) {
                     if k == "filename" {
                         // Drop traversal: write basename only; drop if basename invalid/empty.
@@ -226,6 +250,15 @@ mod tests {
 
     fn exts(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn capture_check_msg_answers_allow() {
+        // Defaults = empty exts + min 0: always allow. Pure via capture_allowed
+        // (handle() would read real user capture-filter.json — non-hermetic).
+        assert!(capture_allowed(&[], 0, "f.bin", "https://x/f.bin", "", 10));
+        assert!(!capture_allowed(&exts(&["zip"]), 0, "f.bin", "https://x/f.bin", "", 10));
+        assert!(!capture_allowed(&[], 100, "f.zip", "https://x/f.zip", "", 10));
     }
 
     #[test]
