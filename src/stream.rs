@@ -55,7 +55,9 @@ fn manifest_kind_from_url(url: &str) -> Option<Manifest> {
 /// download into an orphan "complete" file. Only context that rescues it:
 /// `x-page-url` pointing at a manifest itself. Returns rejection reason.
 fn segment_only_reject(task: &DownloadTask) -> Option<String> {
-    if !url_path_ends(&task.url, &[".ts", ".m4s"]) {
+    // Only .m4s is a bare fragment (no init, unplayable alone). Bare .ts is
+    // a self-contained stream: allow through to probe.
+    if !url_path_ends(&task.url, &[".m4s"]) {
         return None;
     }
     let has_manifest_ctx = task
@@ -927,9 +929,7 @@ async fn download_hls_media(
                 }
                 fixed
             }
-            Err(e @ engine::ValidateFail::Msg(_))
-                if e.to_string().contains("empty") || e.to_string().contains("playlist/HTML") =>
-            {
+            Err(e @ (engine::ValidateFail::Empty | engine::ValidateFail::Playlist)) => {
                 return Err(engine::quarantine_bad(&dest, &e))
             }
             // Other magic mismatch (e.g. decrypted non-TS payload in .ts):
@@ -1020,13 +1020,13 @@ mod tests {
             filename: "seg1.ts".into(),
             ..Default::default()
         };
-        assert!(segment_only_reject(&bare_ts).is_some());
-        // Page URL is a video page, not a manifest: still rejected.
+        // Bare .ts now allowed: self-contained, goes through probe.
+        assert!(segment_only_reject(&bare_ts).is_none());
         let mut page_ctx = bare_ts.clone();
         page_ctx
             .headers
             .insert("x-page-url".into(), "https://x.org/watch?v=abc123".into());
-        assert!(segment_only_reject(&page_ctx).is_some());
+        assert!(segment_only_reject(&page_ctx).is_none());
         // Page URL is the parent manifest: allowed (manifest context).
         let mut man_ctx = bare_ts.clone();
         man_ctx

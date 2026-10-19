@@ -682,20 +682,51 @@ pub async fn download_http(
         }
         file.flush().await.map_err(|e| e.to_string())?;
         drop(file);
-        let dest = dedup_dest(&dest, Some(n));
-        if let Some(name) = dest.file_name().map(|s| s.to_string_lossy().into_owned()) {
-            if name != task.filename {
-                task.filename = name;
+        // Validate temp BEFORE dedup/rename: on failure delete temp only —
+        // final dest (pre-existing/other-task file) stays untouched.
+        let vdest = match validate_output(&tmp, &task.filename) {
+            Ok(_) => {
+                let dest = dedup_dest(&dest, Some(n));
+                if let Some(name) = dest.file_name().map(|s| s.to_string_lossy().into_owned()) {
+                    if name != task.filename {
+                        task.filename = name;
+                    }
+                }
+                tokio::fs::rename(&tmp, &dest)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                dest
             }
-        }
-        tokio::fs::rename(&tmp, &dest)
-            .await
-            .map_err(|e| e.to_string())?;
-        // Validate before Complete: manifest/HTML/magic mismatch quarantined.
-        match validate_output(&dest, &task.filename) {
+            Err(ValidateFail::TsInMp4) => {
+                // Remux temp in place, then dedup/rename to final dest.
+                let fixed = ensure_mp4_or_ts_validated(&tmp).await?;
+                let dest = dedup_dest(&dest, Some(n));
+                let dest = if fixed.extension().and_then(|e| e.to_str()) == Some("ts") {
+                    dest.with_extension("ts")
+                } else {
+                    dest
+                };
+                if let Some(name) = dest.file_name().map(|s| s.to_string_lossy().into_owned()) {
+                    if name != task.filename {
+                        task.filename = name;
+                    }
+                }
+                tokio::fs::rename(&fixed, &dest)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                dest
+            }
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(format!("invalid output: {e}"));
+            }
+        };
+        // vdest already validated pre-rename (TsInMp4 remuxed there); this
+        // gate only re-checks the renamed file, no quarantine (dest is ours).
+        match validate_output(&vdest, &task.filename) {
             Ok(_) => {}
             Err(ValidateFail::TsInMp4) => {
-                let final_path = ensure_mp4_or_ts(&dest).await?;
+                let final_path = ensure_mp4_or_ts(&vdest).await?;
                 if let Some(name) = final_path
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
@@ -887,6 +918,39 @@ pub async fn download_http(
             "size mismatch: assembled {assembled} != total {total}"
         ));
     }
+    // Validate assembled temp BEFORE dedup/rename: on failure delete temp
+    // only — final dest (pre-existing/other-task file) stays untouched.
+    match validate_output(&tmp, &task.filename) {
+        Ok(_) => {}
+        Err(ValidateFail::TsInMp4) => {
+            let fixed = ensure_mp4_or_ts_validated(&tmp).await?;
+            let is_ts = fixed.extension().and_then(|e| e.to_str()) == Some("ts");
+            let dest0 = dedup_dest(&dest, Some(total));
+            let dest = if is_ts {
+                dest0.with_extension("ts")
+            } else {
+                dest0
+            };
+            if let Some(name) = dest.file_name().map(|s| s.to_string_lossy().into_owned()) {
+                if name != task.filename {
+                    task.filename = name;
+                }
+            }
+            tokio::fs::rename(&fixed, &dest)
+                .await
+                .map_err(|e| e.to_string())?;
+            let _ = tokio::fs::remove_dir_all(&part_dir).await;
+            finish_check(&dest, &task).await?;
+            task.status = TaskStatus::Complete;
+            task.downloaded = total;
+            return Ok(task);
+        }
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            let _ = tokio::fs::remove_dir_all(&part_dir).await;
+            return Err(format!("invalid output: {e}"));
+        }
+    }
     let dest = dedup_dest(&dest, Some(total));
     if let Some(name) = dest.file_name().map(|s| s.to_string_lossy().into_owned()) {
         if name != task.filename {
@@ -897,23 +961,6 @@ pub async fn download_http(
         .await
         .map_err(|e| e.to_string())?;
     let _ = tokio::fs::remove_dir_all(&part_dir).await;
-    match validate_output(&dest, &task.filename) {
-        Ok(_) => {}
-        Err(ValidateFail::TsInMp4) => {
-            let final_path = ensure_mp4_or_ts(&dest).await?;
-            if let Some(name) = final_path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-            {
-                task.filename = name;
-            }
-            finish_check(&final_path, &task).await?;
-            task.status = TaskStatus::Complete;
-            task.downloaded = total;
-            return Ok(task);
-        }
-        Err(e) => return Err(quarantine_bad(&dest, &e)),
-    }
     finish_check(&dest, &task).await?;
     task.status = TaskStatus::Complete;
     task.downloaded = total;
@@ -1466,12 +1513,10 @@ pub async fn download_media(
                 return Ok(task);
             }
             Err(e) => {
-                // Assembled segments: empty/manifest hard-fail; generic magic
-                // mismatch tolerated (fMP4 concat not standalone container,
-                // per-segment manifest guard already ran).
-                let hard =
-                    e.to_string().contains("empty") || e.to_string().contains("playlist/HTML");
-                if hard {
+                // Assembled segments (raw concat, pre-remux): Empty/Playlist
+                // hard-fail; generic magic mismatch tolerated (fMP4 concat
+                // not standalone container, per-segment guard already ran).
+                if matches!(e, ValidateFail::Empty | ValidateFail::Playlist) {
                     let _ = tokio::fs::remove_dir_all(&work).await;
                     task.status = TaskStatus::Error;
                     task.error = format!("invalid output: {e}");
@@ -1524,14 +1569,28 @@ pub async fn download_media(
     // Final gate: muxed/multi-track output must not be manifest/empty/wrong magic.
     // Subtitle-only dest is text sidecar copy: skip media magic there.
     if track_files.is_empty() && !subtitle_files.is_empty() {
-        // subtitle-only: only non-empty check applies
-        if matches!(validate_output(&dest, "x.bin"), Err(ValidateFail::Msg(_))) {
+        // subtitle-only: only empty/missing check applies (strict would
+        // magic-reject text; non-media validate still errors Empty).
+        if matches!(validate_output(&dest, "x.bin"), Err(ValidateFail::Empty)) {
             task.status = TaskStatus::Error;
             task.error = "invalid output: subtitle file empty/missing".into();
             return Ok(task);
         }
+    } else if track_files.len() == 1 {
+        // Single-track raw concat already gated tolerantly above; reaching
+        // here means it passed/renamed. Only Empty/Playlist hard-fail.
+        if matches!(
+            validate_output(&dest, &task.filename),
+            Err(ValidateFail::Empty | ValidateFail::Playlist)
+        ) {
+            task.status = TaskStatus::Error;
+            task.error = "invalid output: empty/playlist".into();
+            return Ok(task);
+        }
     } else {
-        match validate_output(&dest, &task.filename) {
+        // Post-mux final gate (strict): ANY validate error hard-fails —
+        // ffmpeg/mux output corrupt under any extension.
+        match validate_output_strict(&dest, &task.filename, true) {
             Ok(_) => {}
             Err(ValidateFail::TsInMp4) => {
                 let fixed = ensure_mp4_or_ts(&dest).await?;
@@ -1546,14 +1605,9 @@ pub async fn download_media(
                 return Ok(task);
             }
             Err(e) => {
-                // See single-track note: only empty/manifest hard-fail for assembled media.
-                let hard =
-                    e.to_string().contains("empty") || e.to_string().contains("playlist/HTML");
-                if hard {
-                    task.status = TaskStatus::Error;
-                    task.error = format!("invalid output: {e}");
-                    return Ok(task);
-                }
+                task.status = TaskStatus::Error;
+                task.error = format!("invalid output: {e}");
+                return Ok(task);
             }
         }
     }
@@ -1811,7 +1865,7 @@ fn validate_output_impl(
         || text.to_ascii_lowercase().starts_with("<!doctype html")
         || text.to_ascii_lowercase().starts_with("<html")
     {
-        return Err(msg("output is playlist/HTML, not media"));
+        return Err(ValidateFail::Playlist);
     }
     // Extension from filename context first: media track temp files are
     // `.bin` on disk but must validate against final dest extension.
@@ -1832,12 +1886,16 @@ fn validate_output_impl(
         return Err(ValidateFail::TsInMp4);
     }
     let ok = match ext.as_str() {
-        "mp4" | "m4v" | "mov" | "m4a" => head.len() >= 8 && &head[4..8] == b"ftyp",
+        // mov/m4a excluded: legacy QuickTime has no ftyp, ADTS-.m4a neither.
+        "mp4" | "m4v" => head.len() >= 8 && &head[4..8] == b"ftyp",
         "webm" | "mkv" => head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]),
         "mp3" => head.starts_with(b"ID3") || (head.len() >= 2 && head[0] == 0xFF && head[1] & 0xE0 == 0xE0),
         "ts" => is_ts(head),
         _ => true,
     };
+    // Strict (post-mux): unknown/generic extension has no magic rule to
+    // pass — corrupt ffmpeg output must not slip through as `_ => true`.
+    let ok = ok && !(force_media && !is_media_ext(&ext));
     if !ok {
         return Err(msg("output magic bytes do not match extension"));
     }
@@ -1851,8 +1909,15 @@ pub async fn ensure_mp4_or_ts(dest: &Path) -> Result<PathBuf, String> {
     let tmp = dest.with_extension("remux.mp4");
     match mux_tracks(&[dest.to_path_buf()], &tmp).await {
         Ok(()) => {
-            std::fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
-            Ok(dest.to_path_buf())
+            // Re-validate remux result; corrupt ffmpeg output falls back to .ts.
+            if validate_output_strict(&tmp, "x.mp4", true).is_ok() {
+                std::fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
+                return Ok(dest.to_path_buf());
+            }
+            let _ = std::fs::remove_file(&tmp);
+            let ts = dest.with_extension("ts");
+            std::fs::rename(dest, &ts).map_err(|e| e.to_string())?;
+            Ok(ts)
         }
         Err(_) => {
             let ts = dest.with_extension("ts");
@@ -1862,10 +1927,30 @@ pub async fn ensure_mp4_or_ts(dest: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Quarantine bad output as `<name>.bad` (overwrite prior) then report Err.
+/// ensure_mp4_or_ts for temp files whose on-disk name lacks the final
+/// extension (`.partial-x`, track `.bin`): validate/remux against the
+/// final filename, then restore temp naming for the caller's rename.
+/// Falls back to `.ts` rename (of the temp) when remux output invalid.
+pub async fn ensure_mp4_or_ts_validated(tmp: &Path) -> Result<PathBuf, String> {
+    // Give temp an .mp4 sibling name so ensure_mp4_or_ts logic applies.
+    let probe = tmp.with_extension("mp4");
+    std::fs::rename(tmp, &probe).map_err(|e| e.to_string())?;
+    match ensure_mp4_or_ts(&probe).await {
+        Ok(p) => Ok(p),
+        Err(e) => Err(e),
+    }
+}
+
+/// Quarantine bad output as `<name>.bad` then report Err. ponytail: never
+/// delete a pre-existing `.bad` (may belong to another task) — first free
+/// `.bad`, `.bad-1`, ... wins.
 pub fn quarantine_bad(dest: &Path, why: &ValidateFail) -> String {
-    let bad = PathBuf::from(format!("{}.bad", dest.display()));
-    let _ = std::fs::remove_file(&bad);
+    let mut bad = PathBuf::from(format!("{}.bad", dest.display()));
+    let mut n = 1u32;
+    while bad.exists() {
+        bad = PathBuf::from(format!("{}.bad-{n}", dest.display()));
+        n += 1;
+    }
     let _ = std::fs::rename(dest, &bad);
     format!("invalid output: {why} (quarantined as {})", bad.display())
 }
@@ -1929,8 +2014,9 @@ mod tests {
         let p = tmp_file("mp4", "a.mp4", &mp4);
         assert!(validate_output(&p, "a.mp4").is_ok(), "valid ftyp mp4 ok");
         let p = tmp_file("m3u", "b.mp4", b"#EXTM3U\n#EXT-X-VERSION:3\n");
-        assert!(
-            matches!(validate_output(&p, "b.mp4"), Err(ValidateFail::Msg(_))),
+        assert_eq!(
+            validate_output(&p, "b.mp4"),
+            Err(ValidateFail::Playlist),
             "playlist in mp4 err"
         );
         let mut ts = vec![0x47u8];
@@ -1942,8 +2028,9 @@ mod tests {
             "TS in mp4 sentinel"
         );
         let p = tmp_file("empty", "d.mp4", b"");
-        assert!(
-            matches!(validate_output(&p, "d.mp4"), Err(ValidateFail::Msg(_))),
+        assert_eq!(
+            validate_output(&p, "d.mp4"),
+            Err(ValidateFail::Empty),
             "empty err"
         );
         let p = tmp_file("webm", "e.webm", &[0x1A, 0x45, 0xDF, 0xA3, 1, 2]);
@@ -1956,10 +2043,80 @@ mod tests {
             "bad mp4 magic err"
         );
         let p = tmp_file("html", "h.mp4", b"<html><body>x</body></html>");
-        assert!(
-            matches!(validate_output(&p, "h.mp4"), Err(ValidateFail::Msg(_))),
+        assert_eq!(
+            validate_output(&p, "h.mp4"),
+            Err(ValidateFail::Playlist),
             "HTML err"
         );
+    }
+    #[test]
+    fn validate_output_generic_passes() {
+        // 0-byte generic file passes.
+        let p = tmp_file("g0", "a.bin", b"");
+        assert_eq!(validate_output(&p, "a.bin"), Ok(0));
+        // .html file with HTML body passes (it IS the product).
+        let p = tmp_file("g1", "page.html", b"<html><body>x</body></html>");
+        assert!(validate_output(&p, "page.html").is_ok());
+        // .txt with playlist-looking text passes.
+        let p = tmp_file("g2", "list.txt", b"#EXTM3U\nfoo\n");
+        assert!(validate_output(&p, "list.txt").is_ok());
+        // Legacy .mov without ftyp passes (no magic rule for mov).
+        let p = tmp_file("g3", "old.mov", b"legacy-quicktime-no-ftyp....");
+        assert!(validate_output(&p, "old.mov").is_ok());
+        // ADTS in .m4a passes (no ftyp).
+        let p = tmp_file("g3b", "a.m4a", &[0xFF, 0xF1, 1, 2, 3, 4, 5, 6]);
+        assert!(validate_output(&p, "a.m4a").is_ok());
+        // ADTS .aac: media ext, no magic rule -> passes.
+        let p = tmp_file("g4", "a.aac", &[0xFF, 0xF1, 1, 2, 3, 4]);
+        assert!(validate_output(&p, "a.aac").is_ok());
+        // Playlist intentionally downloaded as .m3u8 passes (not media ext).
+        let p = tmp_file("g5", "pl.m3u8", b"#EXTM3U\n#EXT-X-VERSION:3\n");
+        assert!(validate_output(&p, "pl.m3u8").is_ok());
+        // Missing file still errors.
+        let p = tmp_file("g6", "nope.bin", b"x");
+        let _ = std::fs::remove_file(&p);
+        assert!(validate_output(&p, "nope.bin").is_err());
+    }
+    #[test]
+    fn validate_output_strict_forces_media() {
+        let p = tmp_file("s0", "out.bin", b"not-media-at-all......");
+        assert!(validate_output(&p, "out.bin").is_ok(), "generic passes");
+        assert!(
+            validate_output_strict(&p, "out.bin", true).is_err(),
+            "strict rejects generic magic"
+        );
+        let p = tmp_file("s1", "pl.bin", b"#EXTM3U\nx\n");
+        assert_eq!(
+            validate_output_strict(&p, "pl.bin", true),
+            Err(ValidateFail::Playlist)
+        );
+    }
+    #[test]
+    fn is_ts_needs_packet_sync() {
+        // GIF starts 'G'=0x47 but is not TS.
+        assert!(!is_ts(b"GIF89a................"));
+        let mut gif = b"GIF89a".to_vec();
+        gif.resize(200, 0);
+        assert!(!is_ts(&gif), "GIF padded not TS");
+        // Single full packet ok; two packets with sync ok; bad 2nd sync no.
+        let mut one = vec![0x47u8];
+        one.resize(188, 0);
+        assert!(is_ts(&one));
+        let mut two = one.clone();
+        two.extend_from_slice(&one);
+        assert!(is_ts(&two));
+        two[188] = 0x00;
+        assert!(!is_ts(&two));
+    }
+    #[test]
+    fn quarantine_never_overwrites_existing_bad() {
+        let p = tmp_file("q0", "x.mp4", b"new-bad");
+        let prior = PathBuf::from(format!("{}.bad", p.display()));
+        std::fs::write(&prior, b"prior-task-bad").unwrap();
+        let msg = quarantine_bad(&p, &ValidateFail::Empty);
+        assert_eq!(std::fs::read(&prior).unwrap(), b"prior-task-bad");
+        assert!(msg.contains(".bad-1"), "msg: {msg}");
+        assert!(!p.exists());
     }
     #[test]
     fn seg_snapshot_and_cache_trust() {
