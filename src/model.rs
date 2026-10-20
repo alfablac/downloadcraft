@@ -352,6 +352,36 @@ pub struct Settings {
     /// Extra mpv args, whitespace-split (Streams Options common flags).
     #[serde(default)]
     pub mpv_extra_args: String,
+    /// Drives: configured cloud/server storage accounts (secrets plain, DriveAccount).
+    #[serde(default)]
+    pub drive_accounts: Vec<DriveAccount>,
+    /// Legacy (removed global): per-account streams now controls parallel.
+    /// Kept parsed for old state files; ignored.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub drive_transfers: u32,
+    /// Drives: saved sync jobs.
+    #[serde(default)]
+    pub drive_syncs: Vec<DriveSync>,
+}
+
+/// Saved Drives sync job. Mode: mirror|update|copy.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct DriveSync {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub src_account: String,
+    #[serde(default)]
+    pub src_path: String,
+    #[serde(default)]
+    pub dst_account: String,
+    #[serde(default)]
+    pub dst_path: String,
+    #[serde(default)]
+    pub mode: String,
 }
 fn def_mpv_volume() -> u32 {
     100
@@ -367,6 +397,139 @@ fn def_nntp_port() -> u16 {
 }
 fn def_nntp_connections() -> u32 {
     30
+}
+
+// ── Drives (cloud storage accounts) ─────────────────────────────────
+// Secrets plain in state.json like debrid/NNTP creds (see comment at
+// debrid fields) — ponytail: no OS keychain; add keyring when needed.
+// Tokens/secrets never logged.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DriveKind {
+    #[default]
+    GoogleDrive,
+    OneDrive,
+    Dropbox,
+    WebDav,
+    S3,
+    Sftp,
+    Ftp,
+    Teldrive,
+    Local,
+}
+
+impl DriveKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            DriveKind::GoogleDrive => "Google Drive",
+            DriveKind::OneDrive => "OneDrive",
+            DriveKind::Dropbox => "Dropbox",
+            DriveKind::WebDav => "WebDAV",
+            DriveKind::S3 => "S3-compatible",
+            DriveKind::Sftp => "SFTP",
+            DriveKind::Ftp => "FTP / FTPS",
+            DriveKind::Teldrive => "Telegram (teldrive)",
+            DriveKind::Local => "Local folder",
+        }
+    }
+    pub fn key(self) -> &'static str {
+        match self {
+            DriveKind::GoogleDrive => "gdrive",
+            DriveKind::OneDrive => "onedrive",
+            DriveKind::Dropbox => "dropbox",
+            DriveKind::WebDav => "webdav",
+            DriveKind::S3 => "s3",
+            DriveKind::Sftp => "sftp",
+            DriveKind::Ftp => "ftp",
+            DriveKind::Teldrive => "teldrive",
+            DriveKind::Local => "local",
+        }
+    }
+    pub const ALL: [DriveKind; 9] = [
+        DriveKind::GoogleDrive,
+        DriveKind::OneDrive,
+        DriveKind::Dropbox,
+        DriveKind::WebDav,
+        DriveKind::S3,
+        DriveKind::Sftp,
+        DriveKind::Ftp,
+        DriveKind::Teldrive,
+        DriveKind::Local,
+    ];
+}
+
+/// One configured storage account. `root` = provider root id/path
+/// (drive id, bucket, base path, teldrive channel-root path...).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct DriveAccount {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub kind: DriveKind,
+    /// Base URL / host (WebDAV URL, S3 endpoint, FTP/SFTP host, teldrive URL, local dir).
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub username: String,
+    /// Password / app-password / S3 secret key / FTP-SFTP password. Plain.
+    #[serde(default)]
+    pub secret: String,
+    /// OAuth access token (refreshed automatically). Plain.
+    #[serde(default)]
+    pub access_token: String,
+    /// OAuth refresh token. Plain.
+    #[serde(default)]
+    pub refresh_token: String,
+    /// OAuth token expiry, unix seconds (0 = unknown).
+    #[serde(default)]
+    pub token_expires: u64,
+    /// User-supplied OAuth client id (Google/Microsoft/Dropbox own app).
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+    /// Root: bucket (S3), base path (WebDAV/SFTP/FTP/local), start-folder
+    /// id/path (OAuth drives; Google: folder inside team_drive or My Drive).
+    #[serde(default)]
+    pub root: String,
+    /// Google Shared Drive (Team Drive) id. Empty = My Drive (rclone team_drive).
+    #[serde(default)]
+    pub team_drive: String,
+    /// S3 region (default "auto").
+    #[serde(default)]
+    pub region: String,
+    /// SFTP/FTP port (0 = default), SSH key path (SFTP).
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub ssh_key_path: String,
+    /// Parallel streams per file where backend supports ranged/segmented IO.
+    #[serde(default = "def_drive_streams")]
+    pub streams: u32,
+    /// rclone-crypt: encrypt uploads with crypt password+salt (empty = off).
+    #[serde(default)]
+    pub crypt_password: String,
+    #[serde(default)]
+    pub crypt_salt: String,
+}
+
+fn def_drive_streams() -> u32 {
+    4
+}
+
+impl DriveAccount {
+    pub fn usable(&self) -> bool {
+        !self.id.is_empty()
+    }
+    pub fn display(&self) -> String {
+        if self.name.trim().is_empty() {
+            format!("{} ({})", self.kind.label(), self.id)
+        } else {
+            self.name.clone()
+        }
+    }
 }
 
 /// One debrid provider's config. `Default` = disabled, empty token,
@@ -462,6 +625,9 @@ impl Default for Settings {
             mpv_cache_secs: 30,
             mpv_sub_auto: String::new(),
             mpv_extra_args: String::new(),
+            drive_accounts: Vec::new(),
+            drive_syncs: Vec::new(),
+            drive_transfers: 4,
         }
     }
 }

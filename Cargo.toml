@@ -1,13 +1,15 @@
 [package]
 name = "webcraft"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 description = "Clean-room cross-platform download manager (IDM feature clone)"
 license = "MIT"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "socks", "json", "blocking"] }
+async-trait = "0.1"
+getrandom = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 roxmltree = "0.20"
@@ -31,6 +33,13 @@ librqbit = { version = "9", default-features = false, features = ["rust-tls"] }
 unrar-ng = "=0.7.7"
 zip = { version = "=9.0.5", default-features = false, features = ["deflate", "aes-crypto", "bzip2", "lzma", "ppmd", "deflate64"] }
 sevenz-rust2 = { version = "=0.24.1", default-features = false, features = ["util", "aes256", "compress", "ppmd", "bzip2", "deflate"] }
+# Drives: rclone-crypt compat (scrypt keys, XSalsa20-Poly1305 secretbox,
+# AES-EME name encryption), S3 SigV4 uses hmac+sha2. aes already above.
+crypto_secretbox = "0.1"
+ctr = "0.9"
+hmac = "0.12"
+scrypt = "0.11"
+sha1 = "0.10"
 eframe = { version = "0.29", default-features = false, features = ["glow", "wayland", "x11"] }
 egui = "0.29"
 rfd = "0.15"

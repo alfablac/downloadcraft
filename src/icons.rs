@@ -4,7 +4,7 @@ use egui::epaint::PathStroke;
 use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke};
 
 /// Count of [`Icon`] variants. Kept in sync by exhaustive test below.
-pub const ICON_COUNT: usize = 24;
+pub const ICON_COUNT: usize = 25;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[allow(dead_code)]
@@ -33,6 +33,7 @@ pub enum Icon {
     Info,
     Up,
     Down,
+    Cloud,
 }
 
 /// Stable short name per variant.
@@ -62,6 +63,7 @@ pub fn name(kind: &Icon) -> &'static str {
         Icon::Info => "info",
         Icon::Up => "up",
         Icon::Down => "down",
+        Icon::Cloud => "cloud",
     }
 }
 
@@ -91,6 +93,7 @@ pub const ALL: [Icon; ICON_COUNT] = [
     Icon::Info,
     Icon::Up,
     Icon::Down,
+    Icon::Cloud,
 ];
 
 // --- geometry helpers (pure, unit-testable without a Painter) ---
@@ -437,6 +440,23 @@ pub fn icon(p: &Painter, kind: &Icon, rect: Rect, color: Color32) {
             );
             seg(p, pt(rect, 0.50, 0.22), pt(rect, 0.50, 0.70), s);
         }
+        Icon::Cloud => {
+            let r = rect.width();
+            p.circle_stroke(pt(rect, 0.38, 0.58), r * 0.15, s);
+            p.circle_stroke(pt(rect, 0.58, 0.48), r * 0.18, s);
+            p.circle_stroke(pt(rect, 0.74, 0.60), r * 0.12, s);
+            seg(p, pt(rect, 0.27, 0.68), pt(rect, 0.83, 0.68), s);
+            seg(p, pt(rect, 0.55, 0.68), pt(rect, 0.55, 0.86), s);
+            poly(
+                p,
+                &[
+                    pt(rect, 0.46, 0.78),
+                    pt(rect, 0.55, 0.90),
+                    pt(rect, 0.64, 0.78),
+                ],
+                s,
+            );
+        }
     }
 }
 
@@ -470,6 +490,7 @@ mod tests {
             | Icon::Error
             | Icon::Info
             | Icon::Up
+            | Icon::Cloud
             | Icon::Down => true,
         }
     }

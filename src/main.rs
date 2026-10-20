@@ -3,6 +3,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
+mod drives_ui;
 #[allow(dead_code)]
 mod icons;
 mod theme;

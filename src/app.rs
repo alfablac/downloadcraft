@@ -20,6 +20,7 @@ enum Tab {
     Scheduler,
     Grabber,
     Streams,
+    Drives,
     Options,
 }
 
@@ -562,6 +563,7 @@ struct GrabOutcome {
 pub struct DownloadApp {
     rt: Arc<Mutex<Runtime>>,
     tokio_rt: Arc<tokio::runtime::Runtime>,
+    drives: crate::drives_ui::DrivesUi,
     tab: Tab,
     add_url: String,
     add_referrer: String,
@@ -899,6 +901,7 @@ impl DownloadApp {
         Self {
             rt,
             tokio_rt,
+            drives: crate::drives_ui::DrivesUi::default(),
             tab: Tab::Downloads,
             add_url: String::new(),
             add_referrer: String::new(),
@@ -3514,6 +3517,7 @@ impl eframe::App for DownloadApp {
                             (Tab::Scheduler, "Scheduler", Icon::Clock),
                             (Tab::Grabber, "Site Grabber", Icon::Globe),
                             (Tab::Streams, "Streams", Icon::Play),
+                            (Tab::Drives, "Drives", Icon::Cloud),
                             (Tab::Options, "Options", Icon::Settings),
                         ] {
                             if nav_row_c(ui, ic, label, self.tab == tab, None, rail_compact, None)
@@ -3782,6 +3786,7 @@ impl eframe::App for DownloadApp {
                     // Grabber manages own scroll: results list fills remaining height.
                     Tab::Grabber => self.ui_grabber(ui),
                     Tab::Streams => self.ui_streams(ui),
+                    Tab::Drives => self.ui_drives(ui),
                     Tab::Queues | Tab::Scheduler | Tab::Options => {
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
@@ -4057,6 +4062,10 @@ fn cat_icon(filename: &str) -> Icon {
         "pdf" | "doc" | "docx" | "txt" | "epub" | "xls" | "xlsx" | "ppt" | "pptx" => Icon::Document,
         _ => Icon::File,
     }
+}
+
+pub fn cat_icon_pub(filename: &str) -> Icon {
+    cat_icon(filename)
 }
 
 // free helpers used by menus
@@ -8669,6 +8678,30 @@ impl DownloadApp {
                     });
                 });
             });
+        }
+    }
+
+    fn ui_drives(&mut self, ui: &mut egui::Ui) {
+        let rt = self.rt.clone();
+        let tokio_rt = self.tokio_rt.clone();
+        self.drives.ui(ui, &rt, &tokio_rt);
+        // WebDAV "To Downloads": segmented engine task with basic auth.
+        let pending = std::mem::take(&mut self.drives.pending_download_tasks);
+        for (url, user, pass) in pending {
+            let id = {
+                let mut g = crate::lock_unpoison(&self.rt);
+                let id = g.add_url(&url, "main", "", "");
+                let settings = g.state.settings.clone();
+                if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) {
+                    t.username = user;
+                    t.password = pass;
+                    t.segments = settings.max_connections;
+                }
+                drop(g);
+                id
+            };
+            self.start_task(&id);
+            self.tab = Tab::Downloads;
         }
     }
 

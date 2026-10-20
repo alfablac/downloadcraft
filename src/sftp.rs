@@ -7,7 +7,7 @@ use crate::engine::Controls;
 use crate::model::{DownloadTask, TaskStatus};
 use russh::client;
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
-use russh_sftp::client::SftpSession;
+pub use russh_sftp::client::SftpSession;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -233,6 +233,104 @@ async fn auth_keyboard_interactive(
             }
         }
     }
+}
+
+/// Drive backend seam: authenticated SFTP session (same TOFU + auth order).
+pub async fn connect_session(
+    host: &str,
+    port: u16,
+    user: &str,
+    pass: &str,
+    key_path: &str,
+) -> Result<SftpSession, String> {
+    let hostport = format!("{host}:{port}");
+    let err: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    let handler = Handler {
+        hostport: hostport.clone(),
+        err: err.clone(),
+    };
+    let config = Arc::new(client::Config::default());
+    let mut session = match client::connect(config, (host, port), handler).await {
+        Ok(s) => s,
+        Err(e) => {
+            if let Some(m) = err.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                return Err(m);
+            }
+            return Err(format!("SSH connect {hostport}: {e}"));
+        }
+    };
+    if let Some(m) = err.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        return Err(m);
+    }
+    let kp: Option<PathBuf> = if !key_path.is_empty() {
+        Some(PathBuf::from(key_path))
+    } else if pass.is_empty() {
+        default_key_path()
+    } else {
+        None
+    };
+    let mut authed = false;
+    for method in pick_auth(kp.is_some(), !pass.is_empty()) {
+        match method {
+            SftpAuth::Key => {
+                let k = kp.as_ref().unwrap();
+                let passphrase = if pass.is_empty() { None } else { Some(pass) };
+                if let Ok(key) = load_secret_key(k, passphrase) {
+                    let hash = session
+                        .best_supported_rsa_hash()
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .flatten();
+                    if session
+                        .authenticate_publickey(
+                            user.to_string(),
+                            PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .success()
+                    {
+                        authed = true;
+                        break;
+                    }
+                }
+            }
+            SftpAuth::Password => {
+                if session
+                    .authenticate_password(user.to_string(), pass.to_string())
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .success()
+                {
+                    authed = true;
+                    break;
+                }
+            }
+            SftpAuth::KeyboardInteractive => {
+                if auth_keyboard_interactive(&mut session, user, pass).await? {
+                    authed = true;
+                    break;
+                }
+            }
+            SftpAuth::None => return Err("SFTP: no password and no SSH key".into()),
+        }
+    }
+    if !authed {
+        return Err(format!("SFTP auth failed for {user}@{hostport}"));
+    }
+    let channel = session
+        .channel_open_session()
+        .await
+        .map_err(|e| e.to_string())?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|e| e.to_string())?;
+    let sftp = SftpSession::new(channel.into_stream())
+        .await
+        .map_err(|e| e.to_string())?;
+    sftp.set_timeout(3600);
+    Ok(sftp)
 }
 
 /// SFTP download: metadata size, seek-resume from `<filename>.part`, rename on complete.

@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.14.0-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.15.0-blue">
   <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">
   <img alt="Language" src="https://img.shields.io/badge/built%20with-Rust%20%2B%20egui-orange">
 </p>
@@ -19,7 +19,7 @@
 
 webcraft reimplements the observable behavior of Internet Download Manager from scratch: segmented downloads that resume, queues and schedules, DASH/HLS handling, a site grabber, and deep browser integration. No IDM code, binaries, icons, or activation logic — and no affiliation with Tonec.
 
-**Current version:** 0.14.0 · Changelog lives in GitHub Releases.
+**Current version:** 0.15.0 · Changelog lives in GitHub Releases.
 
 **Runs on:** Windows 10/11 x86_64 · macOS 13+ (Intel and Apple Silicon) · Linux x86_64 (Ubuntu 22.04+, X11 and Wayland).
 
@@ -55,6 +55,16 @@ webcraft reimplements the observable behavior of Internet Download Manager from 
 | Metalink | v3 and v4, with bundled mirrors and SHA-256 checksums |
 | WebDAV | `webdav://` and `webdavs://`, mapped to HTTP/HTTPS |
 | DASH / HLS | MPD and playlist downloads, AES-128 HLS, subtitle sidecars. DRM-protected streams are refused |
+
+### Drives (cloud storage)
+
+- Drives tab (next to Streams / Site Grabber): dual-pane browser — This PC (download folder) or any account per pane, breadcrumb navigation, copy/move/delete/mkdir/rename, transfer panel with pause/resume/cancel and speed. Copy skips existing names unless *Overwrite* on. WebDAV files can also go *To Downloads* into segmented engine.
+- Accounts (unlimited, no tier limits): Google Drive, OneDrive, Dropbox (OAuth in browser — paste your own OAuth client_id/secret from Google/Azure/Dropbox app; tokens plain in `state.json` like Debrid tokens, auto-refreshed), WebDAV (Nextcloud/ownCloud/etc app passwords), S3-compatible (AWS/R2/B2/MinIO, SigV4, multipart), SFTP, FTP/FTPS, Telegram via your self-hosted teldrive server (server URL + API key), local folders.
+- Getting tokens — Wizard (rclone config order): from empty Drives tab or Accounts > Add account. 1 Provider 2 Details+Setup steps (console URL, clicks, Client ID/secret fields) 3 Connect (OAuth browser opens at redirect `http://127.0.0.1:53682/` registered in console — Google Desktop app needs none — or paste-code fallback; key/password providers Test here) 4 Root: Google separate Team Drive pick (list with new token, My Drive default) + optional start folder (paste drive folder link/id), S3 bucket, other root paths 5 Review with final test > Finish. Only Finish saves account (no save-first trips), then auto-opens it in a pane. Cancel saves nothing.
+- Multithreaded: per-account Parallel streams (Edit account) = concurrent files per job plus segments per file; parallel ranged downloads, SFTP parallel sessions, S3 multipart parallel parts, Drive/Dropbox/OneDrive session chunk uploads. FTP single-stream per file.
+- Sync: saved jobs, compare preview first, copy (missing) / update (newer or bigger) / mirror (plus delete destination extras) between any two accounts.
+- Optional per-account rclone-crypt encryption: file contents + filenames encrypted on upload (scrypt keys, standard name encryption), compatible with rclone crypt remotes using same password/salt.
+- Import: Accounts > Import rclone — paste rclone.conf sections to create accounts (obscured passwords revealed; token/team_drive mapped; warnings for bucket/root fields to finish).
 
 ### Debrid
 

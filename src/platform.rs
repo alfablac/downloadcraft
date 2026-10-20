@@ -730,6 +730,36 @@ pub fn register_protocol() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Open external URL in default browser (OAuth sign-in).
+/// Windows: `cmd start` splits unquoted URLs at `&` (drops client_id= etc).
+/// Use rundll32 FileProtocolHandler: URL passed as one argv, no shell.
+pub fn open_url(url: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = Command::new("rundll32");
+        cmd.args(["url.dll,FileProtocolHandler", url]);
+        if no_window(&mut cmd).spawn().is_err() {
+            // Fallback: cmd start with caret-escaped ampersands.
+            let escaped = url.replace('&', "^&");
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "start", "", &escaped]);
+            let _ = no_window(&mut cmd).spawn();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("open").arg(url).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = Command::new("xdg-open").arg(url).spawn();
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = url;
+    }
+}
+
 pub fn open_path(path: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {

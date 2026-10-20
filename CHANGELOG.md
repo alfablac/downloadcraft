@@ -1,10 +1,28 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+All notable changes to webcraft. Versions follow the app version in Cargo.toml.
+
+## [0.15.0] - 2026-10-20
+
+### Added
+
+- Drives tab: dual-pane cloud storage (next to Streams / Site Grabber) - Google Drive, OneDrive, Dropbox (OAuth, own client_id), WebDAV, S3-compatible, SFTP, FTP/FTPS, Telegram via self-hosted teldrive, local folders. Browse/upload/download/copy/move with pause/resume/cancel, multithreaded ranged/session transfers where supported, sync (compare preview, copy/update/mirror, saved jobs), per-account rclone-crypt encryption.
+- Drives account setup wizard (rclone config order) from zero accounts: Provider > Details (per-provider console steps, fixed redirect http://127.0.0.1:53682/) > Connect/Test in draft (browser auto-capture, paste-code fallback, cancel) > Root pick after sign-in (Google Team Drive separate from optional start folder; Shared Drives auto-list) > Review final test > Finish saves once and opens selected account in a pane.
+- Drives Accounts: Edit anytime with Test connection, Duplicate (clone credentials to another Team Drive/root), and Import rclone.conf paste (obscured passwords revealed; token/team_drive mapped).
+- Drives transfers panel: multi-file concurrency via per-account Parallel streams (concurrent files + segments per file), S3 multipart parallel parts, job summaries (source -> destination), (i) info (bytes/%/speed/ETA/elapsed), per-job Remove (deletes destination data for stopped jobs), red full error text. Shift-range and Ctrl/Cmd multi-select; Refresh and Up on both panes.
+
+### Fixed
+
+- Windows browser open no longer truncates OAuth URL at & (Google Missing required parameter: client_id 400).
+- Wizard/accounts/sync windows fixed max 580/620x700 (content no longer pushes window big).
+- Destination folders created once per job after existence check (Google Drive create-folder was duplicating per file/segment).
+- Upload progress counts destination-upload bytes only (local staging copy no longer jumps to 100%).
+- Upload cancel now interrupts in-flight upload; partial destinations removed on error.
 
 ## [0.14.0] - 2026-10-20
 
 ### Added
+
 
 - Per-download proxy override (Add URL *Transfer → Proxy*, browser Capture, Progress dialog; Progress edits apply on restart). Empty inherits global Settings proxy. Drives reqwest downloads, probing (incl. yt-dlp `--proxy`), torrent/NZB/debrid fetches; SOCKS5 proxies now work (reqwest `socks` feature). FTP/SFTP, NNTP articles, torrent swarm stay direct.
 - NZB post-download unpack: archive extraction with NZB-embedded passwords (`<meta type="password">`, `{{pw}}` in NZB/archive names, per-archive override); `{{pw}}` secrets stripped from output names.
