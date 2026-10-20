@@ -80,6 +80,11 @@ pub struct DownloadTask {
     /// SFTP private-key file (empty = password auth, else ~/.ssh/id_* probe).
     #[serde(default)]
     pub ssh_key_path: String,
+    /// Display-only debrid route info:
+    /// `"<Provider> · <host> · <cached|cached: unknown|not cached>"`.
+    /// Empty = not debrid. Never holds resolved URL/token.
+    #[serde(default)]
+    pub debrid_info: String,
     /// Torrent file indices to download (empty = all files).
     #[serde(default)]
     pub torrent_files: Vec<usize>,
@@ -301,6 +306,43 @@ pub struct Settings {
     /// Empty/missing key = theme::type_key_color default.
     #[serde(default)]
     pub type_colors: Vec<(String, [u8; 3])>,
+    /// mpv player (Streams page + Options > mpv). Custom exe path; empty = auto-find.
+    #[serde(default)]
+    pub mpv_path: String,
+    #[serde(default)]
+    pub mpv_fullscreen: bool,
+    #[serde(default)]
+    pub mpv_keep_open: bool,
+    #[serde(default)]
+    pub mpv_loop: bool,
+    #[serde(default = "def_mpv_volume")]
+    pub mpv_volume: u32,
+    #[serde(default = "def_mpv_speed")]
+    pub mpv_speed: f32,
+    #[serde(default)]
+    pub mpv_start: String,
+    /// mpv --hwdec value ("" = mpv default, e.g. "auto-safe").
+    #[serde(default)]
+    pub mpv_hwdec: String,
+    #[serde(default = "def_true")]
+    pub mpv_cache: bool,
+    #[serde(default = "def_mpv_cache_secs")]
+    pub mpv_cache_secs: u32,
+    /// mpv --sub-auto value ("" = mpv default, e.g. "fuzzy"/"all").
+    #[serde(default)]
+    pub mpv_sub_auto: String,
+    /// Extra mpv args, whitespace-split (Streams Options common flags).
+    #[serde(default)]
+    pub mpv_extra_args: String,
+}
+fn def_mpv_volume() -> u32 {
+    100
+}
+fn def_mpv_speed() -> f32 {
+    1.0
+}
+fn def_mpv_cache_secs() -> u32 {
+    30
 }
 fn def_nntp_port() -> u16 {
     563
@@ -389,6 +431,18 @@ impl Default for Settings {
             nav_count_badges: true,
             category_colors: Vec::new(),
             type_colors: Vec::new(),
+            mpv_path: String::new(),
+            mpv_fullscreen: false,
+            mpv_keep_open: false,
+            mpv_loop: false,
+            mpv_volume: 100,
+            mpv_speed: 1.0,
+            mpv_start: String::new(),
+            mpv_hwdec: String::new(),
+            mpv_cache: true,
+            mpv_cache_secs: 30,
+            mpv_sub_auto: String::new(),
+            mpv_extra_args: String::new(),
         }
     }
 }
@@ -882,6 +936,47 @@ mod tests {
             DebridProviderCfg::default(),
             "missing debrid cfg defaults"
         );
+    }
+
+    #[test]
+    fn settings_mpv_defaults_roundtrip_and_old_state() {
+        let s = Settings::default();
+        assert_eq!(s.mpv_volume, 100);
+        assert!((s.mpv_speed - 1.0).abs() < f32::EPSILON);
+        assert!(s.mpv_cache);
+        assert_eq!(s.mpv_cache_secs, 30);
+        assert!(s.mpv_path.is_empty() && s.mpv_start.is_empty() && s.mpv_hwdec.is_empty());
+        assert!(s.mpv_sub_auto.is_empty() && s.mpv_extra_args.is_empty());
+        assert!(!s.mpv_fullscreen && !s.mpv_keep_open && !s.mpv_loop);
+        let back: Settings = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(&s).unwrap()
+        );
+        // Old state without mpv_* keys: serde defaults fill them.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        for k in [
+            "mpv_path",
+            "mpv_fullscreen",
+            "mpv_keep_open",
+            "mpv_loop",
+            "mpv_volume",
+            "mpv_speed",
+            "mpv_start",
+            "mpv_hwdec",
+            "mpv_cache",
+            "mpv_cache_secs",
+            "mpv_sub_auto",
+            "mpv_extra_args",
+        ] {
+            obj.remove(k);
+        }
+        let old: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(old.mpv_volume, 100);
+        assert!((old.mpv_speed - 1.0).abs() < f32::EPSILON);
+        assert!(old.mpv_cache);
+        assert_eq!(old.mpv_cache_secs, 30);
     }
 
     #[test]

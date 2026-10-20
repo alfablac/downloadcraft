@@ -8,7 +8,7 @@
 
 use crate::model::{DebridProviderCfg, Settings};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Provider {
     Rd,
     Ad,
@@ -126,6 +126,23 @@ pub struct ResolvedFile {
     pub size: Option<u64>,
     /// Direct download URL. Never persist, never log.
     pub url: String,
+    /// Provider already knew file cached (instant availability). `None`
+    /// = API gave no cheap signal. Display only; never persist.
+    pub cached: Option<bool>,
+}
+
+/// Pure builder for `DownloadTask::debrid_info`:
+/// `"<Provider label> · <hoster host> · <cached|cached: unknown|not cached>"`.
+/// Magnet URLs have no hoster host; caller passes name-derived label
+/// (`"magnet"`). Empty host -> omitted only if caller passes empty string;
+/// keeps format exact for hoster path (host always from `url_host`).
+pub fn format_debrid_info(provider: &str, host: &str, cached: Option<bool>) -> String {
+    let cache = match cached {
+        Some(true) => "cached",
+        Some(false) => "not cached",
+        None => "cached: unknown",
+    };
+    format!("{provider} · {host} · {cache}")
 }
 
 /// ISO-8601 `2026-11-18T10:00:00.000Z` -> unix secs (UTC), via TB parser.
@@ -259,7 +276,45 @@ pub async fn account(http: reqwest::Client, p: Provider, key: &str) -> Result<Ac
     }
 }
 
+// ---------- hosts cache (successful lists only, 10 min TTL) ----------
+const HOSTS_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+type HostsCache = std::collections::HashMap<(Provider, u64), (std::time::Instant, Vec<HostStatus>)>;
+static HOSTS_CACHE: std::sync::OnceLock<std::sync::Mutex<HostsCache>> = std::sync::OnceLock::new();
+fn hosts_cache() -> &'static std::sync::Mutex<HostsCache> {
+    HOSTS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+/// Hash only: raw key never stored/logged; token change -> cache miss.
+fn key_hash(key: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+fn hosts_cache_get(cache: &HostsCache, p: Provider, kh: u64, now: std::time::Instant) -> Option<Vec<HostStatus>> {
+    let (at, hosts) = cache.get(&(p, kh))?;
+    (now.duration_since(*at) < HOSTS_TTL).then(|| hosts.clone())
+}
+fn hosts_cache_put(cache: &mut HostsCache, p: Provider, kh: u64, now: std::time::Instant, hosts: Vec<HostStatus>) {
+    cache.insert((p, kh), (now, hosts));
+}
+
 pub async fn hosts(
+    http: reqwest::Client,
+    p: Provider,
+    key: &str,
+) -> Result<Vec<HostStatus>, String> {
+    let kh = key_hash(key);
+    if let Some(hit) = hosts_cache().lock().ok().and_then(|c| hosts_cache_get(&c, p, kh, std::time::Instant::now())) {
+        return Ok(hit);
+    }
+    let list = hosts_uncached(http, p, key).await?;
+    if let Ok(mut c) = hosts_cache().lock() {
+        hosts_cache_put(&mut c, p, kh, std::time::Instant::now(), list.clone());
+    }
+    Ok(list)
+}
+
+async fn hosts_uncached(
     http: reqwest::Client,
     p: Provider,
     key: &str,
@@ -338,6 +393,22 @@ pub fn host_up(hosts: &[HostStatus], url: &str) -> Option<bool> {
         .map(|h| h.supported && h.up)
 }
 
+/// Check-then-sleep poll: first check immediate; interval slept only
+/// before later checks, at most max_polls checks total.
+async fn poll_delayed<C, CFut, S, SFut, T>(max_polls: usize, interval: std::time::Duration, mut sleep: S, mut check: C) -> Result<Option<T>, String>
+where
+    C: FnMut() -> CFut,
+    CFut: std::future::Future<Output = Result<Option<T>, String>>,
+    S: FnMut(std::time::Duration) -> SFut,
+    SFut: std::future::Future<Output = ()>,
+{
+    for i in 0..max_polls {
+        if i > 0 { sleep(interval).await; }
+        if let Some(v) = check().await? { return Ok(Some(v)); }
+    }
+    Ok(None)
+}
+
 /// Resolve hoster URL to direct link via provider. Err = unsupported/fail.
 pub async fn unrestrict(
     http: reqwest::Client,
@@ -349,10 +420,15 @@ pub async fn unrestrict(
         Provider::Rd => {
             let c = crate::debrid_rd::RdClient::new(key, http);
             let r = c.unrestrict_link(url).await?;
+            // ponytail: RD hoster unrestrict/link returns no cache-residency
+            // field (only magnet instantAvailability, disabled upstream);
+            // cached unknown, not fabricated. Add RD check-based signal
+            // only if API exposes residency.
             Ok(ResolvedFile {
                 name: r.filename,
                 size: r.filesize,
                 url: r.download,
+                cached: None,
             })
         }
         Provider::Ad => {
@@ -363,21 +439,24 @@ pub async fn unrestrict(
                     name: u.filename,
                     size: u.filesize.map(|n| n.max(0) as u64),
                     url: link,
+                    cached: None,
                 });
             }
             if let Some(id) = u.delayed_id {
-                // poll >=5s, up to ~60s
-                for _ in 0..12 {
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                // First delayed poll immediate (unlock satisfies AD >=5s
+                // spacing), then 5s polls, up to ~60s.
+                let ready = poll_delayed(13, std::time::Duration::from_secs(5), |d| tokio::time::sleep(d), || async {
                     let d = c.delayed(id).await?;
-                    if d.is_ready() {
-                        if let Some(link) = d.link {
-                            return Ok(ResolvedFile {
-                                name: d.filename,
-                                size: d.filesize.map(|n| n.max(0) as u64),
-                                url: link,
-                            });
-                        }
+                    Ok::<Option<crate::debrid_ad::AdDelayed>, String>(d.is_ready().then_some(d))
+                }).await?;
+                if let Some(d) = ready {
+                    if let Some(link) = d.link {
+                        return Ok(ResolvedFile {
+                            name: d.filename,
+                            size: d.filesize.map(|n| n.max(0) as u64),
+                            url: link,
+                            cached: None,
+                        });
                     }
                 }
                 return Err("AllDebrid: delayed link not ready after 60s".into());
@@ -401,6 +480,7 @@ pub async fn unrestrict(
                 },
                 size: Some(f.size),
                 url: link,
+                cached: None,
             })
         }
     }
@@ -526,6 +606,9 @@ pub async fn magnet_files(
                     name,
                     size: r.filesize,
                     url: r.download,
+                    // RD links present == torrent finished on RD side, but
+                    // instant-availability field unavailable; unknown.
+                    cached: None,
                 });
             }
             Ok(out)
@@ -574,6 +657,7 @@ pub async fn magnet_files(
                                 },
                                 size: f.size.map(|n| n.max(0) as u64),
                                 url: link,
+                                cached: Some(up.ready),
                             });
                         } else if let Some(id) = u.delayed_id {
                             // short poll
@@ -592,6 +676,7 @@ pub async fn magnet_files(
                                     name: f.name.clone(),
                                     size: f.size.map(|n| n.max(0) as u64),
                                     url: link,
+                                    cached: Some(up.ready),
                                 });
                             }
                         }
@@ -644,6 +729,9 @@ pub async fn magnet_files(
                     name: f.name,
                     size: Some(f.size),
                     url: link,
+                    // torrent_list at poll gives ready state but no
+                    // cached flag (checkcached not called here) — unknown.
+                    cached: None,
                 });
             }
             Ok(out)
@@ -735,7 +823,7 @@ pub async fn download_via_debrid(
         task.filename.clone()
     };
     if is_magnet(&original_url) {
-        let (_p, files) = resolve_magnet(http.clone(), settings, &original_url).await?;
+        let (p, files) = resolve_magnet(http.clone(), settings, &original_url).await?;
         let chosen = if files.len() == 1 {
             files.into_iter().next().unwrap()
         } else {
@@ -750,23 +838,34 @@ pub async fn download_via_debrid(
                 }
             }
         };
+        // Magnet has no hoster host; token btih hash would be sensitive-ish
+        // in UI, so literal "magnet" placeholder keeps format shape.
+        // Downloaded stream path restores original URL (match spec).
+        let cached = chosen.cached;
         task.url = chosen.url;
+        task.debrid_info = format_debrid_info(p.label(), "magnet", cached);
+        let debrid_info = task.debrid_info.clone();
         if !chosen.name.is_empty() {
             task.filename = crate::model::sanitize_filename(&chosen.name);
         }
         let mut done = crate::engine::download_http(http, task, ctrl).await?;
         done.url = original_url;
+        done.debrid_info = debrid_info;
         // keep resolved filename (done.filename already correct)
         return Ok(done);
     }
     // hoster URL
-    let (_p, f) = resolve_hoster(http.clone(), settings, &original_url).await?;
+    let (p, f) = resolve_hoster(http.clone(), settings, &original_url).await?;
+    let host = url_host(&original_url);
     task.url = f.url;
+    task.debrid_info = format_debrid_info(p.label(), &host, f.cached);
+    let debrid_info = task.debrid_info.clone();
     if !f.name.is_empty() {
         task.filename = crate::model::sanitize_filename(&f.name);
     }
     let mut done = crate::engine::download_http(http, task, ctrl).await?;
     done.url = original_url;
+    done.debrid_info = debrid_info;
     Ok(done)
 }
 
@@ -836,6 +935,28 @@ mod tests {
         let old: Settings = serde_json::from_value(v).unwrap();
         assert!(!old.debrid_rd.enabled && old.debrid_rd.api_key.is_empty());
         assert!(old.debrid_rd.use_for_hosters && old.debrid_rd.use_for_magnets);
+    }
+
+    #[test]
+    fn debrid_info_format_contract() {
+        assert_eq!(
+            format_debrid_info("Real-Debrid", "rapidgator.net", Some(true)),
+            "Real-Debrid · rapidgator.net · cached"
+        );
+        assert_eq!(
+            format_debrid_info("Real-Debrid", "rapidgator.net", None),
+            "Real-Debrid · rapidgator.net · cached: unknown"
+        );
+        assert_eq!(
+            format_debrid_info("AllDebrid", "rg.to", Some(false)),
+            "AllDebrid · rg.to · not cached"
+        );
+        let orig = "https://rapidgator.net/file/b6df95dee983c06f41b3caa31755a9fe/x.part1.rar.html";
+        assert_eq!(url_host(orig), "rapidgator.net");
+        assert_eq!(
+            format_debrid_info("Real-Debrid", &url_host(orig), Some(true)),
+            "Real-Debrid · rapidgator.net · cached"
+        );
     }
 
     #[test]

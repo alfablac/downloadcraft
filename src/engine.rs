@@ -44,7 +44,11 @@ fn b64(data: &[u8]) -> String {
     out
 }
 
-fn headers_for(task: &DownloadTask) -> reqwest::header::HeaderMap {
+/// Wire headers for HTTP(S) requests: referrer/cookies fields, then
+/// `task.headers` (invalid name/value dropped, pseudo-headers stripped),
+/// then Basic auth unless an Authorization header already present.
+/// Single source for engine + stream fetches (FTP/SFTP ignore headers).
+pub(crate) fn headers_for(task: &DownloadTask) -> reqwest::header::HeaderMap {
     let mut h = reqwest::header::HeaderMap::new();
     if !task.referrer.is_empty() {
         if let Ok(v) = task.referrer.parse() {
@@ -279,7 +283,10 @@ pub fn plan_segments(total: u64, wanted: u32) -> Vec<(u64, u64)> {
     v
 }
 
-pub const MIN_SPLIT: u64 = 256 * 1024;
+/// Split floor: both halves of a split must stay >= this. 256KB floor let
+/// repeated splits shred a download into 30+ crawling parts; 4MB keeps any
+/// stolen tail worth a fresh connection.
+pub const MIN_SPLIT: u64 = 4 * 1024 * 1024;
 /// New end for victim when stealing its tail: split remaining (from committed
 /// `done`) in half. None when either half would be < MIN_SPLIT.
 /// ponytail: keyed on committed done, not in-flight progress; in-flight bytes
@@ -298,9 +305,92 @@ fn split_point(start: u64, end: u64, done: u64) -> Option<u64> {
     }
 }
 
+/// Bytes of `written` (streamed for range starting at `range_start`) that
+/// survive a shrink of the segment end to `end`. Rest was live-counted in
+/// `ctrl.downloaded` but is discarded and re-downloaded by the thief.
+fn seg_keep(end: u64, range_start: u64, written: u64) -> u64 {
+    (end + 1).saturating_sub(range_start).min(written)
+}
+
+/// Undo live-count of discarded bytes: counter was charged all `written`,
+/// only `keep` gets committed to segment `done`.
+fn apply_shrink_correction(ctrl: &Controls, written: u64, keep: u64) {
+    let over = written.saturating_sub(keep);
+    if over > 0 {
+        ctrl.downloaded.fetch_sub(over, Ordering::Relaxed);
+    }
+}
+
+/// Committed bytes across segments. Invariant: equals bytes counted once in
+/// `ctrl.downloaded` whenever no segment is mid-stream.
+fn committed_total(segs: &[SegmentState]) -> u64 {
+    segs.iter().map(|s| s.done).sum()
+}
+
+enum Claim {
+    Pending(usize),
+    Split(usize),
+    None,
+}
+
+/// Pure claim policy (testable core of `claim_or_split`): prefer unclaimed
+/// unfinished segment; else split largest remaining active segment, but only
+/// while `segs.len() < cap` (worker-pool size fixed at download start).
+/// At/over cap an idle worker gets None and exits — remaining workers finish
+/// their segments. Legacy over-cap state still claims pending work, it just
+/// never splits further.
+fn try_claim_or_split(
+    segs: &mut Vec<SegmentState>,
+    active: &mut std::collections::HashSet<usize>,
+    cap: usize,
+) -> Claim {
+    let remaining = |sg: &SegmentState| (sg.end + 1).saturating_sub(sg.start + sg.done);
+    for (i, sg) in segs.iter().enumerate() {
+        if remaining(sg) > 0 && !active.contains(&i) {
+            active.insert(i);
+            return Claim::Pending(i);
+        }
+    }
+    if segs.len() >= cap {
+        return Claim::None;
+    }
+    let mut victim: Option<(usize, u64)> = None;
+    for (i, sg) in segs.iter().enumerate() {
+        if active.contains(&i) {
+            if let Some(np) = split_point(sg.start, sg.end, sg.done) {
+                let tail = sg.end - np;
+                if victim.is_none_or(|(_, b)| tail > b) {
+                    victim = Some((i, tail));
+                }
+            }
+        }
+    }
+    let Some((vi, _)) = victim else {
+        return Claim::None;
+    };
+    let old_end = segs[vi].end;
+    let Some(np) = split_point(segs[vi].start, old_end, segs[vi].done) else {
+        return Claim::None;
+    };
+    segs[vi].end = np;
+    let new_idx = segs.len();
+    segs.push(SegmentState {
+        start: np + 1,
+        end: old_end,
+        done: 0,
+    });
+    active.insert(new_idx);
+    Claim::Split(new_idx)
+}
+
 pub struct Probe {
     pub total: Option<u64>,
     pub accept_ranges: bool,
+    /// `Some` only when Range probe itself got `200` (server ignored
+    /// Range): full response body, already paid for. `download_http`
+    /// streams it as plain download — never re-GET, never drain first.
+    /// Never log/persist: `final_url` may carry signed tokens.
+    pub body: Option<reqwest::Response>,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub final_url: String,
@@ -309,6 +399,54 @@ pub struct Probe {
 }
 
 /// Percent-decode to bytes (no '+' handling: CD filenames are not form-encoded).
+/// Body-free probe result cached between Add/capture confirm and download
+/// start. Holds headers only — plain downloads re-GET, segmented downloads
+/// reuse only segment plan (segments validate via ETag in state).
+/// Never persisted, never logged (may carry signed `final_url`).
+#[derive(Clone)]
+pub struct CachedProbe {
+    pub url: String,
+    pub final_url: String,
+    pub total: Option<u64>,
+    pub accept_ranges: bool,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub content_disposition: Option<String>,
+    pub content_type: Option<String>,
+    pub fetched_at: std::time::Instant,
+}
+impl CachedProbe {
+    pub fn into_probe(self) -> Probe {
+        Probe { total: self.total, accept_ranges: self.accept_ranges, body: None, etag: self.etag, last_modified: self.last_modified, final_url: self.final_url, content_disposition: self.content_disposition, content_type: self.content_type }
+    }
+}
+pub const PREWARM_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+pub fn prewarm_fresh(fetched_at: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(fetched_at) < PREWARM_TTL
+}
+// ponytail: process-global single-use registry keyed by original URL;
+// runtime-only (never state.json). Upgrade: per-task-id keys if
+// same-URL-different-headers tasks collide in practice.
+static PREWARM: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, CachedProbe>>> = std::sync::OnceLock::new();
+fn prewarm_registry() -> &'static std::sync::Mutex<std::collections::HashMap<String, CachedProbe>> {
+    PREWARM.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+pub fn prewarm_store(cache: CachedProbe) {
+    let mut g = prewarm_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    g.retain(|_, v| prewarm_fresh(v.fetched_at, now));
+    g.insert(cache.url.clone(), cache);
+}
+pub fn prewarm_drop(url: &str) {
+    prewarm_registry().lock().unwrap_or_else(|e| e.into_inner()).remove(url.trim());
+}
+pub fn prewarm_take(url: &str) -> Option<CachedProbe> { prewarm_take_at(url, std::time::Instant::now()) }
+fn prewarm_take_at(url: &str, now: std::time::Instant) -> Option<CachedProbe> {
+    let mut g = prewarm_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let cache = g.remove(url.trim())?;
+    if cache.url == url.trim() && prewarm_fresh(cache.fetched_at, now) { Some(cache) } else { None }
+}
+
 fn pct_decode_bytes(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -520,6 +658,14 @@ pub fn dedup_dest(dest: &Path, incoming_size: Option<u64>) -> PathBuf {
     dest.to_path_buf()
 }
 
+/// Prewarm: probe now (dialog open) so confirm -> first byte skips
+/// probe round-trip. Result has no body: response dropped after headers.
+pub async fn prewarm(client: &reqwest::Client, task: &DownloadTask) -> Result<CachedProbe, String> {
+    let mut p = probe(client, task).await?;
+    let _ = p.body.take();
+    Ok(CachedProbe { url: task.url.clone(), final_url: p.final_url, total: p.total, accept_ranges: p.accept_ranges, etag: p.etag, last_modified: p.last_modified, content_disposition: p.content_disposition, content_type: p.content_type, fetched_at: std::time::Instant::now() })
+}
+
 pub async fn probe(client: &reqwest::Client, task: &DownloadTask) -> Result<Probe, String> {
     let resp = client
         .get(&task.url)
@@ -558,10 +704,12 @@ pub async fn probe(client: &reqwest::Client, task: &DownloadTask) -> Result<Prob
             .unwrap_or("")
             .to_string();
         let total = cr.rsplit('/').next().and_then(|v| v.parse().ok());
-        let _ = resp.bytes().await;
+        // 1-byte probe body: drop without draining (connection discarded, waste = 1 byte).
+        drop(resp);
         Ok(Probe {
             total,
             accept_ranges: true,
+            body: None,
             etag,
             last_modified: lm,
             final_url,
@@ -569,11 +717,13 @@ pub async fn probe(client: &reqwest::Client, task: &DownloadTask) -> Result<Prob
             content_type: content_type.clone(),
         })
     } else if status.is_success() {
+        // Server ignored Range: 200 body IS whole file. Hand live response to
+        // plain path in download_http — never drain here, never re-GET.
         let total = resp.content_length();
-        let _ = resp.bytes().await;
         Ok(Probe {
             total,
             accept_ranges: false,
+            body: Some(resp),
             etag,
             last_modified: lm,
             final_url,
@@ -611,20 +761,31 @@ fn save_state(
 /// Segmented HTTP download with resume. Segment files: part{i} in dest_dir/.downloadcraft-{id}/
 pub async fn download_http(
     client: reqwest::Client,
+    task: DownloadTask,
+    ctrl: Arc<Controls>,
+) -> Result<DownloadTask, String> {
+    download_http_with_prewarm(client, task, ctrl, None).await
+}
+
+pub async fn download_http_with_prewarm(
+    client: reqwest::Client,
     mut task: DownloadTask,
     ctrl: Arc<Controls>,
+    prewarm: Option<CachedProbe>,
 ) -> Result<DownloadTask, String> {
     // Mirror failover (IDM Url0..UrlN): first URL whose probe succeeds wins; task.url rewritten to it.
     let mut urls = vec![task.url.clone()];
     urls.extend(task.mirrors.iter().cloned());
     let mut found: Option<(String, Probe)> = None;
     let mut last_err = String::new();
+    let mut prewarm = prewarm.filter(|c| c.url == task.url && prewarm_fresh(c.fetched_at, std::time::Instant::now()));
     for u in urls {
         let cand = DownloadTask {
             url: u.clone(),
             ..task.clone()
         };
-        match probe(&client, &cand).await {
+        let hit = if u == task.url { prewarm.take().map(|c| c.into_probe()) } else { None };
+        match match hit { Some(p) => Ok(p), None => probe(&client, &cand).await } {
             Ok(p) => {
                 found = Some((u, p));
                 break;
@@ -632,8 +793,16 @@ pub async fn download_http(
             Err(e) => last_err = e,
         }
     }
-    let Some((used_url, probe)) = found else {
+    let Some((used_url, mut probe)) = found else {
         return Err(format!("all mirrors failed (last: {last_err})"));
+    };
+    // Probe resolved redirects: plain/segment requests go to final_url,
+    // not through redirect chain again. Internal only — never logged,
+    // task.url returned to callers stays used mirror URL.
+    let fetch_url = if probe.final_url.is_empty() {
+        used_url.clone()
+    } else {
+        probe.final_url.clone()
     };
     task.url = used_url;
     task.total = probe.total;
@@ -651,12 +820,16 @@ pub async fn download_http(
     let part_dir = task.dest_dir.join(format!(".downloadcraft-{}", task.id));
     // Server ignored Range: plain streaming download with throttle.
     if !probe.accept_ranges || probe.total.is_none() {
-        let resp = client
-            .get(&task.url)
-            .headers(headers_for(&task))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+        // Reuse 200 probe body (whole file already streaming); else GET final_url.
+        let resp = match probe.body.take() {
+            Some(r) => r,
+            None => client
+                .get(&fetch_url)
+                .headers(headers_for(&task))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?,
+        };
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
@@ -787,7 +960,7 @@ pub async fn download_http(
                     .map(|s| s.to_string())
                     == probe.etag
                     || probe.etag.is_none();
-                if v.get("url").and_then(|u| u.as_str()) == Some(task.url.as_str())
+                if (v.get("url").and_then(|u| u.as_str()) == Some(fetch_url.as_str()) || v.get("url").and_then(|u| u.as_str()) == Some(task.url.as_str()))
                     && v.get("total").and_then(|t| t.as_u64()) == Some(total)
                     && etag_ok
                 {
@@ -856,19 +1029,24 @@ pub async fn download_http(
             .map(|x| (x.done, x.end.saturating_add(1).saturating_sub(x.start)))
             .collect();
     }
-    // Work-stealing pool: fixed worker count (= initial segment count). Idle
-    // worker splits largest remaining in-flight segment, steals its tail.
+    // Work-stealing pool: fixed worker count (= initial segment count) is
+    // also the hard cap on total segments — idle workers may split only
+    // below it, so parts never multiply past the connection count.
     let etag: Arc<str> = probe.etag.clone().unwrap_or_default().into();
     let segs = Arc::new(tokio::sync::Mutex::new(segs));
     let active = Arc::new(tokio::sync::Mutex::new(
         std::collections::HashSet::<usize>::new(),
     ));
+    // Segment requests fetch final_url; task.url returned stays mirror URL.
+    let mut fetch_task = task.clone();
+    fetch_task.url = fetch_url.clone();
     let mut handles = Vec::new();
     let count = segs.lock().await.len();
-    for _ in 0..count.max(1) {
+    let cap = count.max(1);
+    for _ in 0..cap {
         let (client, task_c, ctrl, segs, active, part_dir, etag) = (
             client.clone(),
-            task.clone(),
+            fetch_task.clone(),
             ctrl.clone(),
             segs.clone(),
             active.clone(),
@@ -877,9 +1055,17 @@ pub async fn download_http(
         );
         handles.push(tokio::spawn(async move {
             loop {
-                let Some(i) =
-                    claim_or_split(&segs, &active, &part_dir, &task_c.url, &etag, total, &ctrl)
-                        .await
+                let Some(i) = claim_or_split(
+                    &segs,
+                    &active,
+                    cap,
+                    &part_dir,
+                    &task_c.url,
+                    &etag,
+                    total,
+                    &ctrl,
+                )
+                .await
                 else {
                     return Ok::<(), String>(());
                 };
@@ -996,12 +1182,13 @@ pub async fn download_http(
     Ok(task)
 }
 
-/// Claim work: prefer unclaimed unfinished segment; else split largest
-/// remaining active segment (tail half >= MIN_SPLIT) and claim new tail.
-/// None when all segments done.
+/// Claim work: prefer unclaimed unfinished segment; else (only while
+/// `segs.len() < cap`) split largest remaining active segment and claim new
+/// tail. None when no claimable work for this worker.
 async fn claim_or_split(
     segs: &Arc<tokio::sync::Mutex<Vec<SegmentState>>>,
     active: &Arc<tokio::sync::Mutex<std::collections::HashSet<usize>>>,
+    cap: usize,
     part_dir: &Path,
     url: &str,
     etag: &Arc<str>,
@@ -1010,35 +1197,11 @@ async fn claim_or_split(
 ) -> Option<usize> {
     let mut s = segs.lock().await;
     let mut act = active.lock().await;
-    let remaining = |sg: &SegmentState| (sg.end + 1).saturating_sub(sg.start + sg.done);
-    for (i, sg) in s.iter().enumerate() {
-        if remaining(sg) > 0 && !act.contains(&i) {
-            act.insert(i);
-            return Some(i);
-        }
-    }
-    let mut victim: Option<(usize, u64)> = None;
-    for (i, sg) in s.iter().enumerate() {
-        if act.contains(&i) {
-            if let Some(np) = split_point(sg.start, sg.end, sg.done) {
-                let tail = sg.end - np;
-                if victim.is_none_or(|(_, b)| tail > b) {
-                    victim = Some((i, tail));
-                }
-            }
-        }
-    }
-    let (vi, _) = victim?;
-    let old_end = s[vi].end;
-    let np = split_point(s[vi].start, old_end, s[vi].done)?;
-    s[vi].end = np;
-    let new_idx = s.len();
-    s.push(SegmentState {
-        start: np + 1,
-        end: old_end,
-        done: 0,
-    });
-    act.insert(new_idx);
+    let new_idx = match try_claim_or_split(&mut s, &mut act, cap) {
+        Claim::Pending(i) => return Some(i),
+        Claim::Split(i) => i,
+        Claim::None => return None,
+    };
     let snapshot: Vec<SegmentState> = s
         .iter()
         .map(|x| SegmentState {
@@ -1109,12 +1272,16 @@ async fn run_segment(
                 let keep = {
                     let s = segs.lock().await;
                     let sg = &s[i];
-                    (sg.end + 1).saturating_sub(start + done).min(written)
+                    // Victim end may have shrunk mid-stream: clamp committed
+                    // done to new length, discard count for tail bytes.
+                    seg_keep(sg.end, start + done, written)
                 };
                 {
                     let mut s = segs.lock().await;
-                    s[i].done = (s[i].done + keep).min(s[i].end + 1 - s[i].start);
+                    let new_len = s[i].end + 1 - s[i].start;
+                    s[i].done = (s[i].done.min(new_len) + keep).min(new_len);
                 }
+                apply_shrink_correction(ctrl, written, keep);
                 let snapshot = {
                     let s = segs.lock().await;
                     s.iter()
@@ -2131,6 +2298,66 @@ pub async fn mux_tracks(tracks: &[PathBuf], dest: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn task_with_headers(pairs: &[(&str, &str)]) -> DownloadTask {
+        DownloadTask {
+            headers: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn headers_for_custom_user_agent_and_bearer_suppresses_basic() {
+        let mut t = task_with_headers(&[
+            ("User-Agent", "MyAgent/1.0"),
+            ("Authorization", "Bearer tok123"),
+        ]);
+        t.username = "u".into();
+        t.password = "p".into();
+        let h = headers_for(&t);
+        assert_eq!(h["user-agent"], "MyAgent/1.0");
+        assert_eq!(h["authorization"], "Bearer tok123");
+    }
+
+    #[test]
+    fn headers_for_basic_added_without_authorization() {
+        let mut t = task_with_headers(&[]);
+        t.username = "u".into();
+        t.password = "p".into();
+        let h = headers_for(&t);
+        // base64("u:p")
+        assert_eq!(h["authorization"], "Basic dTpw");
+    }
+
+    #[test]
+    fn headers_for_drops_invalid_and_pseudo() {
+        let t = task_with_headers(&[
+            ("Bad Name", "v"),
+            ("X-Good", "ok"),
+            ("X-Bad", "a\r\nb"),
+            ("x-ytdlp", "1"),
+            ("x-page-url", "https://ex.com/page"),
+            ("x-page-title", "t"),
+            ("x-nzb", "1"),
+            ("x-yt-format", "18"),
+        ]);
+        let h = headers_for(&t);
+        assert_eq!(h["x-good"], "ok");
+        assert!(!h.contains_key("bad name"));
+        assert!(!h.contains_key("x-bad"));
+        for k in [
+            "x-ytdlp",
+            "x-page-url",
+            "x-page-title",
+            "x-nzb",
+            "x-yt-format",
+        ] {
+            assert!(!h.contains_key(k), "pseudo-header leaked: {k}");
+        }
+    }
     fn tmp_file(tag: &str, name: &str, bytes: &[u8]) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("wc-validate-{}-{}", std::process::id(), tag));
         let _ = std::fs::create_dir_all(&dir);
@@ -2408,25 +2635,183 @@ mod tests {
     }
     #[test]
     fn split_point_halves_remaining() {
-        let kb = 1024u64;
-        assert_eq!(split_point(0, 1024 * kb - 1, 0), Some(512 * kb - 1));
+        let mb = 1024 * 1024u64;
+        assert_eq!(split_point(0, 16 * mb - 1, 0), Some(8 * mb - 1));
         assert_eq!(
-            split_point(0, 512 * kb - 2, 0),
+            split_point(0, 2 * MIN_SPLIT - 2, 0),
             None,
-            "remaining < 512KB never splits"
+            "remaining < 2*MIN_SPLIT never splits"
         );
         assert_eq!(
-            split_point(0, 600 * kb - 1, 200 * kb),
+            split_point(0, 10 * mb - 1, 4 * mb),
             None,
             "done counts toward remaining"
         );
         assert_eq!(
-            split_point(100, 100 + 1024 * kb - 1, 512 * kb),
-            Some(100 + 768 * kb - 1)
+            split_point(100, 100 + 16 * mb - 1, 8 * mb),
+            Some(100 + 12 * mb - 1)
         );
         assert_eq!(split_point(0, 10, 20), None);
         // both halves >= MIN_SPLIT at exact threshold
         assert_eq!(split_point(0, 2 * MIN_SPLIT - 1, 0), Some(MIN_SPLIT - 1));
+        // old 256KB-floor sizes no longer split
+        assert_eq!(split_point(0, 1024 * 1024 - 1, 0), None);
+    }
+
+    fn mk_segs(ranges: &[(u64, u64)]) -> Vec<SegmentState> {
+        ranges
+            .iter()
+            .map(|&(start, end)| SegmentState {
+                start,
+                end,
+                done: 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn claim_cap_never_exceeds_pool() {
+        // 2.9 GB, wanted 8: plan gives <=8, repeated claims/splits stay <=8.
+        let total: u64 = 2_900_000_000;
+        let plan = plan_segments(total, 8);
+        assert!(plan.len() <= 8 && !plan.is_empty());
+        let mut segs = mk_segs(&plan);
+        let cap = segs.len();
+        let mut active: std::collections::HashSet<usize> = (0..cap).collect();
+        // Simulate idle workers repeatedly trying to steal work.
+        for _ in 0..100 {
+            // free a slot, leave others active with plenty remaining
+            active.remove(&0);
+            match try_claim_or_split(&mut segs, &mut active, cap) {
+                Claim::None => {}
+                Claim::Pending(i) | Claim::Split(i) => {
+                    assert!(active.contains(&i));
+                }
+            }
+            assert!(
+                segs.len() <= cap,
+                "segments {} exceeded cap {cap}",
+                segs.len()
+            );
+            // ranges stay disjoint, ordered, cover [0, total)
+            let mut expect = 0u64;
+            // segs stay in start order: splits only append tail of a victim
+            for sg in &segs {
+                assert_eq!(sg.start, expect, "gap/overlap in segments");
+                assert!(sg.end >= sg.start);
+                expect = sg.end + 1;
+            }
+            assert_eq!(expect, total);
+        }
+    }
+
+    #[test]
+    fn claim_no_split_at_cap_or_below_floor() {
+        let mb = 1024 * 1024u64;
+        // At cap: no split even with huge remaining.
+        let mut segs = mk_segs(&[(0, 100 * mb - 1), (100 * mb, 200 * mb - 1)]);
+        let mut active: std::collections::HashSet<usize> = [0, 1].into();
+        // free worker 1's slot by finishing it
+        segs[1].done = 100 * mb;
+        active.remove(&1);
+        assert!(matches!(
+            try_claim_or_split(&mut segs, &mut active, 2),
+            Claim::None
+        ));
+        assert_eq!(segs.len(), 2);
+        // Below cap but remaining < 2*MIN_SPLIT: no split.
+        let mut segs = mk_segs(&[(0, 4 * mb - 1)]);
+        let mut active: std::collections::HashSet<usize> = [0].into();
+        assert!(matches!(
+            try_claim_or_split(&mut segs, &mut active, 8),
+            Claim::None
+        ));
+        assert_eq!(segs.len(), 1);
+        // Below cap + large remaining: splits exactly once into halves >= floor.
+        let mut segs = mk_segs(&[(0, 64 * mb - 1)]);
+        let mut active: std::collections::HashSet<usize> = [0].into();
+        match try_claim_or_split(&mut segs, &mut active, 8) {
+            Claim::Split(1) => {}
+            _ => panic!("expected split to idx 1"),
+        }
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].end + 1, segs[1].start);
+        assert!(segs[0].end + 1 - segs[0].start >= MIN_SPLIT);
+        assert!(segs[1].end + 1 - segs[1].start >= MIN_SPLIT);
+    }
+
+    #[test]
+    fn claim_pending_preferred_and_overcap_legacy_ok() {
+        let mb = 1024 * 1024u64;
+        // Pending unclaimed wins over split.
+        let mut segs = mk_segs(&[(0, 64 * mb - 1), (64 * mb, 128 * mb - 1)]);
+        let mut active: std::collections::HashSet<usize> = [0].into();
+        assert!(matches!(
+            try_claim_or_split(&mut segs, &mut active, 8),
+            Claim::Pending(1)
+        ));
+        assert_eq!(segs.len(), 2);
+        // Legacy over-split state (30 segs, cap 8): loads, claims pending,
+        // never splits further.
+        let plan = plan_segments(300 * mb, 30);
+        assert_eq!(plan.len(), 30);
+        let mut segs = mk_segs(&plan);
+        let mut active: std::collections::HashSet<usize> = [0].into();
+        assert!(matches!(
+            try_claim_or_split(&mut segs, &mut active, 8),
+            Claim::Pending(_)
+        ));
+        active = (0..30).collect();
+        segs[1].done = segs[1].end + 1 - segs[1].start; // finish one
+        active.remove(&1);
+        assert!(matches!(
+            try_claim_or_split(&mut segs, &mut active, 8),
+            Claim::None
+        ));
+        assert_eq!(segs.len(), 30);
+    }
+
+    #[test]
+    fn seg_keep_and_shrink_correction_accounting() {
+        // range [1000, 1999], streamed 800, victim end shrunk to 1499
+        assert_eq!(seg_keep(1499, 1000, 800), 500);
+        // no shrink: keep all
+        assert_eq!(seg_keep(1999, 1000, 800), 800);
+        // written not yet past split: keep all written
+        assert_eq!(seg_keep(1499, 1000, 300), 300);
+        // correction subtracts exactly discarded bytes, once
+        let c = Controls::new(0);
+        c.downloaded.store(1800, Ordering::Relaxed);
+        apply_shrink_correction(&c, 800, 500);
+        assert_eq!(c.downloaded.load(Ordering::Relaxed), 1500);
+        apply_shrink_correction(&c, 500, 500);
+        assert_eq!(
+            c.downloaded.load(Ordering::Relaxed),
+            1500,
+            "no double subtract"
+        );
+        // invariant: after victim commits keep + thief commits tail,
+        // global counter == committed sum, no byte counted twice.
+        let victim_keep = seg_keep(1499, 1000, 800);
+        let thief_bytes = 1999 - 1500 + 1; // stolen tail [1500,1999]
+        let committed = victim_keep + thief_bytes;
+        assert_eq!(committed, 1000);
+        // retry recount: download_range re-adds from committed done each
+        // attempt, attempt-token reset makes re-add idempotent per attempt;
+        // committed_total helper pins sum used for resume/part sync.
+        let segs = vec![
+            SegmentState {
+                start: 0,
+                end: 999,
+                done: 400,
+            },
+            SegmentState {
+                start: 1000,
+                end: 1999,
+                done: 500,
+            },
+        ];
+        assert_eq!(committed_total(&segs), 900);
     }
     #[test]
     fn cd_rfc5987_utf8() {

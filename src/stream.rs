@@ -75,6 +75,11 @@ fn segment_only_reject(task: &DownloadTask) -> Option<String> {
 }
 
 /// `.nzb` URL/local path, `nzb://` wrapper, or explicit `x-nzb` header marker.
+/// True when URL needs manifest/stream probe (DASH/HLS/Metalink) — prewarm gate.
+pub fn is_manifest_url(url: &str) -> bool {
+    manifest_kind_from_url(url).is_some()
+}
+
 pub fn is_nzb_url(task: &DownloadTask) -> bool {
     if task.headers.contains_key("x-nzb") {
         return true;
@@ -155,20 +160,8 @@ impl ProtoKind {
     }
 }
 
-/// Pseudo-headers (task config) must never go on wire. headers_for in
-/// engine.rs strips for HTTP path; stream fetches copy headers manually.
-fn is_pseudo_header(k: &str) -> bool {
-    crate::ytdlp::YT_HEADER_KEYS
-        .iter()
-        .any(|x| k.eq_ignore_ascii_case(x))
-        || k.eq_ignore_ascii_case("x-page-url")
-        || k.eq_ignore_ascii_case("x-page-title")
-        || k.eq_ignore_ascii_case("x-page-stream")
-        || k.eq_ignore_ascii_case("x-page-intent")
-        || k.eq_ignore_ascii_case("x-rep-id")
-        || k.eq_ignore_ascii_case("x-variant-index")
-        || k.eq_ignore_ascii_case("x-nzb")
-}
+// Wire headers: engine::headers_for (strips pseudo-headers, drops
+// invalid, adds Basic auth unless Authorization present). Reused below.
 
 pub fn proto_kind(task: &DownloadTask) -> ProtoKind {
     let lower = task.url.trim().to_ascii_lowercase();
@@ -208,19 +201,7 @@ pub fn proto_kind(task: &DownloadTask) -> ProtoKind {
 /// Probe Content-Type only (headers, body dropped). On any error/non-success -> File.
 /// ponytail: header-only probe misses manifests served as octet-stream/text; body-peek + reuse would need passing fetched text into download_dash/download_hls — add when such servers matter.
 async fn probe_manifest(client: &reqwest::Client, task: &DownloadTask) -> Manifest {
-    let mut req = client.get(&task.url);
-    if !task.referrer.is_empty() {
-        req = req.header("Referer", &task.referrer);
-    }
-    if !task.cookies.is_empty() {
-        req = req.header("Cookie", &task.cookies);
-    }
-    for (k, v) in &task.headers {
-        if is_pseudo_header(k) {
-            continue;
-        }
-        req = req.header(k.as_str(), v.as_str());
-    }
+    let req = client.get(&task.url).headers(engine::headers_for(&task));
     let Ok(resp) = req.send().await else {
         return Manifest::File;
     };
@@ -426,7 +407,12 @@ pub async fn download_url_with_settings(
         Manifest::Metalink => download_metalink(client, task, ctrl).await,
         Manifest::Dash => download_dash(client, task, ctrl, false).await,
         Manifest::Hls => download_hls(client, task, ctrl).await,
-        Manifest::File => engine::download_http(client, task, ctrl).await,
+        // Prewarm hit (Add/capture dialog probe, runtime-only registry):
+        // skips engine probe. Plain downloads re-GET body anyway.
+        Manifest::File => {
+            engine::download_http_with_prewarm(client, task.clone(), ctrl, engine::prewarm_take(&task.url))
+                .await
+        }
     }
 }
 
@@ -481,7 +467,13 @@ async fn download_metalink(
     if f.sha256.is_some() {
         task.sha256 = f.sha256;
     }
-    engine::download_http(client, task, ctrl).await
+    engine::download_http_with_prewarm(
+        client,
+        task.clone(),
+        ctrl,
+        engine::prewarm_take(&task.url),
+    )
+    .await
 }
 
 async fn fetch_text(
@@ -489,19 +481,7 @@ async fn fetch_text(
     task: &DownloadTask,
     url: &str,
 ) -> Result<String, String> {
-    let mut req = client.get(url);
-    if !task.referrer.is_empty() {
-        req = req.header("Referer", &task.referrer);
-    }
-    if !task.cookies.is_empty() {
-        req = req.header("Cookie", &task.cookies);
-    }
-    for (k, v) in &task.headers {
-        if is_pseudo_header(k) {
-            continue;
-        }
-        req = req.header(k.as_str(), v.as_str());
-    }
+    let req = client.get(url).headers(engine::headers_for(&task));
     let resp = req.send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {} for {url}", resp.status()));
@@ -761,19 +741,7 @@ async fn fetch_key(
     task: &DownloadTask,
     url: &str,
 ) -> Result<[u8; 16], String> {
-    let mut req = client.get(url);
-    if !task.referrer.is_empty() {
-        req = req.header("Referer", &task.referrer);
-    }
-    if !task.cookies.is_empty() {
-        req = req.header("Cookie", &task.cookies);
-    }
-    for (k, v) in &task.headers {
-        if is_pseudo_header(k) {
-            continue;
-        }
-        req = req.header(k.as_str(), v.as_str());
-    }
+    let req = client.get(url).headers(engine::headers_for(&task));
     let resp = req.send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {} for key {url}", resp.status()));
