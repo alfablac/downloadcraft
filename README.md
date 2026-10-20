@@ -1,42 +1,93 @@
-# webcraft
+<p align="center">
+  <img src="assets/webcraft.png" alt="webcraft" width="128">
+</p>
 
-webcraft is a download manager written in Rust with egui. It reimplements the observable parts of Internet Download Manager: segmented downloads, queues, schedules, DASH and HLS, a site grabber, and browser integration. The code was written from scratch. It has no IDM code, binaries, icons, or activation logic, and it is not affiliated with Tonec.
+<h1 align="center">webcraft</h1>
 
-Current version: 0.12.1. Changelog lives in GitHub Releases.
+<p align="center">
+  A fast, cross-platform download manager written in Rust — segmented downloads,
+  browser capture, debrid support, and built-in video playback.
+</p>
 
-Runs on Windows 10/11 x86_64, macOS 13 or later (Intel and Apple Silicon), and Linux x86_64 (Ubuntu 22.04 or later, X11 and Wayland).
+<p align="center">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.12.1-blue">
+  <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">
+  <img alt="Language" src="https://img.shields.io/badge/built%20with-Rust%20%2B%20egui-orange">
+</p>
 
-## What it does
+---
 
-- Segmented HTTP downloads that resume from part files after a restart, with dynamic segment splitting when a connection stalls
-- FTP downloads with PASV and REST resume, plus FTPS (explicit ftps:// and implicit ftpsi://) over TLS
-- SFTP over SSH, with password or key login, trust on first use host keys, and seek resume
-- BitTorrent from magnet links or .torrent files, with per-file progress and optional seeding after the download finishes
-- NNTP and NZB downloads, with yEnc decoding, CRC32 checks, TLS, and in-process PAR2 repair (when the NZB includes .par2 files). Archive unpacking is not done
-- Metalink v3 and v4 files, which bring their own mirrors and SHA-256 checksum
-- WebDAV through webdav:// and webdavs:// URLs, mapped to plain HTTP or HTTPS
-- Video pages on YouTube, Vimeo, TikTok, Twitch, Dailymotion, Instagram, X, Facebook, Reddit, SoundCloud, Bilibili, and a few short link hosts, handled by a yt-dlp sidecar when one is available and by the built in DASH and HLS code when it is not
-- Queues with priority, retry counts, and per-queue concurrency limits
-- Schedules with start and stop windows, weekday masks, download quotas, an optional catch up for runs missed while the app was closed, and completion actions that can shut the machine down, with an optional confirmation prompt first
-- Speed limits per task and one global limit shared across running tasks, editable from the progress dialog
-- DASH (MPD) and HLS downloads, including AES-128 HLS and subtitle sidecars. DRM-protected streams are refused
-- Site Grabber with depth, scope, size, and extension filters, plus a site mirror that rewrites links to local relative paths
-- Chromium MV3 and Firefox extensions that hand downloads to the desktop app through a native messaging host
-- Drag-and-drop URLs or .url files onto the main window
-- Clipboard URL monitoring, proxy with authentication, and SHA-256 verification when a checksum is supplied
-- Mirrors per task, with one shared username and password, and failover when a mirror does not answer
-- Rename templates using {name}, {ext}, {date}, {host}, and {category}, and an option to file new downloads into a subfolder named after their category
-- Desktop notifications when a download finishes or fails and when a queue drains, an update checker that fetches a newer release as a normal download, and state saved atomically with a .bak copy to fall back on after a crash
-- System tray, autostart, single-instance lock, and the webcraft:// URL protocol (legacy downloadcraft:// links still accepted)
-- Downloads table that remembers its sort column and dragged column widths, shows the protocol of each row (TORRENT, FTP, NNTP, HLS, and so on), and can be filtered by that type from the side rail
-- Tag badges colored by category and protocol type, in the download list and in dialogs
-- Progress, Add, and Capture dialogs that open as separate windows, with a per-task speed graph, a status word per part, torrent swarm figures (peers, trackers, pieces), and a resume row
-- Panics are written to crash.log in the config folder instead of taking the whole app down silently
-- --smoke-test for CI
+webcraft reimplements the observable behavior of Internet Download Manager from scratch: segmented downloads that resume, queues and schedules, DASH/HLS handling, a site grabber, and deep browser integration. No IDM code, binaries, icons, or activation logic — and no affiliation with Tonec.
 
-Multi-track downloads are muxed with ffmpeg when ffmpeg is on PATH or beside the exe. Single-track downloads do not need it. The app never downloads ffmpeg at runtime. yt-dlp is different: if no yt-dlp binary is found for a video page, the app fetches one from the yt-dlp GitHub releases, and updates an existing copy once it is more than 30 days old.
+**Current version:** 0.12.1 · Changelog lives in GitHub Releases.
 
-## Build
+**Runs on:** Windows 10/11 x86_64 · macOS 13+ (Intel and Apple Silicon) · Linux x86_64 (Ubuntu 22.04+, X11 and Wayland).
+
+## Highlights
+
+- **Fast starts** — links are probed and segmented in the background as soon as they are captured or pasted into the Add dialog, so confirming a download goes straight to the first byte. Queued tasks wake instantly instead of waiting for the next poll.
+- **Segmented HTTP/S** — parallel connections with resume, dynamic tail-splitting when a connection stalls, and a hard cap so segments never multiply into dozens of tiny parts.
+- **Debrid built in** — Real-Debrid, AllDebrid, and TorBox resolve hoster links and magnets; the list and progress dialog show which provider and hoster served each file.
+- **Every protocol** — FTP/FTPS/SFTP, BitTorrent, NNTP/NZB with PAR2 repair, Metalink, WebDAV, DASH, and HLS.
+- **Watch while you download** — video pages resolve through yt-dlp with a format/subtitle picker and browser cookies, and streams can play directly in mpv (embedded or external).
+- **Browser capture** — Chromium and Firefox extensions detect media on the page, pass cookies, and hand downloads to the app silently.
+
+## Features
+
+### Download engine
+
+- Segmented HTTP/S downloads that resume from part files after a restart, with work-stealing across a fixed connection pool (configurable in Options) and correct byte accounting — downloaded never exceeds total
+- Pre-warm probing on add/capture: range probe, redirect resolution, and segment planning happen before you confirm; probe responses are reused instead of re-downloaded
+- Custom HTTP headers per download (User-Agent, Referer, Authorization Bearer, or any header) from the Add dialog's *Headers (advanced)* section — HTTP/S only
+- Mirrors per task with failover, per-task and global speed limits, SHA-256 verification, rename templates (`{name}`, `{ext}`, `{date}`, `{host}`, `{category}`), and category subfolders
+
+### Protocols
+
+| Protocol | Notes |
+| --- | --- |
+| HTTP / HTTPS | Segmented, resumable, mirror failover |
+| FTP | EPSV → PASV → active (PORT) fallback, NAT-aware PASV address handling, segmented downloads when the server accepts `REST` |
+| FTPS | Explicit (`ftps://`) and implicit (`ftpsi://`) TLS; login happens after `AUTH TLS` |
+| SFTP | Password, key, and keyboard-interactive auth with fallback; trust-on-first-use host keys; seek resume |
+| BitTorrent | Magnet links and `.torrent` files, per-file progress, optional seeding after completion |
+| NNTP / NZB | yEnc decoding, CRC32 checks, TLS, in-process PAR2 repair when the NZB includes `.par2` files |
+| Metalink | v3 and v4, with bundled mirrors and SHA-256 checksums |
+| WebDAV | `webdav://` and `webdavs://`, mapped to HTTP/HTTPS |
+| DASH / HLS | MPD and playlist downloads, AES-128 HLS, subtitle sidecars. DRM-protected streams are refused |
+
+### Debrid
+
+- Real-Debrid, AllDebrid, and TorBox: hoster links and magnets are unrestricted through your account, in your preferred provider order
+- Magnet results fan out to one task per file; hoster checks are cached so repeat adds start fast
+- The downloads list shows a Debrid badge and the progress dialog names the provider, hoster, and cache status — no silent fallbacks
+
+### Video and playback
+
+- Video pages on YouTube, Vimeo, TikTok, Twitch, Dailymotion, Instagram, X, Facebook, Reddit, SoundCloud, Bilibili, and short-link hosts, resolved by a yt-dlp sidecar (native DASH/HLS fallback)
+- Format, audio, and subtitle picker before downloading; browser cookies passed from the extension for login-gated pages; yt-dlp runs silently with no console windows
+- Direct playback with mpv: Streams page, embedded player controls (pause, seek, volume, speed), and external mpv with your own options
+
+### Automation and interface
+
+- Queues with priority, retry counts, and per-queue concurrency; schedules with start/stop windows, weekday masks, quotas, missed-run catch-up, and completion actions (including shutdown with confirmation)
+- Site Grabber with depth, scope, size, and extension filters and a mirror mode that rewrites links to local relative paths — including SharePoint via browser cookies
+- Progress dialog with per-part status, speed graph, and live details; downloads table with saved sort/widths, protocol badges, and type filtering from the side rail
+- Desktop notifications, system tray, autostart, single-instance lock, clipboard URL monitoring, drag-and-drop, proxy with authentication, and atomic state saving with a `.bak` fallback
+
+> [!NOTE]
+> Multi-track downloads are muxed with ffmpeg when ffmpeg is on PATH or beside the exe; single-track downloads do not need it. The app never downloads ffmpeg at runtime. yt-dlp is fetched from its GitHub releases when no binary is found, and updated after 30 days.
+
+## Getting started
+
+### Install
+
+- **Windows:** run `webcraft-*-windows-setup.exe` (NSIS, per-user, no admin) or unpack the portable zip. Uninstall from Settings → Apps, or run `$LOCALAPPDATA\Programs\webcraft\Uninstall.exe`.
+- **macOS:** open the `.dmg` and drag `webcraft.app` to Applications. Builds are unsigned, so the first launch needs right-click → Open.
+- **Linux:** run the AppImage, unpack the tarball, or `sudo apt install ./webcraft_*_amd64.deb`. The .deb registers the desktop entry and protocol handler; GNOME tray needs AppIndicator support.
+
+Older installs keep working: on first launch, webcraft copies `state.json`, `capture-filter.json`, and pending inbox messages from the previous (downloadcraft, or older idmcraft) config directory if the new one has no state yet. Existing webcraft state is never overwritten.
+
+### Build from source
 
 ```bash
 cargo build --release
@@ -45,42 +96,30 @@ cargo clippy --all-targets -- -D warnings
 ./target/release/webcraft --smoke-test
 ```
 
-On Windows, cargo may not be on PATH in a fresh PowerShell session. Use `$HOME\.cargo\bin\cargo.exe` or add `$HOME\.cargo\bin` to PATH first.
+> [!TIP]
+> On Windows, cargo may not be on PATH in a fresh PowerShell session. Use `$HOME\.cargo\bin\cargo.exe` or add `$HOME\.cargo\bin` to PATH first.
 
-## Install
-
-Windows: run `webcraft-*-windows-setup.exe` (NSIS, per-user, no admin) or unpack the portable zip. Uninstall from Settings, Apps, webcraft, or run `$LOCALAPPDATA\Programs\webcraft\Uninstall.exe`. Uninstall removes autostart and the browser host registration.
-
-macOS: open the `.dmg` and drag `webcraft.app` to Applications. Builds are unsigned, so the first launch needs right-click, Open. To uninstall, delete the app, `~/Library/LaunchAgents/com.webcraft.plist`, and the `com.webcraft.host.json` files under `~/Library/Application Support/*/NativeMessagingHosts`. Running Options, Remove browser integration first does the host part for you.
-
-Linux: make the AppImage executable and run it, unpack the tarball, or install the package with `sudo apt install ./webcraft_*_amd64.deb`. The .deb registers the desktop entry and protocol handler. Tray on GNOME needs AppIndicator support. Uninstall with `sudo apt remove webcraft` and remove `~/.config/autostart/webcraft.desktop`, or turn autostart off in Options first.
-
-Older installs still work. On first launch, webcraft copies `state.json`, `capture-filter.json`, and any pending inbox messages from the previous (downloadcraft, or older idmcraft) config directory if the new one has no state yet. It does not overwrite existing webcraft state.
+Artifacts land in `target/release/` (`webcraft` app, `webcraft-host` native messaging host) and `dist/` (portable zip via `scripts/package-windows.ps1`, Firefox XPI via `scripts/package-firefox.ps1`).
 
 ## Browser integration
 
-The desktop app registers the native messaging host and protocol every time it starts, so moving the exe does not leave a stale host path behind. Options, Repair browser integration does the same thing by hand.
+The desktop app registers the native messaging host and the `webcraft://` protocol every time it starts, so moving the exe never leaves a stale host path. *Options → Repair browser integration* does the same by hand. The legacy `com.downloadcraft.host` name stays registered for one release cycle so already-installed extensions keep working.
 
-Chromium: load `extensions/chromium` as an unpacked extension.
+- **Chromium:** load `extensions/chromium` as an unpacked extension.
+- **Firefox:** install `extensions/webcraft-firefox.xpi` from about:addons → gear → Install Add-on From File (start webcraft once first so the host is registered). Release Firefox refuses unsigned add-ons permanently — use Developer Edition/Nightly, set `xpinstall.signatures.required` to false where allowed, or load `extensions/firefox` temporarily from about:debugging. Rebuild the XPI with `scripts/package-firefox.ps1`.
 
-Firefox: a ready XPI is at `extensions/webcraft-firefox.xpi`. Remove the previous add-on first; it asks for a native host name that no longer exists. Start webcraft once so it registers the current host, then install the XPI from about:addons, gear menu, Install Add-on From File. Firefox release builds refuse unsigned add-ons permanently; use Firefox Developer Edition or Nightly, or set `xpinstall.signatures.required` to false in about:config on builds that allow it. For a temporary install, load `extensions/firefox` from about:debugging, This Firefox, Load Temporary Add-on. Rebuild the XPI with `scripts/package-firefox.ps1`.
-
-The extension watches for downloads passively and ranks what it finds, so a page that loads many small segments offers the playlist or file first. Capture can be limited by extension allowlist and minimum size in Options, stored in `capture-filter.json`. Video buttons on pages stay out of the way until playback starts.
-
-Native host name: `com.webcraft.host`. The legacy name `com.downloadcraft.host` is also registered for one release cycle so already-installed extensions keep working.
+The extension watches downloads passively and ranks what it finds, so a page with many small segments offers the playlist or file first. It hands video-page links to the app with the page's cookies, where yt-dlp resolves formats. Capture can be limited by an extension allowlist and minimum size in Options (`capture-filter.json`). Video buttons stay hidden until playback starts.
 
 ## Interface
 
-The main window groups related actions and labels each group. Download actions stay with the selected download. Queue actions stay with all downloads. Narrow windows scroll the download table instead of squeezing its columns together, and switch the table to a compact set of columns. Column widths and the sort column are saved and restored on the next launch.
+The main window groups related actions and labels each group: download actions stay with the selected download, queue actions with all downloads. Narrow windows scroll the table instead of squeezing columns, and switch to a compact column set. Column widths and sort order persist between launches. Add, Capture, and Progress dialogs open as separate windows; delete confirmations keep a fixed size so buttons never jump under your cursor. Options save as soon as a setting changes.
 
-Options save as soon as a setting changes. Site Grabber fields use the full panel width for the start URL and extensions list.
+## Documentation
 
-## Docs
-
-- `docs/reverse-engineering.md` records what was observed in IDM, the DASH and HLS experiment tables, and design decisions
-- `docs/parity.md` lists feature status with the tests that back each claim
-- `docs/release-checklist.md` is the manual per-OS sign-off list
+- `docs/reverse-engineering.md` — observations of IDM behavior, DASH/HLS experiment tables, design decisions
+- `docs/parity.md` — feature status with the tests backing each claim
+- `docs/release-checklist.md` — manual per-OS sign-off list
 
 ## Limits
 
-DRM-protected streams are refused on purpose. NNTP downloads repair with included PAR2 files in-process; archive unpacking is not done yet. There is no Safari extension because that needs Xcode signing. `docs/parity.md` lists the partial items.
+DRM-protected streams are refused on purpose. NNTP repair uses PAR2 files included in the NZB; archive unpacking is not done yet. Segmented FTP restarts the file when resumed (single-connection FTP resumes normally). There is no Safari extension — that needs Xcode signing. `docs/parity.md` lists the remaining partial items.
