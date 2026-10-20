@@ -252,9 +252,7 @@ fn extract_zip(path: &Path, dir: &Path, password: Option<&str>) -> Result<(), St
     let mut total_written: u64 = 0;
     for i in 0..za.len() {
         let mut entry = match password {
-            Some(pw) if !pw.is_empty() => za
-                .by_index_decrypt(i, pw.as_bytes())
-                .map_err(fmt_err)?,
+            Some(pw) if !pw.is_empty() => za.by_index_decrypt(i, pw.as_bytes()).map_err(fmt_err)?,
             _ => za.by_index(i).map_err(fmt_err)?,
         };
         let Some(rel) = entry.enclosed_name() else {
@@ -364,12 +362,8 @@ fn extract_7z(path: &Path, dir: &Path, password: Option<&str>) -> Result<(), Str
             return res;
         }
     }
-    sevenz_rust2::decompress_with_password(
-        std::fs::File::open(path).map_err(fmt_err)?,
-        dir,
-        pw,
-    )
-    .map_err(fmt_err)
+    sevenz_rust2::decompress_with_password(std::fs::File::open(path).map_err(fmt_err)?, dir, pw)
+        .map_err(fmt_err)
 }
 
 fn extract_rar(path: &Path, dir: &Path, password: Option<&str>) -> Result<(), String> {
@@ -431,12 +425,15 @@ pub fn unpack_dir(dir: &Path, names: &[String], password: Option<&str>) -> Resul
         if !path.exists() {
             continue;
         }
+        // Per-archive {{pw}} in own name wins over NZB-wide default.
+        let pw = crate::nntp::password_from_braces(name).or_else(|| password.map(str::to_string));
         // ponytail: no nested-archive recursion; extracted .rar stays for manual unpack.
-        extract_archive(&path, dir, password)
-            .map_err(|e| format!("unpack {}: {e}", name))?;
+        extract_archive(&path, dir, pw.as_deref())
+            .map_err(|e| format!("unpack {}: {e}", crate::nntp::strip_brace_password(name)))?;
         for part in archive_parts(dir, name) {
-            std::fs::remove_file(&part)
-                .map_err(|e| format!("extracted OK but could not delete {}: {e}", part.display()))?;
+            std::fs::remove_file(&part).map_err(|e| {
+                format!("extracted OK but could not delete {}: {e}", part.display())
+            })?;
         }
         done += 1;
     }
@@ -463,7 +460,10 @@ mod tests {
 
     #[test]
     fn enclosed_rejects_escape() {
-        assert_eq!(enclosed(Path::new("a/b.txt")), Some(PathBuf::from("a/b.txt")));
+        assert_eq!(
+            enclosed(Path::new("a/b.txt")),
+            Some(PathBuf::from("a/b.txt"))
+        );
         assert_eq!(enclosed(Path::new("../evil")), None);
         assert_eq!(enclosed(Path::new("/abs")), None);
     }
@@ -486,7 +486,10 @@ mod tests {
         }
         let n = unpack_dir(&dir, &["pack.zip".to_string()], None).unwrap();
         assert_eq!(n, 1);
-        assert_eq!(std::fs::read(dir.join("hello.txt")).unwrap(), b"hello unpack");
+        assert_eq!(
+            std::fs::read(dir.join("hello.txt")).unwrap(),
+            b"hello unpack"
+        );
         assert!(!zip_path.exists(), "archive deleted on success");
 
         // Corrupt: flip payload byte, CRC must fail, archive kept.
@@ -501,7 +504,10 @@ mod tests {
             w.finish().unwrap();
         }
         let mut bytes = std::fs::read(&bad_path).unwrap();
-        let pos = bytes.windows(12).position(|w| w == b"payload-data").unwrap();
+        let pos = bytes
+            .windows(12)
+            .position(|w| w == b"payload-data")
+            .unwrap();
         bytes[pos] ^= 0xFF;
         std::fs::write(&bad_path, &bytes).unwrap();
         let err = unpack_dir(&dir, &["bad.zip".to_string()], None).unwrap_err();
@@ -523,7 +529,10 @@ mod tests {
         sevenz_rust2::compress_to_path(&src, &arc).unwrap();
         let n = unpack_dir(&dir, &["pack.7z".to_string()], None).unwrap();
         assert_eq!(n, 1);
-        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"seven zip payload");
+        assert_eq!(
+            std::fs::read(dir.join("a.txt")).unwrap(),
+            b"seven zip payload"
+        );
         assert!(!arc.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -591,7 +600,10 @@ mod tests {
         std::fs::write(&arc, rar5_stored("inner.txt", b"rar payload!")).unwrap();
         let n = unpack_dir(&dir, &["pack.rar".to_string()], None).unwrap();
         assert_eq!(n, 1);
-        assert_eq!(std::fs::read(dir.join("inner.txt")).unwrap(), b"rar payload!");
+        assert_eq!(
+            std::fs::read(dir.join("inner.txt")).unwrap(),
+            b"rar payload!"
+        );
         assert!(!arc.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -624,7 +636,10 @@ mod tests {
         // Right password: extracts, archive deleted.
         let n = unpack_dir(&dir, &["enc.zip".to_string()], Some("s3cret")).unwrap();
         assert_eq!(n, 1);
-        assert_eq!(std::fs::read(dir.join("secret.txt")).unwrap(), b"classified");
+        assert_eq!(
+            std::fs::read(dir.join("secret.txt")).unwrap(),
+            b"classified"
+        );
         assert!(!arc.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -639,7 +654,8 @@ mod tests {
         let nzb = crate::nntp::parse_nzb(xml).unwrap();
         let pw = crate::nntp::nzb_password(&nzb, "https://x/r.nzb");
         assert_eq!(pw.as_deref(), Some("s3cret"));
-        let dir = std::env::temp_dir().join(format!("webcraft-unpack-nzbpw-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("webcraft-unpack-nzbpw-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let arc = dir.join("enc.zip");
@@ -655,26 +671,26 @@ mod tests {
         }
         let n = unpack_dir(&dir, &["enc.zip".to_string()], pw.as_deref()).unwrap();
         assert_eq!(n, 1);
-        assert_eq!(std::fs::read(dir.join("secret.txt")).unwrap(), b"from nzb password");
+        assert_eq!(
+            std::fs::read(dir.join("secret.txt")).unwrap(),
+            b"from nzb password"
+        );
         assert!(!arc.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn encrypted_7z_password() {
-        let dir = std::env::temp_dir().join(format!("webcraft-unpack-enc7z-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("webcraft-unpack-enc7z-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("src");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("s.txt"), b"seven secret").unwrap();
         let arc = dir.join("enc.7z");
-        sevenz_rust2::compress_to_path_encrypted(
-            &src,
-            &arc,
-            sevenz_rust2::Password::from("pw7"),
-        )
-        .unwrap();
+        sevenz_rust2::compress_to_path_encrypted(&src, &arc, sevenz_rust2::Password::from("pw7"))
+            .unwrap();
         assert!(unpack_dir(&dir, &["enc.7z".to_string()], Some("nope")).is_err());
         assert!(arc.exists());
         let n = unpack_dir(&dir, &["enc.7z".to_string()], Some("pw7")).unwrap();
@@ -686,7 +702,8 @@ mod tests {
 
     #[test]
     fn split_zip_001_extract_and_delete() {
-        let dir = std::env::temp_dir().join(format!("webcraft-unpack-split-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("webcraft-unpack-split-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Build zip, split bytes into .001/.002.
@@ -707,7 +724,10 @@ mod tests {
         std::fs::write(dir.join("pack.zip.002"), &bytes[mid..]).unwrap();
         let n = unpack_dir(&dir, &["pack.zip.001".to_string()], None).unwrap();
         assert_eq!(n, 1);
-        assert_eq!(std::fs::read(dir.join("s.txt")).unwrap(), b"split zip payload bytes here");
+        assert_eq!(
+            std::fs::read(dir.join("s.txt")).unwrap(),
+            b"split zip payload bytes here"
+        );
         assert!(!dir.join("pack.zip.001").exists());
         assert!(!dir.join("pack.zip.002").exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -715,10 +735,19 @@ mod tests {
 
     #[test]
     fn multi_volume_rar_parts_listed() {
-        let dir = std::env::temp_dir().join(format!("webcraft-unpack-parts-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("webcraft-unpack-parts-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        for n in ["a.part1.rar", "a.part2.rar", "a.part3.rar", "b.rar", "b.r00", "b.r01", "c.zip"] {
+        for n in [
+            "a.part1.rar",
+            "a.part2.rar",
+            "a.part3.rar",
+            "b.rar",
+            "b.r00",
+            "b.r01",
+            "c.zip",
+        ] {
             std::fs::write(dir.join(n), b"x").unwrap();
         }
         let mut p: Vec<String> = archive_parts(&dir, "a.part1.rar")

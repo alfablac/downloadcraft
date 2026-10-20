@@ -129,19 +129,78 @@ pub fn parse_nzb(xml: &str) -> Result<Nzb, String> {
     })
 }
 
-/// `{{password}}` embedded in a name: SABnzbd convention for NZB filename
-/// (`Release {{secret}}.nzb`) and archive stems (`Release {{secret}}.rar`).
-pub fn password_from_braces(name: &str) -> Option<String> {
-    let start = name.find("{{")? + 2;
-    let end = name[start..].find("}}")? + start;
-    let pw = name[start..end].trim();
-    (!pw.is_empty()).then(|| pw.to_string())
+/// Percent-decode %XX sequences (URL-derived names).
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("");
+            if let Ok(v) = u8::from_str_radix(hex, 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Archive password for this NZB. Priority: `<meta type="password">`,
-/// then `{{pw}}` in NZB source/meta names, then `{{pw}}` in file names.
-/// RAR passwords on Usenet live inside NZB itself.
+/// `{{password}}` embedded in a name: SABnzbd convention for NZB filename
+/// (`Release {{secret}}.nzb`) and archive stems (`Release {{secret}}.rar`).
+/// Scans all pairs, first non-empty wins. Percent-decodes first (URL names).
+pub fn password_from_braces(name: &str) -> Option<String> {
+    let decoded = pct_decode(name);
+    let mut rest = decoded.as_str();
+    while let Some(a) = rest.find("{{") {
+        let after = &rest[a + 2..];
+        let Some(b) = after.find("}}") else { break };
+        let pw = after[..b].trim();
+        if !pw.is_empty() {
+            return Some(pw.to_string());
+        }
+        rest = &after[b + 2..];
+    }
+    None
+}
+
+/// Remove `{{...}}` password segments from a display/output name, so the
+/// secret never lands in folder names, persisted task state, or errors.
+pub fn strip_brace_password(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut rest = name;
+    while let Some(a) = rest.find("{{") {
+        out.push_str(&rest[..a]);
+        match rest[a + 2..].find("}}") {
+            Some(b) => rest = &rest[a + 2 + b + 2..],
+            None => {
+                rest = &rest[a..];
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Archive password for this NZB (NZB-wide default). Priority:
+/// `<meta type="password">`, then `{{pw}}` in NZB source/meta names, then
+/// `{{pw}}` in archive file names. RAR passwords on Usenet live inside NZB.
 pub fn nzb_password(nzb: &Nzb, source_url: &str) -> Option<String> {
+    nzb_password_for(nzb, source_url, None)
+}
+
+/// `nzb_password` with per-archive override: `{{pw}}` in that archive's own
+/// name wins over NZB-wide meta/source defaults.
+pub fn nzb_password_for(nzb: &Nzb, source_url: &str, archive_name: Option<&str>) -> Option<String> {
+    if let Some(name) = archive_name {
+        if let Some(pw) = password_from_braces(name) {
+            return Some(pw);
+        }
+    }
     if let Some(pw) = nzb.meta.get("password") {
         let pw = pw.trim();
         if !pw.is_empty() {
@@ -149,14 +208,6 @@ pub fn nzb_password(nzb: &Nzb, source_url: &str) -> Option<String> {
         }
     }
     let mut candidates: Vec<String> = Vec::new();
-    // URL may percent-encode braces (%7B%7Bpw%7D%7D).
-    candidates.push(
-        source_url
-            .replace("%7B", "{")
-            .replace("%7b", "{")
-            .replace("%7D", "}")
-            .replace("%7d", "}"),
-    );
     if let Some(s) = source_stem(source_url) {
         candidates.push(s);
     }
@@ -170,7 +221,10 @@ pub fn nzb_password(nzb: &Nzb, source_url: &str) -> Option<String> {
             return Some(pw);
         }
     }
-    nzb.files.iter().find_map(|f| password_from_braces(&f.name))
+    nzb.files
+        .iter()
+        .filter(|f| crate::unpack::is_archive(&f.name))
+        .find_map(|f| password_from_braces(&f.name))
 }
 
 /// Sanitized meta value usable as output name; None if sanitizes to
@@ -238,21 +292,24 @@ fn common_prefix(files: &[NzbFile]) -> Option<String> {
 /// from meta title/name, else NZB source stem, else file-name common
 /// prefix, else first file stem, else "nzb-files". Always sanitized.
 pub fn output_name(nzb: &Nzb, source_url: &str) -> String {
+    // Strip {{password}} so secret never becomes folder name. Single file:
+    // name must match file on disk verbatim (task.filename is join path).
+    let clean = |s: &str| crate::model::sanitize_filename(&strip_brace_password(s));
     if nzb.files.len() == 1 {
         return nzb.files[0].name.clone();
     }
     if let Some(n) = meta_name(nzb, "title").or_else(|| meta_name(nzb, "name")) {
-        return n;
+        return clean(&n);
     }
     if let Some(n) = source_stem(source_url) {
-        return n;
+        return clean(&n);
     }
     if let Some(n) = common_prefix(&nzb.files) {
-        return n;
+        return clean(&n);
     }
     nzb.files
         .first()
-        .map(|f| crate::model::sanitize_filename(crate::model::split_stem_ext(&f.name).0))
+        .map(|f| clean(crate::model::split_stem_ext(&f.name).0))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "nzb-files".into())
 }
@@ -1286,7 +1343,10 @@ pub async fn download_nzb(
         .await
         .map_err(|e| format!("unpack task failed: {e}"))??;
         if unpacked > 0 {
-            eprintln!("nntp: unpacked {unpacked} archive(s) in {}", out_dir.display());
+            eprintln!(
+                "nntp: unpacked {unpacked} archive(s) in {}",
+                out_dir.display()
+            );
         }
     }
     for file in &nzb.files {
@@ -1471,7 +1531,10 @@ mod tests {
             "<file subject=\"p &quot;a.rar&quot;\"><segments><segment bytes=\"10\" number=\"1\">a@b</segment></segments></file></nzb>"
         );
         let n = parse_nzb(x).unwrap();
-        assert_eq!(nzb_password(&n, "https://x/r.nzb").as_deref(), Some("s3cret pw"));
+        assert_eq!(
+            nzb_password(&n, "https://x/r.nzb").as_deref(),
+            Some("s3cret pw")
+        );
         // No meta: SABnzbd {{pw}} in NZB filename.
         let plain = parse_nzb(
             "<nzb><file subject=\"p &quot;a.rar&quot;\"><segments><segment bytes=\"10\" number=\"1\">a@b</segment></segments></file></nzb>",
@@ -1490,9 +1553,35 @@ mod tests {
             "<nzb><file subject=\"p &quot;Rel {{filepw}}.rar&quot;\"><segments><segment bytes=\"10\" number=\"1\">a@b</segment></segments></file></nzb>",
         )
         .unwrap();
-        assert_eq!(nzb_password(&fnamed, "https://x/r.nzb").as_deref(), Some("filepw"));
+        assert_eq!(
+            nzb_password(&fnamed, "https://x/r.nzb").as_deref(),
+            Some("filepw")
+        );
         // Meta wins over braces.
-        assert_eq!(nzb_password(&n, "/tmp/{{other}}.nzb").as_deref(), Some("s3cret pw"));
+        assert_eq!(
+            nzb_password(&n, "/tmp/{{other}}.nzb").as_deref(),
+            Some("s3cret pw")
+        );
+        // Encoded password content decoded.
+        assert_eq!(
+            nzb_password(&plain, "https://x/%7B%7Bmy%20pw%7D%7D.nzb").as_deref(),
+            Some("my pw")
+        );
+        // {{pw}} never becomes folder/output name.
+        let multi = parse_nzb(
+            "<nzb><head><meta type=\"title\">Rel {{topsecret}}</meta></head><file subject=\"p &quot;a.rar&quot;\"><segments><segment bytes=\"1\" number=\"1\">a@b</segment></segments></file><file subject=\"p &quot;b.rar&quot;\"><segments><segment bytes=\"1\" number=\"1\">c@b</segment></segments></file></nzb>",
+        )
+        .unwrap();
+        assert_eq!(output_name(&multi, "https://x/r.nzb"), "Rel");
+        // Non-archive file braces must not win over archive file braces.
+        let mixed = parse_nzb(
+            "<nzb><file subject=\"p &quot;notes {{decoy}}.nfo&quot;\"><segments><segment bytes=\"1\" number=\"1\">a@b</segment></segments></file><file subject=\"p &quot;Rel {{realpw}}.rar&quot;\"><segments><segment bytes=\"1\" number=\"1\">c@b</segment></segments></file></nzb>",
+        )
+        .unwrap();
+        assert_eq!(
+            nzb_password(&mixed, "https://x/r.nzb").as_deref(),
+            Some("realpw")
+        );
     }
 
     #[test]

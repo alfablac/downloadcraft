@@ -522,7 +522,10 @@ async fn nntp_auto_unpack_extracts_and_deletes_archive() {
     let nzb_path = dir.join("test.nzb");
     std::fs::write(
         &nzb_path,
-        nzb_xml(&[("p &quot;pack.zip&quot;", vec![("z1@news", zip.len() as u64 + 64, 1)])]),
+        nzb_xml(&[(
+            "p &quot;pack.zip&quot;",
+            vec![("z1@news", zip.len() as u64 + 64, 1)],
+        )]),
     )
     .unwrap();
     let mut settings = settings_for(&fake);
@@ -538,13 +541,19 @@ async fn nntp_auto_unpack_extracts_and_deletes_archive() {
 async fn nntp_auto_unpack_corrupt_archive_kept_and_errors() {
     let dir = tmpdir("unpack-bad");
     let mut zip = stored_zip("hello.txt", b"hello unpack world");
-    let pos = zip.windows(18).position(|w| w == b"hello unpack world").unwrap();
+    let pos = zip
+        .windows(18)
+        .position(|w| w == b"hello unpack world")
+        .unwrap();
     zip[pos] ^= 0xFF; // payload corrupt -> ZIP CRC fails; yEnc crc covers corrupt bytes
     let fake = fake_nntp(vec![("z1@news".into(), yenc(&zip, "pack.zip"))]);
     let nzb_path = dir.join("test.nzb");
     std::fs::write(
         &nzb_path,
-        nzb_xml(&[("p &quot;pack.zip&quot;", vec![("z1@news", zip.len() as u64 + 64, 1)])]),
+        nzb_xml(&[(
+            "p &quot;pack.zip&quot;",
+            vec![("z1@news", zip.len() as u64 + 64, 1)],
+        )]),
     )
     .unwrap();
     let mut settings = settings_for(&fake);
@@ -565,7 +574,11 @@ async fn nntp_auto_unpack_corrupt_archive_kept_and_errors() {
     .await;
     let err = r.expect_err("corrupt archive must error, not Complete");
     assert!(err.contains("unpack"), "{err}");
-    assert_eq!(std::fs::read(dir.join("pack.zip")).unwrap(), zip, "archive kept");
+    assert_eq!(
+        std::fs::read(dir.join("pack.zip")).unwrap(),
+        zip,
+        "archive kept"
+    );
     assert!(!dir.join("hello.txt").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
