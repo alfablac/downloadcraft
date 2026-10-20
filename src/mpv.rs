@@ -184,7 +184,7 @@ pub fn play(s: &Settings, url: &str) -> Result<u32, String> {
 
 // ===================== embedded (--wid) + JSON IPC =====================
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PlayerState {
     pub pause: bool,
     pub time_pos: f64,
@@ -195,6 +195,32 @@ pub struct PlayerState {
     pub eof: bool,
     pub title: String,
     pub error: String, // pipe/launch failure; mpv IPC has no stable error prop
+    pub aid: i64,      // -1 = no audio track selected
+    pub mute: bool,
+    pub paused_for_cache: bool,
+    pub connected: bool, // IPC pipe connected / property events flowing
+    pub path: String,
+}
+
+impl Default for PlayerState {
+    fn default() -> Self {
+        Self {
+            pause: false,
+            time_pos: 0.0,
+            duration: 0.0,
+            volume: 0.0,
+            speed: 0.0,
+            idle: false,
+            eof: false,
+            title: String::new(),
+            error: String::new(),
+            aid: -1,
+            mute: false,
+            paused_for_cache: false,
+            connected: false,
+            path: String::new(),
+        }
+    }
 }
 
 pub struct MpvHandle {
@@ -226,18 +252,32 @@ pub fn embedded_args(
                 | "--force-window"
                 | "--idle"
                 | "--terminal"
+                | "--log-file"
+                | "--volume"
+                | "--mute"
         )
     });
     let emb = [
         format!("--wid={wid}"),
         format!("--input-ipc-server={pipe}"),
+        format!(
+            "--log-file={}",
+            crate::platform::cache_dir()
+                .join("mpv-embedded.log")
+                .display()
+        ),
         "--force-window=yes".into(),
         "--idle=yes".into(),
         "--keepaspect=yes".into(),
         "--cursor-autohide=no".into(),
+        // Keep: egui owns keys.
         "--input-default-bindings=no".into(),
         "--osc=no".into(),
         "--osd-level=0".into(),
+        // Config file could set volume/mute low; embedded must be config-independent.
+        // build_args skips volume==100 assuming mpv default, so force value explicitly.
+        format!("--volume={}", s.mpv_volume),
+        "--mute=no".into(),
     ];
     // build_args puts terminal "--" + url last; insert before it so emb flags not treated as files
     if let Some(pos) = args.iter().position(|a| a == "--") {
@@ -319,6 +359,10 @@ fn ipc_io(pipe: String, rx: mpsc::Receiver<String>, state: Arc<Mutex<PlayerState
         (6, "eof-reached"),
         (7, "core-idle"),
         (8, "media-title"),
+        (9, "aid"),
+        (10, "mute"),
+        (11, "paused-for-cache"),
+        (12, "path"),
     ] {
         let _ = writeln!(wf, "{{\"command\":[\"observe_property\",{id},\"{name}\"]}}");
     }
@@ -352,6 +396,7 @@ fn ipc_io(pipe: String, rx: mpsc::Receiver<String>, state: Arc<Mutex<PlayerState
                 };
                 let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
                 if let Ok(mut g) = state.lock() {
+                    g.connected = true;
                     match name {
                         "pause" => g.pause = data.as_bool().unwrap_or(false),
                         "time-pos" => g.time_pos = data.as_f64().unwrap_or(0.0),
@@ -361,6 +406,11 @@ fn ipc_io(pipe: String, rx: mpsc::Receiver<String>, state: Arc<Mutex<PlayerState
                         "eof-reached" => g.eof = data.as_bool().unwrap_or(false),
                         "core-idle" => g.idle = data.as_bool().unwrap_or(false),
                         "media-title" => g.title = data.as_str().unwrap_or("").to_string(),
+                        // JSON null aid (no audio selected) -> -1.
+                        "aid" => g.aid = data.as_i64().unwrap_or(-1),
+                        "mute" => g.mute = data.as_bool().unwrap_or(false),
+                        "paused-for-cache" => g.paused_for_cache = data.as_bool().unwrap_or(false),
+                        "path" => g.path = data.as_str().unwrap_or("").to_string(),
                         _ => {}
                     }
                 }
@@ -370,6 +420,7 @@ fn ipc_io(pipe: String, rx: mpsc::Receiver<String>, state: Arc<Mutex<PlayerState
     if let Ok(mut g) = state.lock() {
         g.idle = true;
         g.eof = true;
+        g.connected = false;
     }
 }
 
@@ -550,6 +601,14 @@ mod tests {
     }
 
     #[test]
+    fn player_state_defaults() {
+        let st = PlayerState::default();
+        assert_eq!(st.aid, -1);
+        assert!(!st.mute && !st.paused_for_cache && !st.connected);
+        assert!(st.path.is_empty());
+    }
+
+    #[test]
     fn pipe_path_format() {
         let p = ipc_pipe_path(42);
         assert!(p.starts_with(r"\\.\pipe\webcraft-mpv-"));
@@ -561,13 +620,14 @@ mod tests {
         let mut s = Settings::default();
         s.mpv_fullscreen = true;
         s.mpv_extra_args =
-            "--wid=1 --input-ipc-server=x --really-quiet --force-window --osc=yes".into();
+            "--wid=1 --input-ipc-server=x --really-quiet --force-window --osc=yes --volume=20 --mute=yes --log-file=C:/evil.log"
+                .into();
         let a = embedded_args(&s, "https://x/v.mp4", 123, r"\\.\pipe\webcraft-mpv-1-0").unwrap();
         let wid: Vec<_> = a.iter().filter(|x| x.starts_with("--wid")).collect();
         assert_eq!(wid.len(), 1);
         assert_eq!(wid[0], "--wid=123");
         let dash = a.iter().position(|x| x == "--").unwrap();
-        assert_eq!(a[dash - 1], "--osd-level=0");
+        assert_eq!(a[dash - 1], "--mute=no");
         assert_eq!(a.last().unwrap(), "https://x/v.mp4");
         assert!(a.contains(&"--force-window=yes".to_string()));
         assert_eq!(
@@ -577,6 +637,15 @@ mod tests {
             1
         );
         assert!(!a.contains(&"--really-quiet".to_string()));
-        assert_eq!(a[dash - 2], "--osc=no");
+        assert_eq!(a[dash - 2], "--volume=100");
+        assert_eq!(a[dash - 3], "--osd-level=0");
+        assert_eq!(a[dash - 4], "--osc=no");
+        // Forced volume/mute/log-file: single occurrence, last wins over settings/extra args.
+        assert_eq!(a.iter().filter(|x| x.starts_with("--volume")).count(), 1);
+        assert_eq!(a.iter().filter(|x| x.starts_with("--mute")).count(), 1);
+        assert!(a
+            .iter()
+            .any(|x| x.starts_with("--log-file=") && x.ends_with("mpv-embedded.log")));
+        assert_eq!(a.iter().filter(|x| x.starts_with("--log-file")).count(), 1);
     }
 }

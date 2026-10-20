@@ -636,6 +636,84 @@ pub fn split_stem_ext(filename: &str) -> (&str, &str) {
     }
 }
 
+/// True when URL-seeded `filename` carries no title info, so extracted
+/// (yt-dlp) title should replace it. Weak: stem empty / all-digits /
+/// len<=2 / equals URL host first label / equals any URL path segment
+/// (or that segment's stem). Exception: filename exactly equals last
+/// path segment = direct-media URL, name is real -> not weak.
+pub fn filename_stem_is_weak_for_title(filename: &str, url: &str) -> bool {
+    let (stem, _) = split_stem_ext(filename);
+    if stem.is_empty() {
+        return true;
+    }
+    let parsed = url::Url::parse(url).ok();
+    let last_segment = parsed
+        .as_ref()
+        .map(|u| u.path().rsplit('/').next().unwrap_or(""))
+        .unwrap_or("");
+    if !last_segment.is_empty() && filename.eq_ignore_ascii_case(last_segment) {
+        return false;
+    }
+    if stem.chars().count() <= 2 || stem.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    if let Some(u) = &parsed {
+        if let Some(label) = u.host_str().and_then(|h| h.split('.').next()) {
+            if stem.eq_ignore_ascii_case(label) {
+                return true;
+            }
+        }
+        for seg in u.path().split('/') {
+            if seg.is_empty() {
+                continue;
+            }
+            let seg_stem = seg.split('.').next().unwrap_or(seg);
+            if stem.eq_ignore_ascii_case(seg) || stem.eq_ignore_ascii_case(seg_stem) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// First free variant of `filename` in `dir`: as-is if not in `taken`
+/// (case-insensitive) and not on disk, else `{stem}_{n}{ext}` n=1,2,...
+pub fn unique_filename(dir: &std::path::Path, filename: &str, taken: &[String]) -> String {
+    let is_taken =
+        |name: &str| taken.iter().any(|t| t.eq_ignore_ascii_case(name)) || dir.join(name).exists();
+    if !is_taken(filename) {
+        return filename.to_string();
+    }
+    let (stem, ext) = split_stem_ext(filename);
+    let mut n = 1;
+    loop {
+        let cand = format!("{stem}_{n}{ext}");
+        if !is_taken(&cand) {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
+/// True when `filename` collides in `dir` with another task (`taken`,
+/// case-insensitive, excluding `exclude_filename`) or a disk file.
+/// When filename == exclude_filename (own name), disk hit is self, so
+/// only the (exclude-filtered) taken check counts.
+pub fn name_taken(
+    dir: &std::path::Path,
+    filename: &str,
+    taken: &[String],
+    exclude_filename: &str,
+) -> bool {
+    let in_taken = taken
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(filename) && !t.eq_ignore_ascii_case(exclude_filename));
+    if filename.eq_ignore_ascii_case(exclude_filename) {
+        return in_taken;
+    }
+    in_taken || dir.join(filename).exists()
+}
+
 /// Current local date as YYYY-MM-DD. No chrono dep: UTC date from epoch
 /// days via scheduler::civil_from_days inverse; local tz offset ignored
 /// (ponytail: UTC date, off-by-one near midnight acceptable).
@@ -993,5 +1071,66 @@ mod tests {
         assert!(parse_settings_import("{not json").is_err());
         assert!(parse_settings_import("null").is_err());
         assert!(parse_settings_import(r#"{"tasks":[]}"#).is_err());
+    }
+
+    #[test]
+    fn filename_stem_is_weak_for_title_cases() {
+        let x = "https://x.com/u/status/2112294755962949700";
+        assert!(filename_stem_is_weak_for_title("x.mp4", x)); // host label
+        assert!(filename_stem_is_weak_for_title("X.mp4", x)); // case-insens.
+        assert!(filename_stem_is_weak_for_title(
+            "2112294755962949700.mp4",
+            x
+        )); // digits
+        assert!(filename_stem_is_weak_for_title("u.mp4", x)); // path seg + len
+        assert!(filename_stem_is_weak_for_title(
+            "ab.mp4",
+            "https://youtube.com/watch?v=1"
+        )); // len<=2
+        assert!(filename_stem_is_weak_for_title(
+            "",
+            "https://youtube.com/watch?v=1"
+        )); // empty
+        assert!(filename_stem_is_weak_for_title(
+            "123.mp4",
+            "https://youtube.com/watch?v=1"
+        ));
+        assert!(!filename_stem_is_weak_for_title(
+            "My Video.mp4",
+            "https://youtube.com/watch?v=1"
+        ));
+        assert!(!filename_stem_is_weak_for_title(
+            "video.mp4",
+            "https://youtube.com/watch?v=123"
+        ));
+        // Direct-media: filename == last segment verbatim -> not weak.
+        assert!(!filename_stem_is_weak_for_title(
+            "video.mp4",
+            "https://cdn.example.com/video.mp4"
+        ));
+        assert!(!filename_stem_is_weak_for_title(
+            "Video.MP4",
+            "https://cdn.example.com/video.mp4"
+        ));
+        // Stem == non-final path segment -> weak.
+        assert!(filename_stem_is_weak_for_title("status.mp4", x));
+    }
+
+    #[test]
+    fn unique_and_taken_cases() {
+        let dir = std::env::temp_dir().join(format!("webcraft-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let taken = vec!["a.mp4".to_string(), "b.mp4".to_string()];
+        assert_eq!(unique_filename(&dir, "free.mp4", &taken), "free.mp4");
+        assert_eq!(unique_filename(&dir, "a.mp4", &taken), "a_1.mp4");
+        assert_eq!(unique_filename(&dir, "A.mp4", &taken), "A_1.mp4"); // case-insens.
+        std::fs::write(dir.join("a_1.mp4"), b"").unwrap();
+        assert_eq!(unique_filename(&dir, "a.mp4", &taken), "a_2.mp4"); // skips disk _1
+        assert!(name_taken(&dir, "b.mp4", &taken, "self.mp4"));
+        assert!(name_taken(&dir, "a_1.mp4", &taken, "self.mp4")); // disk only
+        assert!(!name_taken(&dir, "free.mp4", &taken, "self.mp4"));
+        assert!(!name_taken(&dir, "a_1.mp4", &taken, "a_1.mp4")); // own disk file = self
+        let _ = std::fs::remove_file(dir.join("a_1.mp4"));
+        let _ = std::fs::remove_dir(&dir);
     }
 }

@@ -68,7 +68,12 @@ fn prewarm_eligible(task: &DownloadTask) -> bool {
 
 /// Spawn engine prewarm on tokio rt (non-blocking; confirm never waits).
 /// No-op when same URL already probed/in flight. `conns` = planned segments cap.
-fn spawn_prewarm(st: &mut PrewarmState, rt: &tokio::runtime::Runtime, task: &DownloadTask, conns: u32) {
+fn spawn_prewarm(
+    st: &mut PrewarmState,
+    rt: &tokio::runtime::Runtime,
+    task: &DownloadTask,
+    conns: u32,
+) {
     let url = task.url.trim().to_string();
     if url.is_empty() || st.url == url {
         return;
@@ -106,8 +111,7 @@ fn spawn_prewarm(st: &mut PrewarmState, rt: &tokio::runtime::Runtime, task: &Dow
 }
 
 /// Prewarm UI result slot: (url, display text). Same stale-drop as yt probe.
-type PrewarmSlot =
-    std::sync::Arc<std::sync::Mutex<Option<(String, Result<String, String>)>>>;
+type PrewarmSlot = std::sync::Arc<std::sync::Mutex<Option<(String, Result<String, String>)>>>;
 static PREWARM_UI: std::sync::OnceLock<PrewarmSlot> = std::sync::OnceLock::new();
 
 fn prewarm_ui_slot() -> PrewarmSlot {
@@ -138,6 +142,49 @@ fn prewarm_poll(st: &mut PrewarmState, url: &str) {
             };
         }
     }
+}
+
+/// Filename collision awaiting user choice (Add/Capture/batch flows).
+/// `unique` precomputed at raise; Rename applies it verbatim.
+#[derive(Clone)]
+struct PendingCollision {
+    id: String,
+    filename: String,
+    dest_dir: std::path::PathBuf,
+    start_now: bool,
+    unique: String,
+}
+
+/// Filenames of other tasks in same dir (collision `taken` list).
+fn taken_names(tasks: &[DownloadTask], dir: &std::path::Path, exclude_id: &str) -> Vec<String> {
+    tasks
+        .iter()
+        .filter(|t| t.id != exclude_id && t.dest_dir == dir)
+        .map(|t| t.filename.clone())
+        .collect()
+}
+
+/// Collision check for task `exclude_id`: another task (same dir, ci
+/// name) or disk file not owned as that task's own dest. Redownload own
+/// completed file (filename == own, disk == own dest) is NOT collision.
+fn task_name_collides(tasks: &[DownloadTask], exclude_id: &str) -> bool {
+    let Some(t) = tasks.iter().find(|t| t.id == exclude_id) else {
+        return false;
+    };
+    let taken = taken_names(tasks, &t.dest_dir, exclude_id);
+    if taken.iter().any(|n| n.eq_ignore_ascii_case(&t.filename)) {
+        return true;
+    }
+    let path = t.dest_dir.join(&t.filename);
+    if !path.is_file() {
+        return false;
+    }
+    // Sole owner of disk path is this task itself (redownload own file).
+    let owners: Vec<&DownloadTask> = tasks
+        .iter()
+        .filter(|o| o.dest_dir.join(&o.filename) == path)
+        .collect();
+    !(owners.len() == 1 && owners[0].id == exclude_id)
 }
 
 /// Add-dialog debrid magnet awaiting fan-out resolution.
@@ -607,6 +654,9 @@ pub struct DownloadApp {
     show_add: bool,
     show_progress_for: Option<String>,
     progress_raise: bool,
+    pending_collision: Option<PendingCollision>,
+    /// Frames left to force-raise Collision viewport (see add_raise_frames).
+    collision_raise_frames: u32,
     /// Frames left to force-raise Progress viewport (see add_raise_frames).
     prog_raise_frames: u32,
     /// Filename prefix of Progress viewport being raised (title match).
@@ -688,6 +738,8 @@ pub struct DownloadApp {
     player_speed: f64,
     /// Player viewport HWND resolved via EnumWindows by title (once, cached).
     player_hwnd: Option<isize>,
+    /// Native child HWND of player viewport; mpv --wid target.
+    player_child: Option<isize>,
     /// Last resolved (paused,duration) for title/status; stale-tolerant.
     player_title_state: (bool, f64),
     prog_task: Option<String>,
@@ -923,8 +975,11 @@ impl DownloadApp {
             player_seek_dragging: false,
             player_speed: 1.0,
             player_hwnd: None,
+            player_child: None,
             player_title_state: (false, 0.0),
             progress_raise: false,
+            pending_collision: None,
+            collision_raise_frames: 0,
             prog_raise_frames: 0,
             prog_raise_title: String::new(),
             selected: None,
@@ -1161,10 +1216,136 @@ impl DownloadApp {
         }
         if pending.start_now {
             for id in &ids {
-                self.start_task(id);
+                if !self.gate_collision(id, true) {
+                    self.start_task(id);
+                }
             }
         }
         ctx.request_repaint();
+    }
+
+    /// Set pending_collision when task `id` collides; true = start held.
+    /// Checks other-task names (ci, same dir) + disk via model::name_taken
+    /// (exclude="" so disk hit counts) and own-path sole-owner exemption.
+    fn gate_collision(&mut self, id: &str, start_now: bool) -> bool {
+        if id.is_empty() || self.pending_collision.is_some() {
+            return self.pending_collision.is_some();
+        }
+        // Compute under lock, assign after (no &mut self while rt held).
+        let pending = {
+            let g = crate::lock_unpoison(&self.rt);
+            let Some(t) = g.state.tasks.iter().find(|t| t.id == id) else {
+                return false;
+            };
+            let taken = taken_names(&g.state.tasks, &t.dest_dir, id);
+            let collides = crate::model::name_taken(&t.dest_dir, &t.filename, &taken, &t.filename)
+                || task_name_collides(&g.state.tasks, id);
+            if !collides {
+                return false;
+            }
+            Some(PendingCollision {
+                id: t.id.clone(),
+                filename: t.filename.clone(),
+                dest_dir: t.dest_dir.clone(),
+                start_now,
+                unique: crate::model::unique_filename(&t.dest_dir, &t.filename, &taken),
+            })
+        };
+        if pending.is_some() {
+            self.pending_collision = pending;
+            self.collision_raise_frames = 90;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Collision dialog (vp_id "webcraft-collision", 480x220).
+    /// Cancel semantics (button/Esc/close_requested): remove task + save
+    /// (avoids stuck duplicate name; user re-adds if wanted).
+    fn ui_collision_dialog(&mut self, ctx: &egui::Context) {
+        let Some(p) = self.pending_collision.clone() else {
+            return;
+        };
+        let title = "Filename already exists".to_string();
+        let builder = egui::ViewportBuilder::default()
+            .with_title(&title)
+            .with_inner_size([480.0, 220.0])
+            .with_min_inner_size([420.0, 200.0])
+            .with_resizable(true);
+        if self.collision_raise_frames > 0 {
+            self.collision_raise_frames -= 1;
+            ctx.send_viewport_cmd_to(vp_id("webcraft-collision"), egui::ViewportCommand::Focus);
+            crate::platform::raise_window(std::process::id(), &title);
+        }
+        let mut close = false;
+        let mut focused = false;
+        let mut action: Option<u8> = None; // 1 rename, 2 overwrite, 3 cancel
+        ctx.show_viewport_immediate(vp_id("webcraft-collision"), builder, |ctx, class| {
+            focused = ctx.input(|i| i.focused);
+            if ctx.input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape)) {
+                close = true;
+            }
+            if matches!(class, egui::ViewportClass::Embedded) {
+                let r = egui::Window::new(&title)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .default_size([480.0, 220.0])
+                    .show(ctx, |ui| {
+                        collision_body(ui, &p);
+                        collision_buttons(ui, &mut action, &p.unique);
+                    });
+            } else {
+                egui::CentralPanel::default()
+                    .frame(dialog_frame())
+                    .show(ctx, |ui| {
+                        collision_body(ui, &p);
+                        collision_buttons(ui, &mut action, &p.unique);
+                    });
+            }
+        });
+        if focused {
+            self.collision_raise_frames = 0;
+        }
+        if close && action.is_none() {
+            action = Some(3);
+        }
+        match action {
+            Some(1) => {
+                let (id, unique, start) = (p.id.clone(), p.unique.clone(), p.start_now);
+                {
+                    let mut g = crate::lock_unpoison(&self.rt);
+                    if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) {
+                        t.filename = unique;
+                    }
+                    g.save();
+                }
+                self.pending_collision = None;
+                self.collision_raise_frames = 0;
+                if start {
+                    self.start_task(&id);
+                }
+            }
+            Some(2) => {
+                let (id, start) = (p.id.clone(), p.start_now);
+                {
+                    let g = crate::lock_unpoison(&self.rt);
+                    g.save();
+                }
+                self.pending_collision = None;
+                self.collision_raise_frames = 0;
+                if start {
+                    self.start_task(&id);
+                }
+            }
+            Some(3) => {
+                remove_task(self, &p.id);
+                self.pending_collision = None;
+                self.collision_raise_frames = 0;
+            }
+            _ => {}
+        }
     }
 
     fn start_task(&mut self, id: &str) {
@@ -1771,7 +1952,9 @@ impl DownloadApp {
                 self.tab = Tab::Downloads;
                 {
                     self.show_add = true;
-                    self.add_just_opened = true; self.add_raise_frames = 90; self.add_focus_done = false;
+                    self.add_just_opened = true;
+                    self.add_raise_frames = 90;
+                    self.add_focus_done = false;
                 }
             }
             "quit" => {
@@ -1791,7 +1974,9 @@ impl DownloadApp {
                     self.tab = Tab::Downloads;
                     {
                         self.show_add = true;
-                        self.add_just_opened = true; self.add_raise_frames = 90; self.add_focus_done = false;
+                        self.add_just_opened = true;
+                        self.add_raise_frames = 90;
+                        self.add_focus_done = false;
                     }
                 }
                 _ => self.show_window(ctx),
@@ -2016,6 +2201,8 @@ impl DownloadApp {
                             drop(cb);
                             let id = g.add_url(&txt, "main", "", "");
                             g.log(format!("Clipboard URL added: {id}"));
+                            drop(g);
+                            self.gate_collision(&id, false);
                         } else {
                             g.clip_last = txt;
                         }
@@ -2230,8 +2417,10 @@ impl DownloadApp {
             if let Some(path) = local {
                 let path_str = path.to_string_lossy().into_owned();
                 let mut g = crate::lock_unpoison(&self.rt);
-                g.add_url(&path_str, "main", "", "");
+                let id = g.add_url(&path_str, "main", "", "");
                 g.log(format!("Dropped file added: {path_str}"));
+                drop(g);
+                self.gate_collision(&id, false);
                 continue;
             }
             let text = file
@@ -2254,8 +2443,10 @@ impl DownloadApp {
                 });
             if let Some(url) = text {
                 let mut g = crate::lock_unpoison(&self.rt);
-                g.add_url(&url, "main", "", "");
+                let id = g.add_url(&url, "main", "", "");
                 g.log(format!("Dropped URL added: {url}"));
+                drop(g);
+                self.gate_collision(&id, false);
             }
         }
         // Idle cost: fast wake only while work runs; egui still repaints on input.
@@ -2269,8 +2460,10 @@ impl DownloadApp {
         let minimized = ctx.input(|i| i.viewport().minimized == Some(true));
         // Dialog viewports run inside root pass: keep frames live while open
         // so child clicks/buttons don't wait 500ms-5s cadence.
-        let dialog_open =
-            self.show_add || self.show_progress_for.is_some() || self.capture_task.is_some();
+        let dialog_open = self.show_add
+            || self.show_progress_for.is_some()
+            || self.capture_task.is_some()
+            || self.pending_collision.is_some();
         let base_ms = if self.hidden || minimized {
             5_000
         } else if dialog_open {
@@ -2504,8 +2697,8 @@ impl DownloadApp {
 }
 
 impl DownloadApp {
-    /// Embedded mpv player viewport. mpv child renders into viewport HWND
-    /// (--wid); egui draws only controls bar under it. See spawn order below.
+    /// Embedded mpv player viewport. mpv renders into native child HWND
+    /// of viewport (--wid=child); egui draws only controls bar under it.
     fn ui_player(&mut self, ctx: &egui::Context) {
         // Title from last snapshot; lags one frame. ponytail: acceptable.
         let (t_paused, _) = self.player_title_state;
@@ -2525,6 +2718,8 @@ impl DownloadApp {
         let mut seek_req: Option<(f64, bool)> = None;
         let mut speed_req: Option<f64> = None;
         let mut vol_req: Option<f64> = None;
+        let mut mute_req: Option<bool> = None;
+        let mut video_rect: Option<egui::Rect> = None;
         ctx.show_viewport_immediate(vp_id("webcraft-player"), builder, |ctx, _class| {
             if ctx.input(|i| i.viewport().close_requested()) {
                 close = true;
@@ -2534,12 +2729,25 @@ impl DownloadApp {
             // retries (show_viewport_immediate creates window first frame).
             if self.player.is_none() {
                 if let Some(url) = self.player_pending.clone() {
-                    let hwnd = self.player_hwnd.or_else(|| {
+                    let parent = self.player_hwnd.or_else(|| {
                         let h = find_player_hwnd();
                         self.player_hwnd = h;
                         h
                     });
-                    match hwnd {
+                    let child = parent.and_then(|p| {
+                        self.player_child.or_else(|| {
+                            let c = crate::platform::create_video_child(p);
+                            self.player_child = c;
+                            c
+                        })
+                    });
+                    if parent.is_some() && child.is_none() {
+                        self.stream_status = "ERR: video surface create failed".into();
+                        self.stream_status_err = true;
+                        self.player_pending = None;
+                        close = true;
+                    }
+                    match child {
                         Some(h) => {
                             let settings = {
                                 let g = crate::lock_unpoison(&self.rt);
@@ -2577,9 +2785,14 @@ impl DownloadApp {
                     s.title.clone(),
                     s.error.clone(),
                     s.eof,
+                    s.aid,
+                    s.mute,
+                    s.connected,
+                    s.paused_for_cache,
+                    s.path.clone(),
                 )
             });
-            if let Some((p, _, d, _, _, _, _, _)) = &snap {
+            if let Some((p, _, d, _, _, _, _, _, _, _, _, _, _)) = &snap {
                 self.player_title_state = (*p, *d);
             }
             let paused = snap.as_ref().map(|s| s.0).unwrap_or(false);
@@ -2591,11 +2804,31 @@ impl DownloadApp {
                         .inner_margin(egui::Margin::same(theme::SP_SM)),
                 )
                 .show(ctx, |ui| {
-                    if let Some((_, tp, dur, vol, _spd, media, err, eof)) = &snap {
-                        if !media.is_empty() {
+                    if let Some((
+                        _,
+                        tp,
+                        dur,
+                        vol,
+                        _spd,
+                        media,
+                        err,
+                        eof,
+                        aid,
+                        muted,
+                        connected,
+                        pfc,
+                        path,
+                    )) = &snap
+                    {
+                        let disp = if media.is_empty() {
+                            path.clone()
+                        } else {
+                            media.clone()
+                        };
+                        if !disp.is_empty() {
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(media.as_str())
+                                    egui::RichText::new(disp.as_str())
                                         .color(theme::TEXT)
                                         .small(),
                                 )
@@ -2606,6 +2839,30 @@ impl DownloadApp {
                             ui.label(
                                 egui::RichText::new(format!("ERR {err}"))
                                     .color(theme::ERR)
+                                    .small(),
+                            );
+                        } else if !connected {
+                            ui.label(
+                                egui::RichText::new("Connecting\u{2026}")
+                                    .color(theme::WARN)
+                                    .small(),
+                            );
+                        } else if *pfc {
+                            ui.label(
+                                egui::RichText::new("Buffering\u{2026}")
+                                    .color(theme::WARN)
+                                    .small(),
+                            );
+                        } else if !eof && *aid < 0 {
+                            ui.label(
+                                egui::RichText::new("No audio track")
+                                    .color(theme::WARN)
+                                    .small(),
+                            );
+                        } else if *muted {
+                            ui.label(
+                                egui::RichText::new("Muted")
+                                    .color(theme::WARN)
                                     .small(),
                             );
                         } else if *eof {
@@ -2667,6 +2924,11 @@ impl DownloadApp {
                             if theme::ghost_btn(ui, "+10s").clicked() {
                                 seek_req = Some((10.0, false));
                             }
+                            if theme::ghost_btn(ui, if *muted { "Unmute" } else { "Mute" })
+                                .clicked()
+                            {
+                                mute_req = Some(!muted);
+                            }
                             ui.label(egui::RichText::new("Vol").color(theme::TEXT_FAINT).small());
                             let mut v = *vol;
                             if ui
@@ -2713,16 +2975,22 @@ impl DownloadApp {
             };
             egui::CentralPanel::default()
                 .frame(frame)
-                .show(ctx, |_ui| {
-                    // ponytail: central left unpainted past Frame bg; mpv owns
-                    // pixels under egui GL surface (--wid child paints there).
-                    // egui present may flicker on some drivers; controls panel
-                    // above is opaque. Do NOT rect_filled here (covers video).
+                .show(ctx, |ui| {
+                    video_rect = Some(ui.max_rect());
                 });
         });
         if close {
             self.quit_player();
             return;
+        }
+        // Video child: egui points -> child client px (child of parent HWND).
+        if let (Some(child), Some(rect)) = (self.player_child, video_rect) {
+            let ppp = ctx.pixels_per_point();
+            let x = (rect.min.x * ppp).round() as i32;
+            let y = (rect.min.y * ppp).round() as i32;
+            let w = (rect.width() * ppp).round() as i32;
+            let h = (rect.height() * ppp).round() as i32;
+            crate::platform::set_video_rect(child, x, y, w, h);
         }
         if let Some(h) = &self.player {
             if toggle_req {
@@ -2745,6 +3013,9 @@ impl DownloadApp {
                 self.player_speed = s;
                 h.set_speed(s);
             }
+            if let Some(m) = mute_req {
+                h.cmd(serde_json::json!({"command":["set_property","mute",m]}));
+            }
         }
     }
 
@@ -2755,6 +3026,9 @@ impl DownloadApp {
         if let Some(h) = self.player.take() {
             h.quit();
         }
+        if let Some(child) = self.player_child.take() {
+            crate::platform::destroy_video_child(child);
+        }
     }
 
     /// Play `url` in embedded player: reuse live handle (loadfile) else
@@ -2763,6 +3037,8 @@ impl DownloadApp {
         if let Some(h) = &self.player {
             match h.loadfile(url) {
                 Ok(()) => {
+                    self.player_seek = 0.0;
+                    self.player_seek_dragging = false;
                     self.stream_status = format!("Playing in player: {url}");
                 }
                 Err(e) => {
@@ -2884,7 +3160,9 @@ impl eframe::App for DownloadApp {
             }
             if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::N)) {
                 self.show_add = true;
-                self.add_just_opened = true; self.add_raise_frames = 90; self.add_focus_done = false;
+                self.add_just_opened = true;
+                self.add_raise_frames = 90;
+                self.add_focus_done = false;
             }
             if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::C)) {
                 let urls: Vec<String> = {
@@ -2934,7 +3212,9 @@ impl eframe::App for DownloadApp {
                             if ui.button("Add new download…").clicked() {
                                 {
                                     self.show_add = true;
-                                    self.add_just_opened = true; self.add_raise_frames = 90; self.add_focus_done = false;
+                                    self.add_just_opened = true;
+                                    self.add_raise_frames = 90;
+                                    self.add_focus_done = false;
                                 }
                                 ui.close_menu();
                             }
@@ -3482,6 +3762,7 @@ impl eframe::App for DownloadApp {
         }
         self.show_pending_delete(ctx);
         self.show_pending_power(ctx);
+        self.ui_collision_dialog(ctx);
         if self.show_add {
             self.ui_add_dialog(ctx);
         }
@@ -3545,7 +3826,9 @@ impl eframe::App for DownloadApp {
                             if theme::primary_btn(ui, label).clicked() {
                                 self.add_url = p.clone();
                                 self.show_add = true;
-                                self.add_just_opened = true; self.add_raise_frames = 90; self.add_focus_done = false;
+                                self.add_just_opened = true;
+                                self.add_raise_frames = 90;
+                                self.add_focus_done = false;
                                 self.completed_notice = None;
                             }
                         }
@@ -3982,7 +4265,9 @@ fn add_url_task(app: &mut DownloadApp, url: &str) {
         let mut g = crate::lock_unpoison(&app.rt);
         g.add_url(url, "main", "", "")
     };
-    app.start_task(&id);
+    if !app.gate_collision(&id, true) {
+        app.start_task(&id);
+    }
 }
 fn fmt_rate(bps: f32) -> String {
     if bps <= 0.0 {
@@ -4668,7 +4953,8 @@ fn yt_error_summary(e: &str) -> (String, String) {
     let friendly = if t.contains("page needs") || t.contains("Sign in") {
         "YouTube rejected browser cookies (yt-dlp limitation). Retries without cookies; public videos need no login.".to_string()
     } else if t.contains("NoneType") || t.contains("has no attribute") || t.starts_with("ERROR:") {
-        "yt-dlp could not read this page/stream (extractor error). Download below still works.".to_string()
+        "yt-dlp could not read this page/stream (extractor error). Download below still works."
+            .to_string()
     } else if raw_first_line.is_empty() {
         "yt-dlp probe failed.".to_string()
     } else {
@@ -4700,9 +4986,7 @@ fn ui_yt_probe_section(
     }
     if !st.error.is_empty() {
         let (friendly, _) = yt_error_summary(&st.error);
-        ui.add(
-            egui::Label::new(egui::RichText::new(friendly).color(theme::ERR).small()).wrap(),
-        );
+        ui.add(egui::Label::new(egui::RichText::new(friendly).color(theme::ERR).small()).wrap());
         egui::CollapsingHeader::new(egui::RichText::new("Details").small())
             .id_salt(format!("{id}_yt_err_details"))
             .default_open(false)
@@ -4713,7 +4997,9 @@ fn ui_yt_probe_section(
                     .show(ui, |ui| {
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new(&st.error).color(theme::TEXT_FAINT).small(),
+                                egui::RichText::new(&st.error)
+                                    .color(theme::TEXT_FAINT)
+                                    .small(),
                             )
                             .wrap(),
                         );
@@ -4977,6 +5263,26 @@ fn vp_id(name: &str) -> egui::ViewportId {
     egui::ViewportId::from_hash_of(name)
 }
 
+fn collision_body(ui: &mut egui::Ui, p: &PendingCollision) {
+    ui.label(egui::RichText::new(format!("\"{}\" already exists in", p.filename)).strong());
+    ui.label(egui::RichText::new(p.dest_dir.display().to_string()).small());
+    ui.add_space(8.0);
+}
+
+fn collision_buttons(ui: &mut egui::Ui, action: &mut Option<u8>, unique: &str) {
+    ui.horizontal_wrapped(|ui| {
+        if theme::primary_btn(ui, &format!("Rename to {unique}")).clicked() {
+            *action = Some(1);
+        }
+        if theme::ghost_btn(ui, "Overwrite").clicked() {
+            *action = Some(2);
+        }
+        if theme::ghost_btn(ui, "Cancel").clicked() {
+            *action = Some(3);
+        }
+    });
+}
+
 /// Compact stat tile: faint label above strong value (progress dialog).
 fn stat_tile(ui: &mut egui::Ui, label: &str, value: String) {
     ui.vertical(|ui| {
@@ -5098,7 +5404,9 @@ impl DownloadApp {
                 if icon_btn(ui, Icon::Plus, "Add URL", true, 86.0).clicked() {
                     {
                         self.show_add = true;
-                        self.add_just_opened = true; self.add_raise_frames = 90; self.add_focus_done = false;
+                        self.add_just_opened = true;
+                        self.add_raise_frames = 90;
+                        self.add_focus_done = false;
                     }
                 }
             });
@@ -5654,9 +5962,17 @@ impl DownloadApp {
                 let conns = crate::lock_unpoison(&app.rt).state.settings.max_connections;
                 spawn_prewarm(&mut app.prewarm_cap, &rt, &t, conns);
                 if !app.prewarm_cap.text.is_empty() {
-                    ui.label(egui::RichText::new(&app.prewarm_cap.text).small().color(theme::TEXT_MUTED));
+                    ui.label(
+                        egui::RichText::new(&app.prewarm_cap.text)
+                            .small()
+                            .color(theme::TEXT_MUTED),
+                    );
                 } else if app.prewarm_cap.loading {
-                    ui.label(egui::RichText::new("Probing…").small().color(theme::TEXT_MUTED));
+                    ui.label(
+                        egui::RichText::new("Probing…")
+                            .small()
+                            .color(theme::TEXT_MUTED),
+                    );
                 }
             }
             // yt-dlp picker: video page or explicit yt-dlp engine.
@@ -5701,7 +6017,10 @@ impl DownloadApp {
                     // Probe title fills filename while user kept funnel name.
                     if let Some(d) = &app.yt_probe_cap.dump {
                         if !d.title.is_empty()
-                            && (app.capture_name.is_empty() || !app.capture_name.contains('.'))
+                            && crate::model::filename_stem_is_weak_for_title(
+                                &app.capture_name,
+                                &t.url,
+                            )
                         {
                             let ext = "mp4";
                             app.capture_name =
@@ -5857,6 +6176,20 @@ impl DownloadApp {
                     if !t.headers.contains_key("x-ytdlp") {
                         t.headers.insert("x-ytdlp".into(), "1".into());
                     }
+                    // Dump present but per-frame fill lost race: adopt title
+                    // over weak URL seed (Replace/extend: title + old ext).
+                    if let Some(d) = &self.yt_probe_cap.dump {
+                        if !d.title.trim().is_empty()
+                            && crate::model::filename_stem_is_weak_for_title(&t.filename, &t.url)
+                        {
+                            let ext = crate::model::split_stem_ext(&t.filename).1.to_string();
+                            t.filename = crate::model::sanitize_filename(&format!(
+                                "{}{}",
+                                d.title.trim(),
+                                ext
+                            ));
+                        }
+                    }
                     // Only extract forces ext here; native audio ext resolved in ytdlp.rs from format.
                     if let Some(want) = &ch.extract {
                         let stem = crate::model::split_stem_ext(&t.filename).0.to_string();
@@ -5880,6 +6213,9 @@ impl DownloadApp {
                     TaskStatus::Paused
                 };
                 let start_id = (act == "start").then(|| t.id.clone());
+                // Task taken from capture_task above, pushed below: capture
+                // pushed id before push (capture_task is None by gate time).
+                let pushed_id = t.id.clone();
                 {
                     let mut g = crate::lock_unpoison(&self.rt);
                     if t.queue_id.is_empty() || !g.state.queues.iter().any(|q| q.id == t.queue_id) {
@@ -5888,8 +6224,10 @@ impl DownloadApp {
                     g.state.tasks.push(t);
                     g.save();
                 }
-                // start_task locks rt itself — call outside lock scope.
-                if let Some(id) = start_id {
+                // Gate after push: gate finds task by id, excludes own id.
+                if self.gate_collision(&pushed_id, act == "start") {
+                    ctx.request_repaint();
+                } else if let Some(id) = start_id {
                     self.start_task(&id);
                 } else {
                     ctx.request_repaint();
@@ -6667,13 +7005,18 @@ impl DownloadApp {
                             // write_headers adds x-ytdlp only for explicit choices; route
                             // generic pages/playlists through yt-dlp too (probe matched).
                             t.headers.insert("x-ytdlp".into(), "1".into());
-                            // Probe title as filename (mirror capture): only over virgin
-                            // seed (no dot), user edits / URL-derived names untouched.
-                            if !t.filename.contains('.') {
+                            // Probe title as filename (mirror capture): only over weak
+                            // URL seed, user edits / direct-media names untouched.
+                            if crate::model::filename_stem_is_weak_for_title(&t.filename, &t.url) {
                                 if let Some(d) = &self.yt_probe_add.dump {
                                     if !d.title.trim().is_empty() {
-                                        t.filename =
-                                            crate::model::sanitize_filename(d.title.trim());
+                                        let ext =
+                                            crate::model::split_stem_ext(&t.filename).1.to_string();
+                                        t.filename = crate::model::sanitize_filename(&format!(
+                                            "{}{}",
+                                            d.title.trim(),
+                                            ext
+                                        ));
                                     }
                                 }
                             }
@@ -6693,7 +7036,9 @@ impl DownloadApp {
                     }
                     id
                 };
-                if start_now {
+                if self.gate_collision(&id, start_now) {
+                    // Held: dialog Rename/Overwrite/Cancel decides.
+                } else if start_now {
                     self.start_task(&id);
                 } else {
                     ctx.request_repaint();
@@ -8219,7 +8564,7 @@ impl DownloadApp {
                                     .find(|t| t.id == id)
                                     .is_some_and(|t| t.status == TaskStatus::Queued)
                             };
-                            if queued {
+                            if queued && !self.gate_collision(&id, true) {
                                 self.start_task(&id);
                             }
                             self.tab = Tab::Downloads;
@@ -8469,26 +8814,36 @@ impl DownloadApp {
                     )
                     .clicked()
                     {
-                        for f in self.grab_files.iter().filter(|f| f.selected) {
-                            // Session cookies only to files on start host.
-                            let fh = url::Url::parse(&f.url)
-                                .ok()
-                                .and_then(|u| u.host_str().map(|h| h.to_string()));
-                            let sh = url::Url::parse(&self.grab_url)
-                                .ok()
-                                .and_then(|u| u.host_str().map(|h| h.to_string()));
-                            let ck = if fh.is_some() && fh == sh {
-                                self.grab_cookies.as_str()
-                            } else {
-                                ""
-                            };
+                        // Collect owned rows first: add_url + gate_collision
+                        // (&mut self) cannot run under grab_files iterator.
+                        let rows: Vec<(String, String, String)> = self
+                            .grab_files
+                            .iter()
+                            .filter(|f| f.selected)
+                            .map(|f| {
+                                // Session cookies only to files on start host.
+                                let fh = url::Url::parse(&f.url)
+                                    .ok()
+                                    .and_then(|u| u.host_str().map(|h| h.to_string()));
+                                let sh = url::Url::parse(&self.grab_url)
+                                    .ok()
+                                    .and_then(|u| u.host_str().map(|h| h.to_string()));
+                                let ck = if fh.is_some() && fh == sh {
+                                    self.grab_cookies.clone()
+                                } else {
+                                    String::new()
+                                };
+                                (f.url.clone(), f.page_url.clone(), ck)
+                            })
+                            .collect();
+                        for (url, page_url, ck) in rows {
                             let id = crate::lock_unpoison(&self.rt).add_url(
-                                &f.url.clone(),
+                                &url,
                                 "main",
-                                &f.page_url.clone(),
-                                ck,
+                                &page_url,
+                                ck.as_str(),
                             );
-                            let _ = id;
+                            self.gate_collision(&id, false);
                         }
                     }
                 });
@@ -9355,7 +9710,9 @@ impl DownloadApp {
                                         let id = crate::lock_unpoison(&self.rt)
                                             .add_url(&url, "main", "", "");
                                         // Never self-replace: plain download task.
-                                        self.start_task(&id);
+                                        if !self.gate_collision(&id, true) {
+                                            self.start_task(&id);
+                                        }
                                         crate::lock_unpoison(&self.rt)
                                             .log(format!("Update download queued: {name}"));
                                     }
@@ -9821,10 +10178,15 @@ mod progress_tests {
 
     #[test]
     fn prewarm_eligible_gate() {
-        let t = |u: &str| DownloadTask { url: u.into(), ..Default::default() };
+        let t = |u: &str| DownloadTask {
+            url: u.into(),
+            ..Default::default()
+        };
         assert!(prewarm_eligible(&t("https://example.com/file.zip")));
         assert!(prewarm_eligible(&t("http://example.com/file.bin?tok=1")));
-        assert!(!prewarm_eligible(&t("https://www.youtube.com/watch?v=aqz-KE-bpKQ")));
+        assert!(!prewarm_eligible(&t(
+            "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+        )));
         assert!(!prewarm_eligible(&t("https://example.com/list.m3u8")));
         assert!(!prewarm_eligible(&t("https://example.com/manifest.mpd")));
         assert!(!prewarm_eligible(&t("https://example.com/file.torrent")));

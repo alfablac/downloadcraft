@@ -401,7 +401,10 @@ fn cold_start_capture(arg: &str) -> Option<DownloadTask> {
 }
 
 fn run_gui(initial_urls: Vec<String>, hidden: bool) {
-    platform::trace(&format!("run_gui hidden={hidden} urls={}", initial_urls.len()));
+    platform::trace(&format!(
+        "run_gui hidden={hidden} urls={}",
+        initial_urls.len()
+    ));
     platform::WINDOW_VISIBLE.store(!hidden, std::sync::atomic::Ordering::Relaxed);
     platform::spawn_show_watcher();
     platform::trace("watcher spawned");
@@ -430,7 +433,9 @@ fn run_gui(initial_urls: Vec<String>, hidden: bool) {
     // NOT be live during the call (deadlocks every launch pre-window).
     // Drain into temp first, then lock once to extend.
     let inbox_caps = take_inbox_tasks(&rt);
-    crate::lock_unpoison(&rt).pending_captures.extend(inbox_caps);
+    crate::lock_unpoison(&rt)
+        .pending_captures
+        .extend(inbox_caps);
     platform::trace("inbox drained");
     let rt_clone = rt.clone();
     // Window/taskbar icon: same artwork as .exe resource (assets/webcraft.png -> .ico).
@@ -671,8 +676,7 @@ mod state_tests {
         let t = cold_start_capture("webcraft://add?url=https%3A%2F%2Fex.com%2Ff.zip%3Fx%3D1")
             .expect("add url");
         assert_eq!(t.url, "https://ex.com/f.zip?x=1");
-        let t =
-            cold_start_capture("downloadcraft://add?url=https://ex.com/a.bin").expect("legacy");
+        let t = cold_start_capture("downloadcraft://add?url=https://ex.com/a.bin").expect("legacy");
         assert_eq!(t.url, "https://ex.com/a.bin");
         let t = cold_start_capture("https://ex.com/direct.mp4").expect("bare url");
         assert_eq!(t.url, "https://ex.com/direct.mp4");

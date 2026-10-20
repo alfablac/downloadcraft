@@ -290,11 +290,22 @@ fn key_hash(key: &str) -> u64 {
     key.hash(&mut h);
     h.finish()
 }
-fn hosts_cache_get(cache: &HostsCache, p: Provider, kh: u64, now: std::time::Instant) -> Option<Vec<HostStatus>> {
+fn hosts_cache_get(
+    cache: &HostsCache,
+    p: Provider,
+    kh: u64,
+    now: std::time::Instant,
+) -> Option<Vec<HostStatus>> {
     let (at, hosts) = cache.get(&(p, kh))?;
     (now.duration_since(*at) < HOSTS_TTL).then(|| hosts.clone())
 }
-fn hosts_cache_put(cache: &mut HostsCache, p: Provider, kh: u64, now: std::time::Instant, hosts: Vec<HostStatus>) {
+fn hosts_cache_put(
+    cache: &mut HostsCache,
+    p: Provider,
+    kh: u64,
+    now: std::time::Instant,
+    hosts: Vec<HostStatus>,
+) {
     cache.insert((p, kh), (now, hosts));
 }
 
@@ -304,7 +315,11 @@ pub async fn hosts(
     key: &str,
 ) -> Result<Vec<HostStatus>, String> {
     let kh = key_hash(key);
-    if let Some(hit) = hosts_cache().lock().ok().and_then(|c| hosts_cache_get(&c, p, kh, std::time::Instant::now())) {
+    if let Some(hit) = hosts_cache()
+        .lock()
+        .ok()
+        .and_then(|c| hosts_cache_get(&c, p, kh, std::time::Instant::now()))
+    {
         return Ok(hit);
     }
     let list = hosts_uncached(http, p, key).await?;
@@ -395,7 +410,12 @@ pub fn host_up(hosts: &[HostStatus], url: &str) -> Option<bool> {
 
 /// Check-then-sleep poll: first check immediate; interval slept only
 /// before later checks, at most max_polls checks total.
-async fn poll_delayed<C, CFut, S, SFut, T>(max_polls: usize, interval: std::time::Duration, mut sleep: S, mut check: C) -> Result<Option<T>, String>
+async fn poll_delayed<C, CFut, S, SFut, T>(
+    max_polls: usize,
+    interval: std::time::Duration,
+    mut sleep: S,
+    mut check: C,
+) -> Result<Option<T>, String>
 where
     C: FnMut() -> CFut,
     CFut: std::future::Future<Output = Result<Option<T>, String>>,
@@ -403,8 +423,12 @@ where
     SFut: std::future::Future<Output = ()>,
 {
     for i in 0..max_polls {
-        if i > 0 { sleep(interval).await; }
-        if let Some(v) = check().await? { return Ok(Some(v)); }
+        if i > 0 {
+            sleep(interval).await;
+        }
+        if let Some(v) = check().await? {
+            return Ok(Some(v));
+        }
     }
     Ok(None)
 }
@@ -445,10 +469,16 @@ pub async fn unrestrict(
             if let Some(id) = u.delayed_id {
                 // First delayed poll immediate (unlock satisfies AD >=5s
                 // spacing), then 5s polls, up to ~60s.
-                let ready = poll_delayed(13, std::time::Duration::from_secs(5), |d| tokio::time::sleep(d), || async {
-                    let d = c.delayed(id).await?;
-                    Ok::<Option<crate::debrid_ad::AdDelayed>, String>(d.is_ready().then_some(d))
-                }).await?;
+                let ready = poll_delayed(
+                    13,
+                    std::time::Duration::from_secs(5),
+                    |d| tokio::time::sleep(d),
+                    || async {
+                        let d = c.delayed(id).await?;
+                        Ok::<Option<crate::debrid_ad::AdDelayed>, String>(d.is_ready().then_some(d))
+                    },
+                )
+                .await?;
                 if let Some(d) = ready {
                     if let Some(link) = d.link {
                         return Ok(ResolvedFile {

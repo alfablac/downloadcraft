@@ -1080,6 +1080,259 @@ pub fn focus_window(hwnd: isize) {
     }
 }
 
+// ---------- dedicated video child window (mpv --wid target) ----------
+// Plain Win32 child, not egui GL surface: Windows composites child HWND
+// above parent client area, mpv paints into it undisturbed; egui keeps
+// painting only surrounding panels, whose rect caller excludes from child.
+
+/// Create 320x240 `WebcraftVideoChild` (WS_CHILD|WS_VISIBLE|WS_CLIPSIBLINGS)
+/// under `parent` HWND. Its HWND goes to mpv `--wid`. None on invalid
+/// parent, creation failure, or non-Windows.
+#[allow(unreachable_code)] // windows arm returns directly; tail is non-windows path
+pub fn create_video_child(parent: isize) -> Option<isize> {
+    #[cfg(windows)]
+    {
+        if parent == 0 {
+            return None;
+        }
+        type Hwnd = *mut core::ffi::c_void;
+        type Bool = i32;
+        type WndProc = unsafe extern "system" fn(Hwnd, u32, usize, isize) -> isize;
+        #[repr(C)]
+        struct WndClassW {
+            style: u32,
+            lpfn_wnd_proc: Option<WndProc>,
+            cb_cls_extra: i32,
+            cb_wnd_extra: i32,
+            h_instance: Hwnd,
+            h_icon: Hwnd,
+            h_cursor: Hwnd,
+            hbr_background: Hwnd,
+            lpsz_menu_name: *const u16,
+            lpsz_class_name: *const u16,
+        }
+        extern "system" {
+            fn RegisterClassW(class: *const WndClassW) -> u16;
+            fn CreateWindowExW(
+                ex_style: u32,
+                class: *const u16,
+                name: *const u16,
+                style: u32,
+                x: i32,
+                y: i32,
+                w: i32,
+                h: i32,
+                parent: Hwnd,
+                menu: Hwnd,
+                instance: Hwnd,
+                param: *mut core::ffi::c_void,
+            ) -> Hwnd;
+            fn DefWindowProcW(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> isize;
+            fn GetModuleHandleW(name: *const u16) -> Hwnd;
+            fn IsWindow(hwnd: Hwnd) -> Bool;
+        }
+        const WS_CHILD: u32 = 0x4000_0000;
+        const WS_VISIBLE: u32 = 0x1000_0000;
+        const WS_CLIPSIBLINGS: u32 = 0x0400_0000;
+        static REGISTERED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let class: Vec<u16> = "WebcraftVideoChild\0".encode_utf16().collect();
+        let title: [u16; 1] = [0];
+        unsafe {
+            if IsWindow(parent as Hwnd) == 0 {
+                return None;
+            }
+            let instance = GetModuleHandleW(std::ptr::null());
+            if !REGISTERED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let wc = WndClassW {
+                    style: 0,
+                    lpfn_wnd_proc: Some(DefWindowProcW),
+                    cb_cls_extra: 0,
+                    cb_wnd_extra: 0,
+                    h_instance: instance,
+                    h_icon: std::ptr::null_mut(),
+                    h_cursor: std::ptr::null_mut(),
+                    // Null brush: no GDI erase, mpv owns every pixel.
+                    hbr_background: std::ptr::null_mut(),
+                    lpsz_menu_name: std::ptr::null(),
+                    lpsz_class_name: class.as_ptr(),
+                };
+                // 0 with ERROR_CLASS_ALREADY_EXISTS is fine; CreateWindowExW decides.
+                let _ = RegisterClassW(&wc);
+            }
+            let hwnd = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                title.as_ptr(),
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+                0,
+                0,
+                320,
+                240,
+                parent as Hwnd,
+                std::ptr::null_mut(),
+                instance,
+                std::ptr::null_mut(),
+            );
+            if hwnd.is_null() {
+                return None;
+            }
+            return Some(hwnd as isize);
+        }
+    }
+    let _ = parent;
+    None
+}
+
+/// Move/resize video child in parent client coords (physical px). Hidden
+/// when `w <= 0 || h <= 0`. No-op on null handle / non-Windows.
+pub fn set_video_rect(child: isize, x: i32, y: i32, w: i32, h: i32) {
+    #[cfg(windows)]
+    {
+        if child == 0 {
+            return;
+        }
+        type Hwnd = *mut core::ffi::c_void;
+        type Bool = i32;
+        extern "system" {
+            fn SetWindowPos(
+                hwnd: Hwnd,
+                after: Hwnd,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32,
+                flags: u32,
+            ) -> Bool;
+            fn ShowWindow(hwnd: Hwnd, cmd: i32) -> Bool;
+        }
+        const SWP_NOACTIVATE: u32 = 0x0010;
+        const SWP_SHOWWINDOW: u32 = 0x0040;
+        unsafe {
+            if w <= 0 || h <= 0 {
+                ShowWindow(child as Hwnd, 0); // SW_HIDE
+            } else {
+                // HWND_TOP (0) + SWP_SHOWWINDOW: place above parent GL
+                // surface and ensure visible in one call.
+                SetWindowPos(
+                    child as Hwnd,
+                    std::ptr::null_mut(),
+                    x,
+                    y,
+                    w,
+                    h,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (child, x, y, w, h);
+    }
+}
+
+/// Destroy video child. Caller must stop mpv rendering into it first.
+/// No-op on null handle / non-Windows.
+pub fn destroy_video_child(child: isize) {
+    #[cfg(windows)]
+    {
+        if child == 0 {
+            return;
+        }
+        type Hwnd = *mut core::ffi::c_void;
+        type Bool = i32;
+        extern "system" {
+            fn DestroyWindow(hwnd: Hwnd) -> Bool;
+        }
+        unsafe {
+            DestroyWindow(child as Hwnd);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = child;
+    }
+}
+
+/// Screen coords of `hwnd` client-area origin (ClientToScreen on 0,0).
+/// Caller places child at `rect_screen - client_origin(parent)`. None on
+/// invalid handle / failure / non-Windows.
+#[allow(unreachable_code)] // windows arm returns directly; tail is non-windows path
+pub fn client_origin(hwnd: isize) -> Option<(i32, i32)> {
+    #[cfg(windows)]
+    {
+        if hwnd == 0 {
+            return None;
+        }
+        type Hwnd = *mut core::ffi::c_void;
+        type Bool = i32;
+        #[repr(C)]
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+        extern "system" {
+            fn ClientToScreen(hwnd: Hwnd, pt: *mut Point) -> Bool;
+            fn IsWindow(hwnd: Hwnd) -> Bool;
+        }
+        unsafe {
+            if IsWindow(hwnd as Hwnd) == 0 {
+                return None;
+            }
+            let mut pt = Point { x: 0, y: 0 };
+            if ClientToScreen(hwnd as Hwnd, &mut pt) == 0 {
+                return None;
+            }
+            return Some((pt.x, pt.y));
+        }
+    }
+    let _ = hwnd;
+    None
+}
+
+/// Raw GetWindowRect as `(left, top, right, bottom)` screen coords
+/// (right/bottom exclusive). None on invalid handle / failure / non-Windows.
+#[allow(unreachable_code)] // windows arm returns directly; tail is non-windows path
+pub fn window_rect(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+    #[cfg(windows)]
+    {
+        if hwnd == 0 {
+            return None;
+        }
+        type Hwnd = *mut core::ffi::c_void;
+        type Bool = i32;
+        #[repr(C)]
+        struct Rect {
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+        }
+        extern "system" {
+            fn GetWindowRect(hwnd: Hwnd, rect: *mut Rect) -> Bool;
+            fn IsWindow(hwnd: Hwnd) -> Bool;
+        }
+        unsafe {
+            if IsWindow(hwnd as Hwnd) == 0 {
+                return None;
+            }
+            let mut r = Rect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if GetWindowRect(hwnd as Hwnd, &mut r) == 0 {
+                return None;
+            }
+            return Some((r.left, r.top, r.right, r.bottom));
+        }
+    }
+    let _ = hwnd;
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1186,5 +1439,16 @@ mod tests {
             .map(|n| (b'a' + n) as char)
             .collect();
         assert_eq!(id, CHROME_EXT_ID, "update CHROME_EXT_ID or manifest key");
+    }
+    #[test]
+    fn video_child_invalid_handles_no_panic() {
+        assert_eq!(create_video_child(0), None);
+        // Non-null but bogus parent: Windows IsWindow gate -> None, no panic.
+        assert_eq!(create_video_child(1), None);
+        set_video_rect(0, 0, 0, 10, 10);
+        set_video_rect(0, 0, 0, 0, 0);
+        destroy_video_child(0);
+        assert_eq!(client_origin(0), None);
+        assert_eq!(window_rect(0), None);
     }
 }

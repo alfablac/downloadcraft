@@ -950,6 +950,61 @@ fn reset_ctrl_for_retry(ctrl: &Controls, attempt_idx: usize) {
     ctrl.phase.store(PHASE_EXTRACTING, Ordering::SeqCst);
 }
 
+/// Adopt gate: extensionless seed (old rule), weak URL-derived stem
+/// (`x.mp4` from x.com), or capture carried a page title (user came from
+/// a page dialog; seeded name was not a deliberate rename).
+fn title_adopt_gate(filename: &str, url: &str, has_page_title: bool) -> bool {
+    !filename.contains('.')
+        || crate::model::filename_stem_is_weak_for_title(filename, url)
+        || has_page_title
+}
+
+/// Pure adopt decision: `Some("{title}.{ext}")` sanitized when title
+/// non-empty and gate passes, else None (keep current filename).
+fn title_adopt_name(
+    filename: &str,
+    url: &str,
+    title: &str,
+    ext: &str,
+    has_page_title: bool,
+) -> Option<String> {
+    let title = title.trim();
+    if title.is_empty() || !title_adopt_gate(filename, url, has_page_title) {
+        return None;
+    }
+    Some(crate::model::sanitize_filename(&format!("{title}.{ext}")))
+}
+
+/// Cheap title re-derive when -J probe failed: yt-dlp download extractor
+/// knows title even when dump path does not. First non-empty stdout line.
+async fn fetch_title_fallback(
+    path: &std::path::Path,
+    task: &DownloadTask,
+    jar: Option<&std::path::Path>,
+) -> Option<String> {
+    let mut full = base_args(&task.url, task, jar);
+    let url = full.pop()?;
+    full.extend([
+        "--skip-download".to_string(),
+        "--print".to_string(),
+        "%(title)s".to_string(),
+    ]);
+    full.push(url);
+    let path = path.to_path_buf();
+    let out = tokio::task::spawn_blocking(move || run_timeout(&path, &full, 120))
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
 /// Download via yt-dlp. On success returns completed task; caller falls back to native on Err.
 pub async fn download_with_ytdlp(
     task: DownloadTask,
@@ -969,15 +1024,33 @@ pub async fn download_with_ytdlp(
     let mut task = task;
     // Explicit x-yt-* choice (picker) wins over auto selector.
     let choice = YtChoice::from_headers(&task.headers);
+    // Probe-failure fallback: title for adopt below when -J dump unknown.
+    // ponytail: extra -J-class call only on probe failure; skip if needed
+    // later by timing it out shorter.
+    let fallback_title = if dump.is_none() {
+        fetch_title_fallback(&path, &task, jar.as_deref()).await
+    } else {
+        None
+    };
     let (fmt_arg, extra_args, audio_mode) = build_selector(&choice, dump.as_ref());
-    if let Some(d) = &dump {
-        if !d.title.trim().is_empty() && !task.filename.contains('.') {
-            let ext = if audio_mode {
-                choice.extract.as_deref().unwrap_or("m4a")
-            } else {
-                "mp4"
-            };
-            task.filename = crate::model::sanitize_filename(&format!("{}.{}", d.title, ext));
+    {
+        let title = dump
+            .as_ref()
+            .map(|d| d.title.as_str())
+            .or(fallback_title.as_deref())
+            .unwrap_or("");
+        let ext = if audio_mode {
+            choice.extract.as_deref().unwrap_or("m4a")
+        } else {
+            "mp4"
+        };
+        let has_page_title = task
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("x-page-title"));
+        if let Some(name) = title_adopt_name(&task.filename, &task.url, title, ext, has_page_title)
+        {
+            task.filename = name;
         }
     }
     if audio_mode {
@@ -1385,6 +1458,56 @@ pub fn is_video_page(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn title_adopt_gate_cases() {
+        // Weak host stem + dot: adopt (bug case).
+        assert_eq!(
+            title_adopt_name(
+                "x.mp4",
+                "https://x.com/user/status/123",
+                "Cool Clip",
+                "mp4",
+                false
+            ),
+            Some("Cool Clip.mp4".into())
+        );
+        // Deliberate descriptive name: keep.
+        assert_eq!(
+            title_adopt_name(
+                "My Video.mp4",
+                "https://x.com/user/status/123",
+                "Cool Clip",
+                "mp4",
+                false
+            ),
+            None
+        );
+        // Extensionless seed: old rule still adopts.
+        assert_eq!(
+            title_adopt_name(
+                "1894729834",
+                "https://example.com/watch?v=1",
+                "Cool Clip",
+                "mp4",
+                false
+            ),
+            Some("Cool Clip.mp4".into())
+        );
+        // Blank title never adopts; page-title header forces adopt.
+        assert_eq!(
+            title_adopt_name("x.mp4", "https://x.com/a", "  ", "mp4", false),
+            None
+        );
+        assert_eq!(
+            title_adopt_name("My Video.mp4", "https://x.com/a", "Cool Clip", "mp4", true),
+            Some("Cool Clip.mp4".into())
+        );
+        // Audio ext flows through unchanged stem.
+        assert_eq!(
+            title_adopt_name("x.mp4", "https://x.com/a", "Cool Clip", "mp3", false),
+            Some("Cool Clip.mp3".into())
+        );
+    }
     #[test]
     fn stdout_line_phases_and_estimate() {
         let ctrl = Controls::new(0);

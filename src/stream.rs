@@ -410,8 +410,13 @@ pub async fn download_url_with_settings(
         // Prewarm hit (Add/capture dialog probe, runtime-only registry):
         // skips engine probe. Plain downloads re-GET body anyway.
         Manifest::File => {
-            engine::download_http_with_prewarm(client, task.clone(), ctrl, engine::prewarm_take(&task.url))
-                .await
+            engine::download_http_with_prewarm(
+                client,
+                task.clone(),
+                ctrl,
+                engine::prewarm_take(&task.url),
+            )
+            .await
         }
     }
 }
@@ -467,13 +472,8 @@ async fn download_metalink(
     if f.sha256.is_some() {
         task.sha256 = f.sha256;
     }
-    engine::download_http_with_prewarm(
-        client,
-        task.clone(),
-        ctrl,
-        engine::prewarm_take(&task.url),
-    )
-    .await
+    engine::download_http_with_prewarm(client, task.clone(), ctrl, engine::prewarm_take(&task.url))
+        .await
 }
 
 async fn fetch_text(

@@ -417,7 +417,16 @@ pub struct CachedProbe {
 }
 impl CachedProbe {
     pub fn into_probe(self) -> Probe {
-        Probe { total: self.total, accept_ranges: self.accept_ranges, body: None, etag: self.etag, last_modified: self.last_modified, final_url: self.final_url, content_disposition: self.content_disposition, content_type: self.content_type }
+        Probe {
+            total: self.total,
+            accept_ranges: self.accept_ranges,
+            body: None,
+            etag: self.etag,
+            last_modified: self.last_modified,
+            final_url: self.final_url,
+            content_disposition: self.content_disposition,
+            content_type: self.content_type,
+        }
     }
 }
 pub const PREWARM_TTL: std::time::Duration = std::time::Duration::from_secs(120);
@@ -427,7 +436,9 @@ pub fn prewarm_fresh(fetched_at: std::time::Instant, now: std::time::Instant) ->
 // ponytail: process-global single-use registry keyed by original URL;
 // runtime-only (never state.json). Upgrade: per-task-id keys if
 // same-URL-different-headers tasks collide in practice.
-static PREWARM: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, CachedProbe>>> = std::sync::OnceLock::new();
+static PREWARM: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, CachedProbe>>,
+> = std::sync::OnceLock::new();
 fn prewarm_registry() -> &'static std::sync::Mutex<std::collections::HashMap<String, CachedProbe>> {
     PREWARM.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -438,13 +449,22 @@ pub fn prewarm_store(cache: CachedProbe) {
     g.insert(cache.url.clone(), cache);
 }
 pub fn prewarm_drop(url: &str) {
-    prewarm_registry().lock().unwrap_or_else(|e| e.into_inner()).remove(url.trim());
+    prewarm_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(url.trim());
 }
-pub fn prewarm_take(url: &str) -> Option<CachedProbe> { prewarm_take_at(url, std::time::Instant::now()) }
+pub fn prewarm_take(url: &str) -> Option<CachedProbe> {
+    prewarm_take_at(url, std::time::Instant::now())
+}
 fn prewarm_take_at(url: &str, now: std::time::Instant) -> Option<CachedProbe> {
     let mut g = prewarm_registry().lock().unwrap_or_else(|e| e.into_inner());
     let cache = g.remove(url.trim())?;
-    if cache.url == url.trim() && prewarm_fresh(cache.fetched_at, now) { Some(cache) } else { None }
+    if cache.url == url.trim() && prewarm_fresh(cache.fetched_at, now) {
+        Some(cache)
+    } else {
+        None
+    }
 }
 
 fn pct_decode_bytes(s: &str) -> Vec<u8> {
@@ -663,7 +683,17 @@ pub fn dedup_dest(dest: &Path, incoming_size: Option<u64>) -> PathBuf {
 pub async fn prewarm(client: &reqwest::Client, task: &DownloadTask) -> Result<CachedProbe, String> {
     let mut p = probe(client, task).await?;
     let _ = p.body.take();
-    Ok(CachedProbe { url: task.url.clone(), final_url: p.final_url, total: p.total, accept_ranges: p.accept_ranges, etag: p.etag, last_modified: p.last_modified, content_disposition: p.content_disposition, content_type: p.content_type, fetched_at: std::time::Instant::now() })
+    Ok(CachedProbe {
+        url: task.url.clone(),
+        final_url: p.final_url,
+        total: p.total,
+        accept_ranges: p.accept_ranges,
+        etag: p.etag,
+        last_modified: p.last_modified,
+        content_disposition: p.content_disposition,
+        content_type: p.content_type,
+        fetched_at: std::time::Instant::now(),
+    })
 }
 
 pub async fn probe(client: &reqwest::Client, task: &DownloadTask) -> Result<Probe, String> {
@@ -778,14 +808,22 @@ pub async fn download_http_with_prewarm(
     urls.extend(task.mirrors.iter().cloned());
     let mut found: Option<(String, Probe)> = None;
     let mut last_err = String::new();
-    let mut prewarm = prewarm.filter(|c| c.url == task.url && prewarm_fresh(c.fetched_at, std::time::Instant::now()));
+    let mut prewarm = prewarm
+        .filter(|c| c.url == task.url && prewarm_fresh(c.fetched_at, std::time::Instant::now()));
     for u in urls {
         let cand = DownloadTask {
             url: u.clone(),
             ..task.clone()
         };
-        let hit = if u == task.url { prewarm.take().map(|c| c.into_probe()) } else { None };
-        match match hit { Some(p) => Ok(p), None => probe(&client, &cand).await } {
+        let hit = if u == task.url {
+            prewarm.take().map(|c| c.into_probe())
+        } else {
+            None
+        };
+        match match hit {
+            Some(p) => Ok(p),
+            None => probe(&client, &cand).await,
+        } {
             Ok(p) => {
                 found = Some((u, p));
                 break;
@@ -960,7 +998,8 @@ pub async fn download_http_with_prewarm(
                     .map(|s| s.to_string())
                     == probe.etag
                     || probe.etag.is_none();
-                if (v.get("url").and_then(|u| u.as_str()) == Some(fetch_url.as_str()) || v.get("url").and_then(|u| u.as_str()) == Some(task.url.as_str()))
+                if (v.get("url").and_then(|u| u.as_str()) == Some(fetch_url.as_str())
+                    || v.get("url").and_then(|u| u.as_str()) == Some(task.url.as_str()))
                     && v.get("total").and_then(|t| t.as_u64()) == Some(total)
                     && etag_ok
                 {
