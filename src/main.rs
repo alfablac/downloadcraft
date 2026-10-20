@@ -426,9 +426,11 @@ fn run_gui(initial_urls: Vec<String>, hidden: bool) {
     crate::lock_unpoison(&rt).pending_captures.extend(caps);
     // drain inbox into pending captures (confirm dialog shows on first frame)
     platform::trace("cold-start caps finalized");
-    crate::lock_unpoison(&rt)
-        .pending_captures
-        .extend(take_inbox_tasks(&rt));
+    // take_inbox_tasks -> finalize_capture_tasks re-locks rt, so guard must
+    // NOT be live during the call (deadlocks every launch pre-window).
+    // Drain into temp first, then lock once to extend.
+    let inbox_caps = take_inbox_tasks(&rt);
+    crate::lock_unpoison(&rt).pending_captures.extend(inbox_caps);
     platform::trace("inbox drained");
     let rt_clone = rt.clone();
     // Window/taskbar icon: same artwork as .exe resource (assets/webcraft.png -> .ico).
@@ -558,7 +560,9 @@ fn apply_page_title_naming(t: &mut DownloadTask) {
 /// Finalize capture tasks in place: id/filename/queue/naming funnel/order/log.
 /// Shared by inbox drain and cold-start CLI/protocol args. Caller holds no lock.
 fn finalize_capture_tasks(rt: &Arc<Mutex<Runtime>>, tasks: &mut [DownloadTask]) {
+    platform::trace(&format!("finalize start n={}", tasks.len()));
     for t in tasks.iter_mut() {
+        platform::trace("finalize lock");
         let mut g = crate::lock_unpoison(rt);
         if t.id.is_empty() {
             t.id = new_id();
@@ -645,7 +649,7 @@ pub fn take_inbox_tasks(rt: &Arc<Mutex<Runtime>>) -> Vec<DownloadTask> {
             let _ = std::fs::remove_file(p);
         }
     }
-    platform::trace("take_inbox parsed");
+    platform::trace(&format!("take_inbox parsed n={}", out.len()));
     finalize_capture_tasks(rt, &mut out);
     platform::trace("take_inbox finalized");
     out

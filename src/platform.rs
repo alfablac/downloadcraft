@@ -51,10 +51,17 @@ pub fn write_capture_filter(settings: &crate::model::Settings) {
 /// at 64KB) so "no window" reports carry last reached step in crash.log.
 pub fn trace(step: &str) {
     let path = config_dir().join("startup.log");
-    if std::fs::metadata(&path).map(|m| m.len() > 65536).unwrap_or(false) {
+    if std::fs::metadata(&path)
+        .map(|m| m.len() > 65536)
+        .unwrap_or(false)
+    {
         let _ = std::fs::remove_file(&path);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         use std::io::Write;
         let ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -849,6 +856,230 @@ pub fn notify(title: &str, body: &str) {
         .show();
 }
 
+// ---------- embedded child window (mpv --wid alternative: reparent) ----------
+
+/// Style transform for embed_child: pure, unit-tested.
+fn embedded_style(style: u32) -> u32 {
+    const WS_POPUP: u32 = 0x8000_0000;
+    const WS_CHILD: u32 = 0x4000_0000;
+    const WS_VISIBLE: u32 = 0x1000_0000;
+    const WS_CAPTION: u32 = 0x00C0_0000;
+    const WS_THICKFRAME: u32 = 0x0004_0000;
+    (style & !WS_POPUP & !WS_CAPTION & !WS_THICKFRAME) | WS_CHILD | WS_VISIBLE
+}
+
+/// First top-level window owned by `pid` whose title starts with
+/// `title_prefix`. HWND returned as isize. None on non-Windows / not found.
+#[allow(unreachable_code)] // windows arm returns directly; tail is non-windows path
+pub fn top_level_hwnd(pid: u32, title_prefix: &str) -> Option<isize> {
+    #[cfg(windows)]
+    {
+        if pid == 0 {
+            return None;
+        }
+        type Hwnd = *mut core::ffi::c_void;
+        type Bool = i32;
+        extern "system" {
+            fn EnumWindows(cb: extern "system" fn(Hwnd, isize) -> Bool, p: isize) -> Bool;
+            fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
+            fn GetWindowTextW(hwnd: Hwnd, text: *mut u16, max: i32) -> i32;
+        }
+        struct Search {
+            pid: u32,
+            prefix: Vec<u16>,
+            found: Hwnd,
+        }
+        extern "system" fn find(hwnd: Hwnd, p: isize) -> Bool {
+            unsafe {
+                let s = &mut *(p as *mut Search);
+                let mut pid = 0;
+                GetWindowThreadProcessId(hwnd, &mut pid);
+                if pid != s.pid {
+                    return 1;
+                }
+                let mut buf = [0u16; 256];
+                let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), 256);
+                if n > 0 && buf[..n as usize].starts_with(&s.prefix) {
+                    s.found = hwnd;
+                    return 0;
+                }
+            }
+            1
+        }
+        let mut search = Search {
+            pid,
+            prefix: title_prefix.encode_utf16().collect(),
+            found: std::ptr::null_mut(),
+        };
+        unsafe {
+            EnumWindows(find, &mut search as *mut Search as isize);
+        }
+        if search.found.is_null() {
+            return None;
+        }
+        return Some(search.found as isize);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (pid, title_prefix);
+        None
+    }
+}
+
+/// Raise top-level window of `pid` whose title starts with `title_prefix`
+/// above foreground app (browser holds foreground; egui Focus alone denied).
+/// Same force sequence as spawn_show_watcher. False when not found.
+/// No-op on non-Windows.
+#[allow(unreachable_code)] // windows arm returns directly; tail is non-windows path
+pub fn raise_window(pid: u32, title_prefix: &str) -> bool {
+    #[cfg(windows)]
+    {
+        if pid == 0 || title_prefix.is_empty() {
+            return false;
+        }
+        let Some(found) = top_level_hwnd(pid, title_prefix) else {
+            return false;
+        };
+        type Hwnd = *mut core::ffi::c_void;
+        type Bool = i32;
+        extern "system" {
+            fn ShowWindow(hwnd: Hwnd, cmd: i32) -> Bool;
+            fn SetForegroundWindow(hwnd: Hwnd) -> Bool;
+            fn BringWindowToTop(hwnd: Hwnd) -> Bool;
+            fn SetWindowPos(
+                hwnd: Hwnd,
+                after: Hwnd,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32,
+                flags: u32,
+            ) -> Bool;
+            fn GetForegroundWindow() -> Hwnd;
+            fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
+            fn GetCurrentThreadId() -> u32;
+            fn AttachThreadInput(a: u32, b: u32, attach: Bool) -> Bool;
+            fn SetFocus(hwnd: Hwnd) -> Hwnd;
+        }
+        unsafe {
+            let hwnd = found as Hwnd;
+            ShowWindow(hwnd, 9); // SW_RESTORE
+            let fg = GetForegroundWindow();
+            let mut fg_pid = 0;
+            let fg_tid = if fg.is_null() {
+                0
+            } else {
+                GetWindowThreadProcessId(fg, &mut fg_pid)
+            };
+            let our_tid = GetCurrentThreadId();
+            let attached =
+                fg_tid != 0 && fg_tid != our_tid && AttachThreadInput(our_tid, fg_tid, 1) != 0;
+            BringWindowToTop(hwnd);
+            // HWND_TOPMOST then NOTOPMOST: raises above foreground app without staying always-on-top.
+            SetWindowPos(hwnd, -1isize as Hwnd, 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0040);
+            SetWindowPos(hwnd, -2isize as Hwnd, 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0040);
+            SetForegroundWindow(hwnd);
+            SetFocus(hwnd);
+            if attached {
+                AttachThreadInput(our_tid, fg_tid, 0);
+            }
+        }
+        return true;
+    }
+    let _ = (pid, title_prefix);
+    false
+}
+
+/// Reparent `child` into `parent`: strip popup/caption/frame, set
+/// WS_CHILD|WS_VISIBLE, SetParent, initial 1x1 rect (caller resizes via
+/// set_embedded_rect). No-op on non-Windows / null handles.
+pub fn embed_child(child: isize, parent: isize) {
+    #[cfg(windows)]
+    {
+        if child == 0 || parent == 0 {
+            return;
+        }
+        type Hwnd = *mut core::ffi::c_void;
+        extern "system" {
+            fn GetWindowLongW(hwnd: Hwnd, idx: i32) -> i32;
+            fn SetWindowLongW(hwnd: Hwnd, idx: i32, val: i32) -> i32;
+            fn SetParent(child: Hwnd, parent: Hwnd) -> Hwnd;
+        }
+        const GWL_STYLE: i32 = -16;
+        unsafe {
+            let hwnd = child as Hwnd;
+            let style = embedded_style(GetWindowLongW(hwnd, GWL_STYLE) as u32);
+            SetWindowLongW(hwnd, GWL_STYLE, style as i32);
+            SetParent(hwnd, parent as Hwnd);
+        }
+        set_embedded_rect(child, 0, 0, 1, 1);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (child, parent);
+    }
+}
+
+/// Move/resize an embedded child without activating or changing z-order.
+pub fn set_embedded_rect(hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
+    #[cfg(windows)]
+    {
+        if hwnd == 0 {
+            return;
+        }
+        type Hwnd = *mut core::ffi::c_void;
+        type Bool = i32;
+        extern "system" {
+            fn SetWindowPos(
+                hwnd: Hwnd,
+                after: Hwnd,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32,
+                flags: u32,
+            ) -> Bool;
+        }
+        const SWP_NOACTIVATE: u32 = 0x0010;
+        const SWP_NOZORDER: u32 = 0x0004;
+        unsafe {
+            SetWindowPos(
+                hwnd as Hwnd,
+                std::ptr::null_mut(),
+                x,
+                y,
+                w,
+                h,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (hwnd, x, y, w, h);
+    }
+}
+
+pub fn focus_window(hwnd: isize) {
+    #[cfg(windows)]
+    {
+        if hwnd == 0 {
+            return;
+        }
+        type Hwnd = *mut core::ffi::c_void;
+        extern "system" {
+            fn SetFocus(hwnd: Hwnd) -> Hwnd;
+        }
+        unsafe {
+            SetFocus(hwnd as Hwnd);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,6 +1126,23 @@ mod tests {
     fn power_cmd_nonempty() {
         let (p, _) = power_command(PowerAction::Shutdown);
         assert!(!p.is_empty());
+    }
+    #[test]
+    fn embedded_style_math() {
+        // WS_POPUP(0x80000000)|WS_CAPTION(0x00C00000)|WS_VISIBLE|other bit
+        let s = embedded_style(0x8000_0000 | 0x00C0_0000 | 0x0004_0000 | 0x0000_0002);
+        assert_eq!(s & 0x8000_0000, 0, "popup cleared");
+        assert_eq!(s & 0x00C0_0000, 0, "caption cleared");
+        assert_eq!(s & 0x0004_0000, 0, "thickframe cleared");
+        assert_eq!(s & 0x4000_0000, 0x4000_0000, "child set");
+        assert_eq!(s & 0x1000_0000, 0x1000_0000, "visible set");
+        assert_eq!(s & 0x0000_0002, 0x0000_0002, "unrelated bits kept");
+        assert_eq!(embedded_style(0), 0x4000_0000 | 0x1000_0000);
+    }
+    #[test]
+    fn top_level_hwnd_zero_pid_none() {
+        assert_eq!(top_level_hwnd(0, ""), None);
+        assert_eq!(top_level_hwnd(0, "webcraft"), None);
     }
     #[test]
     fn manifest_json_content() {

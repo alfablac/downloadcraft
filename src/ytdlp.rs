@@ -428,17 +428,41 @@ fn anon_task(task: &DownloadTask) -> DownloadTask {
     t
 }
 
-fn should_retry_anon(url: &str, task: &DownloadTask, err: &str) -> bool {
-    if !is_youtube_url(url) {
-        return false;
-    }
-    let has_cookies = !task.cookies.trim().is_empty()
+fn task_has_cookies(task: &DownloadTask) -> bool {
+    !task.cookies.trim().is_empty()
         || !task.cookies_json.trim().is_empty()
         || task
             .headers
             .iter()
-            .any(|(k, v)| k.eq_ignore_ascii_case("cookie") && !v.trim().is_empty());
-    if !has_cookies {
+            .any(|(k, v)| k.eq_ignore_ascii_case("cookie") && !v.trim().is_empty())
+}
+
+/// (max video height, video-format count): anon-adoption comparison key.
+fn dump_video_quality(dump: &YtDump) -> (u32, usize) {
+    let v = dump.video_formats();
+    (
+        v.iter().map(|f| f.height.unwrap_or(0)).max().unwrap_or(0),
+        v.len(),
+    )
+}
+
+/// Degraded success: cookied YouTube probe returns only itag-18 360p +
+/// storyboards (storyboards are not video-bearing), vs anon full ladder.
+/// Genuine 360p-only videos also match; harmless, anon adopted only if better.
+fn dump_is_degraded(dump: &YtDump) -> bool {
+    let (max_h, n) = dump_video_quality(dump);
+    (1..=2).contains(&n) && max_h <= 360
+}
+
+fn should_reprobe_anon_degraded(url: &str, task: &DownloadTask, dump: &YtDump) -> bool {
+    is_youtube_url(url) && task_has_cookies(task) && dump_is_degraded(dump)
+}
+
+fn should_retry_anon(url: &str, task: &DownloadTask, err: &str) -> bool {
+    if !is_youtube_url(url) {
+        return false;
+    }
+    if !task_has_cookies(task) {
         return false;
     }
     let e = err.to_ascii_lowercase();
@@ -447,9 +471,26 @@ fn should_retry_anon(url: &str, task: &DownloadTask, err: &str) -> bool {
         "page needs be reloaded",
         "sign in to confirm",
         "sign in confirm",
+        // Exact-id in cookied client pool missing (pool often itag 18 only):
+        // selector falls through silently, but bare exact ids hard-error here.
+        "requested format not available",
+        "requested format is not available",
     ]
     .iter()
     .any(|p| e.contains(p))
+}
+
+/// Attempt order as `is_anon` flags. Adopted anon dump means download must
+/// run in same (anon) session that listed those formats: cookied pool may
+/// lack picked id and selector silently degrades to muxed 360p. Cookied is
+/// fallback on any anon failure. Not adopted: cookied first (preserves
+/// age-gated/private access), anon only on `should_retry_anon` error.
+fn download_attempt_order(used_anon: bool) -> [bool; 2] {
+    if used_anon {
+        [true, false]
+    } else {
+        [false, true]
+    }
 }
 
 fn base_args(url: &str, task: &DownloadTask, cookie_jar: Option<&std::path::Path>) -> Vec<String> {
@@ -721,9 +762,9 @@ pub fn build_selector(choice: &YtChoice, dump: Option<&YtDump>) -> (String, Vec<
         None if choice.quality_height.map(|q| q > 0).unwrap_or(false) => {
             let h = choice.quality_height.unwrap_or(0);
             match choice.audio.as_deref() {
-                Some(a) if a != "best" && a != "none" => format!(
-                    "bv*[height<={h}][height>0]+{a}/b[height<={h}][height>0]/bv*+ba/b"
-                ),
+                Some(a) if a != "best" && a != "none" => {
+                    format!("bv*[height<={h}][height>0]+{a}/b[height<={h}][height>0]/bv*+ba/b")
+                }
                 _ => format!("bv*[height<={h}][height>0]+ba/b[height<={h}][height>0]/bv*+ba/b"),
             }
         }
@@ -773,21 +814,38 @@ pub fn build_selector(choice: &YtChoice, dump: Option<&YtDump>) -> (String, Vec<
 
 pub async fn fetch_formats(url: &str, task: &DownloadTask) -> Result<YtDump, String> {
     let jar = write_cookie_jar(task);
-    fetch_formats_jar(url, task, jar.as_deref()).await
+    fetch_formats_jar(url, task, jar.as_deref())
+        .await
+        .map(|(d, _)| d)
 }
 
+/// Returns `(dump, used_anon)`: `used_anon` true when cookied dump missing
+/// or degraded and anonymous dump adopted. Downloaders using dump must try
+/// anon session first (see `download_attempt_order`).
 async fn fetch_formats_jar(
     url: &str,
     task: &DownloadTask,
     jar: Option<&std::path::Path>,
-) -> Result<YtDump, String> {
+) -> Result<(YtDump, bool), String> {
     match fetch_formats_jar_once(url, task, jar).await {
+        Ok(dump) if should_reprobe_anon_degraded(url, task, &dump) => {
+            let t = anon_task(task);
+            let jar2 = write_cookie_jar(&t);
+            match fetch_formats_jar_once(url, &t, jar2.as_deref()).await {
+                Ok(anon_dump) if dump_video_quality(&anon_dump) > dump_video_quality(&dump) => {
+                    Ok((anon_dump, true))
+                }
+                _ => Ok((dump, false)),
+            }
+        }
         Err(e) if should_retry_anon(url, task, &e) => {
             let t = anon_task(task);
             let jar2 = write_cookie_jar(&t);
-            fetch_formats_jar_once(url, &t, jar2.as_deref()).await
+            fetch_formats_jar_once(url, &t, jar2.as_deref())
+                .await
+                .map(|d| (d, true))
         }
-        other => other,
+        other => other.map(|d| (d, false)),
     }
 }
 
@@ -818,9 +876,7 @@ fn parse_progress(
     ctrl: &Controls,
     video_done_base: &Arc<std::sync::atomic::AtomicU64>,
 ) {
-    let Some(rest) = line.strip_prefix("download:") else {
-        return;
-    };
+    let rest = line.strip_prefix("download:").unwrap_or(line);
     // Template: download:<downloaded>|<total>|<estimate>|<speed>; total/estimate may be "NA".
     // ponytail: 4th field (speed) kept in template for slot stability, intentionally unparsed.
     let mut it = rest.split('|');
@@ -843,12 +899,8 @@ fn parse_progress(
 
 /// Handle one yt-dlp stdout line: progress, postprocess, bracket phases.
 /// `base` = per-file downloaded base (video_done_base shared with parse_progress).
-pub fn handle_stdout_line(
-    line: &str,
-    ctrl: &Controls,
-    base: &Arc<std::sync::atomic::AtomicU64>,
-) {
-    if line.starts_with("download:") {
+pub fn handle_stdout_line(line: &str, ctrl: &Controls, base: &Arc<std::sync::atomic::AtomicU64>) {
+    if line.starts_with("download:") || looks_like_bare_progress(line) {
         ctrl.phase.store(PHASE_DOWNLOADING, Ordering::Relaxed);
         parse_progress(line, ctrl, base);
     } else if let Some(status) = line.strip_prefix("postprocess:") {
@@ -867,6 +919,12 @@ pub fn handle_stdout_line(
     }
 }
 
+/// Bare yt-dlp progress: `1024|11295255|NA|510940.67` (>=4 `|` fields,
+/// first char ASCII digit). Guards template-prefix surprises.
+fn looks_like_bare_progress(line: &str) -> bool {
+    line.chars().next().is_some_and(|c| c.is_ascii_digit()) && line.split('|').count() >= 4
+}
+
 /// Reader filter: which stdout lines reach handle_stdout_line. Kept pure
 /// so forwarding set testable without spawning yt-dlp.
 fn stdout_line_forwarded(line: &str) -> bool {
@@ -878,6 +936,18 @@ fn stdout_line_forwarded(line: &str) -> bool {
         || line.starts_with("[VideoConvertor]")
         || line.starts_with("[EmbedSubtitle]")
         || line.starts_with("[download] Destination:")
+        || looks_like_bare_progress(line)
+}
+
+/// Retry attempts reuse same Controls: clear stale progress so next
+/// attempt's Destination fold does not double-count prior attempt bytes.
+fn reset_ctrl_for_retry(ctrl: &Controls, attempt_idx: usize) {
+    if attempt_idx == 0 {
+        return;
+    }
+    ctrl.downloaded.store(0, Ordering::SeqCst);
+    ctrl.total.store(0, Ordering::SeqCst);
+    ctrl.phase.store(PHASE_EXTRACTING, Ordering::SeqCst);
 }
 
 /// Download via yt-dlp. On success returns completed task; caller falls back to native on Err.
@@ -892,9 +962,10 @@ pub async fn download_with_ytdlp(
     // Also adopt video title as filename when seeded name is extensionless ID.
     // One jar for probe + download (yt-dlp may rewrite jar between calls).
     let jar = write_cookie_jar(&task);
-    let dump = fetch_formats_jar(&task.url, &task, jar.as_deref())
-        .await
-        .ok();
+    let (dump, used_anon) = match fetch_formats_jar(&task.url, &task, jar.as_deref()).await {
+        Ok((d, u)) => (Some(d), u),
+        Err(_) => (None, false),
+    };
     let mut task = task;
     // Explicit x-yt-* choice (picker) wins over auto selector.
     let choice = YtChoice::from_headers(&task.headers);
@@ -956,7 +1027,9 @@ pub async fn download_with_ytdlp(
         "--encoding".into(),
         "utf-8".into(),
         "--progress-template".into(),
-        "download:%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s".into(),
+        // `download:` before colon is yt-dlp progress *type selector*, not
+        // printed text; second `download:` is emitted prefix for parser.
+        "download:download:%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s".into(),
         "--progress-template".into(),
         "postprocess:postprocess:%(progress.status)s".into(),
         "-f".into(),
@@ -980,7 +1053,9 @@ pub async fn download_with_ytdlp(
     let url = full.pop().expect("url");
     full.extend(args.clone());
     full.push(url);
-    // Prebuilt anonymous retry (no cookies/headers): used only if should_retry_anon.
+    // Two sessions: cookied (`full`) and anonymous (`full2`). Order from
+    // probe adoption: adopted anon dump -> anon first, cookied fallback on
+    // any failure; else cookied first, anon only on retryable error.
     let t_anon = anon_task(&task);
     let jar2 = write_cookie_jar(&t_anon);
     let mut full2 = base_args(&t_anon.url, &t_anon, jar2.as_deref());
@@ -988,37 +1063,45 @@ pub async fn download_with_ytdlp(
     full2.extend(args);
     full2.push(url2);
 
-    let ctrl2 = ctrl.clone();
-    let path2 = path.clone();
     let started = std::time::SystemTime::now();
-    let out = tokio::task::spawn_blocking(move || run_ytdlp_download(&path2, &full, &ctrl2))
-        .await
-        .map_err(|e| e.to_string())?;
-    match out {
-        Ok(()) => {}
-        Err(e) if e == "cancelled" => {
-            let mut t = task.clone();
-            t.status = TaskStatus::Paused;
-            t.downloaded = ctrl.downloaded.load(Ordering::Relaxed);
-            return Ok(t);
-        }
-        Err(e) if should_retry_anon(&task.url, &task, &e) => {
-            let ctrl2 = ctrl.clone();
-            match tokio::task::spawn_blocking(move || run_ytdlp_download(&path, &full2, &ctrl2))
+    let order = download_attempt_order(used_anon);
+    let attempts: [Vec<String>; 2] = [full, full2];
+    // attempts indexed by order: false=cookied(0), true=anon(1)
+    let mut last_err: Option<String> = None;
+    for (idx, is_anon) in order.iter().enumerate() {
+        reset_ctrl_for_retry(&ctrl, idx);
+        let args_try = attempts[usize::from(*is_anon)].clone();
+        let ctrl2 = ctrl.clone();
+        let path2 = path.clone();
+        let out =
+            tokio::task::spawn_blocking(move || run_ytdlp_download(&path2, &args_try, &ctrl2))
                 .await
-                .map_err(|e2| e2.to_string())?
-            {
-                Ok(()) => {}
-                Err(e2) if e2 == "cancelled" => {
-                    let mut t2 = task.clone();
-                    t2.status = TaskStatus::Paused;
-                    t2.downloaded = ctrl.downloaded.load(Ordering::Relaxed);
-                    return Ok(t2);
+                .map_err(|e| e.to_string())?;
+        match out {
+            Ok(()) => {
+                last_err = None;
+                break;
+            }
+            Err(e) if e == "cancelled" => {
+                let mut t = task.clone();
+                t.status = TaskStatus::Paused;
+                t.downloaded = ctrl.downloaded.load(Ordering::Relaxed);
+                return Ok(t);
+            }
+            Err(e) => {
+                let is_last = idx + 1 == order.len();
+                // Cookied-first: anon gated on retryable error. Anon-first:
+                // cookied fallback unconditional.
+                let may_retry = !is_last && (used_anon || should_retry_anon(&task.url, &task, &e));
+                if !may_retry {
+                    return Err(e);
                 }
-                Err(e2) => return Err(e2),
+                last_err = Some(e);
             }
         }
-        Err(e) => return Err(e),
+    }
+    if let Some(e) = last_err {
+        return Err(e);
     }
     // yt-dlp may keep source ext despite -o exact path: find dest or newest stem.* sibling.
     // Exclude intermediates (.f<id>., .part/.ytdl) and files predating this run.
@@ -1334,6 +1417,34 @@ mod tests {
         assert_eq!(crate::engine::phase_name(99), "Downloading");
     }
     #[test]
+    fn retry_reset_clears_progress_after_first_attempt() {
+        let ctrl = Controls::new(0);
+        ctrl.downloaded.store(500, Ordering::Relaxed);
+        ctrl.total.store(1000, Ordering::Relaxed);
+        ctrl.phase.store(PHASE_DOWNLOADING, Ordering::Relaxed);
+
+        reset_ctrl_for_retry(&ctrl, 0); // first attempt: no-op
+        assert_eq!(ctrl.downloaded.load(Ordering::Relaxed), 500);
+        assert_eq!(ctrl.total.load(Ordering::Relaxed), 1000);
+        assert_eq!(ctrl.phase.load(Ordering::Relaxed), PHASE_DOWNLOADING);
+
+        for idx in [1, 2] {
+            ctrl.downloaded.store(500, Ordering::Relaxed);
+            ctrl.total.store(1000, Ordering::Relaxed);
+            ctrl.phase.store(PHASE_FINALIZING, Ordering::Relaxed);
+            reset_ctrl_for_retry(&ctrl, idx);
+            assert_eq!(ctrl.downloaded.load(Ordering::Relaxed), 0);
+            assert_eq!(ctrl.total.load(Ordering::Relaxed), 0);
+            assert_eq!(ctrl.phase.load(Ordering::Relaxed), PHASE_EXTRACTING);
+        }
+
+        // Post-reset progress folds only new attempt bytes, not stale base.
+        let base = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        handle_stdout_line("download:500|1000|NA|1", &ctrl, &base);
+        assert_eq!(ctrl.downloaded.load(Ordering::Relaxed), 500);
+        assert!(ctrl.downloaded.load(Ordering::Relaxed) <= 1000);
+    }
+    #[test]
     fn youtube_url_cases() {
         for u in [
             "https://youtube.com/watch?v=x",
@@ -1398,6 +1509,26 @@ mod tests {
         ));
     }
     #[test]
+    fn retry_anon_requested_format_not_available() {
+        let mut t = DownloadTask::default();
+        t.cookies_json = r#"[{"name":"a","value":"b"}]"#.into();
+        assert!(should_retry_anon(
+            "https://www.youtube.com/watch?v=x",
+            &t,
+            "ERROR: Requested format not available. Use --list-formats"
+        ));
+        assert!(should_retry_anon(
+            "https://www.youtube.com/watch?v=x",
+            &t,
+            "error: requested format not available"
+        ));
+    }
+    #[test]
+    fn download_attempt_order_anon_first_when_adopted() {
+        assert_eq!(download_attempt_order(true), [true, false]);
+        assert_eq!(download_attempt_order(false), [false, true]);
+    }
+    #[test]
     fn base_args_js_runtimes_node() {
         let t = DownloadTask::default();
         let a = base_args("https://example.com/v", &t, None);
@@ -1415,6 +1546,86 @@ mod tests {
         assert!(!is_video_page("https://vimeo.com/about"));
         assert!(!is_video_page("not a url"));
     }
+    fn vf(height: Option<u32>, vcodec: &str, ext: &str) -> YtFormat {
+        YtFormat {
+            format_id: "x".into(),
+            ext: ext.into(),
+            width: None,
+            height,
+            fps: None,
+            vcodec: Some(vcodec.into()),
+            acodec: Some("mp4a".into()),
+            tbr: None,
+            abr: None,
+            language: None,
+            format_note: None,
+            filesize: None,
+            filesize_approx: None,
+        }
+    }
+
+    #[test]
+    fn degraded_360p_dump_triggers_anon_reprobe_only_with_cookies() {
+        let degraded = YtDump {
+            title: "t".into(),
+            uploader: None,
+            channel: None,
+            thumbnail: None,
+            duration: None,
+            formats: vec![
+                vf(Some(360), "avc1", "mp4"),
+                vf(None, "none", "mhtml"),
+                vf(None, "none", "mhtml"),
+            ],
+            entries: Vec::new(),
+            subtitles: std::collections::BTreeMap::new(),
+            automatic_captions: std::collections::BTreeMap::new(),
+        };
+        assert!(dump_is_degraded(&degraded));
+        let url = "https://www.youtube.com/watch?v=abc";
+        let cookied = DownloadTask {
+            cookies: "SID=x".into(),
+            ..Default::default()
+        };
+        assert!(should_reprobe_anon_degraded(url, &cookied, &degraded));
+        assert!(!should_reprobe_anon_degraded(
+            url,
+            &DownloadTask::default(),
+            &degraded
+        ));
+        let full = YtDump {
+            formats: vec![
+                vf(Some(360), "avc1", "mp4"),
+                vf(Some(720), "avc1", "mp4"),
+                vf(Some(2160), "vp9", "webm"),
+            ],
+            ..degraded.clone()
+        };
+        assert!(!dump_is_degraded(&full));
+        assert!(!should_reprobe_anon_degraded(url, &cookied, &full));
+        assert!(dump_video_quality(&full) > dump_video_quality(&degraded));
+        let only720 = YtDump {
+            formats: vec![vf(Some(720), "avc1", "mp4")],
+            ..degraded.clone()
+        };
+        assert!(!dump_is_degraded(&only720));
+        assert!(!should_reprobe_anon_degraded(url, &cookied, &only720));
+        let many_low = YtDump {
+            formats: vec![
+                vf(Some(360), "avc1", "mp4"),
+                vf(Some(240), "avc1", "mp4"),
+                vf(Some(144), "avc1", "mp4"),
+            ],
+            ..degraded.clone()
+        };
+        assert!(!dump_is_degraded(&many_low));
+        assert!(!should_reprobe_anon_degraded(
+            "https://vimeo.com/1",
+            &cookied,
+            &degraded
+        ));
+    }
+
     #[test]
     fn pick_best_prefers_height_over_muxed() {
         let fs = vec![
@@ -1544,23 +1755,41 @@ mod tests {
             };
             let (s, _, _) = build_selector(&c, None);
             assert_eq!(
-                s,
-                "bv*[height<=720][height>0]+ba/b[height<=720][height>0]/bv*+ba/b",
+                s, "bv*[height<=720][height>0]+ba/b[height<=720][height>0]/bv*+ba/b",
                 "audio={a}"
             );
         }
         // Reader filter forwards postprocess bracket lines, not noise.
-        assert!(stdout_line_forwarded("[Merger] Merging formats into \"x.mp4\""));
+        assert!(stdout_line_forwarded(
+            "[Merger] Merging formats into \"x.mp4\""
+        ));
         assert!(stdout_line_forwarded("[VideoRemuxer] Not remuxing"));
         assert!(stdout_line_forwarded("[ExtractAudio] Destination: x.mp3"));
         assert!(stdout_line_forwarded("[VideoConvertor] Converting video"));
-        assert!(stdout_line_forwarded("[EmbedSubtitle] Embedding subtitles in x.mkv"));
+        assert!(stdout_line_forwarded(
+            "[EmbedSubtitle] Embedding subtitles in x.mkv"
+        ));
         assert!(stdout_line_forwarded("[download] Destination: x.f137.mp4"));
         assert!(stdout_line_forwarded("download:1|2|3|4"));
         assert!(stdout_line_forwarded("postprocess:started"));
         assert!(!stdout_line_forwarded("[youtube] Extracting URL"));
         assert!(!stdout_line_forwarded("[download] 12.3% of 10MiB"));
         assert!(!stdout_line_forwarded("[info] Writing video metadata"));
+        // Bug A real format: bare (old eaten prefix) + prefixed (new template).
+        assert!(stdout_line_forwarded("1024|11295255|NA|510940.67"));
+        assert!(stdout_line_forwarded("download:1024|11295255|NA|510940.67"));
+        assert!(!stdout_line_forwarded("1024|11295255"));
+        for line in [
+            "1024|11295255|NA|510940.67",
+            "download:1024|11295255|NA|510940.67",
+        ] {
+            let ctrl = Controls::new(0);
+            let base = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            handle_stdout_line(line, &ctrl, &base);
+            assert_eq!(ctrl.phase.load(Ordering::Relaxed), PHASE_DOWNLOADING);
+            assert_eq!(ctrl.downloaded.load(Ordering::Relaxed), 1024);
+            assert_eq!(ctrl.total.load(Ordering::Relaxed), 11295255);
+        }
     }
 
     #[test]

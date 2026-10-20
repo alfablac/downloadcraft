@@ -19,6 +19,7 @@ enum Tab {
     Queues,
     Scheduler,
     Grabber,
+    Streams,
     Options,
 }
 
@@ -35,6 +36,109 @@ type NzbProbeSlot =
 /// yt-dlp -J probe result slot: (url probed, result). Same stale-drop pattern.
 type YtProbeSlot =
     std::sync::Arc<std::sync::Mutex<Option<(String, Result<ytdlp::YtDump, String>)>>>;
+
+/// HTTP prewarm state (Add + capture dialogs): last spawned URL + result
+/// text ("Probing…" / "2.9 GB · 8 connections" / error). Runtime-only;
+/// probe payload lives in engine::prewarm registry, never persisted/logged.
+#[derive(Default)]
+struct PrewarmState {
+    url: String,
+    loading: bool,
+    text: String,
+}
+
+/// Prewarm gate: plain http(s) files only. Skips FTP/SFTP/torrent/NZB,
+/// yt-dlp video pages (yt probe owns them), manifests (stream probe),
+/// explicit yt-dlp tasks (non-http schemes excluded by prefix check).
+fn prewarm_eligible(task: &DownloadTask) -> bool {
+    let u = task.url.trim();
+    let l = u.to_ascii_lowercase();
+    if !l.starts_with("http://") && !l.starts_with("https://") {
+        return false;
+    }
+    if task.headers.contains_key("x-ytdlp")
+        || ytdlp::is_video_page(u)
+        || crate::torrent::is_torrent_url(u)
+        || crate::stream::is_nzb_url_str(u)
+    {
+        return false;
+    }
+    !crate::stream::is_manifest_url(u)
+}
+
+/// Spawn engine prewarm on tokio rt (non-blocking; confirm never waits).
+/// No-op when same URL already probed/in flight. `conns` = planned segments cap.
+fn spawn_prewarm(st: &mut PrewarmState, rt: &tokio::runtime::Runtime, task: &DownloadTask, conns: u32) {
+    let url = task.url.trim().to_string();
+    if url.is_empty() || st.url == url {
+        return;
+    }
+    st.url = url.clone();
+    st.loading = true;
+    st.text = "Probing…".into();
+    let mut probe_task = task.clone();
+    probe_task.url = url.clone();
+    let client = engine::build_client("");
+    let slot = prewarm_ui_slot();
+    rt.spawn(async move {
+        match engine::prewarm(&client, &probe_task).await {
+            Ok(cache) => {
+                let text = match cache.total {
+                    Some(t) if cache.accept_ranges => {
+                        let n = engine::plan_segments(t, conns.max(1)).len();
+                        format!("{} · {} connections", fmt_bytes(t), n)
+                    }
+                    Some(t) => format!("{} · single connection", fmt_bytes(t)),
+                    None => "Size unknown".into(),
+                };
+                engine::prewarm_store(cache);
+                if let Ok(mut g) = slot.lock() {
+                    *g = Some((url, Ok(text)));
+                }
+            }
+            Err(e) => {
+                if let Ok(mut g) = slot.lock() {
+                    *g = Some((url, Err(e)));
+                }
+            }
+        }
+    });
+}
+
+/// Prewarm UI result slot: (url, display text). Same stale-drop as yt probe.
+type PrewarmSlot =
+    std::sync::Arc<std::sync::Mutex<Option<(String, Result<String, String>)>>>;
+static PREWARM_UI: std::sync::OnceLock<PrewarmSlot> = std::sync::OnceLock::new();
+
+fn prewarm_ui_slot() -> PrewarmSlot {
+    PREWARM_UI
+        .get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(None)))
+        .clone()
+}
+
+/// Poll prewarm result for `url`; changed URL resets (caller respawns).
+fn prewarm_poll(st: &mut PrewarmState, url: &str) {
+    let url = url.trim();
+    if st.url != url {
+        st.url = url.to_string();
+        st.loading = false;
+        st.text.clear();
+        return;
+    }
+    if !st.loading {
+        return;
+    }
+    let done = prewarm_ui_slot().lock().ok().and_then(|mut g| g.take());
+    if let Some((tag, res)) = done {
+        if tag == url {
+            st.loading = false;
+            st.text = match res {
+                Ok(t) => t,
+                Err(_) => String::new(), // probe failure silent: confirm does normal probe
+            };
+        }
+    }
+}
 
 /// Add-dialog debrid magnet awaiting fan-out resolution.
 #[derive(Clone)]
@@ -81,7 +185,7 @@ struct YtProbeState {
     dump: Option<ytdlp::YtDump>,
     /// "" = Auto (best), format_id, or "audio:<id>".
     format: String,
-    /// "" = Auto (best), else max height tier e.g. "1080". Exact format wins.
+    /// "" = Auto (best), else max height tier e.g. "1080". Mutually exclusive with `format`.
     quality: String,
     /// "" = auto, "best", "none", or audio format_id.
     audio: String,
@@ -414,11 +518,18 @@ pub struct DownloadApp {
     add_user: String,
     add_pass: String,
     add_key: String,
+    /// Custom HTTP(S)-only header draft rows (name, value); empty rows ignored.
+    add_headers: Vec<(String, String)>,
     add_mirrors: String,
     add_desc: String,
     add_queue: String,
     add_start_now: bool,
     add_just_opened: bool,
+    /// Frames left to force-raise Add viewport (egui Focus denied when
+    /// browser holds foreground; platform::raise_window covers it).
+    add_raise_frames: u32,
+    /// URL field re-focused once Add viewport first reports focused.
+    add_focus_done: bool,
     /// Torrent file-picker probe result slot (list_only, spawned on thread).
     add_torrent_slot: TorrentProbeSlot,
     /// URL the picker probe was run for (edit invalidates probe).
@@ -452,6 +563,10 @@ pub struct DownloadApp {
     grab_status: String,
     grab_busy: bool,
     grab_auto_explore: bool,
+    stream_url: String,
+    stream_status: String,
+    /// true = stream_status is error (ERR color), else OK.
+    stream_status_err: bool,
     last_tick: std::time::Instant,
     #[allow(dead_code)]
     tray: Option<TrayState>,
@@ -462,6 +577,9 @@ pub struct DownloadApp {
     debrid_slot: DebridProbeSlot,
     debrid_hosts_slot: DebridHostsSlot,
     debrid_ctx: Option<egui::Context>,
+    /// Clone of egui ctx for worker-completion wake (`start_task`
+    /// spawned tasks). Set in `update()`; None until first frame.
+    egui_ctx: Option<egui::Context>,
     debrid_ui: DebridUiCache,
     show_about: bool,
     search: String,
@@ -489,6 +607,10 @@ pub struct DownloadApp {
     show_add: bool,
     show_progress_for: Option<String>,
     progress_raise: bool,
+    /// Frames left to force-raise Progress viewport (see add_raise_frames).
+    prog_raise_frames: u32,
+    /// Filename prefix of Progress viewport being raised (title match).
+    prog_raise_title: String,
     selected: Option<String>,
     /// Multi-select set for downloads table (Ctrl/Shift/Ctrl+A). `selected`
     /// stays primary (last clicked) for toolbar/menus/progress.
@@ -545,13 +667,29 @@ pub struct DownloadApp {
     capture_just_opened: bool,
     /// Raise capture viewport once on pop (like progress_raise).
     capture_raise: bool,
+    /// Frames left to force-raise Capture viewport (see add_raise_frames).
+    cap_raise_frames: u32,
+    /// Name field re-focused once Capture viewport first reports focused.
+    cap_focus_done: bool,
     /// Startup trace: first update() reached (window/event loop live).
     first_update_traced: bool,
     yt_probe_add: YtProbeState,
     yt_probe_cap: YtProbeState,
+    prewarm_add: PrewarmState,
+    prewarm_cap: PrewarmState,
     add_vp_sent: Option<egui::Vec2>,
     cap_vp_sent: Option<egui::Vec2>,
     prog_vp_sent: Option<egui::Vec2>,
+    player: Option<downloadcraft_lib::mpv::embedded::MpvHandle>,
+    /// URL awaiting player viewport HWND (spawn on first ui_player frame).
+    player_pending: Option<String>,
+    player_seek: f64,
+    player_seek_dragging: bool,
+    player_speed: f64,
+    /// Player viewport HWND resolved via EnumWindows by title (once, cached).
+    player_hwnd: Option<isize>,
+    /// Last resolved (paused,duration) for title/status; stale-tolerant.
+    player_title_state: (bool, f64),
     prog_task: Option<String>,
     /// Last frame's measured dialog body height (+ closed-section heights);
     /// fed to fit_vp next frame so native viewports fit content as if all
@@ -711,11 +849,14 @@ impl DownloadApp {
             add_user: String::new(),
             add_pass: String::new(),
             add_key: String::new(),
+            add_headers: Vec::new(),
             add_mirrors: String::new(),
             add_desc: String::new(),
             add_queue: "main".into(),
             add_start_now: true,
             add_just_opened: false,
+            add_raise_frames: 0,
+            add_focus_done: false,
             add_torrent_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
             add_torrent_url: String::new(),
             add_torrent_files: Vec::new(),
@@ -743,6 +884,9 @@ impl DownloadApp {
             grab_status: "Enter a start URL, then Explore.".into(),
             grab_busy: false,
             grab_auto_explore: false,
+            stream_url: String::new(),
+            stream_status: String::new(),
+            stream_status_err: false,
             last_tick: std::time::Instant::now(),
             tray: Some(TrayState { _nav: tray }),
             hidden,
@@ -752,6 +896,7 @@ impl DownloadApp {
             debrid_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
             debrid_hosts_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
             debrid_ctx: None,
+            egui_ctx: None,
             debrid_ui: DebridUiCache::default(),
             show_about: false,
             search: String::new(),
@@ -772,7 +917,16 @@ impl DownloadApp {
             options_notice: "Changes save automatically.".into(),
             show_add: false,
             show_progress_for: None,
+            player: None,
+            player_pending: None,
+            player_seek: 0.0,
+            player_seek_dragging: false,
+            player_speed: 1.0,
+            player_hwnd: None,
+            player_title_state: (false, 0.0),
             progress_raise: false,
+            prog_raise_frames: 0,
+            prog_raise_title: String::new(),
             selected: None,
             selected_ids: std::collections::HashSet::new(),
             selection_anchor: None,
@@ -808,9 +962,13 @@ impl DownloadApp {
             capture_name: String::new(),
             capture_just_opened: false,
             capture_raise: false,
+            cap_raise_frames: 0,
+            cap_focus_done: false,
             first_update_traced: false,
             yt_probe_add: YtProbeState::default(),
             yt_probe_cap: YtProbeState::default(),
+            prewarm_add: PrewarmState::default(),
+            prewarm_cap: PrewarmState::default(),
             add_vp_sent: None,
             cap_vp_sent: None,
             prog_vp_sent: None,
@@ -1172,6 +1330,11 @@ impl DownloadApp {
             }
             g.save();
         });
+        // Worker finished while poll may idle 5s: wake now so capped
+        // deadline (retry gate / queue free slot) applies next frame.
+        if let Some(ctx) = self.egui_ctx.clone() {
+            ctx.request_repaint();
+        }
         self.handles.insert(id.to_string(), handle);
     }
 
@@ -1441,14 +1604,24 @@ impl DownloadApp {
             .show(ctx, |ui| {
                 ui.label(format!("Delete {n} download(s) from the list?"));
                 ui.checkbox(&mut self.delete_from_disk, "Also delete files from disk");
+                // Reserve warning height always: buttons must not jump when
+                // checkbox toggles (checked/unchecked pixel-same size).
+                // Height mirrors warning label (small text, may wrap at modal
+                // width); allocate fixed region, draw only when checked.
+                let (warn_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 28.0),
+                    egui::Sense::hover(),
+                );
                 if self.delete_from_disk {
-                    ui.label(
-                        egui::RichText::new(
-                            "Removes downloaded files, partial data and temp files. Cannot be undone.",
-                        )
-                        .color(theme::TEXT_MUTED)
-                        .small(),
-                    );
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(warn_rect), |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Removes downloaded files, partial data and temp files. Cannot be undone.",
+                            )
+                            .color(theme::TEXT_MUTED)
+                            .small(),
+                        );
+                    });
                 }
                 ui.horizontal(|ui| {
                     if theme::primary_btn(ui, "Delete").clicked() {
@@ -1598,7 +1771,7 @@ impl DownloadApp {
                 self.tab = Tab::Downloads;
                 {
                     self.show_add = true;
-                    self.add_just_opened = true;
+                    self.add_just_opened = true; self.add_raise_frames = 90; self.add_focus_done = false;
                 }
             }
             "quit" => {
@@ -1618,7 +1791,7 @@ impl DownloadApp {
                     self.tab = Tab::Downloads;
                     {
                         self.show_add = true;
-                        self.add_just_opened = true;
+                        self.add_just_opened = true; self.add_raise_frames = 90; self.add_focus_done = false;
                     }
                 }
                 _ => self.show_window(ctx),
@@ -2098,7 +2271,7 @@ impl DownloadApp {
         // so child clicks/buttons don't wait 500ms-5s cadence.
         let dialog_open =
             self.show_add || self.show_progress_for.is_some() || self.capture_task.is_some();
-        let ms = if self.hidden || minimized {
+        let base_ms = if self.hidden || minimized {
             5_000
         } else if dialog_open {
             50
@@ -2113,8 +2286,74 @@ impl DownloadApp {
         } else {
             5_000
         };
-        ctx.request_repaint_after(std::time::Duration::from_millis(ms));
+        // Cap at nearest retry/scheduler deadline; startable-now = 0 (next
+        // frame). Idle battery kept: deadline only shortens, never 60fps.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let ms = {
+            let g = crate::lock_unpoison(&self.rt);
+            let (day, secs_of_day) = today_parts();
+            capped_wake_ms(
+                base_ms,
+                now,
+                day,
+                secs_of_day,
+                &g.state.tasks,
+                &g.state.queues,
+                &g.state.schedules,
+                g.state.settings.scheduler_enabled,
+            )
+        };
+        if ms == 0 {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(ms));
+        }
     }
+}
+
+/// Milliseconds until nearest armed deadline, capped at idle `base_ms`.
+/// `now` = unix secs, `day`/`secs_of_day` = scheduler clock (`today_parts`).
+/// `next_retry_at == 0` = ungated, `> now` = gated. Pure: unit-tested.
+fn capped_wake_ms(
+    base_ms: u64,
+    now: u64,
+    day: i64,
+    secs_of_day: u32,
+    tasks: &[DownloadTask],
+    queues: &[Queue],
+    schedules: &[Schedule],
+    scheduler_enabled: bool,
+) -> u64 {
+    let mut wake = base_ms;
+    let mut cap = |secs: i64| {
+        if secs > 0 {
+            wake = wake.min(((secs as u64) * 1000).max(1));
+        } else {
+            wake = 0; // due / overdue: poll next frame
+        }
+    };
+    for t in tasks.iter().filter(|t| t.status == TaskStatus::Queued) {
+        if !queues
+            .iter()
+            .find(|q| q.id == t.queue_id)
+            .map(|q| q.auto_start)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        cap(t.next_retry_at as i64 - now as i64);
+    }
+    if scheduler_enabled {
+        for s in schedules {
+            if let Some(d) = next_run_in(s, day, secs_of_day) {
+                cap(d);
+            }
+        }
+    }
+    wake
 }
 
 fn today_parts() -> (i64, u32) {
@@ -2264,8 +2503,283 @@ impl DownloadApp {
     }
 }
 
+impl DownloadApp {
+    /// Embedded mpv player viewport. mpv child renders into viewport HWND
+    /// (--wid); egui draws only controls bar under it. See spawn order below.
+    fn ui_player(&mut self, ctx: &egui::Context) {
+        // Title from last snapshot; lags one frame. ponytail: acceptable.
+        let (t_paused, _) = self.player_title_state;
+        let title = if self.player.is_some() && t_paused {
+            "webcraft player (paused)".to_string()
+        } else {
+            "webcraft player".to_string()
+        };
+        let builder = egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_inner_size([880.0, 560.0])
+            .with_min_inner_size([480.0, 320.0]);
+        let mut close = false;
+        let mut stop_req = false;
+        let mut toggle_req = false;
+        // (target_secs, is_absolute) — slider: absolute; -/+10s: relative.
+        let mut seek_req: Option<(f64, bool)> = None;
+        let mut speed_req: Option<f64> = None;
+        let mut vol_req: Option<f64> = None;
+        ctx.show_viewport_immediate(vp_id("webcraft-player"), builder, |ctx, _class| {
+            if ctx.input(|i| i.viewport().close_requested()) {
+                close = true;
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            // FIRST: --wid INTO HWND. No HWND yet -> do not spawn; next frame
+            // retries (show_viewport_immediate creates window first frame).
+            if self.player.is_none() {
+                if let Some(url) = self.player_pending.clone() {
+                    let hwnd = self.player_hwnd.or_else(|| {
+                        let h = find_player_hwnd();
+                        self.player_hwnd = h;
+                        h
+                    });
+                    match hwnd {
+                        Some(h) => {
+                            let settings = {
+                                let g = crate::lock_unpoison(&self.rt);
+                                g.state.settings.clone()
+                            };
+                            match downloadcraft_lib::mpv::embedded::spawn_embedded(
+                                &settings, &url, h,
+                            ) {
+                                Ok(handle) => {
+                                    self.stream_status = format!("Playing in player: {url}");
+                                    self.stream_status_err = false;
+                                    self.player = Some(handle);
+                                    self.player_pending = None;
+                                }
+                                Err(e) => {
+                                    self.stream_status = format!("ERR {e}");
+                                    self.stream_status_err = true;
+                                    self.player_pending = None;
+                                    close = true;
+                                }
+                            }
+                        }
+                        None => { /* HWND not enumerated yet; keep pending */ }
+                    }
+                }
+            }
+            let snap = self.player.as_ref().map(|h| {
+                let s = crate::lock_unpoison(&h.state);
+                (
+                    s.pause,
+                    s.time_pos,
+                    s.duration,
+                    s.volume,
+                    s.speed,
+                    s.title.clone(),
+                    s.error.clone(),
+                    s.eof,
+                )
+            });
+            if let Some((p, _, d, _, _, _, _, _)) = &snap {
+                self.player_title_state = (*p, *d);
+            }
+            let paused = snap.as_ref().map(|s| s.0).unwrap_or(false);
+            egui::TopBottomPanel::bottom("player-controls")
+                .exact_height(92.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme::SURFACE)
+                        .inner_margin(egui::Margin::same(theme::SP_SM)),
+                )
+                .show(ctx, |ui| {
+                    if let Some((_, tp, dur, vol, _spd, media, err, eof)) = &snap {
+                        if !media.is_empty() {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(media.as_str())
+                                        .color(theme::TEXT)
+                                        .small(),
+                                )
+                                .truncate(),
+                            );
+                        }
+                        if !err.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("ERR {err}"))
+                                    .color(theme::ERR)
+                                    .small(),
+                            );
+                        } else if *eof {
+                            ui.label(
+                                egui::RichText::new("Ended")
+                                    .color(theme::TEXT_FAINT)
+                                    .small(),
+                            );
+                        }
+                        if !self.player_seek_dragging {
+                            self.player_seek = *tp;
+                        }
+                        let seek_max = dur.max(0.1);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} / {}",
+                                    fmt_hms(*tp),
+                                    fmt_hms(*dur)
+                                ))
+                                .color(theme::TEXT_MUTED)
+                                .small()
+                                .monospace(),
+                            );
+                            let resp = ui.add(
+                                egui::Slider::new(&mut self.player_seek, 0.0..=seek_max)
+                                    .show_value(false),
+                            );
+                            if resp.drag_started() {
+                                self.player_seek_dragging = true;
+                            }
+                            if resp.drag_stopped() {
+                                self.player_seek_dragging = false;
+                                seek_req = Some((self.player_seek, true));
+                            }
+                            if icon_btn(ui, Icon::Video, "Full", false, 52.0).clicked() {
+                                ctx.send_viewport_cmd_to(
+                                    vp_id("webcraft-player"),
+                                    egui::ViewportCommand::Fullscreen(true),
+                                );
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            let (ic, lbl) = if paused {
+                                (Icon::Play, "Play")
+                            } else {
+                                (Icon::Pause, "Pause")
+                            };
+                            if icon_btn(ui, ic, lbl, true, 76.0).clicked() {
+                                toggle_req = true;
+                            }
+                            // No Stop icon in set; Delete glyph = stop track.
+                            if icon_btn(ui, Icon::Delete, "Stop", false, 64.0).clicked() {
+                                stop_req = true;
+                            }
+                            if theme::ghost_btn(ui, "-10s").clicked() {
+                                seek_req = Some((-10.0, false));
+                            }
+                            if theme::ghost_btn(ui, "+10s").clicked() {
+                                seek_req = Some((10.0, false));
+                            }
+                            ui.label(egui::RichText::new("Vol").color(theme::TEXT_FAINT).small());
+                            let mut v = *vol;
+                            if ui
+                                .add(egui::Slider::new(&mut v, 0.0..=100.0).show_value(false))
+                                .changed()
+                            {
+                                vol_req = Some(v);
+                            }
+                            ui.label(
+                                egui::RichText::new(format!("{vol:.0}"))
+                                    .color(theme::TEXT_MUTED)
+                                    .small()
+                                    .monospace(),
+                            );
+                            ui.label(
+                                egui::RichText::new("Speed")
+                                    .color(theme::TEXT_FAINT)
+                                    .small(),
+                            );
+                            let mut sel = self.player_speed;
+                            egui::ComboBox::from_id_salt("player-speed")
+                                .selected_text(format!("{sel}x"))
+                                .show_ui(ui, |ui| {
+                                    for s in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
+                                        ui.selectable_value(&mut sel, s, format!("{s}x"));
+                                    }
+                                });
+                            if sel != self.player_speed {
+                                speed_req = Some(sel);
+                            }
+                        });
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Starting player\u{2026}")
+                                .color(theme::TEXT_MUTED)
+                                .small(),
+                        );
+                    }
+                });
+            let frame = if self.player.is_some() {
+                egui::Frame::none()
+            } else {
+                egui::Frame::none().fill(egui::Color32::BLACK)
+            };
+            egui::CentralPanel::default()
+                .frame(frame)
+                .show(ctx, |_ui| {
+                    // ponytail: central left unpainted past Frame bg; mpv owns
+                    // pixels under egui GL surface (--wid child paints there).
+                    // egui present may flicker on some drivers; controls panel
+                    // above is opaque. Do NOT rect_filled here (covers video).
+                });
+        });
+        if close {
+            self.quit_player();
+            return;
+        }
+        if let Some(h) = &self.player {
+            if toggle_req {
+                h.toggle_pause();
+            }
+            if stop_req {
+                h.stop();
+            }
+            if let Some((t, absolute)) = seek_req {
+                if absolute {
+                    h.seek_abs(t);
+                } else {
+                    h.seek_rel(t);
+                }
+            }
+            if let Some(v) = vol_req {
+                h.set_volume(v);
+            }
+            if let Some(s) = speed_req {
+                self.player_speed = s;
+                h.set_speed(s);
+            }
+        }
+    }
+
+    fn quit_player(&mut self) {
+        self.player_pending = None;
+        self.player_hwnd = None;
+        self.player_seek_dragging = false;
+        if let Some(h) = self.player.take() {
+            h.quit();
+        }
+    }
+
+    /// Play `url` in embedded player: reuse live handle (loadfile) else
+    /// queue viewport spawn (HWND known next frame).
+    fn play_embedded(&mut self, url: &str) {
+        if let Some(h) = &self.player {
+            match h.loadfile(url) {
+                Ok(()) => {
+                    self.stream_status = format!("Playing in player: {url}");
+                }
+                Err(e) => {
+                    self.stream_status = format!("ERR {e}");
+                    self.player_pending = Some(url.to_string());
+                }
+            }
+        } else {
+            self.player_pending = Some(url.to_string());
+            self.stream_status = format!("Opening player: {url}");
+        }
+    }
+}
+
 impl eframe::App for DownloadApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.quit_player();
         // Stop workers first so Runtime drop does not wait on blocking pool.
         {
             let g = crate::lock_unpoison(&self.rt);
@@ -2291,6 +2805,7 @@ impl eframe::App for DownloadApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.egui_ctx = Some(ctx.clone());
         if !self.first_update_traced {
             self.first_update_traced = true;
             crate::platform::trace("app::update first frame");
@@ -2325,6 +2840,9 @@ impl eframe::App for DownloadApp {
                 }
                 return;
             }
+        }
+        if self.allow_close && ctx.input(|i| i.viewport().close_requested()) {
+            self.quit_player();
         }
         if self.hidden {
             return;
@@ -2366,7 +2884,7 @@ impl eframe::App for DownloadApp {
             }
             if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::N)) {
                 self.show_add = true;
-                self.add_just_opened = true;
+                self.add_just_opened = true; self.add_raise_frames = 90; self.add_focus_done = false;
             }
             if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::C)) {
                 let urls: Vec<String> = {
@@ -2416,12 +2934,16 @@ impl eframe::App for DownloadApp {
                             if ui.button("Add new download…").clicked() {
                                 {
                                     self.show_add = true;
-                                    self.add_just_opened = true;
+                                    self.add_just_opened = true; self.add_raise_frames = 90; self.add_focus_done = false;
                                 }
                                 ui.close_menu();
                             }
                             if ui.button("Add batch from clipboard").clicked() {
                                 add_batch_clipboard(self);
+                                ui.close_menu();
+                            }
+                            if ui.button("Play video in mpv…").clicked() {
+                                self.tab = Tab::Streams;
                                 ui.close_menu();
                             }
                             if ui.button("Run Site Grabber").clicked() {
@@ -2538,6 +3060,10 @@ impl eframe::App for DownloadApp {
                             }
                             if ui.button("Scheduler").clicked() {
                                 self.tab = Tab::Scheduler;
+                                ui.close_menu();
+                            }
+                            if ui.button("Streams").clicked() {
+                                self.tab = Tab::Streams;
                                 ui.close_menu();
                             }
                             if ui.button("Site Grabber").clicked() {
@@ -2672,6 +3198,7 @@ impl eframe::App for DownloadApp {
                     (Tab::Queues, "Queues", Icon::Queue),
                     (Tab::Scheduler, "Scheduler", Icon::Clock),
                     (Tab::Grabber, "Site Grabber", Icon::Globe),
+                    (Tab::Streams, "Streams", Icon::Play),
                     (Tab::Options, "Options", Icon::Settings),
                 ] {
                     if nav_row_c(ui, ic, label, self.tab == tab, None, rail_compact, None).clicked()
@@ -2777,9 +3304,9 @@ impl eframe::App for DownloadApp {
                     ui.add_space(4.0);
                 }
                 // Single pass over tasks (proto_kind may stat local files).
-                let type_counts: [usize; 8] = {
+                let type_counts: [usize; 7] = {
                     let g = crate::lock_unpoison(&self.rt);
-                    let mut tc = [0usize; 8];
+                    let mut tc = [0usize; 7];
                     for t in &g.state.tasks {
                         let k = crate::stream::proto_kind(t);
                         for sel in TypeSel::ALL {
@@ -2931,6 +3458,7 @@ impl eframe::App for DownloadApp {
                     Tab::Downloads => self.ui_downloads(ui),
                     // Grabber manages own scroll: results list fills remaining height.
                     Tab::Grabber => self.ui_grabber(ui),
+                    Tab::Streams => self.ui_streams(ui),
                     Tab::Queues | Tab::Scheduler | Tab::Options => {
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
@@ -2961,6 +3489,9 @@ impl eframe::App for DownloadApp {
             self.ui_progress_dialog(ctx, &id);
         }
         self.ui_capture_dialog(ctx);
+        if self.player.is_some() || self.player_pending.is_some() {
+            self.ui_player(ctx);
+        }
         if let Some(id) = self.completed_notice.clone() {
             // Resolve task by id; filename/path derive from it.
             let task = crate::lock_unpoison(&self.rt)
@@ -3014,7 +3545,7 @@ impl eframe::App for DownloadApp {
                             if theme::primary_btn(ui, label).clicked() {
                                 self.add_url = p.clone();
                                 self.show_add = true;
-                                self.add_just_opened = true;
+                                self.add_just_opened = true; self.add_raise_frames = 90; self.add_focus_done = false;
                                 self.completed_notice = None;
                             }
                         }
@@ -3118,7 +3649,6 @@ enum TypeSel {
     Torrent,
     Nntp,
     Ftp,
-    Stream,
     YtDlp,
     Metalink,
     Http,
@@ -3126,11 +3656,10 @@ enum TypeSel {
 }
 
 impl TypeSel {
-    const ALL: [TypeSel; 8] = [
+    const ALL: [TypeSel; 7] = [
         TypeSel::Torrent,
         TypeSel::Nntp,
         TypeSel::Ftp,
-        TypeSel::Stream,
         TypeSel::YtDlp,
         TypeSel::Metalink,
         TypeSel::Http,
@@ -3142,7 +3671,6 @@ impl TypeSel {
             TypeSel::Torrent => "Torrent",
             TypeSel::Nntp => "Nntp",
             TypeSel::Ftp => "Ftp",
-            TypeSel::Stream => "Stream",
             TypeSel::YtDlp => "YtDlp",
             TypeSel::Metalink => "Metalink",
             TypeSel::Http => "Http",
@@ -3154,7 +3682,6 @@ impl TypeSel {
             TypeSel::Torrent => "Torrents",
             TypeSel::Nntp => "NNTP / NZB",
             TypeSel::Ftp => "FTP / SFTP",
-            TypeSel::Stream => "Streams",
             TypeSel::YtDlp => "YT-DLP",
             TypeSel::Metalink => "Metalink",
             TypeSel::Http => "HTTP",
@@ -3166,7 +3693,6 @@ impl TypeSel {
             TypeSel::Torrent => Icon::Down,
             TypeSel::Nntp => Icon::Queue,
             TypeSel::Ftp => Icon::Globe,
-            TypeSel::Stream => Icon::Play,
             TypeSel::YtDlp => Icon::Video,
             TypeSel::Metalink => Icon::Link,
             TypeSel::Http => Icon::Download,
@@ -3180,7 +3706,6 @@ impl TypeSel {
             (TypeSel::Torrent, Torrent)
                 | (TypeSel::Nntp, Nntp)
                 | (TypeSel::Ftp, Ftp | Ftps | Sftp)
-                | (TypeSel::Stream, Dash | Hls)
                 | (TypeSel::YtDlp, YtDlp)
                 | (TypeSel::Metalink, Metalink)
                 | (TypeSel::Http, Http)
@@ -4130,6 +4655,28 @@ fn yt_choice_from_state(st: &YtProbeState) -> ytdlp::YtChoice {
     }
 }
 
+/// Friendly one-line summary + first raw line (<=160 chars) for a yt-dlp error.
+/// Full raw text must never render inline; UI shows it only under Details.
+fn yt_error_summary(e: &str) -> (String, String) {
+    let first = e
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default();
+    let raw_first_line: String = first.chars().take(160).collect();
+    let t = e.trim();
+    let friendly = if t.contains("page needs") || t.contains("Sign in") {
+        "YouTube rejected browser cookies (yt-dlp limitation). Retries without cookies; public videos need no login.".to_string()
+    } else if t.contains("NoneType") || t.contains("has no attribute") || t.starts_with("ERROR:") {
+        "yt-dlp could not read this page/stream (extractor error). Download below still works.".to_string()
+    } else if raw_first_line.is_empty() {
+        "yt-dlp probe failed.".to_string()
+    } else {
+        format!("yt-dlp probe failed: {raw_first_line}")
+    };
+    (friendly, raw_first_line)
+}
+
 /// Quality/audio/subtitle picker. `id` prefixes egui ids per dialog.
 #[allow(clippy::too_many_arguments)]
 fn ui_yt_probe_section(
@@ -4152,33 +4699,26 @@ fn ui_yt_probe_section(
         return;
     }
     if !st.error.is_empty() {
-        // Extractor bugs (GloboArticle NoneType crash) surface as raw
-        // ERROR:/traceback text; friendly line first, raw kept below.
-        let e = st.error.trim();
-        let cookie_err = e.contains("page needs") || e.contains("Sign in");
-        let extractor_err =
-            e.contains("NoneType") || e.contains("has no attribute") || e.starts_with("ERROR:");
-        if cookie_err {
-            ui.label(
-                egui::RichText::new("YouTube rejected browser cookies (yt-dlp limitation). Webcraft retries without cookies; public videos need no login. If persists, paste link in Add URL instead.")
-                    .color(theme::ERR)
-                    .small(),
-            );
-            ui.label(egui::RichText::new(e).color(theme::TEXT_FAINT).small());
-        } else if extractor_err {
-            ui.label(
-                egui::RichText::new("yt-dlp could not read this page/stream (extractor error). Download below still works.")
-                    .color(theme::ERR)
-                    .small(),
-            );
-            ui.label(egui::RichText::new(e).color(theme::TEXT_FAINT).small());
-        } else {
-            ui.label(
-                egui::RichText::new(format!("yt-dlp probe failed: {}", st.error))
-                    .color(theme::ERR)
-                    .small(),
-            );
-        }
+        let (friendly, _) = yt_error_summary(&st.error);
+        ui.add(
+            egui::Label::new(egui::RichText::new(friendly).color(theme::ERR).small()).wrap(),
+        );
+        egui::CollapsingHeader::new(egui::RichText::new("Details").small())
+            .id_salt(format!("{id}_yt_err_details"))
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt(format!("{id}_yt_err_scroll"))
+                    .max_height(110.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&st.error).color(theme::TEXT_FAINT).small(),
+                            )
+                            .wrap(),
+                        );
+                    });
+            });
         if ghost_btn_w(ui, "Retry probe").clicked() {
             start_yt_probe(st, rt, url, referrer, cookies, cookies_json);
         }
@@ -4191,7 +4731,8 @@ fn ui_yt_probe_section(
         return;
     };
     if !dump.title.is_empty() {
-        ui.label(egui::RichText::new(&dump.title).strong());
+        ui.add(egui::Label::new(egui::RichText::new(&dump.title).strong()).truncate())
+            .on_hover_text(&dump.title);
     }
     let mut meta: Vec<String> = Vec::new();
     if !dump.uploader().is_empty() {
@@ -4237,6 +4778,7 @@ fn ui_yt_probe_section(
                         .clicked()
                     {
                         st.format = f.format_id.clone();
+                        st.quality.clear();
                         st.extract.clear();
                         if f.is_video_only() {
                             if st.audio.is_empty() {
@@ -4256,11 +4798,25 @@ fn ui_yt_probe_section(
                             .clicked()
                         {
                             st.format = v;
+                            st.quality.clear();
                         }
                     }
                 }
             });
-        // Max-height tier; backend precedence: exact format > tier > auto.
+        {
+            let vids = dump.video_formats();
+            let max_h = vids.iter().filter_map(|f| f.height).max().unwrap_or(0);
+            if !vids.is_empty() && vids.len() <= 2 && max_h <= 360 {
+                ui.label(
+                    egui::RichText::new(
+                        "yt-dlp returned limited formats (cookie session) — qualities may missing. Webcraft retries without cookies automatically.",
+                    )
+                    .color(theme::WARN)
+                    .small(),
+                );
+            }
+        }
+        // Max-height tier; selecting a tier clears any exact format (mutually exclusive).
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("Max")
@@ -4285,11 +4841,14 @@ fn ui_yt_probe_section(
                     ] {
                         if ui.selectable_label(st.quality == v, lbl).clicked() {
                             st.quality = v.to_string();
+                            if !v.is_empty() {
+                                st.format.clear();
+                            }
                         }
                     }
                 })
                 .response
-                .on_hover_text("Max quality tier. Ignored if an exact format is picked above.");
+                .on_hover_text("Max quality tier. Selecting a tier clears any exact format picked above.");
         });
         ui.end_row();
         if !is_audio_sel {
@@ -4427,6 +4986,28 @@ fn stat_tile(ui: &mut egui::Ui, label: &str, value: String) {
 }
 
 /// TextEdit filling grid field col.
+/// Header draft row check: Ok = empty (ignored) or valid wire header.
+/// Name must parse as HTTP header name; value must not contain CR/LF.
+/// Error text never includes the value (may hold a token).
+fn header_row_error(name: &str, value: &str) -> Option<String> {
+    let (name, value) = (name.trim(), value.trim());
+    if name.is_empty() && value.is_empty() {
+        return None;
+    }
+    if name.is_empty() {
+        return Some("Header name is empty.".into());
+    }
+    if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+        return Some(format!("Invalid header name: {name}"));
+    }
+    if reqwest::header::HeaderValue::from_str(value).is_err() {
+        return Some(format!(
+            "Invalid value for header {name} (CR/LF not allowed)."
+        ));
+    }
+    None
+}
+
 fn fill_edit<'a>(buf: &'a mut String) -> egui::TextEdit<'a> {
     egui::TextEdit::singleline(buf).desired_width(f32::INFINITY)
 }
@@ -4517,7 +5098,7 @@ impl DownloadApp {
                 if icon_btn(ui, Icon::Plus, "Add URL", true, 86.0).clicked() {
                     {
                         self.show_add = true;
-                        self.add_just_opened = true;
+                        self.add_just_opened = true; self.add_raise_frames = 90; self.add_focus_done = false;
                     }
                 }
             });
@@ -4768,7 +5349,7 @@ impl DownloadApp {
                 } else {
                     ui.label(egui::RichText::new("No downloads here").color(theme::TEXT_MUTED).size(14.0));
                     ui.label(egui::RichText::new("Add a URL, paste from clipboard (Tasks → Add batch), or send from browser extension.").color(theme::TEXT_MUTED));
-                    if theme::primary_btn(ui, "+ Add URL").clicked() { { self.show_add = true; self.add_just_opened = true; } }
+                    if theme::primary_btn(ui, "+ Add URL").clicked() { { self.show_add = true; self.add_just_opened = true; self.add_raise_frames = 90; self.add_focus_done = false; } }
                 }
                 ui.add_space(24.0);
             });
@@ -4790,7 +5371,7 @@ impl DownloadApp {
 
                     ui.horizontal(|ui| { ui.spacing_mut().item_spacing.x = COL_GAP; let mut ci = 0usize; let mut nw = || { ci += 1; cols[ci - 1] };
                         let task_rate = self.task_rate(&t.id);
-                        cell(ui, nw(), |ui| { let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover()); icon(ui.painter(), &cat_icon(&t.filename), irect, theme::TEXT_MUTED); let kind = crate::stream::proto_kind(&t); let bw = theme::badge_width(ui, kind.label()); if ui.available_width() - bw >= 60.0 { theme::badge(ui, kind.label(), theme::proto_color(kind)); } ui.add(egui::Label::new(egui::RichText::new(&t.filename).color(theme::TEXT).small()).truncate().selectable(false)).on_hover_text(if t.error.is_empty() { format!("{} - {}\n{}", kind.full_name(), t.filename, t.url) } else { format!("{}\nError: {}", t.filename, t.error) }); });
+                        cell(ui, nw(), |ui| { let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover()); icon(ui.painter(), &cat_icon(&t.filename), irect, theme::TEXT_MUTED); let kind = crate::stream::proto_kind(&t); let bw = theme::badge_width(ui, kind.label()); if ui.available_width() - bw >= 60.0 { theme::badge(ui, kind.label(), theme::proto_color(kind)); } if !t.debrid_info.is_empty() { let db = theme::badge_width(ui, "Debrid"); if ui.available_width() - db >= 60.0 { theme::badge(ui, "Debrid", theme::TEAL_500); } } ui.add(egui::Label::new(egui::RichText::new(&t.filename).color(theme::TEXT).small()).truncate().selectable(false)).on_hover_text(if t.error.is_empty() { format!("{} - {}\n{}{}", kind.full_name(), t.filename, t.url, if t.debrid_info.is_empty() { String::new() } else { format!("\nDebrid: {}", t.debrid_info) }) } else { format!("{}\nError: {}", t.filename, t.error) }); });
                         if !compact_table { let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(if t.queue_id.is_empty() { "main" } else { &t.queue_id }).color(theme::TEXT_MUTED).small()).truncate().selectable(false)).on_hover_text(if t.queue_id.is_empty() { "main".to_string() } else { t.queue_id.clone() })); }
                         let w = nw(); cell_r(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(match t.total { Some(n) => fmt_bytes(n), None => "—".into() }).color(theme::TEXT_MUTED).small()).truncate().selectable(false)).on_hover_text(match t.total { Some(n) => fmt_bytes(n), None => "unknown size".to_string() }));
                         let sc = theme::status_color(t.status);
@@ -4917,6 +5498,8 @@ impl DownloadApp {
                     self.cap_vp_sent = None;
                     self.cap_body_h = None;
                     self.capture_raise = true;
+                    self.cap_raise_frames = 90;
+                    self.cap_focus_done = false;
                 }
                 None => return,
             }
@@ -4971,9 +5554,13 @@ impl DownloadApp {
                         .id(egui::Id::new("capture-name"))
                         .desired_width(f32::INFINITY),
                 );
-                if app.capture_just_opened {
+                let vp_focused = ui.ctx().input(|i| i.focused);
+                if app.capture_just_opened || (vp_focused && !app.cap_focus_done) {
                     name_resp.request_focus();
                     focus_name = true;
+                    if vp_focused {
+                        app.cap_focus_done = true;
+                    }
                 }
                 ui.end_row();
                 if let Some(total) = t.total {
@@ -5058,6 +5645,18 @@ impl DownloadApp {
                             t.headers.remove("x-ytdlp");
                         }
                     }
+                }
+            }
+            // HTTP prewarm for captured files (mirrors Add dialog).
+            if prewarm_eligible(&t) {
+                prewarm_poll(&mut app.prewarm_cap, &t.url);
+                let rt = app.tokio_rt.clone();
+                let conns = crate::lock_unpoison(&app.rt).state.settings.max_connections;
+                spawn_prewarm(&mut app.prewarm_cap, &rt, &t, conns);
+                if !app.prewarm_cap.text.is_empty() {
+                    ui.label(egui::RichText::new(&app.prewarm_cap.text).small().color(theme::TEXT_MUTED));
+                } else if app.prewarm_cap.loading {
+                    ui.label(egui::RichText::new("Probing…").small().color(theme::TEXT_MUTED));
                 }
             }
             // yt-dlp picker: video page or explicit yt-dlp engine.
@@ -5147,9 +5746,17 @@ impl DownloadApp {
         if self.capture_raise {
             self.capture_raise = false;
             ctx.send_viewport_cmd_to(vp_id("webcraft-capture"), egui::ViewportCommand::Focus);
+        } else if self.cap_raise_frames > 0 {
+            self.cap_raise_frames -= 1;
+            ctx.send_viewport_cmd_to(vp_id("webcraft-capture"), egui::ViewportCommand::Focus);
+        }
+        if self.cap_raise_frames > 0 {
+            crate::platform::raise_window(std::process::id(), "Download file");
         }
         let mut cap_body = Some(cap_body);
+        let mut cap_focused = false;
         ctx.show_viewport_immediate(vp_id("webcraft-capture"), builder, |ctx, class| {
+            cap_focused = ctx.input(|i| i.focused);
             if !matches!(class, egui::ViewportClass::Embedded) {
                 fit_vp(
                     ctx,
@@ -5226,7 +5833,11 @@ impl DownloadApp {
                     });
             }
         });
+        if cap_focused {
+            self.cap_raise_frames = 0;
+        }
         let Some(act) = action else { return };
+        self.cap_raise_frames = 0;
         let mut t = self.capture_task.take().unwrap();
         let name_input = std::mem::take(&mut self.capture_name);
         match act {
@@ -5253,6 +5864,12 @@ impl DownloadApp {
                     }
                 }
                 self.yt_probe_cap = YtProbeState::default();
+                // "later" keeps no download running: drop prewarm (single-use
+                // take on next start would be stale anyway past 120s).
+                if act == "later" && !self.prewarm_cap.url.is_empty() {
+                    engine::prewarm_drop(&self.prewarm_cap.url.clone());
+                }
+                self.prewarm_cap = PrewarmState::default();
                 // Category combo in dialog wins (write-back above); don't
                 // recompute from filename and silently revert user pick.
                 // dest_dir already shown/editable in dialog (Browse wins);
@@ -5274,10 +5891,16 @@ impl DownloadApp {
                 // start_task locks rt itself — call outside lock scope.
                 if let Some(id) = start_id {
                     self.start_task(&id);
+                } else {
+                    ctx.request_repaint();
                 }
             }
             _ => {
                 self.yt_probe_cap = YtProbeState::default();
+                if !self.prewarm_cap.url.is_empty() {
+                    engine::prewarm_drop(&self.prewarm_cap.url.clone());
+                }
+                self.prewarm_cap = PrewarmState::default();
                 /* Cancel: drop task entirely. */
             }
         }
@@ -5606,8 +6229,16 @@ impl DownloadApp {
             self.add_vp_sent = None;
             self.add_body_h = None;
             ctx.send_viewport_cmd_to(vp_id("webcraft-add"), egui::ViewportCommand::Focus);
+        } else if self.add_raise_frames > 0 {
+            self.add_raise_frames -= 1;
+            ctx.send_viewport_cmd_to(vp_id("webcraft-add"), egui::ViewportCommand::Focus);
         }
+        if self.add_raise_frames > 0 {
+            crate::platform::raise_window(std::process::id(), "Add download");
+        }
+        let mut add_focused = false;
         ctx.show_viewport_immediate(vp_id("webcraft-add"), builder, |ctx, class| {
+            add_focused = ctx.input(|i| i.focused);
             if !matches!(class, egui::ViewportClass::Embedded) {
                 fit_vp(ctx, vp_id("webcraft-add"), egui::vec2(560.0, 680.0), self.add_body_h, &mut self.add_vp_sent);
             }
@@ -5618,6 +6249,11 @@ impl DownloadApp {
                 cancel = true;
             }
             let body = |ui: &mut egui::Ui, app: &mut Self, start: &mut Option<bool>, cancel: &mut bool| {
+                // Invalid header row blocks Add like other dialog gates.
+                let hdr_error = app
+                    .add_headers
+                    .iter()
+                    .find_map(|(n, v)| header_row_error(n, v));
                 let out = egui::ScrollArea::vertical()
                     .id_salt("add-main")
                     .auto_shrink([false, false])
@@ -5632,13 +6268,17 @@ impl DownloadApp {
                                 .id(egui::Id::new("add-url"))
                                 .hint_text("https://… or magnet:?xt=urn:btih:…"),
                         );
-                        if app.add_just_opened {
+                        let vp_focused = ui.ctx().input(|i| i.focused);
+                        if app.add_just_opened || (vp_focused && !app.add_focus_done) {
                             resp.request_focus();
+                            if vp_focused {
+                                app.add_focus_done = true;
+                            }
                             app.add_just_opened = false;
                         }
                         // Same gates as Start button: no Enter bypass while
                         // probing or with zero torrent files selected.
-                        let enter_blocked = app.add_torrent_loading || app.yt_probe_add.loading
+                        let enter_blocked = hdr_error.is_some() || app.add_torrent_loading || app.yt_probe_add.loading
                             || (crate::torrent::is_torrent_url(&app.add_url)
                                 && app.add_torrent_files.len() > 1
                                 && app.add_torrent_files.iter().all(|(_, s)| !s));
@@ -5736,6 +6376,33 @@ impl DownloadApp {
                         let (u, r, c) = (app.add_url.trim().to_string(), app.add_referrer.clone(), app.add_cookies.clone());
                         let rt = app.tokio_rt.clone();
                         ui_yt_probe_section(ui, &mut app.yt_probe_add, "add", &u, &r, &c, "", &rt);
+                    } else if !app.add_url.trim().is_empty() {
+                        // HTTP prewarm: stable probe-able URL spawns background
+                        // probe+plan; confirm never waits for it.
+                        let t = DownloadTask {
+                            url: normalize_webdav(app.add_url.trim()),
+                            referrer: app.add_referrer.clone(),
+                            cookies: app.add_cookies.clone(),
+                            username: app.add_user.clone(),
+                            password: app.add_pass.clone(),
+                            ..Default::default()
+                        };
+                        // Changed URL since last frame: stale prewarm dropped.
+                        if !app.prewarm_add.url.is_empty() && app.prewarm_add.url != t.url {
+                            engine::prewarm_drop(&app.prewarm_add.url.clone());
+                            app.prewarm_add = PrewarmState::default();
+                        }
+                        if prewarm_eligible(&t) {
+                            prewarm_poll(&mut app.prewarm_add, &t.url);
+                            let rt = app.tokio_rt.clone();
+                            let conns = crate::lock_unpoison(&app.rt).state.settings.max_connections;
+                            spawn_prewarm(&mut app.prewarm_add, &rt, &t, conns);
+                            if !app.prewarm_add.text.is_empty() {
+                                ui.label(egui::RichText::new(&app.prewarm_add.text).small().color(theme::TEXT_MUTED));
+                            } else if app.prewarm_add.loading {
+                                ui.label(egui::RichText::new("Probing…").small().color(theme::TEXT_MUTED));
+                            }
+                        }
                     }
                     ui.add_space(theme::SP_SM);
                     section(ui, "Transfer");
@@ -5758,6 +6425,32 @@ impl DownloadApp {
                         ui.end_row();
                     });
                     ui.add_space(theme::SP_SM);
+                    egui::CollapsingHeader::new("Headers (advanced) — HTTP/HTTPS only")
+                        .id_salt("add-headers-hdr")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("Sent only on HTTP/HTTPS downloads. Ignored for FTP, SFTP and torrents.").color(theme::TEXT_FAINT).small());
+                            let mut rm: Option<usize> = None;
+                            for (i, (hn, hv)) in app.add_headers.iter_mut().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::TextEdit::singleline(hn).hint_text("Name").desired_width(150.0));
+                                    let is_auth = hn.trim().eq_ignore_ascii_case("authorization");
+                                    ui.add(egui::TextEdit::singleline(hv).hint_text(if is_auth { "Bearer <token>" } else { "Value" }).password(is_auth).desired_width(220.0));
+                                    if icon_btn(ui, Icon::Delete, "", false, 28.0).on_hover_text("Remove header").clicked() { rm = Some(i); }
+                                });
+                            }
+                            if let Some(i) = rm { app.add_headers.remove(i); }
+                            if let Some(e) = &hdr_error {
+                                ui.label(egui::RichText::new(e.clone()).color(theme::ERR).small());
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.small_button("+ Row").clicked() { app.add_headers.push((String::new(), String::new())); }
+                                for (pn, pv) in [("User-Agent", ""), ("Referer", ""), ("Authorization", "Bearer "), ("Accept", "")] {
+                                    if ui.small_button(pn).clicked() { app.add_headers.push((pn.into(), pv.into())); }
+                                }
+                            });
+                            ui.label(egui::RichText::new("Authorization preset: replace trailing text with your token — stored as \"Bearer <token>\". Rows editable/removable.").color(theme::TEXT_FAINT).small());
+                        });
                     let auth_resp = egui::CollapsingHeader::new("Auth (advanced)")
                         .id_salt("add-auth-hdr")
                         .default_open(false)
@@ -5806,7 +6499,7 @@ impl DownloadApp {
                     }
                     if ui
                         .add_enabled_ui(
-                            !app.add_url.trim().is_empty() && !app.add_torrent_loading && !app.yt_probe_add.loading && !torrent_blocked,
+                            !app.add_url.trim().is_empty() && !app.add_torrent_loading && !app.yt_probe_add.loading && !torrent_blocked && hdr_error.is_none(),
                             |ui| primary_btn_w(ui, "Start download"),
                         )
                         .inner
@@ -5837,8 +6530,12 @@ impl DownloadApp {
                 });
             }
         });
+        if add_focused {
+            self.add_raise_frames = 0;
+        }
         if cancel {
             self.show_add = false;
+            self.add_raise_frames = 0;
             return;
         }
         if let Some(start_now) = start {
@@ -5864,6 +6561,15 @@ impl DownloadApp {
                         .collect::<Vec<_>>(),
                     self.add_desc.clone(),
                 );
+                // Valid non-empty rows only; invalid blocked at dialog gate.
+                let custom_headers: std::collections::BTreeMap<String, String> = self
+                    .add_headers
+                    .iter()
+                    .map(|(n, v)| (n.trim().to_string(), v.trim().to_string()))
+                    .filter(|(n, v)| {
+                        !(n.is_empty() && v.is_empty()) && header_row_error(n, v).is_none()
+                    })
+                    .collect();
                 // Debrid magnet fan-out: resolve async, poll_debrid_add
                 // creates one task per file. Picker selection ignored here
                 // (provider file names != librqbit indices).
@@ -5898,6 +6604,7 @@ impl DownloadApp {
                             ctx2.request_repaint();
                         });
                         self.show_add = false;
+                        self.add_raise_frames = 0;
                         return;
                     }
                 }
@@ -5917,6 +6624,7 @@ impl DownloadApp {
                         t.ssh_key_path = key;
                         t.mirrors = mirrors;
                         t.description = desc;
+                        t.headers.extend(custom_headers.clone());
                         // Torrent picker: empty vec = all files; validate vs probe.
                         // Only for torrent tasks; stale picker state must not leak.
                         if crate::torrent::is_torrent_task(t) && !self.add_torrent_files.is_empty()
@@ -5978,11 +6686,17 @@ impl DownloadApp {
                             t.status = TaskStatus::Paused;
                         }
                     }
-                    g.save();
+                    // start_task saves after flipping to Downloading; double
+                    // save skipped only on start_now path.
+                    if !start_now {
+                        g.save();
+                    }
                     id
                 };
                 if start_now {
                     self.start_task(&id);
+                } else {
+                    ctx.request_repaint();
                 }
                 // Clear draft incl. password: no stale secrets next open.
                 self.add_url.clear();
@@ -5998,10 +6712,17 @@ impl DownloadApp {
                 self.add_user.clear();
                 self.add_pass.clear();
                 self.add_key.clear();
+                self.add_headers.clear();
                 self.add_mirrors.clear();
                 self.add_desc.clear();
                 self.yt_probe_add = YtProbeState::default();
+                // Cancel: drop prewarm entry (abandoned cost = 1 range request).
+                if !self.prewarm_add.url.is_empty() {
+                    engine::prewarm_drop(&self.prewarm_add.url.clone());
+                }
+                self.prewarm_add = PrewarmState::default();
                 self.show_add = false;
+                self.add_raise_frames = 0;
             }
         }
     }
@@ -6034,7 +6755,15 @@ impl DownloadApp {
             .with_resizable(true);
         if self.progress_raise {
             self.progress_raise = false;
+            self.prog_raise_frames = 90;
+            self.prog_raise_title = format!("Progress - {}", t.filename);
             ctx.send_viewport_cmd_to(vp_id("webcraft-progress"), egui::ViewportCommand::Focus);
+        } else if self.prog_raise_frames > 0 {
+            self.prog_raise_frames -= 1;
+            ctx.send_viewport_cmd_to(vp_id("webcraft-progress"), egui::ViewportCommand::Focus);
+        }
+        if self.prog_raise_frames > 0 {
+            crate::platform::raise_window(std::process::id(), &self.prog_raise_title.clone());
         }
         let task_rate = self.task_rate(&t.id);
         let eta_txt = match t.total {
@@ -6097,9 +6826,24 @@ impl DownloadApp {
                 } else {
                     theme::status_color(t.status)
                 };
-                let status_lbl = if t.status == TaskStatus::Downloading && (t.headers.contains_key("x-ytdlp") || ytdlp::is_video_page(&t.url)) { crate::engine::phase_name(app.phase_map.get(&t.id).copied().unwrap_or(0)).to_string() } else { format!("{:?}", t.status) };
+                let status_lbl = if t.status == TaskStatus::Downloading
+                    && (t.headers.contains_key("x-ytdlp") || ytdlp::is_video_page(&t.url))
+                {
+                    crate::engine::phase_name(app.phase_map.get(&t.id).copied().unwrap_or(0))
+                        .to_string()
+                } else {
+                    format!("{:?}", t.status)
+                };
                 theme::badge(ui, &status_lbl, sc);
                 theme::badge(ui, kind.label(), theme::proto_color(kind));
+                if !t.debrid_info.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&t.debrid_info)
+                            .color(theme::TEAL_500)
+                            .small(),
+                    )
+                    .on_hover_text(&t.debrid_info);
+                }
                 theme::badge(
                     ui,
                     if t.category.is_empty() {
@@ -6704,7 +7448,9 @@ impl DownloadApp {
             (b_close, b_toggle, b_copy)
         };
         let mut body = Some(body);
+        let mut prog_focused = false;
         ctx.show_viewport_immediate(vp_id("webcraft-progress"), builder, |ctx, class| {
+            prog_focused = ctx.input(|i| i.focused);
             if ctx.input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape)) {
                 close = true;
             }
@@ -6743,6 +7489,12 @@ impl DownloadApp {
             copy_link |= out.2;
         });
         self.prog_vp_sent = prog_sent;
+        if prog_focused {
+            self.prog_raise_frames = 0;
+        }
+        if close {
+            self.prog_raise_frames = 0;
+        }
         if copy_link {
             if let Ok(mut cb) = arboard::Clipboard::new() {
                 let _ = cb.set_text(t.url.clone());
@@ -6945,6 +7697,7 @@ impl DownloadApp {
                                 x.retry_interval_secs = interval;
                             }
                             g.save();
+                            ui.ctx().request_repaint();
                         }
                     });
                 });
@@ -6963,6 +7716,7 @@ impl DownloadApp {
                         let mut g = crate::lock_unpoison(&self.rt);
                         g.state.settings.scheduler_enabled = master;
                         g.save();
+                        ui.ctx().request_repaint();
                     }
                 });
             });
@@ -7398,6 +8152,195 @@ impl DownloadApp {
         }
     }
 
+    fn ui_streams(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(8.0);
+                ui.heading("Streams");
+                ui.add_space(6.0);
+                theme::panel().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    section(ui, "Play in mpv (embedded in app)");
+                    form_grid("streams-grid").show(ui, |ui| {
+                        form_label(ui, "Video URL");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.stream_url)
+                                .hint_text(
+                                    "https://example.com/video.mp4, .m3u8, or local file path",
+                                )
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.end_row();
+                    });
+                    let url = self.stream_url.trim().to_string();
+                    let ctx = ui.ctx().clone();
+                    ui.horizontal_wrapped(|ui| {
+                        if icon_btn_enabled(
+                            ui,
+                            Icon::Play,
+                            "Play in mpv",
+                            true,
+                            120.0,
+                            !url.is_empty(),
+                        )
+                        .clicked()
+                        {
+                            self.play_embedded(&url);
+                            self.stream_status_err = self.stream_status.starts_with("ERR ");
+                        }
+                        if theme::ghost_btn(ui, "Paste").clicked() {
+                            if let Ok(mut cb) = arboard::Clipboard::new() {
+                                if let Ok(txt) = cb.get_text() {
+                                    if !txt.trim().is_empty() {
+                                        self.stream_url = txt.trim().to_string();
+                                    }
+                                }
+                            }
+                            ctx.request_repaint();
+                        }
+                        if theme::ghost_btn(ui, "Clear").clicked() {
+                            self.stream_url.clear();
+                            self.stream_status.clear();
+                            self.stream_status_err = false;
+                            ctx.request_repaint();
+                        }
+                        if theme::ghost_btn(ui, "Download").clicked() && !url.is_empty() {
+                            let id = {
+                                let mut g = crate::lock_unpoison(&self.rt);
+                                g.add_url(&url, "main", "", "")
+                            };
+                            // Add dialog may have queued it already.
+                            let queued = {
+                                let g = crate::lock_unpoison(&self.rt);
+                                g.state
+                                    .tasks
+                                    .iter()
+                                    .find(|t| t.id == id)
+                                    .is_some_and(|t| t.status == TaskStatus::Queued)
+                            };
+                            if queued {
+                                self.start_task(&id);
+                            }
+                            self.tab = Tab::Downloads;
+                            ctx.request_repaint();
+                        }
+                    });
+                    if !self.stream_status.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(self.stream_status.clone())
+                                .color(if self.stream_status_err {
+                                    theme::ERR
+                                } else {
+                                    theme::OK
+                                })
+                                .small(),
+                        );
+                    }
+                    ui.add_space(6.0);
+                    let mpv_found = {
+                        let g = crate::lock_unpoison(&self.rt);
+                        downloadcraft_lib::mpv::find_mpv(&g.state.settings.mpv_path)
+                    };
+                    match mpv_found {
+                        Some(p) => {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "mpv (embedded in app): {}",
+                                    p.display()
+                                ))
+                                .color(theme::TEXT_FAINT)
+                                .small(),
+                            );
+                        }
+                        None => {
+                            ui.label(
+                                egui::RichText::new(
+                                    "mpv not found. Install mpv or set Options > mpv > Path.",
+                                )
+                                .color(theme::ERR)
+                                .small(),
+                            );
+                        }
+                    }
+                });
+                ui.add_space(10.0);
+                theme::panel().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    section(ui, "Stream downloads");
+                    let rows: Vec<(String, String, String, TaskStatus)> = {
+                        let g = crate::lock_unpoison(&self.rt);
+                        g.state
+                            .tasks
+                            .iter()
+                            .filter(|t| {
+                                matches!(
+                                    crate::stream::proto_kind(t),
+                                    crate::stream::ProtoKind::Dash | crate::stream::ProtoKind::Hls
+                                )
+                            })
+                            .map(|t| (t.id.clone(), t.filename.clone(), t.url.clone(), t.status))
+                            .collect()
+                    };
+                    if rows.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No DASH/HLS downloads yet.")
+                                .color(theme::TEXT_MUTED)
+                                .small(),
+                        );
+                    }
+                    let mut to_play: Option<String> = None;
+                    let mut to_start: Option<String> = None;
+                    for (id, filename, url, status) in &rows {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(filename).color(theme::TEXT),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(url);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(url).color(theme::TEXT_MUTED).small(),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(url);
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    theme::badge(
+                                        ui,
+                                        &format!("{status:?}"),
+                                        theme::status_color(*status),
+                                    );
+                                    if *status != TaskStatus::Downloading
+                                        && theme::ghost_btn(ui, "Start download").clicked()
+                                    {
+                                        to_start = Some(id.clone());
+                                    }
+                                    if icon_btn(ui, Icon::Play, "Play", false, 78.0).clicked() {
+                                        to_play = Some(url.clone());
+                                    }
+                                },
+                            );
+                        });
+                        ui.separator();
+                    }
+                    if let Some(url) = to_play {
+                        self.play_embedded(&url);
+                        self.stream_status_err = self.stream_status.starts_with("ERR ");
+                    }
+                    if let Some(id) = to_start {
+                        self.start_task(&id);
+                    }
+                });
+            });
+    }
     fn ui_grabber(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -7953,6 +8896,7 @@ impl DownloadApp {
                 (5, "Proxy", Icon::Link),
                 (6, "Browser", Icon::Globe),
                 (8, "Debrid", Icon::Link),
+                (9, "mpv", Icon::Play),
                 (7, "About", Icon::Info),
             ] {
                 if icon_btn(ui, ic, name, self.options_tab == i, 104.0).clicked() {
@@ -8291,6 +9235,64 @@ impl DownloadApp {
                     }
                     ui.label(egui::RichText::new("Hoster status re-checked on Options open when stale (>10 min) and via Refresh. Multi-file magnets: Add dialog resolves via debrid and creates one task per file; starting a single magnet task directly only works for single-file magnets (falls back to local torrent otherwise).").color(theme::TEXT_FAINT).small());
                 }
+                9 => {
+                    section(ui, "mpv player");
+                    form_grid("opts-mpv-grid").show(ui, |ui| {
+                        form_label(ui, "Path");
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut settings.mpv_path).hint_text("empty = auto-detect beside exe / config bin / PATH").desired_width(f32::INFINITY));
+                            if icon_btn(ui, Icon::FolderOpen, "Browse", false, 96.0).clicked() {
+                                if let Some(path) = rfd::FileDialog::new().pick_file() {
+                                    settings.mpv_path = path.display().to_string();
+                                }
+                            }
+                        });
+                        ui.end_row();
+                        form_label(ui, "Volume");
+                        ui.add(egui::Slider::new(&mut settings.mpv_volume, 0..=100).text("Volume"));
+                        ui.end_row();
+                        form_label(ui, "Speed");
+                        ui.add_sized([DRAG_W, theme::BTN_H], drag(&mut settings.mpv_speed).range(0.25..=4.0).speed(0.05));
+                        ui.end_row();
+                        form_label(ui, "Start position");
+                        ui.add(egui::TextEdit::singleline(&mut settings.mpv_start).hint_text("90 or 00:01:30 or 50%").desired_width(f32::INFINITY));
+                        ui.end_row();
+                        form_label(ui, "Hardware decoding");
+                        egui::ComboBox::from_id_salt("mpv-hwdec")
+                            .selected_text(if settings.mpv_hwdec.is_empty() { "Auto" } else { settings.mpv_hwdec.as_str() })
+                            .show_ui(ui, |ui| {
+                                for opt in ["", "auto-safe", "yes", "no"] {
+                                    ui.selectable_value(&mut settings.mpv_hwdec, opt.to_string(), if opt.is_empty() { "Auto" } else { opt });
+                                }
+                            });
+                        ui.end_row();
+                        form_label(ui, "Subtitles");
+                        egui::ComboBox::from_id_salt("mpv-sub-auto")
+                            .selected_text(if settings.mpv_sub_auto.is_empty() { "Auto" } else { settings.mpv_sub_auto.as_str() })
+                            .show_ui(ui, |ui| {
+                                for opt in ["", "all", "fuzzy", "exact", "no"] {
+                                    ui.selectable_value(&mut settings.mpv_sub_auto, opt.to_string(), if opt.is_empty() { "Auto" } else { opt });
+                                }
+                            });
+                        ui.end_row();
+                        form_label(ui, "Cache seconds");
+                        ui.add_sized([DRAG_W, theme::BTN_H], drag(&mut settings.mpv_cache_secs).range(0..=600));
+                        ui.end_row();
+                        form_label(ui, "Extra flags");
+                        ui.add(egui::TextEdit::singleline(&mut settings.mpv_extra_args).hint_text("--profile=fast (advanced)").desired_width(f32::INFINITY));
+                        ui.end_row();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(LABEL_W + 12.0);
+                        ui.vertical(|ui| {
+                            ui.checkbox(&mut settings.mpv_fullscreen, "Fullscreen");
+                            ui.checkbox(&mut settings.mpv_keep_open, "Keep open (--keep-open)");
+                            ui.checkbox(&mut settings.mpv_loop, "Loop file");
+                            ui.checkbox(&mut settings.mpv_cache, "Cache");
+                        });
+                    });
+                    ui.label(egui::RichText::new("Flags apply to Play in mpv on the Streams page. Changes save automatically like other options.").color(theme::TEXT_FAINT).small());
+                }
                 _ => {
                     section(ui, "About");
                     ui.label(egui::RichText::new("App updates").strong());
@@ -8544,6 +9546,100 @@ mod progress_tests {
     }
 
     #[test]
+    fn capped_wake_ms_deadlines() {
+        let now = 1_700_000_000u64;
+        let (day, secs) = (20_000i64, 43_200u32); // noon
+        let queues = vec![
+            Queue {
+                id: "main".into(),
+                auto_start: true,
+                ..Default::default()
+            },
+            Queue {
+                id: "off".into(),
+                auto_start: false,
+                ..Default::default()
+            },
+        ];
+        let mk = |queue: &str, retry_at: u64| DownloadTask {
+            url: "https://ex.com/f".into(),
+            queue_id: queue.into(),
+            status: TaskStatus::Queued,
+            next_retry_at: retry_at,
+            ..Default::default()
+        };
+        let empty: &[DownloadTask] = &[];
+        // Nothing armed: idle base untouched (no forced loop).
+        assert_eq!(
+            capped_wake_ms(5_000, now, day, secs, empty, &queues, &[], true),
+            5_000
+        );
+        // Startable now (ungated / gate passed): next frame.
+        assert_eq!(
+            capped_wake_ms(5_000, now, day, secs, &[mk("main", 0)], &queues, &[], true),
+            0
+        );
+        assert_eq!(
+            capped_wake_ms(
+                5_000,
+                now,
+                day,
+                secs,
+                &[mk("main", now - 1)],
+                &queues,
+                &[],
+                true
+            ),
+            0
+        );
+        // Gate in 30s: capped at gate, not 5s idle cadence remainder.
+        assert_eq!(
+            capped_wake_ms(
+                120_000,
+                now,
+                day,
+                secs,
+                &[mk("main", now + 30)],
+                &queues,
+                &[],
+                true
+            ),
+            30_000
+        );
+        // Non-auto-start queue ignored.
+        assert_eq!(
+            capped_wake_ms(5_000, now, day, secs, &[mk("off", 0)], &queues, &[], true),
+            5_000
+        );
+        // Scheduler next start in 60s caps; disabled master ignores it.
+        let sch = Schedule {
+            id: "s".into(),
+            queue_id: "main".into(),
+            enabled: true,
+            recurrence: Recurrence::Daily,
+            start_secs: secs + 60,
+            ..Default::default()
+        };
+        assert_eq!(
+            capped_wake_ms(
+                120_000,
+                now,
+                day,
+                secs,
+                empty,
+                &queues,
+                &[sch.clone()],
+                true
+            ),
+            60_000
+        );
+        assert_eq!(
+            capped_wake_ms(120_000, now, day, secs, empty, &queues, &[sch], false),
+            120_000
+        );
+    }
+
+    #[test]
     fn toggled_selection_rules() {
         // From all (empty): uncheck one -> rest.
         assert_eq!(toggled_selection(&[], 3, 1, false), Some(vec![0, 2]));
@@ -8724,6 +9820,22 @@ mod progress_tests {
     }
 
     #[test]
+    fn prewarm_eligible_gate() {
+        let t = |u: &str| DownloadTask { url: u.into(), ..Default::default() };
+        assert!(prewarm_eligible(&t("https://example.com/file.zip")));
+        assert!(prewarm_eligible(&t("http://example.com/file.bin?tok=1")));
+        assert!(!prewarm_eligible(&t("https://www.youtube.com/watch?v=aqz-KE-bpKQ")));
+        assert!(!prewarm_eligible(&t("https://example.com/list.m3u8")));
+        assert!(!prewarm_eligible(&t("https://example.com/manifest.mpd")));
+        assert!(!prewarm_eligible(&t("https://example.com/file.torrent")));
+        assert!(!prewarm_eligible(&t("ftp://example.com/file.zip")));
+        assert!(!prewarm_eligible(&t("magnet:?xt=urn:btih:abc")));
+        assert!(!prewarm_eligible(&t("not a url")));
+        let mut yt = t("https://example.com/file.zip");
+        yt.headers.insert("x-ytdlp".into(), "1".into());
+        assert!(!prewarm_eligible(&yt));
+    }
+
     fn yt_probe_eligible_gate() {
         assert!(yt_probe_eligible("https://example.com/watch?v=1"));
         assert!(yt_probe_eligible("https://example.com/list.m3u8?tok=1"));
@@ -8743,7 +9855,7 @@ mod progress_tests {
         assert_eq!(yt_choice_from_state(&st).quality_height, None);
         st.quality = "1080".into();
         assert_eq!(yt_choice_from_state(&st).quality_height, Some(1080));
-        // Exact format coexists; backend precedence exact > tier.
+        // Backend precedence exact > tier (defensive; UI clears are mutually exclusive).
         st.format = "137".into();
         let ch = yt_choice_from_state(&st);
         assert_eq!(ch.format.as_deref(), Some("137"));
@@ -8771,5 +9883,92 @@ mod progress_tests {
             grab_name("magnet:?xt=urn:btih:abc&dn=Cool+Torrent"),
             "Cool Torrent"
         );
+    }
+
+    #[test]
+    fn yt_err_summary_cookie() {
+        let (friendly, raw) = yt_error_summary("page needs to be reloaded. Sign in to confirm");
+        assert!(friendly.contains("rejected browser cookies"));
+        assert_eq!(raw, "page needs to be reloaded. Sign in to confirm");
+    }
+
+    #[test]
+    fn yt_err_summary_extractor() {
+        let (friendly, _) = yt_error_summary("ERROR: 'NoneType' object has no attribute 'get'");
+        assert!(friendly.contains("extractor error"));
+    }
+
+    #[test]
+    fn yt_err_summary_generic_truncates_first_line() {
+        let long = "x".repeat(250);
+        let input = format!("{long}\nsecond line must not appear");
+        let (friendly, raw) = yt_error_summary(&input);
+        assert_eq!(raw.chars().count(), 160);
+        assert!(friendly.starts_with("yt-dlp probe failed: "));
+        assert!(!friendly.contains("second line"));
+    }
+}
+
+fn fmt_hms(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+/// Player viewport HWND via title match (same trick as platform watcher).
+/// eframe 0.29 immediate-viewport frame exposes no typed HWND to app code;
+/// `frame` param unused there. Cross-platform fallback: None (spawn retries,
+/// then user closes). Windows primary target.
+#[cfg(windows)]
+fn find_player_hwnd() -> Option<isize> {
+    type Hwnd = *mut core::ffi::c_void;
+    type Bool = i32;
+    extern "system" {
+        fn EnumWindows(cb: extern "system" fn(Hwnd, isize) -> Bool, p: isize) -> Bool;
+        fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
+        fn GetWindowTextW(hwnd: Hwnd, text: *mut u16, max: i32) -> i32;
+    }
+    extern "system" fn find(hwnd: Hwnd, p: isize) -> Bool {
+        unsafe {
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid != std::process::id() {
+                return 1;
+            }
+            let mut buf = [0u16; 64];
+            let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), 64);
+            if n > 0 && String::from_utf16_lossy(&buf[..n as usize]).starts_with("webcraft player")
+            {
+                *(p as *mut Hwnd) = hwnd;
+                return 0;
+            }
+        }
+        1
+    }
+    let mut hwnd: Hwnd = std::ptr::null_mut();
+    unsafe {
+        EnumWindows(find, &mut hwnd as *mut Hwnd as isize);
+    }
+    if hwnd.is_null() {
+        None
+    } else {
+        Some(hwnd as isize)
+    }
+}
+
+#[cfg(not(windows))]
+fn find_player_hwnd() -> Option<isize> {
+    None
+}
+
+#[cfg(test)]
+mod player_fmt_tests {
+    use super::fmt_hms;
+
+    #[test]
+    fn hms_formats() {
+        assert_eq!(fmt_hms(0.0), "0:00:00");
+        assert_eq!(fmt_hms(65.0), "0:01:05");
+        assert_eq!(fmt_hms(3661.0), "1:01:01");
+        assert_eq!(fmt_hms(-5.0), "0:00:00");
     }
 }

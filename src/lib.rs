@@ -9,6 +9,7 @@ pub mod hls;
 pub mod metalink;
 pub mod model;
 pub mod mpd;
+pub mod mpv;
 pub mod nntp;
 pub mod par2;
 pub mod platform;
