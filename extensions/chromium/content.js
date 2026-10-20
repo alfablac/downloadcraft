@@ -20,7 +20,7 @@
   }
   function elementFor(video) {
     const a = anchorFor(video);
-    return { id: elementId(video), srcs: directUrls(video), srcKey: a.srcKey, postId: a.postId, since: a.since, now: Date.now() };
+    return { id: elementId(video), srcs: directUrls(video), srcKey: a.srcKey, postId: a.postId, streamId: streamIdFor(video), since: a.since, now: Date.now() };
   }
   function filenameFromUrl(u) {
     try { const p = new URL(u).pathname; const last = p.split("/").pop(); return last ? decodeURIComponent(last) : u; } catch (e) { return u.split("/").pop() || u; }
@@ -124,7 +124,7 @@
     const m = String(u || "").match(/amplify_video\/(\d+)|ext_tw_video\/(\d+)|v\.redd\.it\/([a-z0-9]+)/i);
     return m ? (m[1] || m[2] || m[3]) : "";
   }
-  const CARD_SEL = "article,[data-testid='tweet'],shreddit-post,ytd-rich-item-renderer,ytd-video-renderer,ytd-compact-video-renderer";
+  const CARD_SEL = "article,.thing,[data-permalink],[data-testid='tweet'],shreddit-post,ytd-rich-item-renderer,ytd-video-renderer,ytd-compact-video-renderer";
   function cardScope(video) {
     let el = video;
     for (let i = 0; i < 4 && el; i++) {
@@ -134,6 +134,16 @@
       if (el && el.closest) { const s = el.closest(CARD_SEL); if (s) return s; }
     }
     return null;
+  }
+  function streamIdFor(video) {
+    try {
+      const scope = video ? cardScope(video) : null;
+      if (!scope) return "";
+      const fromAttr = streamIdFromUrl((scope.getAttribute && scope.getAttribute("data-url")) || "");
+      if (fromAttr) return fromAttr;
+      const a = scope.querySelector && scope.querySelector('a[href*="v.redd.it"]');
+      return a ? streamIdFromUrl(a.href || "") : "";
+    } catch (e) { return ""; }
   }
   function cleanPermalink(u) {
     try {
@@ -155,6 +165,8 @@
     try {
       const scope = video ? cardScope(video) : null;
       if (scope) {
+        const dp = scope.getAttribute && scope.getAttribute("data-permalink");
+        if (dp) return cleanPermalink(new URL(dp, location.origin).href);
         const links = [...scope.querySelectorAll('a[href*="/status/"],a[href*="/comments/"],a[href*="/watch?v="],a[href*="/shorts/"],a[href*="youtu.be/"]')];
         const own = links.filter((a) => cardScope(a) === scope);
         const timed = own.find((a) => a.querySelector("time"));
@@ -171,6 +183,7 @@
   }
   function scopedCandidates(video, candidates) {
     const pid = idFromUrl(permalinkFor(video)) || idFromUrl(location.href);
+    const streamId = streamIdFor(video);
     const since = video._wcFirstPlay || video._wcSeen || 0;
     const reddit = /(^|\.)reddit\.com$/.test(location.hostname);
     return candidates.filter((c) => {
@@ -178,9 +191,10 @@
       const sid = streamIdFromUrl(c.url);
       const xSid = sid && !/v\.redd\.it/.test(c.url) ? sid : "";
       if (xSid && pid) return xSid === pid;
+      if (streamId && boundedIdHit(c.url, streamId)) return true;
       if (pid && boundedIdHit(c.url, pid)) return true;
       if (xSid && !pid) return false;
-      if (reddit && pid) return false;
+      if (reddit && (pid || streamId)) return false;
       if (since && c.time) return c.time >= since - 2000 && c.time <= since + 45000;
       return false;
     });

@@ -506,6 +506,12 @@ fn base_args(url: &str, task: &DownloadTask, cookie_jar: Option<&std::path::Path
         a.push("--referer".into());
         a.push(task.referrer.clone());
     }
+    // Effective proxy resolved into task.proxy_url by caller (start_task /
+    // probe task); bare yt-dlp subprocess honors no global setting itself.
+    if !task.proxy_url.trim().is_empty() {
+        a.push("--proxy".into());
+        a.push(task.proxy_url.trim().to_string());
+    }
     if let Some(jar) = cookie_jar {
         a.push("--cookies".into());
         a.push(jar.to_string_lossy().into_owned());
@@ -1633,8 +1639,10 @@ mod tests {
     }
     #[test]
     fn retry_anon_requested_format_not_available() {
-        let mut t = DownloadTask::default();
-        t.cookies_json = r#"[{"name":"a","value":"b"}]"#.into();
+        let t = DownloadTask {
+            cookies_json: r#"[{"name":"a","value":"b"}]"#.into(),
+            ..Default::default()
+        };
         assert!(should_retry_anon(
             "https://www.youtube.com/watch?v=x",
             &t,
@@ -1650,6 +1658,19 @@ mod tests {
     fn download_attempt_order_anon_first_when_adopted() {
         assert_eq!(download_attempt_order(true), [true, false]);
         assert_eq!(download_attempt_order(false), [false, true]);
+    }
+    #[test]
+    fn base_args_proxy_from_task() {
+        let mut t = DownloadTask::default();
+        let a = base_args("https://example.com/v", &t, None);
+        assert!(!a.iter().any(|x| x == "--proxy"), "args {a:?}");
+        t.proxy_url = " socks5://127.0.0.1:1080 ".into();
+        let a = base_args("https://example.com/v", &t, None);
+        assert!(
+            a.windows(2)
+                .any(|w| w == ["--proxy", "socks5://127.0.0.1:1080"]),
+            "args {a:?}"
+        );
     }
     #[test]
     fn base_args_js_runtimes_node() {

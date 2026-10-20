@@ -201,7 +201,7 @@ pub fn proto_kind(task: &DownloadTask) -> ProtoKind {
 /// Probe Content-Type only (headers, body dropped). On any error/non-success -> File.
 /// ponytail: header-only probe misses manifests served as octet-stream/text; body-peek + reuse would need passing fetched text into download_dash/download_hls — add when such servers matter.
 async fn probe_manifest(client: &reqwest::Client, task: &DownloadTask) -> Manifest {
-    let req = client.get(&task.url).headers(engine::headers_for(&task));
+    let req = client.get(&task.url).headers(engine::headers_for(task));
     let Ok(resp) = req.send().await else {
         return Manifest::File;
     };
@@ -481,7 +481,7 @@ async fn fetch_text(
     task: &DownloadTask,
     url: &str,
 ) -> Result<String, String> {
-    let req = client.get(url).headers(engine::headers_for(&task));
+    let req = client.get(url).headers(engine::headers_for(task));
     let resp = req.send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {} for {url}", resp.status()));
@@ -741,7 +741,7 @@ async fn fetch_key(
     task: &DownloadTask,
     url: &str,
 ) -> Result<[u8; 16], String> {
-    let req = client.get(url).headers(engine::headers_for(&task));
+    let req = client.get(url).headers(engine::headers_for(task));
     let resp = req.send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {} for key {url}", resp.status()));

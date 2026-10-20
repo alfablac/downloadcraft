@@ -125,8 +125,11 @@ function recordRequest(details) {
     }
   } catch (e) {}
 }
+function isPlaylistUrl(u) { try { const p = new URL(u).pathname.toLowerCase(); return p.endsWith(".mpd") || p.endsWith(".m3u8"); } catch (e) { return /\.(mpd|m3u8)($|[?#])/i.test(String(u || "")); } }
 function pruneCandidates(now = Date.now()) {
-  for (const [url, c] of candidates) if (now - c.time > CANDIDATE_TTL_MS) candidates.delete(url);
+  for (const [url, c] of candidates) if (now - c.time > (isPlaylistUrl(url) ? 30 * 60 * 1000 : CANDIDATE_TTL_MS)) candidates.delete(url);
+  // Cap: evict non-playlists (oldest first) before playlists; playlists alone over cap fall back to FIFO.
+  if (candidates.size > CANDIDATE_MAX) { for (const url of [...candidates.keys()]) { if (candidates.size <= CANDIDATE_MAX) break; if (!isPlaylistUrl(url)) candidates.delete(url); } }
   while (candidates.size > CANDIDATE_MAX) candidates.delete(candidates.keys().next().value);
 }
 function headerOf(headers, name) { const h = (headers || []).find((x) => x.name.toLowerCase() === name); return h ? h.value || "" : ""; }
@@ -279,17 +282,16 @@ browser.runtime.onMessage.addListener((msg, sender) => {
     if (msg.element) {
       // Element-scoped (IDM): same tab+frame only, never other-frame/tab.
       const byUrl = new Map();
-      // status 206 = partial byte slice, not standalone file: never panel.
-      [...requestRecords.values(), ...candidates.values()].forEach((r) => { if (r && r.url && r.status !== 206) byUrl.set(r.url, r); });
+      [...requestRecords.values(), ...candidates.values()].forEach((r) => { if (r && r.url) byUrl.set(r.url, r); });
       const senderFrame = sender.frameId != null ? sender.frameId : null;
-      const el = { tabId: sender.tab ? sender.tab.id : tabId, frameId: senderFrame, srcs: msg.element.srcs || [], srcKey: msg.element.srcKey || "", postId: msg.element.postId || "", since: msg.element.since || 0, now: Date.now() };
+      const el = { tabId: sender.tab ? sender.tab.id : tabId, frameId: senderFrame, srcs: msg.element.srcs || [], srcKey: msg.element.srcKey || "", postId: msg.element.postId || "", streamId: msg.element.streamId || "", since: msg.element.since || 0, now: Date.now() };
       pool = typeof matchRecordsForElement === "function" ? matchRecordsForElement([...byUrl.values()], el, Date.now()) : [];
       // Element-frame match empty: retry frame-agnostic (frameId=null passes
       // tolerant filter) before returning empty.
       if (!pool.length && senderFrame != null && typeof matchRecordsForElement === "function") pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null }, Date.now());
     } else {
       // No frame filter: player frame != sniffer frame on embeds drops all.
-      pool = [...candidates.values()].filter((c) => c.status !== 206 && (tabId == null || c.tabId === tabId));
+      pool = [...candidates.values()].filter((c) => tabId == null || c.tabId === tabId);
     }
     const list = (typeof rankCandidates === "function" ? rankCandidates : (x) => x)(pool);
     return Promise.resolve({ type: "candidates", candidates: list });

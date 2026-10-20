@@ -617,8 +617,10 @@ mod tests {
 
     #[test]
     fn embedded_args_last_wins_and_strips_conflicts() {
-        let mut s = Settings::default();
-        s.mpv_fullscreen = true;
+        let mut s = Settings {
+            mpv_fullscreen: true,
+            ..Default::default()
+        };
         s.mpv_extra_args =
             "--wid=1 --input-ipc-server=x --really-quiet --force-window --osc=yes --volume=20 --mute=yes --log-file=C:/evil.log"
                 .into();

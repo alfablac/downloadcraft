@@ -264,12 +264,7 @@ fn parse_epsv_port(reply: &str) -> Option<u16> {
         .next()?
         .trim()
         .to_string();
-    inner
-        .split('|')
-        .filter(|s| !s.is_empty())
-        .next_back()?
-        .parse()
-        .ok()
+    inner.split('|').rfind(|s| !s.is_empty())?.parse().ok()
 }
 fn is_private_or_unspec(ip: Ipv4Addr) -> bool {
     // std is_private covers 10/8, 172.16/12, 192.168/16.

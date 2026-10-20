@@ -323,6 +323,7 @@ fn apply_shrink_correction(ctrl: &Controls, written: u64, keep: u64) {
 
 /// Committed bytes across segments. Invariant: equals bytes counted once in
 /// `ctrl.downloaded` whenever no segment is mid-stream.
+#[cfg(test)]
 fn committed_total(segs: &[SegmentState]) -> u64 {
     segs.iter().map(|s| s.done).sum()
 }
@@ -1224,6 +1225,7 @@ pub async fn download_http_with_prewarm(
 /// Claim work: prefer unclaimed unfinished segment; else (only while
 /// `segs.len() < cap`) split largest remaining active segment and claim new
 /// tail. None when no claimable work for this worker.
+#[allow(clippy::too_many_arguments)] // flat list mirrors call sites; grouping churn not worth it
 async fn claim_or_split(
     segs: &Arc<tokio::sync::Mutex<Vec<SegmentState>>>,
     active: &Arc<tokio::sync::Mutex<std::collections::HashSet<usize>>>,

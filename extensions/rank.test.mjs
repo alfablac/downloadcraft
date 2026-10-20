@@ -95,4 +95,14 @@ const ceil = [
 ];
 assert.deepEqual(matchRecordsForElement(ceil, { tabId: 7, frameId: 3, srcs: [], since: T, now: T }, T).map((r) => r.url), ["https://cdn/v1.mp4", "https://cdn/v2.mp4"], "F10e ceiling: both timing videos included");
 
+// streamId tier: reddit comments id != v.redd.it stream id; DASH url carries stream id only.
+const streamRecs = [
+  { url: "https://v.redd.it/cz2wlzfaeiwh1/DASHPlaylist.mpd", tabId: 7, frameId: 3, time: T, type: "application/dash+xml" },
+  { url: "https://v.redd.it/otherstream9/DASHPlaylist.mpd", tabId: 7, frameId: 3, time: T, type: "application/dash+xml" },
+];
+assert.deepEqual(matchRecordsForElement(streamRecs, { tabId: 7, frameId: 3, srcs: [], postId: "", streamId: "cz2wlzfaeiwh1", since: 0, now: T }, T).map((r) => r.url), ["https://v.redd.it/cz2wlzfaeiwh1/DASHPlaylist.mpd"], "streamId tier hits v.redd.it playlist");
+assert.deepEqual(also.matchRecordsForElement(streamRecs, { tabId: 7, frameId: 3, srcs: [], postId: "", streamId: "cz2wlzfaeiwh1", since: 0, now: T }, T).map((r) => r.url), ["https://v.redd.it/cz2wlzfaeiwh1/DASHPlaylist.mpd"], "streamId firefox parity");
+// postId tier precedence over streamId (exclusive tiers, postId before streamId)
+assert.deepEqual(matchRecordsForElement([...streamRecs, { url: "https://cdn/post_abc123_x.mp4", tabId: 7, frameId: 3, time: T, type: "video/mp4" }], { tabId: 7, frameId: 3, srcs: [], postId: "abc123", streamId: "cz2wlzfaeiwh1", since: 0, now: T }, T).map((r) => r.url), ["https://cdn/post_abc123_x.mp4"], "postId tier before streamId");
+
 console.log("rank.test.mjs OK", urls);

@@ -445,8 +445,8 @@ fn run_gui(initial_urls: Vec<String>, hidden: bool) {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_icon(std::sync::Arc::new(win_icon))
-            .with_inner_size([1180.0, 720.0])
-            .with_min_inner_size([760.0, 520.0])
+            .with_inner_size([1440.0, 900.0])
+            .with_min_inner_size([900.0, 620.0])
             .with_title(format!("webcraft v{}", env!("CARGO_PKG_VERSION")))
             .with_visible(!hidden),
         ..Default::default()

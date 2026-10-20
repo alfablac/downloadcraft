@@ -73,6 +73,7 @@ fn spawn_prewarm(
     rt: &tokio::runtime::Runtime,
     task: &DownloadTask,
     conns: u32,
+    global_proxy: &str,
 ) {
     let url = task.url.trim().to_string();
     if url.is_empty() || st.url == url {
@@ -83,7 +84,10 @@ fn spawn_prewarm(
     st.text = "Probing…".into();
     let mut probe_task = task.clone();
     probe_task.url = url.clone();
-    let client = engine::build_client("");
+    // Probe same egress as eventual download (task override else global).
+    probe_task.proxy_url =
+        crate::model::effective_proxy(&probe_task.proxy_url, global_proxy).to_string();
+    let client = engine::build_client(&probe_task.proxy_url);
     let slot = prewarm_ui_slot();
     rt.spawn(async move {
         match engine::prewarm(&client, &probe_task).await {
@@ -136,10 +140,7 @@ fn prewarm_poll(st: &mut PrewarmState, url: &str) {
     if let Some((tag, res)) = done {
         if tag == url {
             st.loading = false;
-            st.text = match res {
-                Ok(t) => t,
-                Err(_) => String::new(), // probe failure silent: confirm does normal probe
-            };
+            st.text = res.unwrap_or_default(); // probe failure silent: confirm does normal probe
         }
     }
 }
@@ -195,6 +196,7 @@ struct PendingDebridAdd {
     cookies: String,
     queue_id: String,
     start_now: bool,
+    proxy_url: String,
 }
 
 type DebridAddSlot =
@@ -227,6 +229,8 @@ struct DebridUiCache {
 struct YtProbeState {
     slot: Option<YtProbeSlot>,
     url: String,
+    /// Effective proxy at last probe start (staleness note when edited).
+    proxy_used: String,
     loading: bool,
     error: String,
     dump: Option<ytdlp::YtDump>,
@@ -568,6 +572,7 @@ pub struct DownloadApp {
     /// Custom HTTP(S)-only header draft rows (name, value); empty rows ignored.
     add_headers: Vec<(String, String)>,
     add_mirrors: String,
+    add_proxy: String,
     add_desc: String,
     add_queue: String,
     add_start_now: bool,
@@ -903,6 +908,7 @@ impl DownloadApp {
             add_key: String::new(),
             add_headers: Vec::new(),
             add_mirrors: String::new(),
+            add_proxy: String::new(),
             add_desc: String::new(),
             add_queue: "main".into(),
             add_start_now: true,
@@ -1079,6 +1085,21 @@ impl DownloadApp {
         self.sync_tray_label();
     }
 
+    /// Capture/Add reveal: window restored small (user resize, DPI clamp)
+    /// shows compact/truncated table. Grow root viewport back to full-table
+    /// size (only ever grows; never shrinks a larger user window). OS clamps
+    /// to monitor work area.
+    fn show_window_full(&mut self, ctx: &egui::Context) {
+        self.show_window(ctx);
+        let cur = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()));
+        let want = cur
+            .map(|s| egui::vec2(s.x.max(FULL_MAIN_W), s.y.max(FULL_MAIN_H)))
+            .unwrap_or(egui::vec2(FULL_MAIN_W, FULL_MAIN_H));
+        if cur.map(|s| s.x < want.x || s.y < want.y).unwrap_or(true) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
+        }
+    }
+
     fn hide_window(&mut self, ctx: &egui::Context) {
         self.hidden = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -1206,6 +1227,7 @@ impl DownloadApp {
                         total: f.size,
                         referrer: pending.referrer.clone(),
                         cookies: pending.cookies.clone(),
+                        proxy_url: pending.proxy_url.clone(),
                         ..Default::default()
                     };
                     ids.push(task.id.clone());
@@ -1260,7 +1282,7 @@ impl DownloadApp {
         }
     }
 
-    /// Collision dialog (vp_id "webcraft-collision", 480x220).
+    /// Collision dialog (vp_id "webcraft-collision", 560x280).
     /// Cancel semantics (button/Esc/close_requested): remove task + save
     /// (avoids stuck duplicate name; user re-adds if wanted).
     fn ui_collision_dialog(&mut self, ctx: &egui::Context) {
@@ -1270,8 +1292,8 @@ impl DownloadApp {
         let title = "Filename already exists".to_string();
         let builder = egui::ViewportBuilder::default()
             .with_title(&title)
-            .with_inner_size([480.0, 220.0])
-            .with_min_inner_size([420.0, 200.0])
+            .with_inner_size([560.0, 280.0])
+            .with_min_inner_size([480.0, 240.0])
             .with_resizable(true);
         if self.collision_raise_frames > 0 {
             self.collision_raise_frames -= 1;
@@ -1287,11 +1309,11 @@ impl DownloadApp {
                 close = true;
             }
             if matches!(class, egui::ViewportClass::Embedded) {
-                let r = egui::Window::new(&title)
+                egui::Window::new(&title)
                     .collapsible(false)
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .default_size([480.0, 220.0])
+                    .default_size([560.0, 280.0])
                     .show(ctx, |ui| {
                         collision_body(ui, &p);
                         collision_buttons(ui, &mut action, &p.unique);
@@ -1388,7 +1410,14 @@ impl DownloadApp {
             .insert(id.to_string(), ctrl.clone());
         let rt = self.rt.clone();
         let tid = id.to_string();
-        let client = engine::build_client(&settings.proxy_url);
+        // Per-task proxy override wins over global (empty = inherit).
+        // Spawn-local clone carries effective proxy so yt-dlp subprocess
+        // (reads task.proxy_url only) uses same egress as reqwest client.
+        let eff_proxy =
+            crate::model::effective_proxy(&task.proxy_url, &settings.proxy_url).to_string();
+        let mut task = task;
+        task.proxy_url = eff_proxy.clone();
+        let client = engine::build_client(&eff_proxy);
         let ctrl2 = ctrl.clone();
         let handle = self.tokio_rt.spawn(async move {
             // Inner spawn: downloader panic (e.g. librqbit internals) surfaces as
@@ -1414,6 +1443,9 @@ impl DownloadApp {
                     let err = done.error.clone();
                     let fname = done.filename.clone();
                     if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == tid) {
+                        // done carries effective proxy; keep stored override-only value.
+                        let mut done = done;
+                        done.proxy_url = t.proxy_url.clone();
                         *t = done;
                     }
                     g.log(format!("Finished {fname}: {:?} {err}", status));
@@ -1781,6 +1813,7 @@ impl DownloadApp {
         egui::Window::new("Delete downloads")
             .collapsible(false)
             .resizable(false)
+            .default_width(440.0)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(format!("Delete {n} download(s) from the list?"));
@@ -1861,6 +1894,7 @@ impl DownloadApp {
         egui::Window::new("Confirm power action")
             .collapsible(false)
             .resizable(false)
+            .default_width(400.0)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(format!("Downloads complete. {label} this computer now?"));
@@ -1970,7 +2004,7 @@ impl DownloadApp {
             match content.trim() {
                 "toggle" => self.toggle_window(ctx),
                 "add" => {
-                    self.show_window(ctx);
+                    self.show_window_full(ctx);
                     self.tab = Tab::Downloads;
                     {
                         self.show_add = true;
@@ -2043,7 +2077,7 @@ impl DownloadApp {
         let has_capture = self.capture_task.is_some()
             || !crate::lock_unpoison(&self.rt).pending_captures.is_empty();
         if has_capture && !self.capture_revealed {
-            self.show_window(ctx);
+            self.show_window_full(ctx);
         }
         self.capture_revealed = has_capture;
         if self.grab_busy {
@@ -2510,6 +2544,7 @@ impl DownloadApp {
 /// Milliseconds until nearest armed deadline, capped at idle `base_ms`.
 /// `now` = unix secs, `day`/`secs_of_day` = scheduler clock (`today_parts`).
 /// `next_retry_at == 0` = ungated, `> now` = gated. Pure: unit-tested.
+#[allow(clippy::too_many_arguments)] // flat list mirrors call sites; grouping churn not worth it
 fn capped_wake_ms(
     base_ms: u64,
     now: u64,
@@ -2709,8 +2744,8 @@ impl DownloadApp {
         };
         let builder = egui::ViewportBuilder::default()
             .with_title(title)
-            .with_inner_size([880.0, 560.0])
-            .with_min_inner_size([480.0, 320.0]);
+            .with_inner_size([1024.0, 640.0])
+            .with_min_inner_size([640.0, 400.0]);
         let mut close = false;
         let mut stop_req = false;
         let mut toggle_req = false;
@@ -2797,7 +2832,7 @@ impl DownloadApp {
             }
             let paused = snap.as_ref().map(|s| s.0).unwrap_or(false);
             egui::TopBottomPanel::bottom("player-controls")
-                .exact_height(92.0)
+                .exact_height(108.0)
                 .frame(
                     egui::Frame::none()
                         .fill(theme::SURFACE)
@@ -2860,11 +2895,7 @@ impl DownloadApp {
                                     .small(),
                             );
                         } else if *muted {
-                            ui.label(
-                                egui::RichText::new("Muted")
-                                    .color(theme::WARN)
-                                    .small(),
-                            );
+                            ui.label(egui::RichText::new("Muted").color(theme::WARN).small());
                         } else if *eof {
                             ui.label(
                                 egui::RichText::new("Ended")
@@ -2973,11 +3004,9 @@ impl DownloadApp {
             } else {
                 egui::Frame::none().fill(egui::Color32::BLACK)
             };
-            egui::CentralPanel::default()
-                .frame(frame)
-                .show(ctx, |ui| {
-                    video_rect = Some(ui.max_rect());
-                });
+            egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+                video_rect = Some(ui.max_rect());
+            });
         });
         if close {
             self.quit_player();
@@ -3464,186 +3493,200 @@ impl eframe::App for DownloadApp {
             .show(ctx, |ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 2.0;
-                if !rail_compact {
-                    ui.label(
-                        egui::RichText::new("WORKSPACE")
-                            .color(theme::TEXT_FAINT)
-                            .small()
-                            .strong(),
-                    );
-                    ui.add_space(4.0);
-                }
-                for (tab, label, ic) in [
-                    (Tab::Downloads, "Downloads", Icon::Download),
-                    (Tab::Queues, "Queues", Icon::Queue),
-                    (Tab::Scheduler, "Scheduler", Icon::Clock),
-                    (Tab::Grabber, "Site Grabber", Icon::Globe),
-                    (Tab::Streams, "Streams", Icon::Play),
-                    (Tab::Options, "Options", Icon::Settings),
-                ] {
-                    if nav_row_c(ui, ic, label, self.tab == tab, None, rail_compact, None).clicked()
-                    {
-                        self.tab = tab;
-                    }
-                }
-                ui.add_space(8.0);
-                ui.separator();
-                if !rail_compact {
-                    ui.horizontal(|ui| {
-                        let (irect, _) =
-                            ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                        icon(ui.painter(), &Icon::Folder, irect, theme::TEXT_FAINT);
-                        ui.label(
-                            egui::RichText::new("CATEGORIES")
-                                .color(theme::TEXT_FAINT)
-                                .small()
-                                .strong(),
-                        );
-                    });
-                    ui.add_space(4.0);
-                }
-                let cats: &[(&str, Icon)] = &[
-                    ("All Downloads", Icon::Download),
-                    ("Compressed", Icon::Archive),
-                    ("Documents", Icon::Document),
-                    ("Programs", Icon::Program),
-                    ("Video", Icon::Video),
-                    ("Audio", Icon::Music),
-                    ("General", Icon::File),
-                    ("Unfinished", Icon::Clock),
-                    ("Finished", Icon::Check),
-                ];
-                // Per-category counts, same membership rule as downloads table filter (below).
-                let counts: Vec<usize> = {
-                    let g = crate::lock_unpoison(&self.rt);
-                    cats.iter()
-                        .map(|(c, _)| match *c {
-                            "All Downloads" => g.state.tasks.len(),
-                            "Unfinished" => g
-                                .state
-                                .tasks
-                                .iter()
-                                .filter(|t| t.status != TaskStatus::Complete)
-                                .count(),
-                            "Finished" => g
-                                .state
-                                .tasks
-                                .iter()
-                                .filter(|t| t.status == TaskStatus::Complete)
-                                .count(),
-                            cat => g
-                                .state
-                                .tasks
-                                .iter()
-                                .filter(|t| {
-                                    t.category == cat
-                                        || crate::model::category_for(&t.filename) == cat
-                                })
-                                .count(),
-                        })
-                        .collect()
-                };
-                // Badge colors from settings clone; None = plain count text.
-                let nav_settings = {
-                    let g = crate::lock_unpoison(&self.rt);
-                    g.state.settings.clone()
-                };
-                let badged = nav_settings.nav_count_badges;
-                for ((c, ic), n) in cats.iter().zip(counts.iter()) {
-                    let badge =
-                        badged.then(|| theme::category_color_or(c, &nav_settings.category_colors));
-                    if nav_row_c(
-                        ui,
-                        *ic,
-                        c,
-                        self.category == *c,
-                        Some(*n),
-                        rail_compact,
-                        badge,
-                    )
-                    .clicked()
-                    {
-                        self.category = c.to_string();
-                        self.tab = Tab::Downloads;
-                    }
-                }
-                ui.add_space(8.0);
-                ui.separator();
-                if !rail_compact {
-                    ui.horizontal(|ui| {
-                        let (irect, _) =
-                            ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                        icon(ui.painter(), &Icon::Link, irect, theme::TEXT_FAINT);
-                        ui.label(
-                            egui::RichText::new("TYPE")
-                                .color(theme::TEXT_FAINT)
-                                .small()
-                                .strong(),
-                        );
-                    });
-                    ui.add_space(4.0);
-                }
-                // Single pass over tasks (proto_kind may stat local files).
-                let type_counts: [usize; 7] = {
-                    let g = crate::lock_unpoison(&self.rt);
-                    let mut tc = [0usize; 7];
-                    for t in &g.state.tasks {
-                        let k = crate::stream::proto_kind(t);
-                        for sel in TypeSel::ALL {
-                            if sel.matches(k) {
-                                tc[sel.index()] += 1;
-                                break;
+                // Rail content (~670px) exceeds panel height at small windows;
+                // scroll instead of clipping bottom rows.
+                egui::ScrollArea::vertical()
+                    .id_salt("rail")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        if !rail_compact {
+                            ui.label(
+                                egui::RichText::new("WORKSPACE")
+                                    .color(theme::TEXT_FAINT)
+                                    .small()
+                                    .strong(),
+                            );
+                            ui.add_space(4.0);
+                        }
+                        for (tab, label, ic) in [
+                            (Tab::Downloads, "Downloads", Icon::Download),
+                            (Tab::Queues, "Queues", Icon::Queue),
+                            (Tab::Scheduler, "Scheduler", Icon::Clock),
+                            (Tab::Grabber, "Site Grabber", Icon::Globe),
+                            (Tab::Streams, "Streams", Icon::Play),
+                            (Tab::Options, "Options", Icon::Settings),
+                        ] {
+                            if nav_row_c(ui, ic, label, self.tab == tab, None, rail_compact, None)
+                                .clicked()
+                            {
+                                self.tab = tab;
                             }
                         }
-                    }
-                    tc
-                };
-                if nav_row_c(
-                    ui,
-                    Icon::Download,
-                    "All types",
-                    self.type_filter.is_none(),
-                    None,
-                    rail_compact,
-                    None,
-                )
-                .clicked()
-                {
-                    self.type_filter = None;
-                    self.tab = Tab::Downloads;
-                }
-                for sel in TypeSel::ALL {
-                    let badge =
-                        badged.then(|| theme::type_color_or(sel.key(), &nav_settings.type_colors));
-                    if nav_row_c(
-                        ui,
-                        sel.icon(),
-                        sel.label(),
-                        self.type_filter == Some(sel),
-                        Some(type_counts[sel.index()]),
-                        rail_compact,
-                        badge,
-                    )
-                    .clicked()
-                    {
-                        self.type_filter = Some(sel);
-                        self.tab = Tab::Downloads;
-                    }
-                }
-                ui.add_space(8.0);
-                ui.separator();
-                if !rail_compact {
-                    ui.label(
-                        egui::RichText::new("ffmpeg: PATH/beside exe only")
-                            .color(theme::TEXT_FAINT)
-                            .small(),
-                    );
-                    ui.label(
-                        egui::RichText::new("DRM content refused")
-                            .color(theme::TEXT_FAINT)
-                            .small(),
-                    );
-                }
+                        ui.add_space(8.0);
+                        ui.separator();
+                        if !rail_compact {
+                            ui.horizontal(|ui| {
+                                let (irect, _) = ui.allocate_exact_size(
+                                    egui::vec2(16.0, 16.0),
+                                    egui::Sense::hover(),
+                                );
+                                icon(ui.painter(), &Icon::Folder, irect, theme::TEXT_FAINT);
+                                ui.label(
+                                    egui::RichText::new("CATEGORIES")
+                                        .color(theme::TEXT_FAINT)
+                                        .small()
+                                        .strong(),
+                                );
+                            });
+                            ui.add_space(4.0);
+                        }
+                        let cats: &[(&str, Icon)] = &[
+                            ("All Downloads", Icon::Download),
+                            ("Compressed", Icon::Archive),
+                            ("Documents", Icon::Document),
+                            ("Programs", Icon::Program),
+                            ("Video", Icon::Video),
+                            ("Audio", Icon::Music),
+                            ("General", Icon::File),
+                            ("Unfinished", Icon::Clock),
+                            ("Finished", Icon::Check),
+                        ];
+                        // Per-category counts, same membership rule as downloads table filter (below).
+                        let counts: Vec<usize> = {
+                            let g = crate::lock_unpoison(&self.rt);
+                            cats.iter()
+                                .map(|(c, _)| match *c {
+                                    "All Downloads" => g.state.tasks.len(),
+                                    "Unfinished" => g
+                                        .state
+                                        .tasks
+                                        .iter()
+                                        .filter(|t| t.status != TaskStatus::Complete)
+                                        .count(),
+                                    "Finished" => g
+                                        .state
+                                        .tasks
+                                        .iter()
+                                        .filter(|t| t.status == TaskStatus::Complete)
+                                        .count(),
+                                    cat => g
+                                        .state
+                                        .tasks
+                                        .iter()
+                                        .filter(|t| {
+                                            t.category == cat
+                                                || crate::model::category_for(&t.filename) == cat
+                                        })
+                                        .count(),
+                                })
+                                .collect()
+                        };
+                        // Badge colors from settings clone; None = plain count text.
+                        let nav_settings = {
+                            let g = crate::lock_unpoison(&self.rt);
+                            g.state.settings.clone()
+                        };
+                        let badged = nav_settings.nav_count_badges;
+                        for ((c, ic), n) in cats.iter().zip(counts.iter()) {
+                            let badge = badged.then(|| {
+                                theme::category_color_or(c, &nav_settings.category_colors)
+                            });
+                            if nav_row_c(
+                                ui,
+                                *ic,
+                                c,
+                                self.category == *c,
+                                Some(*n),
+                                rail_compact,
+                                badge,
+                            )
+                            .clicked()
+                            {
+                                self.category = c.to_string();
+                                self.tab = Tab::Downloads;
+                            }
+                        }
+                        ui.add_space(8.0);
+                        ui.separator();
+                        if !rail_compact {
+                            ui.horizontal(|ui| {
+                                let (irect, _) = ui.allocate_exact_size(
+                                    egui::vec2(16.0, 16.0),
+                                    egui::Sense::hover(),
+                                );
+                                icon(ui.painter(), &Icon::Link, irect, theme::TEXT_FAINT);
+                                ui.label(
+                                    egui::RichText::new("TYPE")
+                                        .color(theme::TEXT_FAINT)
+                                        .small()
+                                        .strong(),
+                                );
+                            });
+                            ui.add_space(4.0);
+                        }
+                        // Single pass over tasks (proto_kind may stat local files).
+                        let type_counts: [usize; 7] = {
+                            let g = crate::lock_unpoison(&self.rt);
+                            let mut tc = [0usize; 7];
+                            for t in &g.state.tasks {
+                                let k = crate::stream::proto_kind(t);
+                                for sel in TypeSel::ALL {
+                                    if sel.matches(k) {
+                                        tc[sel.index()] += 1;
+                                        break;
+                                    }
+                                }
+                            }
+                            tc
+                        };
+                        if nav_row_c(
+                            ui,
+                            Icon::Download,
+                            "All types",
+                            self.type_filter.is_none(),
+                            None,
+                            rail_compact,
+                            None,
+                        )
+                        .clicked()
+                        {
+                            self.type_filter = None;
+                            self.tab = Tab::Downloads;
+                        }
+                        for sel in TypeSel::ALL {
+                            let badge = badged.then(|| {
+                                theme::type_color_or(sel.key(), &nav_settings.type_colors)
+                            });
+                            if nav_row_c(
+                                ui,
+                                sel.icon(),
+                                sel.label(),
+                                self.type_filter == Some(sel),
+                                Some(type_counts[sel.index()]),
+                                rail_compact,
+                                badge,
+                            )
+                            .clicked()
+                            {
+                                self.type_filter = Some(sel);
+                                self.tab = Tab::Downloads;
+                            }
+                        }
+                        ui.add_space(8.0);
+                        ui.separator();
+                        if !rail_compact {
+                            ui.label(
+                                egui::RichText::new("ffmpeg: PATH/beside exe only")
+                                    .color(theme::TEXT_FAINT)
+                                    .small(),
+                            );
+                            ui.label(
+                                egui::RichText::new("DRM content refused")
+                                    .color(theme::TEXT_FAINT)
+                                    .small(),
+                            );
+                        }
+                    });
             });
 
         // ── Bottom status bar ──
@@ -3753,7 +3796,7 @@ impl eframe::App for DownloadApp {
             });
 
         if self.show_about {
-            egui::Window::new("About webcraft").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            egui::Window::new("About webcraft").collapsible(false).resizable(false).default_width(460.0).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
                 ui.label(format!("webcraft {} — clean-room cross-platform download manager.", env!("CARGO_PKG_VERSION")));
                 ui.label("Rust + egui. Segmented downloads, DASH/HLS, queues, scheduler, Site Grabber.");
                 ui.label("No proprietary code, binaries, icons, or activation logic.");
@@ -4511,6 +4554,10 @@ fn paint_btn(
 /// independently, so header and row columns never lined up). Name column takes remainder.
 /// Fixed widths follow live IDM ListSettings (File Name|Q 30|Size 75|Status 65|
 /// Time left 73|Transfer rate 82); Progress/Actions are webcraft extras.
+/// Full-size main window (logical points). Mirrors NativeOptions default;
+/// capture/Add reveals grow a smaller restored window back to this.
+pub(crate) const FULL_MAIN_W: f32 = 1440.0;
+pub(crate) const FULL_MAIN_H: f32 = 900.0;
 const COL_GAP: f32 = 10.0; // header/rows use item_spacing.x = 10; leading cell at row_origin_x
 const COL_MIN: f32 = 36.0;
 const NAME_MIN: f32 = 120.0;
@@ -4541,7 +4588,8 @@ fn dl_cols(avail: f32, compact: bool, stored: Option<&[f32]>) -> Vec<f32> {
         &[44.0, 75.0, 76.0, 73.0, 82.0, 132.0, 58.0]
     };
     if let Some(s) = stored.filter(|s| s.len() == fixed.len() + 1) {
-        // User widths: clamp per-column; Name = remainder only when total fits avail, else keep user width (h-scroll handles overflow).
+        // User widths: clamp per-column; Name = remainder when total fits
+        // avail, else shrink-to-fit below (whole table stays visible).
         let mut v: Vec<f32> = s
             .iter()
             .enumerate()
@@ -4551,6 +4599,29 @@ fn dl_cols(avail: f32, compact: bool, stored: Option<&[f32]>) -> Vec<f32> {
         if total <= avail {
             v[0] =
                 (avail - v[1..].iter().sum::<f32>() - COL_GAP * fixed.len() as f32).max(NAME_MIN);
+        } else {
+            // Stored widths exceed avail (window shrunk since drag): shrink
+            // Name to floor first, then scale other cols above their mins,
+            // so whole table fits instead of overflowing into h-scroll.
+            // ponytail: proportional scale only; per-column priorities if a
+            // column must stay exact.
+            let gaps = COL_GAP * fixed.len() as f32;
+            v[0] = NAME_MIN;
+            let over = avail - gaps - v.iter().sum::<f32>();
+            if over < 0.0 {
+                let slack: f32 = v[1..]
+                    .iter()
+                    .enumerate()
+                    .map(|(j, w)| w - col_min(j + 1, compact))
+                    .sum();
+                if slack > 0.0 {
+                    let k = (1.0 + over / slack).clamp(0.0, 1.0);
+                    for (j, w) in v[1..].iter_mut().enumerate() {
+                        let m = col_min(j + 1, compact);
+                        *w = m + (*w - m) * k;
+                    }
+                }
+            }
         }
         return v;
     }
@@ -4813,6 +4884,7 @@ fn start_yt_probe(
     referrer: &str,
     cookies: &str,
     cookies_json: &str,
+    proxy: &str,
 ) {
     let slot: YtProbeSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
     st.slot = Some(slot.clone());
@@ -4832,6 +4904,7 @@ fn start_yt_probe(
         referrer: referrer.to_string(),
         cookies: cookies.to_string(),
         cookies_json: cookies_json.to_string(),
+        proxy_url: proxy.to_string(),
         ..Default::default()
     };
     let url_owned = url.to_string();
@@ -4974,8 +5047,12 @@ fn ui_yt_probe_section(
     cookies: &str,
     cookies_json: &str,
     rt: &tokio::runtime::Runtime,
+    proxy: &str,
 ) {
     yt_probe_poll(st, url);
+    // Proxy edited after probe ran: cached formats came via old egress.
+    // Re-probe lazily on next Retry/Probe click; note staleness inline.
+    let proxy_stale = st.proxy_used != proxy && (!st.url.is_empty() || st.loading);
     section(ui, "Video (yt-dlp)");
     if st.loading {
         ui.horizontal(|ui| {
@@ -5006,16 +5083,32 @@ fn ui_yt_probe_section(
                     });
             });
         if ghost_btn_w(ui, "Retry probe").clicked() {
-            start_yt_probe(st, rt, url, referrer, cookies, cookies_json);
+            st.proxy_used = proxy.to_string();
+            start_yt_probe(st, rt, url, referrer, cookies, cookies_json, proxy);
         }
         return;
     }
     let Some(dump) = st.dump.clone() else {
+        if proxy_stale {
+            ui.label(
+                egui::RichText::new("Proxy changed — probe again for formats via new proxy.")
+                    .color(theme::WARN)
+                    .small(),
+            );
+        }
         if ghost_btn_w(ui, "Probe formats (quality / audio / subtitles)").clicked() {
-            start_yt_probe(st, rt, url, referrer, cookies, cookies_json);
+            st.proxy_used = proxy.to_string();
+            start_yt_probe(st, rt, url, referrer, cookies, cookies_json, proxy);
         }
         return;
     };
+    if proxy_stale {
+        ui.label(
+            egui::RichText::new("Proxy changed since probe — listed formats came via previous proxy; download uses new proxy.")
+                .color(theme::WARN)
+                .small(),
+        );
+    }
     if !dump.title.is_empty() {
         ui.add(egui::Label::new(egui::RichText::new(&dump.title).strong()).truncate())
             .on_hover_text(&dump.title);
@@ -5679,7 +5772,7 @@ impl DownloadApp {
 
                     ui.horizontal(|ui| { ui.spacing_mut().item_spacing.x = COL_GAP; let mut ci = 0usize; let mut nw = || { ci += 1; cols[ci - 1] };
                         let task_rate = self.task_rate(&t.id);
-                        cell(ui, nw(), |ui| { let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover()); icon(ui.painter(), &cat_icon(&t.filename), irect, theme::TEXT_MUTED); let kind = crate::stream::proto_kind(&t); let bw = theme::badge_width(ui, kind.label()); if ui.available_width() - bw >= 60.0 { theme::badge(ui, kind.label(), theme::proto_color(kind)); } if !t.debrid_info.is_empty() { let db = theme::badge_width(ui, "Debrid"); if ui.available_width() - db >= 60.0 { theme::badge(ui, "Debrid", theme::TEAL_500); } } ui.add(egui::Label::new(egui::RichText::new(&t.filename).color(theme::TEXT).small()).truncate().selectable(false)).on_hover_text(if t.error.is_empty() { format!("{} - {}\n{}{}", kind.full_name(), t.filename, t.url, if t.debrid_info.is_empty() { String::new() } else { format!("\nDebrid: {}", t.debrid_info) }) } else { format!("{}\nError: {}", t.filename, t.error) }); });
+                        cell(ui, nw(), |ui| { let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover()); icon(ui.painter(), &cat_icon(&t.filename), irect, theme::TEXT_MUTED); let kind = crate::stream::proto_kind(&t); let bw = theme::badge_width(ui, kind.label()); let show_kind = ui.available_width() - bw >= 60.0; if show_kind { theme::badge(ui, kind.label(), theme::proto_color(kind)); } let has_debrid = !t.debrid_info.is_empty(); if has_debrid { let db = theme::badge_width(ui, "Debrid"); if ui.available_width() - db >= 60.0 { theme::badge(ui, "Debrid", theme::TEAL_500); } } ui.add(egui::Label::new(egui::RichText::new(&t.filename).color(theme::TEXT).small()).truncate().selectable(false)).on_hover_text(if t.error.is_empty() { format!("{} - {}\n{}{}", kind.full_name(), t.filename, t.url, if t.debrid_info.is_empty() { String::new() } else { format!("\nDebrid: {}", t.debrid_info) }) } else { format!("{}\nError: {}", t.filename, t.error) }); });
                         if !compact_table { let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(if t.queue_id.is_empty() { "main" } else { &t.queue_id }).color(theme::TEXT_MUTED).small()).truncate().selectable(false)).on_hover_text(if t.queue_id.is_empty() { "main".to_string() } else { t.queue_id.clone() })); }
                         let w = nw(); cell_r(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(match t.total { Some(n) => fmt_bytes(n), None => "—".into() }).color(theme::TEXT_MUTED).small()).truncate().selectable(false)).on_hover_text(match t.total { Some(n) => fmt_bytes(n), None => "unknown size".to_string() }));
                         let sc = theme::status_color(t.status);
@@ -5825,8 +5918,8 @@ impl DownloadApp {
                                                      // Independent native window: no main-rect clip / shrink-wrap.
         let builder = egui::ViewportBuilder::default()
             .with_title("Download file")
-            .with_inner_size([520.0, 480.0])
-            .with_min_inner_size([440.0, 360.0])
+            .with_inner_size([580.0, 700.0])
+            .with_min_inner_size([480.0, 420.0])
             .with_max_inner_size([4096.0, 4096.0])
             .with_resizable(true);
         let cap_body = |ui: &mut egui::Ui, app: &mut DownloadApp| {
@@ -5935,6 +6028,14 @@ impl DownloadApp {
                         }
                     });
                 ui.end_row();
+                form_label(ui, "Proxy");
+                ui.add(
+                    egui::TextEdit::singleline(&mut t.proxy_url)
+                        .hint_text("empty = global proxy; http://user:pass@host:port or socks5://host:port")
+                        .desired_width(ui.available_width()),
+                )
+                .on_hover_text("Per-download proxy. Used for probing (incl. yt-dlp) and downloading this URL. HTTP/HLS/DASH/yt-dlp; FTP/SFTP/NNTP/torrent swarm stay direct.");
+                ui.end_row();
             });
             // Engine choice for streams/video pages: native (default) vs yt-dlp.
             // Stored as x-ytdlp header, honored before manifest dispatch.
@@ -5960,7 +6061,12 @@ impl DownloadApp {
                 prewarm_poll(&mut app.prewarm_cap, &t.url);
                 let rt = app.tokio_rt.clone();
                 let conns = crate::lock_unpoison(&app.rt).state.settings.max_connections;
-                spawn_prewarm(&mut app.prewarm_cap, &rt, &t, conns);
+                let global_proxy = crate::lock_unpoison(&app.rt)
+                    .state
+                    .settings
+                    .proxy_url
+                    .clone();
+                spawn_prewarm(&mut app.prewarm_cap, &rt, &t, conns, &global_proxy);
                 if !app.prewarm_cap.text.is_empty() {
                     ui.label(
                         egui::RichText::new(&app.prewarm_cap.text)
@@ -5992,6 +6098,14 @@ impl DownloadApp {
                         && app.yt_probe_cap.dump.is_none();
                     if virgin {
                         let rt = app.tokio_rt.clone();
+                        let global_proxy = crate::lock_unpoison(&app.rt)
+                            .state
+                            .settings
+                            .proxy_url
+                            .clone();
+                        let eff_proxy =
+                            crate::model::effective_proxy(&t.proxy_url, &global_proxy).to_string();
+                        app.yt_probe_cap.proxy_used = eff_proxy.clone();
                         start_yt_probe(
                             &mut app.yt_probe_cap,
                             &rt,
@@ -5999,10 +6113,18 @@ impl DownloadApp {
                             &t.referrer,
                             &t.cookies,
                             &t.cookies_json,
+                            &eff_proxy,
                         );
                     }
                     let (u, r, c) = (t.url.clone(), t.referrer.clone(), t.cookies.clone());
                     let rt = app.tokio_rt.clone();
+                    let global_proxy = crate::lock_unpoison(&app.rt)
+                        .state
+                        .settings
+                        .proxy_url
+                        .clone();
+                    let eff_proxy =
+                        crate::model::effective_proxy(&t.proxy_url, &global_proxy).to_string();
                     ui.add_space(6.0);
                     ui_yt_probe_section(
                         ui,
@@ -6013,6 +6135,7 @@ impl DownloadApp {
                         &c,
                         &t.cookies_json,
                         &rt,
+                        &eff_proxy,
                     );
                     // Probe title fills filename while user kept funnel name.
                     if let Some(d) = &app.yt_probe_cap.dump {
@@ -6080,7 +6203,7 @@ impl DownloadApp {
                 fit_vp(
                     ctx,
                     vp_id("webcraft-capture"),
-                    egui::vec2(520.0, 480.0),
+                    egui::vec2(580.0, 700.0),
                     self.cap_body_h,
                     &mut self.cap_vp_sent,
                 );
@@ -6124,11 +6247,11 @@ impl DownloadApp {
                     .collapsible(false)
                     .resizable(true)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .default_size([520.0, 480.0])
-                    .min_size([360.0, 300.0])
+                    .default_size([580.0, 700.0])
+                    .min_size([440.0, 360.0])
                     .max_size([
-                        (scr.width() - 24.0).max(360.0),
-                        (scr.height() - 24.0).max(300.0),
+                        (scr.width() - 24.0).max(440.0),
+                        (scr.height() - 24.0).max(360.0),
                     ])
                     .show(ctx, |ui| {
                         let max_h = (ui.available_height() - FOOTER_H).max(48.0);
@@ -6400,7 +6523,11 @@ impl DownloadApp {
         let rt = self.tokio_rt.clone();
         let (proxy, settings) = {
             let g = self.rt.lock().unwrap_or_else(|e| e.into_inner());
-            (g.state.settings.proxy_url.clone(), g.state.settings.clone())
+            (
+                crate::model::effective_proxy(&self.add_proxy, &g.state.settings.proxy_url)
+                    .to_string(),
+                g.state.settings.clone(),
+            )
         };
         std::thread::spawn(move || {
             let task = DownloadTask {
@@ -6536,7 +6663,7 @@ impl DownloadApp {
         let rt = self.tokio_rt.clone();
         let proxy = {
             let g = self.rt.lock().unwrap_or_else(|e| e.into_inner());
-            g.state.settings.proxy_url.clone()
+            crate::model::effective_proxy(&self.add_proxy, &g.state.settings.proxy_url).to_string()
         };
         std::thread::spawn(move || {
             let task = DownloadTask {
@@ -6557,8 +6684,8 @@ impl DownloadApp {
         // Independent native window: no main-rect clip / shrink-wrap weirdness.
         let builder = egui::ViewportBuilder::default()
             .with_title("Add download")
-            .with_inner_size([560.0, 680.0])
-            .with_min_inner_size([460.0, 420.0])
+            .with_inner_size([620.0, 840.0])
+            .with_min_inner_size([520.0, 480.0])
             .with_max_inner_size([4096.0, 4096.0])
             .with_resizable(true);
         let mut start: Option<bool> = None; // Some(true)=now, Some(false)=later
@@ -6578,7 +6705,7 @@ impl DownloadApp {
         ctx.show_viewport_immediate(vp_id("webcraft-add"), builder, |ctx, class| {
             add_focused = ctx.input(|i| i.focused);
             if !matches!(class, egui::ViewportClass::Embedded) {
-                fit_vp(ctx, vp_id("webcraft-add"), egui::vec2(560.0, 680.0), self.add_body_h, &mut self.add_vp_sent);
+                fit_vp(ctx, vp_id("webcraft-add"), egui::vec2(620.0, 840.0), self.add_body_h, &mut self.add_vp_sent);
             }
             if ctx.input(|i| i.viewport().close_requested()) {
                 cancel = true;
@@ -6713,7 +6840,9 @@ impl DownloadApp {
                         ui.add_space(theme::SP_SM);
                         let (u, r, c) = (app.add_url.trim().to_string(), app.add_referrer.clone(), app.add_cookies.clone());
                         let rt = app.tokio_rt.clone();
-                        ui_yt_probe_section(ui, &mut app.yt_probe_add, "add", &u, &r, &c, "", &rt);
+                        let global_proxy = crate::lock_unpoison(&app.rt).state.settings.proxy_url.clone();
+                        let eff_proxy = crate::model::effective_proxy(&app.add_proxy, &global_proxy).to_string();
+                        ui_yt_probe_section(ui, &mut app.yt_probe_add, "add", &u, &r, &c, "", &rt, &eff_proxy);
                     } else if !app.add_url.trim().is_empty() {
                         // HTTP prewarm: stable probe-able URL spawns background
                         // probe+plan; confirm never waits for it.
@@ -6723,6 +6852,7 @@ impl DownloadApp {
                             cookies: app.add_cookies.clone(),
                             username: app.add_user.clone(),
                             password: app.add_pass.clone(),
+                            proxy_url: app.add_proxy.clone(),
                             ..Default::default()
                         };
                         // Changed URL since last frame: stale prewarm dropped.
@@ -6734,7 +6864,8 @@ impl DownloadApp {
                             prewarm_poll(&mut app.prewarm_add, &t.url);
                             let rt = app.tokio_rt.clone();
                             let conns = crate::lock_unpoison(&app.rt).state.settings.max_connections;
-                            spawn_prewarm(&mut app.prewarm_add, &rt, &t, conns);
+                            let global_proxy = crate::lock_unpoison(&app.rt).state.settings.proxy_url.clone();
+                            spawn_prewarm(&mut app.prewarm_add, &rt, &t, conns, &global_proxy);
                             if !app.prewarm_add.text.is_empty() {
                                 ui.label(egui::RichText::new(&app.prewarm_add.text).small().color(theme::TEXT_MUTED));
                             } else if app.prewarm_add.loading {
@@ -6751,6 +6882,14 @@ impl DownloadApp {
                                 .hint_text("mirror URLs, comma separated (failover)")
                                 .desired_width(ui.available_width()),
                         );
+                        ui.end_row();
+                        form_label(ui, "Proxy");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut app.add_proxy)
+                                .hint_text("empty = global proxy; http://user:pass@host:port or socks5://host:port")
+                                .desired_width(ui.available_width()),
+                        )
+                        .on_hover_text("Per-download proxy. Used for probing (incl. yt-dlp) and downloading this URL. HTTP/HLS/DASH/yt-dlp; FTP/SFTP/NNTP/torrent swarm stay direct.");
                         ui.end_row();
                         form_label(ui, "Description");
                         ui.add(fill_edit(&mut app.add_desc));
@@ -6858,9 +6997,9 @@ impl DownloadApp {
                     .collapsible(false)
                     .resizable(true)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .default_size([560.0, 680.0])
-                    .min_size([380.0, 320.0])
-                    .max_size([(scr.width() - 24.0).max(380.0), (scr.height() - 24.0).max(320.0)])
+                    .default_size([620.0, 840.0])
+                    .min_size([480.0, 420.0])
+                    .max_size([(scr.width() - 24.0).max(480.0), (scr.height() - 24.0).max(420.0)])
                     .show(ctx, |ui| bb(ui, self, &mut start, &mut cancel));
             } else {
                 egui::CentralPanel::default().frame(dialog_frame()).show(ctx, |ui| {
@@ -6888,7 +7027,7 @@ impl DownloadApp {
                         self.add_queue.clone()
                     },
                 );
-                let (user, pass, key, mirrors, desc) = (
+                let (user, pass, key, mirrors, desc, proxy_override) = (
                     self.add_user.clone(),
                     self.add_pass.clone(),
                     self.add_key.clone(),
@@ -6898,6 +7037,7 @@ impl DownloadApp {
                         .filter(|s| !s.is_empty())
                         .collect::<Vec<_>>(),
                     self.add_desc.clone(),
+                    self.add_proxy.trim().to_string(),
                 );
                 // Valid non-empty rows only; invalid blocked at dialog gate.
                 let custom_headers: std::collections::BTreeMap<String, String> = self
@@ -6914,7 +7054,14 @@ impl DownloadApp {
                 if crate::debrid::is_magnet(&url) && self.pending_debrid_add.is_none() {
                     let (settings, proxy) = {
                         let g = crate::lock_unpoison(&self.rt);
-                        (g.state.settings.clone(), g.state.settings.proxy_url.clone())
+                        (
+                            g.state.settings.clone(),
+                            crate::model::effective_proxy(
+                                &proxy_override,
+                                &g.state.settings.proxy_url,
+                            )
+                            .to_string(),
+                        )
                     };
                     if crate::debrid::any_for_magnets(&settings) {
                         if let Ok(mut s) = self.debrid_add_slot.try_lock() {
@@ -6926,6 +7073,7 @@ impl DownloadApp {
                             cookies: cookies.clone(),
                             queue_id: queue.clone(),
                             start_now,
+                            proxy_url: proxy_override.clone(),
                         });
                         let slot = self.debrid_add_slot.clone();
                         let rt2 = self.tokio_rt.clone();
@@ -6962,6 +7110,7 @@ impl DownloadApp {
                         t.ssh_key_path = key;
                         t.mirrors = mirrors;
                         t.description = desc;
+                        t.proxy_url = proxy_override;
                         t.headers.extend(custom_headers.clone());
                         // Torrent picker: empty vec = all files; validate vs probe.
                         // Only for torrent tasks; stale picker state must not leak.
@@ -7059,6 +7208,7 @@ impl DownloadApp {
                 self.add_key.clear();
                 self.add_headers.clear();
                 self.add_mirrors.clear();
+                self.add_proxy.clear();
                 self.add_desc.clear();
                 self.yt_probe_add = YtProbeState::default();
                 // Cancel: drop prewarm entry (abandoned cost = 1 range request).
@@ -7094,8 +7244,8 @@ impl DownloadApp {
         // Independent native window: content outgrows main window rect.
         let builder = egui::ViewportBuilder::default()
             .with_title(format!("Progress - {}", t.filename))
-            .with_inner_size([640.0, 720.0])
-            .with_min_inner_size([440.0, 380.0])
+            .with_inner_size([700.0, 860.0])
+            .with_min_inner_size([520.0, 480.0])
             .with_max_inner_size([4096.0, 4096.0])
             .with_resizable(true);
         if self.progress_raise {
@@ -7471,6 +7621,31 @@ impl DownloadApp {
                                 .small(),
                         );
                     });
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Proxy").color(theme::TEXT_FAINT).small());
+                        let mut px = t.proxy_url.clone();
+                        // Client/yt-dlp proxy baked at start; edit applies on restart.
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut px)
+                                    .hint_text("empty = global proxy")
+                                    .desired_width(ui.available_width().min(360.0)),
+                            )
+                            .on_hover_text("Per-download proxy override. Takes effect next time this download starts.")
+                            .changed()
+                        {
+                            let mut g = crate::lock_unpoison(&app.rt);
+                            if let Some(x) = g.state.tasks.iter_mut().find(|x| x.id == t.id) {
+                                x.proxy_url = px.trim().to_string();
+                            }
+                            g.save();
+                        }
+                        ui.label(
+                            egui::RichText::new("applies on restart")
+                                .color(theme::TEXT_FAINT)
+                                .small(),
+                        );
+                    });
                     // SWARM (torrent snapshot; hidden when absent)
                     if kind == crate::stream::ProtoKind::Torrent {
                         if let Some(snap) = seg_view.as_ref().and_then(|v| v.torrent.clone()) {
@@ -7806,11 +7981,11 @@ impl DownloadApp {
                     .collapsible(false)
                     .resizable(true)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .default_size([640.0, 720.0])
-                    .min_size([380.0, 320.0])
+                    .default_size([700.0, 860.0])
+                    .min_size([480.0, 420.0])
                     .max_size([
-                        (scr.width() - 24.0).max(380.0),
-                        (scr.height() - 24.0).max(320.0),
+                        (scr.width() - 24.0).max(480.0),
+                        (scr.height() - 24.0).max(420.0),
                     ])
                     .show(ctx, |ui| bb(ui, self))
                     .and_then(|r| r.inner)
@@ -7819,7 +7994,7 @@ impl DownloadApp {
                 fit_vp(
                     ctx,
                     vp_id("webcraft-progress"),
-                    egui::vec2(640.0, 720.0),
+                    egui::vec2(700.0, 860.0),
                     prog_h_in,
                     &mut prog_sent,
                 );
@@ -7942,7 +8117,7 @@ impl DownloadApp {
                                     .small()
                                     .monospace(),
                             );
-                            let name_w = (ui.available_width() - 250.0).max(80.0);
+                            let name_w = (ui.available_width() - 350.0).max(80.0);
                             ui.add_sized(
                                 [name_w, theme::ROW_H_NAV],
                                 egui::Label::new(&t.filename).truncate().selectable(false),
@@ -8966,8 +9141,9 @@ impl DownloadApp {
                 });
             });
             ui.separator();
-            // Captured links get remaining page height (was capped 320px).
-            let list_h = ui.available_height().max(160.0);
+            // Leave 40px below for Project JSON header; else list consumes
+            // all remaining height and pushes it off-panel (no outer scroll).
+            let list_h = (ui.available_height() - 40.0).max(160.0);
             if self.grab_files.is_empty() {
                 ui.label(
                     egui::RichText::new(if self.grab_busy {
@@ -9419,7 +9595,7 @@ impl DownloadApp {
                         );
                         ui.end_row();
                     });
-                    ui.label(egui::RichText::new("Leave empty for a direct connection. New downloads use the saved proxy.").color(theme::TEXT_FAINT).small());
+                    ui.label(egui::RichText::new("Leave empty for a direct connection. Default for all downloads; override per download in Add URL (Transfer → Proxy), browser Capture, or Progress dialog. SOCKS needs no extra setup.").color(theme::TEXT_FAINT).small());
                     ui.add_space(10.0);
                     section(ui, "NNTP (Usenet / NZB)");
                     form_grid("opts-nntp-grid").show(ui, |ui| {
@@ -9985,7 +10161,7 @@ mod progress_tests {
                 secs,
                 empty,
                 &queues,
-                &[sch.clone()],
+                std::slice::from_ref(&sch),
                 true
             ),
             60_000
@@ -10198,6 +10374,7 @@ mod progress_tests {
         assert!(!prewarm_eligible(&yt));
     }
 
+    #[test]
     fn yt_probe_eligible_gate() {
         assert!(yt_probe_eligible("https://example.com/watch?v=1"));
         assert!(yt_probe_eligible("https://example.com/list.m3u8?tok=1"));
@@ -10224,6 +10401,35 @@ mod progress_tests {
         assert_eq!(ch.quality_height, Some(1080));
         st.quality = "bogus".into();
         assert_eq!(yt_choice_from_state(&st).quality_height, None);
+    }
+
+    #[test]
+    fn dl_cols_stored_overflow_shrinks_to_fit() {
+        // Persisted widths from a large window must fit a smaller avail:
+        // full table visible, no h-scroll overflow.
+        let stored = [900.0, 44.0, 200.0, 150.0, 120.0, 150.0, 300.0, 58.0];
+        for avail in [620.0, 760.0, 980.0] {
+            let v = dl_cols(avail, false, Some(&stored));
+            let total: f32 = v.iter().sum::<f32>() + COL_GAP * (v.len() - 1) as f32;
+            assert!(
+                total <= avail + 0.5,
+                "avail {avail} total {total} cols {v:?}"
+            );
+            assert!(v[0] >= NAME_MIN - 0.5);
+            for (j, w) in v.iter().enumerate().skip(1) {
+                assert!(*w >= col_min(j, false) - 0.5, "col {j} below min");
+            }
+        }
+        // Compact set likewise.
+        let stored_c = [800.0, 200.0, 150.0, 300.0, 58.0];
+        let v = dl_cols(680.0, true, Some(&stored_c));
+        let total: f32 = v.iter().sum::<f32>() + COL_GAP * (v.len() - 1) as f32;
+        assert!(total <= 680.5, "compact total {total} cols {v:?}");
+        // Full main window (1440 - rail 176 - margins 24 = 1240) fits defaults.
+        let v = dl_cols(1240.0, false, None);
+        let total: f32 = v.iter().sum::<f32>() + COL_GAP * (v.len() - 1) as f32;
+        assert!(total <= 1240.5);
+        assert!(v[0] > 370.0);
     }
 
     #[test]

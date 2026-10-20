@@ -20,7 +20,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned: -D warnings clippy turns new stable lints into CI failures.
+      # Bump deliberately after running cargo clippy --all-targets -- -D warnings.
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: ${{ matrix.os == 'macos-latest' && 'x86_64-apple-darwin,aarch64-apple-darwin' || matrix.target }}
           components: clippy

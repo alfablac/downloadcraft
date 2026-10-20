@@ -917,7 +917,7 @@ pub fn top_level_hwnd(pid: u32, title_prefix: &str) -> Option<isize> {
         if search.found.is_null() {
             return None;
         }
-        return Some(search.found as isize);
+        Some(search.found as isize)
     }
     #[cfg(not(windows))]
     {

@@ -108,8 +108,9 @@
   // ---- request<->element correlation (IDM model) ----
   // Records: {url, redirectFrom, hops:[origin..final], tabId, frameId, time,
   // type, size, status}. el: {tabId, frameId, srcs:[..], srcKey, postId:"",
-  // since:ms, now:ms}. Returns matched records narrowed to {url,type,size,time}.
-  // Tiers EXCLUSIVE: src/hops hit wins; else bounded postId hit; else timing
+  // streamId:"", since:ms, now:ms}. Returns matched records narrowed to {url,type,size,time}.
+  // Tiers EXCLUSIVE: src/hops hit wins; else bounded postId hit; else bounded
+  // streamId hit; else timing
   // (only when element has no real srcs, else timing leaks other videos).
   // ponytail: timing cannot disambiguate two concurrent no-id/no-src videos;
   // both are returned (see rank.test.mjs ceiling case). Upgrade:
@@ -150,6 +151,13 @@
           || hopsOf(r).some(function (h) { return boundedHit(h, e.postId); });
       });
       if (postHits.length) return out(postHits);
+    }
+    if (e.streamId && e.streamId !== e.postId) {
+      var streamHits = pool.filter(function (r) {
+        return boundedHit(r.url, e.streamId) || boundedHit(r.redirectFrom, e.streamId)
+          || hopsOf(r).some(function (h) { return boundedHit(h, e.streamId); });
+      });
+      if (streamHits.length) return out(streamHits);
     }
     // Timing anchored at firstPlay (since), never at click time (now):
     // late click must not widen window. No since -> no timing hits.

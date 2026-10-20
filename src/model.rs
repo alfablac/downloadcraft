@@ -80,6 +80,10 @@ pub struct DownloadTask {
     /// SFTP private-key file (empty = password auth, else ~/.ssh/id_* probe).
     #[serde(default)]
     pub ssh_key_path: String,
+    /// Per-download proxy override (http:// or socks5://, creds allowed).
+    /// Empty = inherit Settings::proxy_url. Plain in state.json like global.
+    #[serde(default)]
+    pub proxy_url: String,
     /// Display-only debrid route info:
     /// `"<Provider> · <host> · <cached|cached: unknown|not cached>"`.
     /// Empty = not debrid. Never holds resolved URL/token.
@@ -93,6 +97,16 @@ pub struct DownloadTask {
     /// magnet URL; stream matches resolved file by this name, not task filename).
     #[serde(default)]
     pub debrid_file_name: String,
+}
+
+/// Effective egress proxy: per-task override when non-empty, else global.
+/// Empty result = direct (except reqwest env/system proxy fallback).
+pub fn effective_proxy<'a>(task_proxy: &'a str, global_proxy: &'a str) -> &'a str {
+    if task_proxy.trim().is_empty() {
+        global_proxy
+    } else {
+        task_proxy
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -898,6 +912,18 @@ mod tests {
         v.as_object_mut().unwrap().remove("torrent_files");
         let old: DownloadTask = serde_json::from_value(v).unwrap();
         assert!(old.torrent_files.is_empty());
+        assert!(old.proxy_url.is_empty());
+    }
+
+    #[test]
+    fn effective_proxy_prefers_task_override() {
+        assert_eq!(effective_proxy("", "http://g:1"), "http://g:1");
+        assert_eq!(effective_proxy("  ", "http://g:1"), "http://g:1");
+        assert_eq!(
+            effective_proxy("socks5://t:2", "http://g:1"),
+            "socks5://t:2"
+        );
+        assert_eq!(effective_proxy("", ""), "");
     }
 
     #[test]

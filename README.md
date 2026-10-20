@@ -39,6 +39,7 @@ webcraft reimplements the observable behavior of Internet Download Manager from 
 - Segmented HTTP/S downloads that resume from part files after a restart, with work-stealing across a fixed connection pool (configurable in Options) and correct byte accounting — downloaded never exceeds total
 - Pre-warm probing on add/capture: range probe, redirect resolution, and segment planning happen before you confirm; probe responses are reused instead of re-downloaded
 - Custom HTTP headers per download (User-Agent, Referer, Authorization Bearer, or any header) from the Add dialog's *Headers (advanced)* section — HTTP/S only
+- Per-download proxy override (Add URL *Transfer → Proxy*, browser Capture, or Progress dialog — Progress edits apply on restart); empty inherits the global Settings proxy. Applies to HTTP/HTTPS, HLS/DASH, Metalink, debrid, fetching NZB/.torrent files, and yt-dlp probe/download (`--proxy`); FTP/SFTP, NNTP articles, and torrent swarm stay direct. HTTP and SOCKS5 proxies work, with credentials in the URL
 - Mirrors per task with failover, per-task and global speed limits, SHA-256 verification, rename templates (`{name}`, `{ext}`, `{date}`, `{host}`, `{category}`), and category subfolders
 
 ### Protocols
@@ -72,7 +73,7 @@ webcraft reimplements the observable behavior of Internet Download Manager from 
 - Queues with priority, retry counts, and per-queue concurrency; schedules with start/stop windows, weekday masks, quotas, missed-run catch-up, and completion actions (including shutdown with confirmation)
 - Site Grabber with depth, scope, size, and extension filters and a mirror mode that rewrites links to local relative paths — including SharePoint via browser cookies
 - Progress dialog with per-part status, speed graph, and live details; downloads table with saved sort/widths, protocol badges, and type filtering from the side rail
-- Desktop notifications, system tray, autostart, single-instance lock, clipboard URL monitoring, drag-and-drop, proxy with authentication, and atomic state saving with a `.bak` fallback
+- Desktop notifications, system tray, autostart, single-instance lock, clipboard URL monitoring, drag-and-drop, HTTP/SOCKS5 proxy with authentication (global default, per-download override — see Download engine), and atomic state saving with a `.bak` fallback
 
 > [!NOTE]
 > Multi-track downloads are muxed with ffmpeg when ffmpeg is on PATH or beside the exe; single-track downloads do not need it. The app never downloads ffmpeg at runtime. yt-dlp is fetched from its GitHub releases when no binary is found, and updated after 30 days.
@@ -108,11 +109,11 @@ The desktop app registers the native messaging host and the `webcraft://` protoc
 - **Chromium:** load `extensions/chromium` as an unpacked extension.
 - **Firefox:** install `extensions/webcraft-firefox.xpi` from about:addons → gear → Install Add-on From File (start webcraft once first so the host is registered). Release Firefox refuses unsigned add-ons permanently — use Developer Edition/Nightly, set `xpinstall.signatures.required` to false where allowed, or load `extensions/firefox` temporarily from about:debugging. Rebuild the XPI with `scripts/package-firefox.ps1`.
 
-The extension watches downloads passively and ranks what it finds, so a page with many small segments offers the playlist or file first. It hands video-page links to the app with the page's cookies, where yt-dlp resolves formats. Capture can be limited by an extension allowlist and minimum size in Options (`capture-filter.json`). Video buttons stay hidden until playback starts.
+The extension watches downloads passively and ranks what it finds, so a page with many small segments offers the playlist or file first. Playlist candidates (.m3u8/.mpd) are kept for 30 minutes (other candidates 5), evicted last when the candidate cap is hit, and partial (206) responses count as candidates too — so a stream detected early is still offered when you click later. It hands video-page links to the app with the page's cookies, where yt-dlp resolves formats. Capture can be limited by an extension allowlist and minimum size in Options (`capture-filter.json`). Video buttons stay hidden until playback starts.
 
 ## Interface
 
-The main window groups related actions and labels each group: download actions stay with the selected download, queue actions with all downloads. Narrow windows scroll the table instead of squeezing columns, and switch to a compact column set. Column widths and sort order persist between launches. Add, Capture, and Progress dialogs open as separate windows; delete confirmations keep a fixed size so buttons never jump under your cursor. Options save as soon as a setting changes.
+The main window opens at 1440×900 and groups related actions and labels each group: download actions stay with the selected download, queue actions with all downloads. Narrow windows switch to a compact column set, persisted column widths shrink to fit instead of forcing horizontal scrolling, and the side rail scrolls when it runs out of height. Column widths and sort order persist between launches. Add (620×840), Capture (580×700), Progress (700×860), Collision (560×280), and Player (1024×640) dialogs open as separate windows; opening Add or a browser Capture grows a smaller restored main window back to full size. Delete confirmations keep a fixed size so buttons never jump under your cursor. Options save as soon as a setting changes.
 
 ## Documentation
 
