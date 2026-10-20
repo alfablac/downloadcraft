@@ -123,4 +123,4 @@ The main window opens at 1440×900 and groups related actions and labels each gr
 
 ## Limits
 
-DRM-protected streams are refused on purpose. NNTP repair uses PAR2 files included in the NZB; archive unpacking is not done yet. Segmented FTP restarts the file when resumed (single-connection FTP resumes normally). There is no Safari extension — that needs Xcode signing. `docs/parity.md` lists the remaining partial items.
+DRM-protected streams are refused on purpose. NNTP repair uses PAR2 files included in the NZB; archive auto-unpack (RAR/ZIP/7z, multi-volume; password from inside NZB: `<meta type="password">` or `{{password}}` in NZB/archive name) on by default in Options → NNTP — archive deleted only after verified extraction, failure keeps archive and marks download Error. Segmented FTP restarts the file when resumed (single-connection FTP resumes normally). There is no Safari extension — that needs Xcode signing. `docs/parity.md` lists the remaining partial items.

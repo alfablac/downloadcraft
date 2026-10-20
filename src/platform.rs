@@ -859,6 +859,8 @@ pub fn notify(title: &str, body: &str) {
 // ---------- embedded child window (mpv --wid alternative: reparent) ----------
 
 /// Style transform for embed_child: pure, unit-tested.
+/// Windows-only production caller; test keeps it live elsewhere.
+#[cfg(any(windows, test))]
 fn embedded_style(style: u32) -> u32 {
     const WS_POPUP: u32 = 0x8000_0000;
     const WS_CHILD: u32 = 0x4000_0000;

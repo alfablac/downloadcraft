@@ -41,7 +41,7 @@
 | WebDAV (`webdav://`/`webdavs://` scheme map, Add dialog + capture ingress) | Done | `app::normalize_webdav` |
 | SFTP (russh, TOFU known-hosts, key/password, seek resume) | Done | `src/sftp.rs` |
 | FTPS explicit `ftps://` + implicit `ftpsi://` (TLS data, resume; no live TLS fixture) | Done | `src/ftp.rs` |
-| NNTP/NZB (yEnc + CRC32, TLS, PAR2 repair in-process src/par2.rs, fake-server e2e; unpack/per-segment resume deferred) | Done | `src/nntp.rs`, `tests/nntp.rs` |
+| NNTP/NZB (yEnc + CRC32, TLS, PAR2 repair in-process src/par2.rs, fake-server e2e; auto-unpack rar/zip/7z src/unpack.rs delete-on-verified-success; per-segment resume deferred) | Done | `src/nntp.rs`, `tests/nntp.rs` |
 | BitTorrent magnet + .torrent (librqbit, persistence, seed-after-complete opt-in) | Done | `src/torrent.rs`, `model::Settings` torrent fields |
 | HLS AES-128 decrypt (plain key over HTTP, not DRM) | Done | `hls::decrypt_segment` + `stream` encrypted temp-parts path; unit vectors + `tests/hls_aes.rs` e2e (sequence IV, explicit IV); SAMPLE-AES/other methods → Protected; RE round 5: IDM manual-add saves playlist plain (KEY never fetched), browser-panel path unverified |
 | DASH nested BaseURL, `$Number%05d$`/`$RepresentationID$` | Done | unit tests |

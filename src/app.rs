@@ -9625,7 +9625,8 @@ impl DownloadApp {
                     });
                     ui.add(egui::Slider::new(&mut settings.nntp_connections, 1..=64).text("Connections"));
                     ui.label(egui::RichText::new("Provider connection limit applies per NZB download.").color(theme::TEXT_FAINT).small());
-                    ui.label(egui::RichText::new("Add an .nzb URL (or NZB file path) as a download to fetch via NNTP. NNTP connections separate from HTTP Connections per file. Higher = faster, respect provider limit. PAR2 repair included when NZB ships .par2 files; unpack not included.").color(theme::TEXT_FAINT).small());
+                    ui.checkbox(&mut settings.nzb_auto_unpack, "Auto-unpack archives after NZB download (RAR/ZIP/7z, incl. multi-volume; archive deleted only on successful extraction)");
+                    ui.label(egui::RichText::new("Add an .nzb URL (or NZB file path) as a download to fetch via NNTP. NNTP connections separate from HTTP Connections per file. Higher = faster, respect provider limit. PAR2 repair included when NZB ships .par2 files. Archive password taken from inside NZB: <meta type=\"password\">, or {{password}} in NZB/archive name.").color(theme::TEXT_FAINT).small());
                 }
                 6 => {
                     section(ui, "Browser integration");

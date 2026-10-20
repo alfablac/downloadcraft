@@ -4,7 +4,8 @@
 // NZB order by single writer to sanitized NZB file names in out dir
 // (dest_dir/<output_name> for multi-file NZB, else dest_dir).
 // PAR2 repair in-process via crate::par2 after download when set includes
-// .par2. ponytail: no archive unpack, no per-segment resume (pause restarts
+// .par2. Auto-unpack via crate::unpack when cfg.auto_unpack (archive deleted
+// only on verified success). ponytail: no per-segment resume (pause restarts
 // current file; completed files skipped via nzbstate sidecar). Add segment
 // cache in .downloadcraft-{task.id} workdir when needed.
 use crate::engine::Controls;
@@ -66,9 +67,12 @@ pub fn parse_nzb(xml: &str) -> Result<Nzb, String> {
     let mut meta = std::collections::BTreeMap::new();
     for m in doc.descendants().filter(|n| n.has_tag_name("meta")) {
         if let Some(k) = m.attribute("type") {
+            // Password values: trim only outer whitespace introduced by XML
+            // formatting; `type` key trimmed+lowercased. Passwords with
+            // meaningful interior spaces preserved.
             let text = m.text().unwrap_or("").trim().to_string();
             if !text.is_empty() {
-                meta.insert(k.to_ascii_lowercase(), text);
+                meta.insert(k.trim().to_ascii_lowercase(), text);
             }
         }
     }
@@ -123,6 +127,50 @@ pub fn parse_nzb(xml: &str) -> Result<Nzb, String> {
         total_bytes,
         meta,
     })
+}
+
+/// `{{password}}` embedded in a name: SABnzbd convention for NZB filename
+/// (`Release {{secret}}.nzb`) and archive stems (`Release {{secret}}.rar`).
+pub fn password_from_braces(name: &str) -> Option<String> {
+    let start = name.find("{{")? + 2;
+    let end = name[start..].find("}}")? + start;
+    let pw = name[start..end].trim();
+    (!pw.is_empty()).then(|| pw.to_string())
+}
+
+/// Archive password for this NZB. Priority: `<meta type="password">`,
+/// then `{{pw}}` in NZB source/meta names, then `{{pw}}` in file names.
+/// RAR passwords on Usenet live inside NZB itself.
+pub fn nzb_password(nzb: &Nzb, source_url: &str) -> Option<String> {
+    if let Some(pw) = nzb.meta.get("password") {
+        let pw = pw.trim();
+        if !pw.is_empty() {
+            return Some(pw.to_string());
+        }
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    // URL may percent-encode braces (%7B%7Bpw%7D%7D).
+    candidates.push(
+        source_url
+            .replace("%7B", "{")
+            .replace("%7b", "{")
+            .replace("%7D", "}")
+            .replace("%7d", "}"),
+    );
+    if let Some(s) = source_stem(source_url) {
+        candidates.push(s);
+    }
+    for k in ["title", "name"] {
+        if let Some(v) = nzb.meta.get(k) {
+            candidates.push(v.clone());
+        }
+    }
+    for c in &candidates {
+        if let Some(pw) = password_from_braces(c) {
+            return Some(pw);
+        }
+    }
+    nzb.files.iter().find_map(|f| password_from_braces(&f.name))
 }
 
 /// Sanitized meta value usable as output name; None if sanitizes to
@@ -340,6 +388,9 @@ pub struct NntpConfig {
     /// ponytail: per-task cap only; N tasks x N conns possible. Strict
     /// provider-account cap = global semaphore, add when needed.
     pub connections: u32,
+    /// Auto-unpack rar/zip/7z in out dir after successful download
+    /// (Settings.nzb_auto_unpack). Archive deleted only on verified success.
+    pub auto_unpack: bool,
 }
 
 impl NntpConfig {
@@ -355,6 +406,7 @@ impl NntpConfig {
                 s.nntp_connections
             }
             .clamp(1, 64),
+            auto_unpack: s.nzb_auto_unpack,
             user: if task.username.is_empty() {
                 s.nntp_user.clone()
             } else {
@@ -1222,6 +1274,21 @@ pub async fn download_nzb(
         }
         return Err(msg);
     }
+    // Auto-unpack after PAR2 repair, before Complete: extraction failure
+    // returns Err (archive kept, app marks Error/retry, never Complete).
+    if cfg.auto_unpack {
+        let names: Vec<String> = nzb.files.iter().map(|f| f.name.clone()).collect();
+        let dir = out_dir.clone();
+        let password = nzb_password(&nzb, &task.url);
+        let unpacked = tokio::task::spawn_blocking(move || {
+            crate::unpack::unpack_dir(&dir, &names, password.as_deref())
+        })
+        .await
+        .map_err(|e| format!("unpack task failed: {e}"))??;
+        if unpacked > 0 {
+            eprintln!("nntp: unpacked {unpacked} archive(s) in {}", out_dir.display());
+        }
+    }
     for file in &nzb.files {
         let _ = tokio::fs::remove_file(out_dir.join(format!("{}.nzbstate", file.name))).await;
     }
@@ -1395,6 +1462,37 @@ mod tests {
         assert_eq!(n.meta.len(), 2, "meta without type skipped: {:?}", n.meta);
         // Title meta (case-insens key) wins as output name.
         assert_eq!(output_name(&n, "https://x/get?id=1"), "My Release");
+    }
+
+    #[test]
+    fn parse_nzb_meta_password_and_braces() {
+        let x = concat!(
+            "<nzb><head><meta type=\" password \">  s3cret pw </meta></head>",
+            "<file subject=\"p &quot;a.rar&quot;\"><segments><segment bytes=\"10\" number=\"1\">a@b</segment></segments></file></nzb>"
+        );
+        let n = parse_nzb(x).unwrap();
+        assert_eq!(nzb_password(&n, "https://x/r.nzb").as_deref(), Some("s3cret pw"));
+        // No meta: SABnzbd {{pw}} in NZB filename.
+        let plain = parse_nzb(
+            "<nzb><file subject=\"p &quot;a.rar&quot;\"><segments><segment bytes=\"10\" number=\"1\">a@b</segment></segments></file></nzb>",
+        )
+        .unwrap();
+        assert_eq!(
+            nzb_password(&plain, "https://x/Release%20%7B%7Bfrom-url%7D%7D.nzb").as_deref(),
+            Some("from-url")
+        );
+        assert_eq!(
+            nzb_password(&plain, "/tmp/Release {{from-file}}.nzb").as_deref(),
+            Some("from-file")
+        );
+        // File name braces fallback.
+        let fnamed = parse_nzb(
+            "<nzb><file subject=\"p &quot;Rel {{filepw}}.rar&quot;\"><segments><segment bytes=\"10\" number=\"1\">a@b</segment></segments></file></nzb>",
+        )
+        .unwrap();
+        assert_eq!(nzb_password(&fnamed, "https://x/r.nzb").as_deref(), Some("filepw"));
+        // Meta wins over braces.
+        assert_eq!(nzb_password(&n, "/tmp/{{other}}.nzb").as_deref(), Some("s3cret pw"));
     }
 
     #[test]

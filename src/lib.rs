@@ -18,5 +18,6 @@ pub mod scheduler;
 pub mod sftp;
 pub mod stream;
 pub mod torrent;
+pub mod unpack;
 pub mod update;
 pub mod ytdlp;

@@ -133,6 +133,56 @@ fn serve_conn(
     }
 }
 
+/// Hand-crafted Stored (method 0) ZIP: local header + central dir + EOCD.
+/// Uses nntp::crc32, no zip writer dep needed test-side.
+fn stored_zip(name: &str, data: &[u8]) -> Vec<u8> {
+    let crc = crc32(data);
+    let mut out = Vec::new();
+    let name_b = name.as_bytes();
+    out.extend_from_slice(b"PK\x03\x04");
+    out.extend_from_slice(&20u16.to_le_bytes()); // version
+    out.extend_from_slice(&0u16.to_le_bytes()); // flags
+    out.extend_from_slice(&0u16.to_le_bytes()); // method 0
+    out.extend_from_slice(&0u16.to_le_bytes()); // time
+    out.extend_from_slice(&0u16.to_le_bytes()); // date
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+    out.extend_from_slice(name_b);
+    out.extend_from_slice(data);
+    let cd_offset = out.len() as u32;
+    out.extend_from_slice(b"PK\x01\x02");
+    out.extend_from_slice(&20u16.to_le_bytes());
+    out.extend_from_slice(&20u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // extra
+    out.extend_from_slice(&0u16.to_le_bytes()); // comment
+    out.extend_from_slice(&0u16.to_le_bytes()); // disk
+    out.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+    out.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+    out.extend_from_slice(&0u32.to_le_bytes()); // local offset
+    out.extend_from_slice(name_b);
+    let cd_size = out.len() as u32 - cd_offset;
+    out.extend_from_slice(b"PK\x05\x06");
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&cd_size.to_le_bytes());
+    out.extend_from_slice(&cd_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
 fn tmpdir(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("downloadcraft-nntp-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -461,6 +511,63 @@ async fn nntp_par2_repairs_missing_segment() {
     assert!(out.join("movie.par2").exists());
     assert!(out.join(&vol_name).exists());
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn nntp_auto_unpack_extracts_and_deletes_archive() {
+    let dir = tmpdir("unpack-ok");
+    let payload: &[u8] = b"hello unpack world";
+    let zip = stored_zip("hello.txt", payload);
+    let fake = fake_nntp(vec![("z1@news".into(), yenc(&zip, "pack.zip"))]);
+    let nzb_path = dir.join("test.nzb");
+    std::fs::write(
+        &nzb_path,
+        nzb_xml(&[("p &quot;pack.zip&quot;", vec![("z1@news", zip.len() as u64 + 64, 1)])]),
+    )
+    .unwrap();
+    let mut settings = settings_for(&fake);
+    settings.nzb_auto_unpack = true;
+    let (done, _ctrl) = run_nzb(&dir, &nzb_path, &settings).await;
+    assert_eq!(done.status, TaskStatus::Complete, "{}", done.error);
+    assert_eq!(std::fs::read(dir.join("hello.txt")).unwrap(), payload);
+    assert!(!dir.join("pack.zip").exists(), "archive deleted on success");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn nntp_auto_unpack_corrupt_archive_kept_and_errors() {
+    let dir = tmpdir("unpack-bad");
+    let mut zip = stored_zip("hello.txt", b"hello unpack world");
+    let pos = zip.windows(18).position(|w| w == b"hello unpack world").unwrap();
+    zip[pos] ^= 0xFF; // payload corrupt -> ZIP CRC fails; yEnc crc covers corrupt bytes
+    let fake = fake_nntp(vec![("z1@news".into(), yenc(&zip, "pack.zip"))]);
+    let nzb_path = dir.join("test.nzb");
+    std::fs::write(
+        &nzb_path,
+        nzb_xml(&[("p &quot;pack.zip&quot;", vec![("z1@news", zip.len() as u64 + 64, 1)])]),
+    )
+    .unwrap();
+    let mut settings = settings_for(&fake);
+    settings.nzb_auto_unpack = true;
+    let task = DownloadTask {
+        id: "nbad".into(),
+        url: nzb_path.to_string_lossy().into_owned(),
+        filename: "x.nzb".into(),
+        dest_dir: dir.clone(),
+        ..Default::default()
+    };
+    let r = download_url_with_settings(
+        build_client(""),
+        task,
+        Arc::new(Controls::new(0)),
+        &settings,
+    )
+    .await;
+    let err = r.expect_err("corrupt archive must error, not Complete");
+    assert!(err.contains("unpack"), "{err}");
+    assert_eq!(std::fs::read(dir.join("pack.zip")).unwrap(), zip, "archive kept");
+    assert!(!dir.join("hello.txt").exists());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

@@ -26,6 +26,11 @@ russh = "0.64"
 russh-sftp = "3"
 # BitTorrent. default-features off: drops default-tls (native-tls) + http-api-client; rust-tls reuses ring/rustls stack already in tree. No http-api/postgres/prometheus.
 librqbit = { version = "9", default-features = false, features = ["rust-tls"] }
+# NZB auto-unpack. zip/sevenz pure Rust (no zstd: keeps C deps out).
+# unrar-ng = vendored UnRAR C++ (cc build: needs MSVC/gcc/clang in build env only).
+unrar-ng = "=0.7.7"
+zip = { version = "=9.0.5", default-features = false, features = ["deflate", "aes-crypto", "bzip2", "lzma", "ppmd", "deflate64"] }
+sevenz-rust2 = { version = "=0.24.1", default-features = false, features = ["util", "aes256", "compress", "ppmd", "bzip2", "deflate"] }
 eframe = { version = "0.29", default-features = false, features = ["glow", "wayland", "x11"] }
 egui = "0.29"
 rfd = "0.15"

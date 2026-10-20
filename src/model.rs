@@ -269,6 +269,10 @@ pub struct Settings {
     /// NNTP provider connections per NZB, independent of HTTP max_connections.
     #[serde(default = "def_nntp_connections")]
     pub nntp_connections: u32,
+    /// Auto-unpack archives (rar/zip/7z) after NZB download completes.
+    /// Archive deleted only after verified successful extraction.
+    #[serde(default = "def_true")]
+    pub nzb_auto_unpack: bool,
     /// Debrid providers (Real-Debrid / AllDebrid / TorBox). Tokens stored
     /// plain in state.json like NNTP/proxy creds — ponytail: no OS keychain;
     /// add keyring when credential theft matters. Tokens never logged.
@@ -429,6 +433,7 @@ impl Default for Settings {
             nntp_user: String::new(),
             nntp_pass: String::new(),
             nntp_connections: 30,
+            nzb_auto_unpack: true,
             debrid_preferred: String::new(),
             debrid_rd: DebridProviderCfg::default(),
             debrid_ad: DebridProviderCfg::default(),

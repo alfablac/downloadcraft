@@ -53,7 +53,7 @@ fn app_running() -> bool {
             // kill(pid,0) succeeds for zombies too; app exits fully on quit,
             // and launch is de-duped by app's own single-instance forward.
         }
-        return kill(pid as i32, 0) == 0;
+        kill(pid as i32, 0) == 0
     }
     #[cfg(not(any(windows, unix)))]
     false
