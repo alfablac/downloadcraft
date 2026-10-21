@@ -7,6 +7,7 @@ mod drives_ui;
 #[allow(dead_code)]
 mod icons;
 mod theme;
+mod ui;
 use downloadcraft_lib::{
     debrid, engine, grabber, model, nntp, platform, queue, scheduler, stream, torrent, ytdlp,
 };
@@ -221,6 +222,7 @@ fn parse_kv_file(path: &std::path::Path) -> Option<DownloadTask> {
                 }
                 "queue" => t.queue_id = v.trim().to_string(),
                 "size" => t.total = v.trim().parse::<u64>().ok().filter(|n| *n > 0),
+                "mime" => t.mime = v.trim().to_string(),
                 _ => {}
             }
         }

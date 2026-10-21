@@ -2,6 +2,29 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.17.0] - 2026-10-21
+
+### Changed
+
+- UI overhaul: shared component module (`src/ui.rs`) for buttons (primary / secondary / ghost / destructive, 28/32/36 pt heights), badges (neutral / success / warning / error / info), form rows and dialogs. Spacing on a 4/8 pt scale set once in the theme; type scale via text styles only.
+- Dialogs use shared width tiers (400 / 560 / 760 / 960) clamped to the screen. In-window dialogs are centered modals that dim and block the window behind them, close with Esc or the close button, and keep the footer pinned with one primary action on the right.
+- Window behavior: the close button quits webcraft; minimizing hides it to the tray. Options "Close to tray" is now "Minimize to tray" (existing setting carried over).
+- README: Interface section with a screenshot tour (`images/`).
+
+### Fixed
+
+- Drives: deleting remote files and removing an account now ask for confirmation first. Run sync is styled as destructive when the plan deletes files.
+- Disabled buttons are visibly dimmed; text fields match button height; badges no longer stretch to row height; delete-confirmation footer no longer shifts when "also delete files" is toggled.
+- Extension manifest versions back in lockstep with the app version.
+
+## [0.16.0] - 2026-10-20
+
+### Fixed
+
+- Segmented downloads: per-download connection pool, parts sized relative to file (`total/(pool×4)`, clamped [4 MB, 64 MB]) instead of infinitesimal splits; 429 responses teach a learned-max gate (coalesces queued parts, drops permits before Retry-After sleep, caps throttle waits). Resume checkpoints byte progress atomically every 1 MB, so Stop/Play no longer restarts from zero.
+- Progress window shows "Reconstructing file" during part assembly (and "Finalizing" during validate/checksum) instead of appearing hung at 100%; status chip now shows engine phase for all downloads, not only yt-dlp.
+- Debrid (Rapidgator etc.): badge and provider info appear as soon as link resolves; progress window Links section shows original + debrided + final URLs live and after completion, with **Copy link** for both. Resolved debrided URL is persisted on the task (bearer token, per user choice) and cleared on redownload.
+
 ## [0.15.0] - 2026-10-20
 
 ### Added

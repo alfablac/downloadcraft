@@ -1542,6 +1542,7 @@ mod tests {
         assert_eq!(crate::engine::phase_name(0), "Downloading");
         assert_eq!(crate::engine::phase_name(1), "Extracting video");
         assert_eq!(crate::engine::phase_name(2), "Merging & processing");
+        assert_eq!(crate::engine::phase_name(4), "Reconstructing file");
         assert_eq!(crate::engine::phase_name(3), "Finalizing");
         assert_eq!(crate::engine::phase_name(99), "Downloading");
     }

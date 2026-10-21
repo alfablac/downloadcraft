@@ -291,6 +291,10 @@ pub fn claim_show_request() -> Option<String> {
 pub fn inbox_dir() -> PathBuf {
     config_dir().join("inbox")
 }
+/// Capture-cancel fallback files polled by native host (extension resumes browser download).
+pub fn browser_resume_dir() -> PathBuf {
+    config_dir().join("browser-resume")
+}
 pub fn ensure_dirs() -> std::io::Result<()> {
     for d in [config_dir(), data_dir(), cache_dir(), inbox_dir()] {
         std::fs::create_dir_all(d)?;

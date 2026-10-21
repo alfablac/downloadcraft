@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.15.0-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.17.0-blue">
   <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">
   <img alt="Language" src="https://img.shields.io/badge/built%20with-Rust%20%2B%20egui-orange">
 </p>
@@ -19,7 +19,7 @@
 
 webcraft reimplements the observable behavior of Internet Download Manager from scratch: segmented downloads that resume, queues and schedules, DASH/HLS handling, a site grabber, and deep browser integration. No IDM code, binaries, icons, or activation logic — and no affiliation with Tonec.
 
-**Current version:** 0.15.0 · Changelog lives in GitHub Releases.
+**Current version:** 0.17.0 · Changelog lives in GitHub Releases.
 
 **Runs on:** Windows 10/11 x86_64 · macOS 13+ (Intel and Apple Silicon) · Linux x86_64 (Ubuntu 22.04+, X11 and Wayland).
 
@@ -123,7 +123,31 @@ The extension watches downloads passively and ranks what it finds, so a page wit
 
 ## Interface
 
-The main window opens at 1440×900 and groups related actions and labels each group: download actions stay with the selected download, queue actions with all downloads. Narrow windows switch to a compact column set, persisted column widths shrink to fit instead of forcing horizontal scrolling, and the side rail scrolls when it runs out of height. Column widths and sort order persist between launches. Add (620×840), Capture (580×700), Progress (700×860), Collision (560×280), and Player (1024×640) dialogs open as separate windows; opening Add or a browser Capture grows a smaller restored main window back to full size. Delete confirmations keep a fixed size so buttons never jump under your cursor. Options save as soon as a setting changes.
+<p align="center">
+  <img src="images/interface.gif" alt="webcraft interface tour" width="900">
+</p>
+
+<table>
+  <tr>
+    <td align="center"><a href="images/01-downloads.png"><img src="images/01-downloads.png" width="280" alt="Downloads"></a><br><sub>Downloads</sub></td>
+    <td align="center"><a href="images/02-add-download.png"><img src="images/02-add-download.png" width="280" alt="Add download"></a><br><sub>Add download</sub></td>
+    <td align="center"><a href="images/03-progress.png"><img src="images/03-progress.png" width="280" alt="Progress"></a><br><sub>Progress</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><a href="images/04-download-complete.png"><img src="images/04-download-complete.png" width="280" alt="Download complete"></a><br><sub>Download complete</sub></td>
+    <td align="center"><a href="images/05-queues.png"><img src="images/05-queues.png" width="280" alt="Queues"></a><br><sub>Queues</sub></td>
+    <td align="center"><a href="images/06-scheduler.png"><img src="images/06-scheduler.png" width="280" alt="Scheduler"></a><br><sub>Scheduler</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><a href="images/07-site-grabber.png"><img src="images/07-site-grabber.png" width="280" alt="Site Grabber"></a><br><sub>Site Grabber</sub></td>
+    <td align="center"><a href="images/08-drives.png"><img src="images/08-drives.png" width="280" alt="Drives"></a><br><sub>Drives</sub></td>
+    <td align="center"><a href="images/09-options.png"><img src="images/09-options.png" width="280" alt="Options"></a><br><sub>Options</sub></td>
+  </tr>
+</table>
+
+<sub>Screenshots use demo downloads from a local test server; no real accounts or tokens.</sub>
+
+The main window opens at 1440×900 and groups related actions and labels each group: download actions stay with the selected download, queue actions with all downloads. Narrow windows switch to a compact column set, persisted column widths shrink to fit instead of forcing horizontal scrolling, and the side rail scrolls when it runs out of height. Column widths and sort order persist between launches. Add (560×840), Capture (560×700), Progress (760×860), Collision (560×240), and Player (960×600) dialogs open as separate windows; opening Add or a browser Capture grows a smaller restored main window back to full size. In-window dialogs dim and block the window behind them, close with Esc, and never make a destructive action the Enter default. Closing the window quits; minimizing hides webcraft to the tray. Options save as soon as a setting changes.
 
 ## Documentation
 

@@ -133,6 +133,14 @@ function pruneCandidates(now = Date.now()) {
   while (candidates.size > CANDIDATE_MAX) candidates.delete(candidates.keys().next().value);
 }
 function headerOf(headers, name) { const h = (headers || []).find((x) => x.name.toLowerCase() === name); return h ? h.value || "" : ""; }
+function totalSizeFromHeaders(headers, statusCode) {
+  // 206 Content-Length is range length, not total; Content-Range total wins.
+  if (statusCode === 206) {
+    const m = /\/(\d+)\s*$/.exec(headerOf(headers, "content-range") || "");
+    if (m) { const n = parseInt(m[1], 10); if (n > 0) return n; } // total '*' falls through
+  }
+  return parseInt(headerOf(headers, "content-length"), 10) || 0;
+}
 function extOfUrl(u) { try { const seg = new URL(u).pathname.split("/").pop() || ""; const i = seg.lastIndexOf("."); return i > 0 ? seg.slice(i + 1).toLowerCase() : ""; } catch (e) { return ""; } }
 function filenameFromDisp(disp, url) {
   const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(disp || "");
@@ -183,20 +191,20 @@ if (browser.webRequest && browser.webRequest.onHeadersReceived) {
   browser.webRequest.onHeadersReceived.addListener(async (details) => {
     recordRequest(details);
     const rec = requestRecords.get(details.requestId);
-    if (rec) { rec.status = details.statusCode || 0; rec.size = parseInt(headerOf(details.responseHeaders, "content-length"), 10) || rec.size || 0; const ct = headerOf(details.responseHeaders, "content-type").split(";")[0].trim().toLowerCase(); if (ct) rec.type = ct; }
+    if (rec) { rec.status = details.statusCode || 0; rec.size = totalSizeFromHeaders(details.responseHeaders, details.statusCode) || rec.size || 0; const ct = headerOf(details.responseHeaders, "content-type").split(";")[0].trim().toLowerCase(); if (ct) rec.type = ct; }
     const d = captureDecision(details);
     if (!d) return {};
     // XHR/other: observe-only. Cancelling them kills site API calls.
     if (d.kind === "download" && (details.type === "xmlhttprequest" || details.type === "other")) return {};
     if (d.kind === "panel") {
-      candidates.set(d.url, { url: d.url, type: d.type, status: details.statusCode || 0, tabId: d.tabId, frameId: details.frameId != null ? details.frameId : null, redirectFrom: rec ? rec.redirectFrom : "", hops: rec ? (rec.hops || []) : [], time: rec ? rec.time : Date.now(), size: parseInt(headerOf(details.responseHeaders, "content-length"), 10) || 0 });
+      candidates.set(d.url, { url: d.url, type: d.type, status: details.statusCode || 0, tabId: d.tabId, frameId: details.frameId != null ? details.frameId : null, redirectFrom: rec ? rec.redirectFrom : "", hops: rec ? (rec.hops || []) : [], time: rec ? rec.time : Date.now(), size: totalSizeFromHeaders(details.responseHeaders, details.statusCode) });
       pruneCandidates();
       return {};
     }
     // Direct to webcraft modal (no browser ask box). Host decides filter
     // (webcraft Settings) BEFORE cancel: deny -> browser keeps file.
     try {
-      const size = parseInt(headerOf(details.responseHeaders, "content-length"), 10) || 0;
+      const size = totalSizeFromHeaders(details.responseHeaders, details.statusCode);
       let allow = false;
       try { const r = await nativeSend({ type: "captureCheck", url: d.url, filename: d.filename, mime: d.mime, size }); allow = !!(r && r.allow === true); } catch (e) { allow = false; }
       if (!allow) return {}; // filtered/host down: browser downloads
@@ -254,23 +262,72 @@ function isAssetDownload(item) {
   const f = String((item && item.filename) || (item && item.url) || "").split(/[?#]/)[0];
   return /\.(json|js|mjs|css)$/i.test(f);
 }
-browser.downloads.onCreated.addListener(async (item) => {
+// Cancel-first fallback: blocking webRequest path above stays primary and
+// decides before body (deny = browser untouched, never stalled). This covers
+// downloads it cannot decide (Save-As, PDF save, XHR/other observe-only).
+// Sync guards + sync cancel only: no await, no pause, before cancel. Item
+// already cancelled, so verdict re-issues instead of resuming: deny/host-down
+// -> browserDownload (fresh browser download); allow -> webcraft. Tradeoff:
+// bytes may leak until cancel lands, re-download restarts from scratch
+// (same as Chromium cancel-first).
+function sizeOfItem(it) { return it && it.totalBytes > 0 ? it.totalBytes : (it && it.fileSize > 0 ? it.fileSize : 0); }
+async function captureCheck(entry) {
+  // Fail-closed verdict (garbage/host down = deny); caller re-issues in browser.
+  try { const r = await nativeSend({ type: "captureCheck", url: entry.url, filename: entry.filename, mime: entry.mime, size: entry.size }); return !!(r && r.allow === true); } catch (e) { return false; }
+}
+browser.downloads.onCreated.addListener((item) => {
   if (isAssetDownload(item)) return;
-  if (!item.url || isBypassed(item.url) || item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
-  try {
-    const url = item.finalUrl || item.url;
-    const entry = { url, filename: basename(item.filename), mime: item.mime || "", size: item.totalBytes > 0 ? item.totalBytes : 0, referrer: item.referrer || "" };
-    // Host filter (webcraft Settings) decides before cancel; deny = untouched.
-    let allow = false;
-    try { const r = await nativeSend({ type: "captureCheck", url: entry.url, filename: entry.filename, mime: entry.mime, size: entry.size }); allow = !!(r && r.allow === true); } catch (e) {}
-    if (!allow) return;
-    await browser.downloads.cancel(item.id).catch(() => {});
+  if (!item || !item.url || item.id == null) return;
+  if (isBypassed(item.url) || isBypassed(item.finalUrl || item.url)) return;
+  if (item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
+  const url = item.finalUrl || item.url;
+  if (!url || url.startsWith("blob:") || url.startsWith("data:")) return;
+  const entry = { url, filename: basename(item.filename), mime: item.mime || "", size: sizeOfItem(item), referrer: item.referrer || "" };
+  const id = item.id;
+  // FIRST action after sync guards: cancel in same handler tick.
+  try { browser.downloads.cancel(id).catch(() => {}); } catch (e) {}
+  (async () => {
     try {
-      const resp = await safeSend(url, null, { referrer: entry.referrer, filename: entry.filename, mime: entry.mime, size: entry.size, captured: true });
-      if (!resp || resp.skipped || resp.type === "error") browserDownload(entry).catch(() => {}); // raced filter/host error: resume native
+      const items = await browser.downloads.search({ id }).catch(() => null);
+      const cur = items && items[0];
+      if (cur && cur.state === "complete") return; // browser won before cancel landed: no duplicate send
+      // "interrupted" expected here: own cancel sets it; not terminal proof.
+      if (cur) {
+        if (!(entry.size > 0)) entry.size = sizeOfItem(cur);
+        if (!entry.filename) entry.filename = basename(cur.filename);
+        if (!entry.mime) entry.mime = cur.mime || "";
+      }
+      if (isBypassed(entry.url)) return; // claimed after sync guards (webRequest markBypass before send): claimant owns delivery, this item already cancelled by us
+      if (!(await captureCheck(entry))) { browserDownload(entry).catch(() => {}); return; } // deny/host-down: fresh browser download (re-issue marks bypass, re-entrant onCreated skips)
+      if (isBypassed(entry.url)) return; // claimed during check: no duplicate send
+      markBypass(entry.url); // BEFORE send: re-entrant onCreated must skip
+      await browser.downloads.removeFile(id).catch(() => {}); // drop cancelled partial: webcraft owns file now
+      try { await browser.downloads.erase({ id }).catch(() => {}); } catch (e) {}
+      const resp = await safeSend(entry.url, null, { referrer: entry.referrer, filename: entry.filename, mime: entry.mime, size: entry.size, captured: true });
+      if (!resp || resp.skipped || resp.type === "error") browserDownload(entry).catch(() => {}); // skipped/error: already cancelled, re-download in browser
     } catch (e) { browserDownload(entry).catch(() => {}); } // host died mid-send: file must not vanish
-  } catch (e) {}
+  })().catch(() => {});
 });
+// Resume poll: Ask box "resume in browser" (and host restart) queues URL in
+// native host; extension polls and restarts it in the browser. Old host reply
+// (unknown-type/error) has no items -> no-op. Comment: poll skip-when-busy
+// mandatory (queue flood) - nativeSend would enqueue behind captures/sends
+// forever, so if capture in-flight/queued, skip this tick entirely.
+async function pollResumeOnce() {
+  if (nativeInFlight || nativeQueue.length) return; // skip-when-busy mandatory (queue flood)
+  try {
+    const r = await nativeSend({ type: "pollResume" });
+    const items = r && Array.isArray(r.items) ? r.items : [];
+    for (const it of items) {
+      if (!it || !it.url || !/^https?:/i.test(it.url)) continue;
+      if (!(Date.now() - (it.ts || 0) < 10 * 60 * 1000)) continue; // fresh only (<10min)
+      browserDownload(it).catch(() => {});
+    }
+  } catch (e) {} // host down/old host: silently no-op
+}
+try { setInterval(() => { pollResumeOnce().catch(() => {}); }, 2000); } catch (e) {}
+try { pollResumeOnce().catch(() => {}); } catch (e) {} // immediate poll (persistent bg)
+
 browser.runtime.onMessage.addListener((msg, sender) => {
   // Legacy stale content scripts may still answer removed ask box: ignore.
   if (msg && msg.type === "downloadcraft-confirm-result") return Promise.resolve({ ok: true });

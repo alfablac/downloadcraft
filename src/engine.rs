@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 pub fn build_client(proxy: &str) -> reqwest::Client {
@@ -93,12 +94,14 @@ pub const PHASE_DOWNLOADING: u8 = 0;
 pub const PHASE_EXTRACTING: u8 = 1;
 pub const PHASE_PROCESSING: u8 = 2;
 pub const PHASE_FINALIZING: u8 = 3;
+pub const PHASE_ASSEMBLING: u8 = 4;
 
 pub fn phase_name(phase: u8) -> &'static str {
     match phase {
         PHASE_EXTRACTING => "Extracting video",
         PHASE_PROCESSING => "Merging & processing",
         PHASE_FINALIZING => "Finalizing",
+        PHASE_ASSEMBLING => "Reconstructing file",
         _ => "Downloading",
     }
 }
@@ -134,6 +137,38 @@ pub struct Controls {
     /// Torrent swarm snapshot (only torrent worker writes). Live-only:
     /// never persisted, GUI renders last known for Complete tasks.
     pub torrent: std::sync::Mutex<Option<TorrentSnap>>,
+    /// Debrid live info (worker writes at resolution time). Live-only:
+    /// never persisted, never logged. Resolved URL carries expiring token.
+    pub live: std::sync::Mutex<Option<LiveInfo>>,
+}
+
+/// Debrid live channel: original is task.url (persisted); resolved/final
+/// only in memory for progress modal + copy. Never persist, never log.
+#[derive(Clone, Default)]
+pub struct LiveInfo {
+    pub debrid_info: String,
+    pub resolved_url: String,
+    pub final_url: String,
+}
+
+/// Redact bearer URL for display: scheme://host/.../last-segment.
+/// Tokens sit in path/query on debrid CDNs, so middle+query dropped.
+pub fn redact_url(u: &str) -> String {
+    let Ok(parsed) = url::Url::parse(u) else {
+        return "...".to_string();
+    };
+    let host = parsed.host_str().unwrap_or("");
+    let last = parsed
+        .path_segments()
+        .and_then(|mut s| s.next_back())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
+    let last_dec = url::form_urlencoded::byte_serialize(last.as_bytes()).collect::<String>();
+    if last.is_empty() {
+        format!("{}://{}", parsed.scheme(), host)
+    } else {
+        format!("{}://{}/.../{}", parsed.scheme(), host, last_dec)
+    }
 }
 
 /// Plain-data torrent swarm snapshot for Info dialog. No seeds/leecher split
@@ -150,6 +185,121 @@ pub struct TorrentSnap {
     pub info_hash: String,
     pub live: bool,
 }
+/// Adaptive per-download concurrency, learned from real segment GETs only
+/// (never probes). Before first 429: optimistic at user max. First 429 batch:
+/// limit locks to currently-admitted (206 in-flight) count — server's
+/// learned max (OVH speedtest: 2). Every GET (first tries AND retries)
+/// must acquire a permit; parked/429'd workers re-acquire. Regain: slow,
+/// only after a full clean streak, never above user max.
+/// ponytail: learned limit not persisted; restart re-learns in one burst.
+pub struct ConcurrencyGate {
+    inner: std::sync::Mutex<GateState>,
+    max: usize,
+}
+struct GateState {
+    limit: usize,
+    in_flight: usize,
+    clean_streak: u32,
+    learned: bool,
+    /// Permits that got 206 and are streaming. Learned max = this count.
+    streaming: usize,
+    throttle_gen: u64,
+}
+/// Clean completions needed to regain one connection slot.
+pub const GATE_REGAIN_STREAK: u32 = 4;
+/// Permit for one in-flight GET. Drop releases.
+pub struct GatePermit {
+    gate: Arc<ConcurrencyGate>,
+}
+impl Drop for GatePermit {
+    fn drop(&mut self) {
+        let mut s = self.gate.lock();
+        s.in_flight = s.in_flight.saturating_sub(1);
+    }
+}
+impl ConcurrencyGate {
+    pub fn new(max: usize) -> Self {
+        let max = max.max(1);
+        Self {
+            inner: std::sync::Mutex::new(GateState {
+                limit: max,
+                in_flight: 0,
+                clean_streak: 0,
+                learned: false,
+                streaming: 0,
+                throttle_gen: 0,
+            }),
+            max,
+        }
+    }
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    pub fn limit(&self) -> usize {
+        self.lock().limit
+    }
+    /// Try take a GET permit. None = at limit, caller waits and retries.
+    pub fn try_acquire(self: &Arc<Self>) -> Option<GatePermit> {
+        let mut s = self.lock();
+        if s.in_flight < s.limit {
+            s.in_flight += 1;
+            Some(GatePermit { gate: self.clone() })
+        } else {
+            None
+        }
+    }
+    /// Wait for permit, honoring pause/cancel. 150ms poll.
+    pub async fn acquire(self: &Arc<Self>, ctrl: &Controls) -> Result<GatePermit, String> {
+        loop {
+            if let Some(p) = self.try_acquire() {
+                return Ok(p);
+            }
+            if ctrl.cancelled.load(Ordering::Relaxed) {
+                return Err("cancelled".into());
+            }
+            wait_not_paused(ctrl).await?;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
+    /// Mark permit's GET as admitted (206). Release on permit drop.
+    pub fn mark_streaming(&self) {
+        self.lock().streaming += 1;
+    }
+    pub fn unmark_streaming(&self) {
+        let mut s = self.lock();
+        s.streaming = s.streaming.saturating_sub(1);
+    }
+    /// 429: learned max = permits actually streaming (206), not holders.
+    /// First call flips learned; later calls only lower, never raise.
+    pub fn on_throttled(&self) -> usize {
+        let mut s = self.lock();
+        s.limit = s.streaming.max(1).min(s.limit);
+        s.learned = true;
+        s.clean_streak = 0;
+        s.throttle_gen += 1;
+        s.limit
+    }
+    pub fn throttle_gen(&self) -> u64 {
+        self.lock().throttle_gen
+    }
+    pub fn learned(&self) -> bool {
+        self.lock().learned
+    }
+    /// Clean segment completion: GATE_REGAIN_STREAK-th one regains a slot,
+    /// only when learned (pre-429 optimism already at max).
+    pub fn on_clean(&self) {
+        let mut s = self.lock();
+        if !s.learned {
+            return;
+        }
+        s.clean_streak += 1;
+        if s.clean_streak >= GATE_REGAIN_STREAK {
+            s.clean_streak = 0;
+            s.limit = (s.limit + 1).min(self.max);
+        }
+    }
+}
+
 impl Controls {
     pub fn new(limit: u64) -> Self {
         Self {
@@ -165,6 +315,7 @@ impl Controls {
             desired_files: std::sync::Mutex::new(None),
             parts_are_segments: AtomicBool::new(false),
             torrent: std::sync::Mutex::new(None),
+            live: std::sync::Mutex::new(None),
         }
     }
 }
@@ -292,17 +443,50 @@ pub const MIN_SPLIT: u64 = 4 * 1024 * 1024;
 /// ponytail: keyed on committed done, not in-flight progress; in-flight bytes
 /// past split point are discarded by victim (see run_segment) and re-downloaded
 /// by thief. Upgrade: track per-segment in-flight offset if waste matters.
+#[cfg(test)]
 fn split_point(start: u64, end: u64, done: u64) -> Option<u64> {
+    split_point_min(start, end, done, MIN_SPLIT)
+}
+fn split_point_min(start: u64, end: u64, done: u64, min_half: u64) -> Option<u64> {
     let cur = start.checked_add(done)?;
     if cur > end {
         return None;
     }
     let remaining = end - cur + 1;
-    if remaining < 2 * MIN_SPLIT {
+    if remaining < 2 * min_half.max(1) {
         None
     } else {
         Some(cur + remaining / 2 - 1)
     }
+}
+
+/// Pool part sizing: parts are a percentage of file, never infinitesimal.
+/// target = total/(pool * PARTS_PER_CONN), clamped [MIN_SPLIT, MAX_PART].
+pub const PARTS_PER_CONN: u64 = 4;
+pub const MAX_PART: u64 = 64 * 1024 * 1024;
+pub fn target_part_size(total: u64, pool: u32) -> u64 {
+    let waves = (pool.max(1) as u64) * PARTS_PER_CONN;
+    // Small files: floor relaxes to per-connection share so pool still
+    // parallelizes (parts never fewer than pool on fresh plan).
+    let floor = MIN_SPLIT.min(total / (pool.max(1) as u64).max(1));
+    (total / waves.max(1)).clamp(floor, MAX_PART)
+}
+/// Plan with pool-relative part size (fresh downloads only; resume keeps
+/// saved segmentation so part files stay valid).
+pub fn plan_parts(total: u64, pool: u32) -> Vec<(u64, u64)> {
+    if total == 0 {
+        return vec![];
+    }
+    let target = target_part_size(total, pool);
+    let n = total.div_ceil(target).max(1);
+    plan_segments(total, n as u32)
+}
+/// Hard cap on non-merged segment count: pool*K waves plus slack so part
+/// size (not count) is binding on huge files.
+pub fn parts_cap(total: u64, pool: u32) -> usize {
+    let by_size = total.div_ceil(MAX_PART).max(1) as usize;
+    let by_waves = (pool.max(1) as usize) * (PARTS_PER_CONN as usize);
+    by_size.max(by_waves)
 }
 
 /// Bytes of `written` (streamed for range starting at `range_start`) that
@@ -310,6 +494,45 @@ fn split_point(start: u64, end: u64, done: u64) -> Option<u64> {
 /// `ctrl.downloaded` but is discarded and re-downloaded by the thief.
 fn seg_keep(end: u64, range_start: u64, written: u64) -> u64 {
     (end + 1).saturating_sub(range_start).min(written)
+}
+
+/// Merge consecutive pending segments (done==0, not active, contiguous)
+/// into single ranges. Returns index remap old->surviving index (None for
+/// removed slots). Callers must re-pin active indexes and rename part files.
+/// Active/started segments untouched: their part files hold bytes.
+/// ponytail: done==0 only; done>0 pending kept separate (part bytes exist).
+fn coalesce_pending(
+    segs: &mut [SegmentState],
+    active: &std::collections::HashSet<usize>,
+) -> bool {
+    let mut changed = false;
+    let mut survivor: Option<usize> = None;
+    for i in 0..segs.len() {
+        if segs[i].merged {
+            continue;
+        }
+        let pending = segs[i].done == 0 && !active.contains(&i);
+        if pending {
+            if let Some(sv) = survivor {
+                if segs[sv].end + 1 == segs[i].start {
+                    segs[sv].end = segs[i].end;
+                    segs[i].merged = true;
+                    changed = true;
+                    continue;
+                }
+            }
+            survivor = Some(i);
+        } else {
+            survivor = None;
+        }
+    }
+    changed
+}
+
+/// Deterministic spread of Retry-After wake times: workers must not wake
+/// in lockstep and re-burst the rate limiter.
+fn throttle_jitter(gen: u64, idx: usize) -> u64 {
+    (gen.wrapping_mul(31).wrapping_add(idx as u64 * 7) % 5) * 250
 }
 
 /// Undo live-count of discarded bytes: counter was charged all `written`,
@@ -339,26 +562,36 @@ enum Claim {
 /// while `segs.len() < cap` (worker-pool size fixed at download start).
 /// At/over cap an idle worker gets None and exits — remaining workers finish
 /// their segments. Legacy over-cap state still claims pending work, it just
+#[cfg(test)]
 /// never splits further.
 fn try_claim_or_split(
     segs: &mut Vec<SegmentState>,
     active: &mut std::collections::HashSet<usize>,
     cap: usize,
 ) -> Claim {
+    try_claim_or_split_t(segs, active, cap, MIN_SPLIT)
+}
+fn try_claim_or_split_t(
+    segs: &mut Vec<SegmentState>,
+    active: &mut std::collections::HashSet<usize>,
+    cap: usize,
+    target: u64,
+) -> Claim {
     let remaining = |sg: &SegmentState| (sg.end + 1).saturating_sub(sg.start + sg.done);
     for (i, sg) in segs.iter().enumerate() {
-        if remaining(sg) > 0 && !active.contains(&i) {
+        if !sg.merged && remaining(sg) > 0 && !active.contains(&i) {
             active.insert(i);
             return Claim::Pending(i);
         }
     }
-    if segs.len() >= cap {
+    let live = segs.iter().filter(|s| !s.merged).count();
+    if live >= cap {
         return Claim::None;
     }
     let mut victim: Option<(usize, u64)> = None;
     for (i, sg) in segs.iter().enumerate() {
         if active.contains(&i) {
-            if let Some(np) = split_point(sg.start, sg.end, sg.done) {
+            if let Some(np) = split_point_min(sg.start, sg.end, sg.done, target) {
                 let tail = sg.end - np;
                 if victim.is_none_or(|(_, b)| tail > b) {
                     victim = Some((i, tail));
@@ -370,7 +603,7 @@ fn try_claim_or_split(
         return Claim::None;
     };
     let old_end = segs[vi].end;
-    let Some(np) = split_point(segs[vi].start, old_end, segs[vi].done) else {
+    let Some(np) = split_point_min(segs[vi].start, old_end, segs[vi].done, target) else {
         return Claim::None;
     };
     segs[vi].end = np;
@@ -379,6 +612,7 @@ fn try_claim_or_split(
         start: np + 1,
         end: old_end,
         done: 0,
+        merged: false,
     });
     active.insert(new_idx);
     Claim::Split(new_idx)
@@ -770,10 +1004,25 @@ struct SegmentState {
     start: u64,
     end: u64,
     done: u64,
+    /// Coalesced into previous pending segment after throttle-learn:
+    /// slot kept (stable indexes/part names), skipped everywhere.
+    merged: bool,
+}
+
+fn seg_clone(x: &SegmentState) -> SegmentState {
+    SegmentState {
+        start: x.start,
+        end: x.end,
+        done: x.done,
+        merged: x.merged,
+    }
 }
 fn state_path_for(part_dir: &Path) -> PathBuf {
     part_dir.join("state.json")
 }
+/// Serializes concurrent save_state writers (8 workers checkpointing same
+/// file raced non-atomically -> torn JSON -> whole resume discarded).
+static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn save_state(
     part_dir: &Path,
     url: &str,
@@ -783,10 +1032,17 @@ fn save_state(
 ) {
     let v: Vec<_> = segs
         .iter()
+        .filter(|s| !s.merged)
         .map(|s| serde_json::json!({"start":s.start,"end":s.end,"done":s.done}))
         .collect();
     let j = serde_json::json!({"url":url,"etag":etag,"total":total,"segments":v});
-    let _ = std::fs::write(state_path_for(part_dir), j.to_string());
+    // Atomic: tmp + rename, serialized. Torn state.json = resume lost.
+    let _g = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dst = state_path_for(part_dir);
+    let tmp = dst.with_extension("json.tmp");
+    if std::fs::write(&tmp, j.to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &dst);
+    }
 }
 
 /// Segmented HTTP download with resume. Segment files: part{i} in dest_dir/.downloadcraft-{id}/
@@ -845,6 +1101,10 @@ pub async fn download_http_with_prewarm(
     };
     task.url = used_url;
     task.total = probe.total;
+    task.accept_ranges = Some(probe.accept_ranges);
+    if let Some(ct) = probe.content_type.as_deref().filter(|s| !s.is_empty()) {
+        task.mime = ct.to_string();
+    }
     // Filename repair: adopt CD/MIME name only for generic placeholders,
     // never overriding user-renamed (specific) filenames.
     if let Some(name) = adopt_server_filename(
@@ -857,18 +1117,49 @@ pub async fn download_http_with_prewarm(
     std::fs::create_dir_all(&task.dest_dir).map_err(|e| e.to_string())?;
     let dest = task.dest_dir.join(&task.filename);
     let part_dir = task.dest_dir.join(format!(".downloadcraft-{}", task.id));
+    {
+        if let Ok(mut l) = ctrl.live.lock() {
+            let e = l.get_or_insert_with(Default::default);
+            if e.final_url.is_empty() {
+                e.final_url = fetch_url.clone();
+            }
+        }
+    }
     // Server ignored Range: plain streaming download with throttle.
     if !probe.accept_ranges || probe.total.is_none() {
-        // Reuse 200 probe body (whole file already streaming); else GET final_url.
-        let resp = match probe.body.take() {
+        // 429 on probe/download: bounded Retry-After waits, then resume logic
+        // above re-probes (not an error attempt storm).
+        let mut resp = match probe.body.take() {
             Some(r) => r,
-            None => client
+            None => {
+                let mut waits = 0u32;
+                loop {
+                    let r = client
+                        .get(&fetch_url)
+                        .headers(headers_for(&task))
+                        .send()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if r.status().as_u16() == 429 && waits < 12 {
+                        waits += 1;
+                        wait_backoff(&ctrl, retry_after_secs(r.headers())).await?;
+                        continue;
+                    }
+                    break r;
+                }
+            }
+        };
+        if resp.status().as_u16() == 429 {
+            // Probe body itself throttled: wait once, refetch plain.
+            let ra = retry_after_secs(resp.headers());
+            wait_backoff(&ctrl, ra).await?;
+            resp = client
                 .get(&fetch_url)
                 .headers(headers_for(&task))
                 .send()
                 .await
-                .map_err(|e| e.to_string())?,
-        };
+                .map_err(|e| e.to_string())?;
+        }
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
@@ -1019,6 +1310,7 @@ pub async fn download_http_with_prewarm(
                                 start,
                                 end,
                                 done: done.min(actual),
+        merged: false,
                             });
                         }
                         // Split tails appended out of order: intervals must tile [0,total) exactly, else discard corrupt state.
@@ -1043,21 +1335,31 @@ pub async fn download_http_with_prewarm(
             }
         }
     }
+    let pool: u32 = if task.segments == 0 {
+        crate::model::Settings::default().max_connections
+    } else {
+        task.segments
+    };
     if segs.is_empty() {
-        let wanted = if task.segments == 0 {
-            crate::model::Settings::default().max_connections
-        } else {
-            task.segments
-        };
-        segs = plan_segments(total, wanted)
+        segs = plan_parts(total, pool)
             .into_iter()
             .map(|(start, end)| SegmentState {
                 start,
                 end,
                 done: 0,
+        merged: false,
             })
             .collect();
     }
+    let target = target_part_size(total, pool);
+    let pcap = parts_cap(total, pool);
+    {
+        if let Ok(mut l) = ctrl.live.lock() {
+            let e = l.get_or_insert_with(Default::default);
+            e.final_url = fetch_url.clone();
+        }
+    }
+    task.final_url = fetch_url.clone();
     ctrl.downloaded.store(resumed, Ordering::Relaxed);
     task.downloaded = resumed;
     ctrl.total.store(total, Ordering::Relaxed);
@@ -1066,7 +1368,7 @@ pub async fn download_http_with_prewarm(
         let mut pg = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner());
         *pg = segs
             .iter()
-            .map(|x| (x.done, x.end.saturating_add(1).saturating_sub(x.start)))
+            .map(|x| if x.merged { (x.end.saturating_add(1).saturating_sub(x.start), x.end.saturating_add(1).saturating_sub(x.start)) } else { (x.done, x.end.saturating_add(1).saturating_sub(x.start)) })
             .collect();
     }
     // Work-stealing pool: fixed worker count (= initial segment count) is
@@ -1080,10 +1382,12 @@ pub async fn download_http_with_prewarm(
     // Segment requests fetch final_url; task.url returned stays mirror URL.
     let mut fetch_task = task.clone();
     fetch_task.url = fetch_url.clone();
+    // Adaptive gate: starts at user max, drops a slot per 429 observed,
+    // regains slowly. Workers gate on live limit, not spawn count.
+    let gate = Arc::new(ConcurrencyGate::new(pool.max(1) as usize));
     let mut handles = Vec::new();
-    let count = segs.lock().await.len();
-    let cap = count.max(1);
-    for _ in 0..cap {
+    // Pool workers == user pool size; wire concurrency = gate permits.
+    for _ in 0..(pool.max(1) as usize) {
         let (client, task_c, ctrl, segs, active, part_dir, etag) = (
             client.clone(),
             fetch_task.clone(),
@@ -1093,24 +1397,31 @@ pub async fn download_http_with_prewarm(
             part_dir.clone(),
             etag.clone(),
         );
+        let gate = gate.clone();
         handles.push(tokio::spawn(async move {
             loop {
                 let Some(i) = claim_or_split(
                     &segs,
                     &active,
-                    cap,
+                    if gate.learned() { 0 } else { pcap },
                     &part_dir,
                     &task_c.url,
                     &etag,
                     total,
                     &ctrl,
+                    target,
                 )
                 .await
                 else {
                     return Ok::<(), String>(());
                 };
-                let r =
-                    run_segment(i, &segs, &client, &task_c, &part_dir, &etag, total, &ctrl).await;
+                // Concurrency enforced per-GET inside run_segment via
+                // gate permits; claim cap only bounds split growth.
+                let r = run_segment(
+                    i, &segs, &client, &task_c, &part_dir, &etag, total, &ctrl, &gate,
+                    &active,
+                )
+                .await;
                 active.lock().await.remove(&i);
                 if ctrl.cancelled.load(Ordering::Relaxed) {
                     return Err("cancelled".to_string());
@@ -1132,10 +1443,11 @@ pub async fn download_http_with_prewarm(
         task.downloaded = ctrl.downloaded.load(Ordering::Relaxed);
         return Ok(task);
     }
+    ctrl.phase.store(PHASE_ASSEMBLING, Ordering::Relaxed);
     // Assemble in byte order: split tails appended (index != byte order).
     let order: Vec<usize> = {
         let s = segs.lock().await;
-        let mut v: Vec<usize> = (0..s.len()).collect();
+        let mut v: Vec<usize> = (0..s.len()).filter(|&i| !s[i].merged).collect();
         v.sort_by_key(|&i| s[i].start);
         v
     };
@@ -1173,6 +1485,7 @@ pub async fn download_http_with_prewarm(
             "size mismatch: assembled {assembled} != total {total}"
         ));
     }
+    ctrl.phase.store(PHASE_FINALIZING, Ordering::Relaxed);
     // Validate assembled temp BEFORE dedup/rename: on failure delete temp
     // only — final dest (pre-existing/other-task file) stays untouched.
     match validate_output(&tmp, &task.filename) {
@@ -1219,6 +1532,7 @@ pub async fn download_http_with_prewarm(
     finish_check(&dest, &task).await?;
     task.status = TaskStatus::Complete;
     task.downloaded = total;
+    task.final_url = fetch_url.clone();
     Ok(task)
 }
 
@@ -1235,27 +1549,24 @@ async fn claim_or_split(
     etag: &Arc<str>,
     total: u64,
     ctrl: &Controls,
+    target: u64,
 ) -> Option<usize> {
     let mut s = segs.lock().await;
     let mut act = active.lock().await;
-    let new_idx = match try_claim_or_split(&mut s, &mut act, cap) {
+    let new_idx = match try_claim_or_split_t(&mut s, &mut act, cap, target) {
         Claim::Pending(i) => return Some(i),
         Claim::Split(i) => i,
         Claim::None => return None,
     };
     let snapshot: Vec<SegmentState> = s
         .iter()
-        .map(|x| SegmentState {
-            start: x.start,
-            end: x.end,
-            done: x.done,
-        })
+        .map(seg_clone)
         .collect();
     {
         let mut pg = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner());
         *pg = snapshot
             .iter()
-            .map(|x| (x.done, x.end.saturating_add(1).saturating_sub(x.start)))
+            .map(|x| if x.merged { (x.end.saturating_add(1).saturating_sub(x.start), x.end.saturating_add(1).saturating_sub(x.start)) } else { (x.done, x.end.saturating_add(1).saturating_sub(x.start)) })
             .collect();
     }
     drop(act);
@@ -1282,8 +1593,28 @@ async fn run_segment(
     etag: &Arc<str>,
     total: u64,
     ctrl: &Arc<Controls>,
+    gate: &Arc<ConcurrencyGate>,
+    active: &Arc<tokio::sync::Mutex<std::collections::HashSet<usize>>>,
 ) -> Result<(), String> {
     let mut attempt = 0;
+    // Fresh-plan save: state.json exists before first byte, so Stop before
+    // any segment completes still resumes (was: file written only on split).
+    {
+        let s = segs.lock().await;
+        save_state(
+            part_dir,
+            &task.url,
+            &if etag.is_empty() {
+                None
+            } else {
+                Some(etag.to_string())
+            },
+            total,
+            &s,
+        );
+    }
+    #[allow(unused_assignments)]
+    let mut last_err = String::new();
     loop {
         let (start, end, done) = {
             let s = segs.lock().await;
@@ -1297,6 +1628,37 @@ async fn run_segment(
         if range_start > end {
             return Ok(());
         }
+        // Checkpoint: persist byte progress + live counters per ~1MiB.
+        let ck_segs = segs.clone();
+        let ck_part_dir = part_dir.to_path_buf();
+        let ck_url = task.url.clone();
+        let ck_etag = if etag.is_empty() {
+            None
+        } else {
+            Some(etag.to_string())
+        };
+        let ck_ctrl = ctrl.clone();
+        let checkpoint = move |abs_done: u64| {
+            if let Ok(mut s) = ck_segs.try_lock() {
+                let new_len = s[i].end + 1 - s[i].start;
+                s[i].done = abs_done.min(new_len);
+                let snap: Vec<SegmentState> = s
+                    .iter()
+                    .map(seg_clone)
+                    .collect();
+                drop(s);
+                if let Ok(mut pg) = ck_ctrl.parts.lock() {
+                    *pg = snap
+                        .iter()
+                        .map(|x| if x.merged { (x.end.saturating_add(1).saturating_sub(x.start), x.end.saturating_add(1).saturating_sub(x.start)) } else { (x.done, x.end.saturating_add(1).saturating_sub(x.start)) })
+                        .collect();
+                }
+                save_state(&ck_part_dir, &ck_url, &ck_etag, total, &snap);
+            }
+        };
+        // Permit BEFORE every GET incl. 429 retries: this is the actual
+        // concurrency enforcement (claim-time rank check raced).
+        let _permit = gate.acquire(ctrl).await?;
         match download_range(
             client,
             task,
@@ -1306,10 +1668,62 @@ async fn run_segment(
             ctrl,
             done,
             Some(i),
+            Some(&checkpoint),
+            Some(gate),
         )
         .await
         {
-            Ok(written) => {
+            Ok(RangeOutcome::Throttled {
+                written,
+                retry_after,
+            }) => {
+                if written > 0 {
+                    // Commit checkpointed bytes like a partial success.
+                    let keep = {
+                        let s = segs.lock().await;
+                        seg_keep(s[i].end, start + done, written)
+                    };
+                    {
+                        let mut s = segs.lock().await;
+                        let new_len = s[i].end + 1 - s[i].start;
+                        s[i].done = (s[i].done.min(new_len) + keep).min(new_len);
+                    }
+                    apply_shrink_correction(ctrl, written, keep);
+                }
+                drop(_permit);
+                // First throttle: collapse queued pieces into big ranges
+                // (stable indexes; merged slots skipped everywhere).
+                {
+                    let mut s = segs.lock().await;
+                    let act = active.lock().await;
+                    if coalesce_pending(&mut s, &act) {
+                        let snap: Vec<SegmentState> = s.iter().map(seg_clone).collect();
+                        drop(act);
+                        drop(s);
+                        let mut pg = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner());
+                        *pg = snap
+                            .iter()
+                            .map(|x| if x.merged { (x.end.saturating_add(1).saturating_sub(x.start), x.end.saturating_add(1).saturating_sub(x.start)) } else { (x.done, x.end.saturating_add(1).saturating_sub(x.start)) })
+                            .collect();
+                        drop(pg);
+                        save_state(
+                            part_dir,
+                            &task.url,
+                            &if etag.is_empty() { None } else { Some(etag.to_string()) },
+                            total,
+                            &snap,
+                        );
+                    }
+                }
+                if gate.throttle_gen() > 24 {
+                    return Err("server keeps throttling (429) after 24 waits".into());
+                }
+                let extra = throttle_jitter(gate.throttle_gen(), i);
+                wait_backoff(ctrl, retry_after + extra / 1000).await?;
+                tokio::time::sleep(Duration::from_millis(extra % 1000)).await;
+                continue;
+            }
+            Ok(RangeOutcome::Done(written)) => {
                 let keep = {
                     let s = segs.lock().await;
                     let sg = &s[i];
@@ -1326,18 +1740,14 @@ async fn run_segment(
                 let snapshot = {
                     let s = segs.lock().await;
                     s.iter()
-                        .map(|x| SegmentState {
-                            start: x.start,
-                            end: x.end,
-                            done: x.done,
-                        })
+                        .map(seg_clone)
                         .collect::<Vec<_>>()
                 };
                 {
                     let mut pg = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner());
                     *pg = snapshot
                         .iter()
-                        .map(|x| (x.done, x.end.saturating_add(1).saturating_sub(x.start)))
+                        .map(|x| if x.merged { (x.end.saturating_add(1).saturating_sub(x.start), x.end.saturating_add(1).saturating_sub(x.start)) } else { (x.done, x.end.saturating_add(1).saturating_sub(x.start)) })
                         .collect();
                 }
                 let et_opt = if etag.is_empty() {
@@ -1349,16 +1759,21 @@ async fn run_segment(
                 if keep < written {
                     continue;
                 }
+                gate.on_clean();
                 return Ok(());
             }
             Err(e) => {
                 if ctrl.cancelled.load(Ordering::Relaxed) {
                     return Err(e);
                 }
+                last_err = e.clone();
                 attempt += 1;
                 if attempt > 5 {
-                    return Err(e);
+                    return Err(format!(
+                        "segment download failed after retries (last: {last_err})"
+                    ));
                 }
+                drop(_permit);
                 tokio::time::sleep(std::time::Duration::from_millis(
                     500 * (1 << attempt.min(4)),
                 ))
@@ -1366,6 +1781,40 @@ async fn run_segment(
             }
         }
     }
+}
+
+/// Parse `Retry-After` (delta-seconds only; HTTP-date ignored). Default 5s,
+/// clamp 1..=60s.
+pub fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> u64 {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(5)
+        .clamp(1, 60)
+}
+
+/// Sleep honoring pause/cancel (200ms poll like body reads).
+async fn wait_backoff(ctrl: &Controls, secs: u64) -> Result<(), String> {
+    let end = std::time::Instant::now() + Duration::from_secs(secs);
+    while std::time::Instant::now() < end {
+        if ctrl.cancelled.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        wait_not_paused(ctrl).await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Ok(())
+}
+
+/// Bytes since last persisted checkpoint; save_state every this many.
+pub const CHECKPOINT_BYTES: u64 = 1024 * 1024;
+
+#[allow(clippy::too_many_arguments)]
+pub enum RangeOutcome {
+    Done(u64),
+    /// 429: bytes checkpointed this call; caller waits, re-ranges.
+    Throttled { written: u64, retry_after: u64 },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1378,7 +1827,9 @@ async fn download_range(
     ctrl: &Controls,
     prior: u64,
     part_index: Option<usize>,
-) -> Result<u64, String> {
+    on_checkpoint: Option<&(dyn Fn(u64) + Send + Sync)>,
+    gate: Option<&ConcurrencyGate>,
+) -> Result<RangeOutcome, String> {
     let resp = client
         .get(&task.url)
         .headers(headers_for(task))
@@ -1386,9 +1837,32 @@ async fn download_range(
         .send()
         .await
         .map_err(|e| e.to_string())?;
+    if resp.status().as_u16() == 429 {
+        let ra = retry_after_secs(resp.headers());
+        if let Some(g) = gate {
+            g.on_throttled();
+        }
+        return Ok(RangeOutcome::Throttled {
+            written: 0,
+            retry_after: ra,
+        });
+    }
     if resp.status().as_u16() != 206 {
         return Err(format!("expected 206 got {}", resp.status()));
     }
+    if let Some(g) = gate {
+        g.mark_streaming();
+    }
+    // Unmark on every exit below via scope guard (fn has multiple returns).
+    struct StreamMark<'a>(Option<&'a ConcurrencyGate>);
+    impl Drop for StreamMark<'_> {
+        fn drop(&mut self) {
+            if let Some(g) = self.0 {
+                g.unmark_streaming();
+            }
+        }
+    }
+    let _stream_mark = StreamMark(gate);
     // Truncate to caller-known done: drops bytes from interrupted attempt.
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
@@ -1425,6 +1899,11 @@ async fn download_range(
                             let mut pg = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some(part) = pg.get_mut(pi) {
                                 part.0 = (prior + n).min(part.1);
+                            }
+                        }
+                        if let Some(cb) = on_checkpoint {
+                            if n % CHECKPOINT_BYTES < chunk.len() as u64 {
+                                cb(prior + n);
                             }
                         }
                     }
@@ -1464,7 +1943,7 @@ async fn download_range(
     if n != expected {
         return Err(format!("short range: got {n} expected {expected}"));
     }
-    Ok(n)
+    Ok(RangeOutcome::Done(n))
 }
 
 async fn finish_check(dest: &Path, task: &DownloadTask) -> Result<(), String> {
@@ -2706,6 +3185,7 @@ mod tests {
                 start,
                 end,
                 done: 0,
+        merged: false,
             })
             .collect()
     }
@@ -2730,9 +3210,8 @@ mod tests {
                 }
             }
             assert!(
-                segs.len() <= cap,
-                "segments {} exceeded cap {cap}",
-                segs.len()
+                segs.iter().filter(|s| !s.merged).count() <= parts_cap(total, cap as u32),
+                "total segments exceeded parts_cap"
             );
             // ranges stay disjoint, ordered, cover [0, total)
             let mut expect = 0u64;
@@ -2747,19 +3226,130 @@ mod tests {
     }
 
     #[test]
+    fn redact_url_hides_token() {
+        let r = redact_url("https://cdn.example.com/d/SECRETTOKEN/file.zip?sig=abc#x");
+        assert_eq!(r, "https://cdn.example.com/.../file.zip");
+        assert!(!r.contains("SECRETTOKEN") && !r.contains("sig"));
+        assert_eq!(redact_url("not a url"), "...");
+    }
+
+    #[test]
+    fn part_size_scales_with_file() {
+        let gib = 1024u64 * 1024 * 1024;
+        // 100MiB @8: floor-bound 4MiB parts, 25 parts (not 8).
+        assert_eq!(target_part_size(100 * 1024 * 1024, 8), MIN_SPLIT);
+        assert_eq!(plan_parts(100 * 1024 * 1024, 8).len(), 25);
+        // 2GiB @8: 64MiB cap-bound, 32 parts (no 1MiB shredding).
+        assert_eq!(target_part_size(2 * gib, 8), MAX_PART);
+        assert_eq!(plan_parts(2 * gib, 8).len(), 32);
+        // 2GiB @16: still 64MiB (waves would give 32MiB >? 2GiB/64=32MiB -> clamp floor? no: 32MiB in [4,64])
+        assert_eq!(plan_parts(2 * gib, 16).len(), 64);
+        // tiny file -> one part per pool worker (floor relaxes)
+        assert_eq!(plan_parts(1024, 8).len(), 8);
+        // parts tiles exactly
+        let plan = plan_parts(2 * gib + 123, 8);
+        let mut expect = 0u64;
+        for (s, e) in &plan {
+            assert_eq!(*s, expect);
+            expect = e + 1;
+        }
+        assert_eq!(expect, 2 * gib + 123);
+        // split respects target: 64MiB remaining, target 64MiB -> no split
+        assert_eq!(split_point_min(0, 64 * 1024 * 1024 - 1, 0, MAX_PART), None);
+        assert!(split_point_min(0, 128 * 1024 * 1024 - 1, 0, MAX_PART).is_some());
+    }
+
+    #[test]
+    fn gate_learned_max_and_permit() {
+        let g = Arc::new(ConcurrencyGate::new(8));
+        let p1 = g.try_acquire().unwrap();
+        let p2 = g.try_acquire().unwrap();
+        let _p3 = g.try_acquire().unwrap();
+        // Two 206-admitted streamers -> learned max 2 on 429.
+        g.mark_streaming();
+        g.mark_streaming();
+        assert_eq!(g.on_throttled(), 2);
+        assert_eq!(g.limit(), 2);
+        g.unmark_streaming();
+        g.unmark_streaming();
+        assert!(g.try_acquire().is_none());
+        drop(p1);
+        assert!(g.try_acquire().is_none());
+        drop(p2);
+        assert!(g.try_acquire().is_some());
+        // Floor 1: throttle with nothing streaming.
+        let g1 = Arc::new(ConcurrencyGate::new(8));
+        let _a = g1.try_acquire().unwrap();
+        assert_eq!(g1.on_throttled(), 1);
+        assert_eq!(g1.limit(), 1);
+        for _ in 0..GATE_REGAIN_STREAK {
+            g1.on_clean();
+        }
+        assert_eq!(g1.limit(), 2);
+        // Jitter spreads wake times deterministically per gen/idx.
+        assert_ne!(throttle_jitter(1, 0), throttle_jitter(1, 3));
+        assert!(throttle_jitter(9, 7) < 5000);
+        // Retry-After parse: seconds, default, clamp.
+        let mut h = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_secs(&h), 5);
+        h.insert(reqwest::header::RETRY_AFTER, "10".parse().unwrap());
+        assert_eq!(retry_after_secs(&h), 10);
+        h.insert(reqwest::header::RETRY_AFTER, "999".parse().unwrap());
+        assert_eq!(retry_after_secs(&h), 60);
+    }
+
+    #[test]
+    fn coalesce_pending_merges_only_unstarted() {
+        let mb = 1024 * 1024u64;
+        // 8 x 10MiB, idx0-1 active, idx2 done>0, rest pending contiguous.
+        let mut segs = mk_segs(&[
+            (0, 10 * mb - 1),
+            (10 * mb, 20 * mb - 1),
+            (20 * mb, 30 * mb - 1),
+            (30 * mb, 40 * mb - 1),
+            (40 * mb, 50 * mb - 1),
+            (50 * mb, 60 * mb - 1),
+        ]);
+        segs[2].done = 5 * mb;
+        let active: std::collections::HashSet<usize> = [0, 1].into();
+        assert!(coalesce_pending(&mut segs, &active));
+        // pending 3,4,5 collapse into 3; active/started untouched.
+        assert_eq!(segs[3].end, 60 * mb - 1);
+        assert!(segs[4].merged && segs[5].merged);
+        assert!(!segs[0].merged && !segs[1].merged && !segs[2].merged);
+        // tiles [0,total) over non-merged
+        let mut expect = 0u64;
+        for sg in segs.iter().filter(|s| !s.merged) {
+            assert_eq!(sg.start, expect);
+            expect = sg.end + 1;
+        }
+        assert_eq!(expect, 60 * mb);
+        // idempotent
+        assert!(!coalesce_pending(&mut segs, &active));
+    }
+
+    #[test]
     fn claim_no_split_at_cap_or_below_floor() {
         let mb = 1024 * 1024u64;
-        // At cap: no split even with huge remaining.
+        // At live cap: no split even with huge remaining (1 done + 1 live, cap 1).
         let mut segs = mk_segs(&[(0, 100 * mb - 1), (100 * mb, 200 * mb - 1)]);
         let mut active: std::collections::HashSet<usize> = [0, 1].into();
-        // free worker 1's slot by finishing it
         segs[1].done = 100 * mb;
         active.remove(&1);
         assert!(matches!(
-            try_claim_or_split(&mut segs, &mut active, 2),
+            try_claim_or_split(&mut segs, &mut active, 1),
             Claim::None
         ));
         assert_eq!(segs.len(), 2);
+        // Parts cap 3 (2 existing + 1): done segment still counts, split ok.
+        let mut segs = mk_segs(&[(0, 100 * mb - 1), (100 * mb, 200 * mb - 1)]);
+        let mut active: std::collections::HashSet<usize> = [0, 1].into();
+        segs[1].done = 100 * mb;
+        active.remove(&1);
+        assert!(matches!(
+            try_claim_or_split(&mut segs, &mut active, 3),
+            Claim::Split(_)
+        ));
         // Below cap but remaining < 2*MIN_SPLIT: no split.
         let mut segs = mk_segs(&[(0, 4 * mb - 1)]);
         let mut active: std::collections::HashSet<usize> = [0].into();
@@ -2845,11 +3435,13 @@ mod tests {
                 start: 0,
                 end: 999,
                 done: 400,
+        merged: false,
             },
             SegmentState {
                 start: 1000,
                 end: 1999,
                 done: 500,
+        merged: false,
             },
         ];
         assert_eq!(committed_total(&segs), 900);

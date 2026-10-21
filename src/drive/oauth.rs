@@ -131,7 +131,9 @@ pub fn preset(kind: crate::model::DriveKind, acc: &crate::model::DriveAccount) -
 /// Build sign-in URL + PKCE pair (pure besides entropy).
 pub fn start(app: &OAuthApp) -> Result<PendingAuth, String> {
     if app.client_id.trim().is_empty() {
-        return Err("client_id empty: create your own OAuth app (Setup steps) and paste Client ID".into());
+        return Err(
+            "client_id empty: create your own OAuth app (Setup steps) and paste Client ID".into(),
+        );
     }
     let verifier = b64url(&rand_bytes(48));
     let challenge = b64url(&sha256(verifier.as_bytes()));
@@ -218,7 +220,9 @@ pub fn wait_loopback(
     open_browser: bool,
 ) -> Result<TokenOut, String> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", REDIRECT_PORT)).map_err(|e| {
-        format!("port {REDIRECT_PORT} busy ({e}) — close rclone/other webcraft, or paste code below")
+        format!(
+            "port {REDIRECT_PORT} busy ({e}) — close rclone/other webcraft, or paste code below"
+        )
     })?;
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     if open_browser {
@@ -272,7 +276,8 @@ pub fn wait_loopback(
                     continue;
                 }
                 if let Some(e) = err {
-                    let body = "<html><body><h2>webcraft: sign-in failed. Back to app.</h2></body></html>";
+                    let body =
+                        "<html><body><h2>webcraft: sign-in failed. Back to app.</h2></body></html>";
                     let _ = sock.write_all(
                         format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}", body.len(), body)
                             .as_bytes(),
@@ -378,10 +383,7 @@ fn parse_token_resp(resp: reqwest::blocking::Response) -> Result<TokenOut, Strin
     let st = resp.status();
     let txt = resp.text().map_err(|e| e.to_string())?;
     if !st.is_success() {
-        return Err(format!(
-            "token HTTP {st}: {}",
-            &txt[..txt.len().min(300)]
-        ));
+        return Err(format!("token HTTP {st}: {}", &txt[..txt.len().min(300)]));
     }
     let v: serde_json::Value = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
     let at = v["access_token"].as_str().unwrap_or("");
@@ -401,7 +403,8 @@ fn url_decode(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16)
+            if let Ok(v) =
+                u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16)
             {
                 out.push(v);
                 i += 3;
@@ -481,7 +484,10 @@ mod tests {
             extra_auth_params: vec![("access_type".into(), "offline".into())],
         };
         let u = authorize_url(&app, REDIRECT_URI, "chal", "st");
-        assert!(u.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A53682%2F"), "{u}");
+        assert!(
+            u.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A53682%2F"),
+            "{u}"
+        );
         assert!(u.contains("code_challenge_method=S256"));
         assert!(u.contains("access_type=offline"));
         assert_eq!(REDIRECT_URI, "http://127.0.0.1:53682/");

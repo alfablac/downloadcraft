@@ -18,8 +18,19 @@ impl SftpDrive {
         if host.is_empty() {
             return Err("SFTP host empty".into());
         }
-        let port = if self.acc.port == 0 { 22 } else { self.acc.port };
-        crate::sftp::connect_session(&host, port, &self.acc.username, &self.acc.secret, &self.acc.ssh_key_path).await
+        let port = if self.acc.port == 0 {
+            22
+        } else {
+            self.acc.port
+        };
+        crate::sftp::connect_session(
+            &host,
+            port,
+            &self.acc.username,
+            &self.acc.secret,
+            &self.acc.ssh_key_path,
+        )
+        .await
     }
     fn full(&self, path: &str) -> String {
         let root = self.acc.root.trim_end_matches('/');
@@ -40,7 +51,10 @@ impl DriveBackend for SftpDrive {
         DriveKind::Sftp
     }
     async fn about(&self) -> Result<String, String> {
-        Ok(format!("sftp://{}@{}", self.acc.username, self.acc.endpoint))
+        Ok(format!(
+            "sftp://{}@{}",
+            self.acc.username, self.acc.endpoint
+        ))
     }
     async fn list(&self, path: &str) -> Result<Vec<RemoteEntry>, String> {
         let s = self.session().await?;
@@ -75,7 +89,9 @@ impl DriveBackend for SftpDrive {
     }
     async fn mkdir(&self, path: &str) -> Result<(), String> {
         let s = self.session().await?;
-        s.create_dir(self.full(path)).await.map_err(|e| e.to_string())
+        s.create_dir(self.full(path))
+            .await
+            .map_err(|e| e.to_string())
     }
     async fn delete(&self, entry: &RemoteEntry) -> Result<(), String> {
         let s = self.session().await?;
@@ -88,7 +104,9 @@ impl DriveBackend for SftpDrive {
                 let rd = s.read_dir(&d).await.map_err(|e| e.to_string())?;
                 for e in rd {
                     let name = e.file_name();
-                    if name == "." || name == ".." { continue; }
+                    if name == "." || name == ".." {
+                        continue;
+                    }
                     let fp = format!("{}/{}", d.trim_end_matches('/'), name);
                     all.push(fp.clone());
                     if e.metadata().is_dir() {
@@ -108,24 +126,42 @@ impl DriveBackend for SftpDrive {
     async fn rename(&self, entry: &RemoteEntry, new_name: &str) -> Result<(), String> {
         let s = self.session().await?;
         let src = self.full(&entry.path);
-        let dst = self.full(&super::join_path(&super::parent_path(&entry.path), new_name));
+        let dst = self.full(&super::join_path(
+            &super::parent_path(&entry.path),
+            new_name,
+        ));
         s.rename(&src, &dst).await.map_err(|e| e.to_string())
     }
-    async fn download(&self, entry: &RemoteEntry, dest: &std::path::Path, parallel: u32, prog: &Progress) -> Result<(), String> {
+    async fn download(
+        &self,
+        entry: &RemoteEntry,
+        dest: &std::path::Path,
+        parallel: u32,
+        prog: &Progress,
+    ) -> Result<(), String> {
         prog.set_total(entry.size);
         if parallel <= 1 || entry.size < 1 << 20 {
             let s = self.session().await?;
-            let mut rf = s.open(self.full(&entry.path)).await.map_err(|e| e.to_string())?;
+            let mut rf = s
+                .open(self.full(&entry.path))
+                .await
+                .map_err(|e| e.to_string())?;
             if let Some(p) = dest.parent() {
-                tokio::fs::create_dir_all(p).await.map_err(|e| e.to_string())?;
+                tokio::fs::create_dir_all(p)
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
-            let mut lf = tokio::fs::File::create(dest).await.map_err(|e| e.to_string())?;
+            let mut lf = tokio::fs::File::create(dest)
+                .await
+                .map_err(|e| e.to_string())?;
             let mut buf = vec![0u8; 256 * 1024];
             loop {
                 prog.wait().await;
                 prog.check()?;
                 let n = rf.read(&mut buf).await.map_err(|e| e.to_string())?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 lf.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
                 prog.add(n as u64);
             }
@@ -134,9 +170,13 @@ impl DriveBackend for SftpDrive {
         }
         // Parallel ranges over concurrent sessions (true multithreaded SFTP).
         if let Some(p) = dest.parent() {
-            tokio::fs::create_dir_all(p).await.map_err(|e| e.to_string())?;
+            tokio::fs::create_dir_all(p)
+                .await
+                .map_err(|e| e.to_string())?;
         }
-        let f = tokio::fs::File::create(dest).await.map_err(|e| e.to_string())?;
+        let f = tokio::fs::File::create(dest)
+            .await
+            .map_err(|e| e.to_string())?;
         f.set_len(entry.size).await.map_err(|e| e.to_string())?;
         drop(f);
         let nseg = parallel.min(8);
@@ -144,7 +184,11 @@ impl DriveBackend for SftpDrive {
         let mut futs = Vec::new();
         for i in 0..nseg {
             let start = i as u64 * chunk;
-            let end = if i + 1 == nseg { entry.size } else { start + chunk };
+            let end = if i + 1 == nseg {
+                entry.size
+            } else {
+                start + chunk
+            };
             let acc = self.acc.clone();
             let remote = self.full(&entry.path);
             let dest = dest.to_path_buf();
@@ -153,9 +197,17 @@ impl DriveBackend for SftpDrive {
                 let drv = SftpDrive { acc };
                 let s = drv.session().await?;
                 let mut rf = s.open(&remote).await.map_err(|e| e.to_string())?;
-                rf.seek(std::io::SeekFrom::Start(start)).await.map_err(|e| e.to_string())?;
-                let mut lf = tokio::fs::OpenOptions::new().write(true).open(&dest).await.map_err(|e| e.to_string())?;
-                lf.seek(std::io::SeekFrom::Start(start)).await.map_err(|e| e.to_string())?;
+                rf.seek(std::io::SeekFrom::Start(start))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let mut lf = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&dest)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                lf.seek(std::io::SeekFrom::Start(start))
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let mut buf = vec![0u8; 256 * 1024];
                 let mut pos = start;
                 while pos < end {
@@ -163,7 +215,9 @@ impl DriveBackend for SftpDrive {
                     prog.check()?;
                     let want = ((end - pos) as usize).min(buf.len());
                     let n = rf.read(&mut buf[..want]).await.map_err(|e| e.to_string())?;
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     lf.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
                     prog.add(n as u64);
                     pos += n as u64;
@@ -177,19 +231,29 @@ impl DriveBackend for SftpDrive {
         }
         Ok(())
     }
-    async fn upload(&self, local: &std::path::Path, dest_dir: &str, name: &str, prog: &Progress) -> Result<RemoteEntry, String> {
+    async fn upload(
+        &self,
+        local: &std::path::Path,
+        dest_dir: &str,
+        name: &str,
+        prog: &Progress,
+    ) -> Result<RemoteEntry, String> {
         let size = super::http_util::file_len(local);
         prog.set_total(size);
         let s = self.session().await?;
         let remote = self.full(&super::join_path(dest_dir, name));
         let mut wf = s.create(&remote).await.map_err(|e| e.to_string())?;
-        let mut lf = tokio::fs::File::open(local).await.map_err(|e| e.to_string())?;
+        let mut lf = tokio::fs::File::open(local)
+            .await
+            .map_err(|e| e.to_string())?;
         let mut buf = vec![0u8; 256 * 1024];
         loop {
             prog.wait().await;
             prog.check()?;
             let n = lf.read(&mut buf).await.map_err(|e| e.to_string())?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             wf.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
             prog.add(n as u64);
         }

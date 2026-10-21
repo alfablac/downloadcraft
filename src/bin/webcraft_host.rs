@@ -13,6 +13,10 @@ fn inbox_dir() -> PathBuf {
     config_dir().join("inbox")
 }
 
+fn browser_resume_dir() -> PathBuf {
+    config_dir().join("browser-resume")
+}
+
 /// Live GUI instance? Mirrors app's single-instance check: lock pid alive.
 /// Host is same-OS standalone binary, so liveness check duplicates per-OS
 /// (app's `process_alive` lives in GUI binary, not a shared lib).
@@ -128,7 +132,8 @@ fn ext_of(filename: &str, url: &str) -> String {
 /// Capture filter from `capture-filter.json` in config dir, written by desktop
 /// whenever capture settings change: {"exts":["mp4","zip"],"minBytes":123}.
 /// Missing/corrupt file = no filter (desktop never ran / settings default).
-/// Unknown size (0/missing) always allowed: cannot prove small.
+/// Unknown size (0/missing) denied when a minimum is set (cannot prove
+/// large enough); allowed when no minimum set.
 /// Empty ext list = all types. Explicit sends (captured=false) never reach here.
 pub fn capture_allowed(
     exts: &[String],
@@ -138,7 +143,7 @@ pub fn capture_allowed(
     mime: &str,
     size: u64,
 ) -> bool {
-    if min_bytes > 0 && size > 0 && size < min_bytes {
+    if min_bytes > 0 && (size == 0 || size < min_bytes) {
         return false;
     }
     if exts.is_empty() {
@@ -201,6 +206,92 @@ fn sanitize_filename(name: &str) -> Option<String> {
     Some(base.to_string())
 }
 
+/// Same URL already queued as unconsumed inbox file within window?
+/// ponytail: O(n inbox) scan per captured send; inbox drained continuously,
+/// add index/state file only if inbox backs up.
+fn recent_duplicate(dir: &std::path::Path, url: &str, now: std::time::SystemTime) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    rd.flatten().any(|e| {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { return false };
+        if !name.starts_with("msg-") || !name.ends_with(".txt") {
+            return false;
+        }
+        let Ok(mtime) = e.metadata().and_then(|m| m.modified()) else {
+            return false;
+        };
+        // Future mtime (clock skew) counts as recent; >10s old does not.
+        if now
+            .duration_since(mtime)
+            .is_ok_and(|d| d >= std::time::Duration::from_secs(10))
+        {
+            return false;
+        }
+        std::fs::read_to_string(e.path())
+            .ok()
+            .and_then(|b| b.lines().next().map(|l| l == format!("url={url}")))
+            .unwrap_or(false)
+    })
+}
+
+/// Poll resume files written by app on capture-window cancel.
+/// Claim by rename to `.taken`: two browser profiles race, first rename wins.
+/// Claimed file deleted regardless parse success. Missing dir = empty.
+/// Freshness: `ts` (unix ms) primary; missing/invalid -> mtime fallback.
+/// Stale if effective ts older than 10 min. Cap 10.
+fn take_resume_items(dir: &std::path::Path, now_ms: u64) -> Vec<serde_json::Value> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let stale_before = now_ms.saturating_sub(600_000);
+    let mut items = Vec::new();
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("resume-") || !name.ends_with(".json") {
+            continue;
+        }
+        let path = e.path();
+        let taken = path.with_extension("taken");
+        if std::fs::rename(&path, &taken).is_err() {
+            continue;
+        }
+        let mtime_ms = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(now_ms);
+        let txt = std::fs::read_to_string(&taken).unwrap_or_default();
+        let _ = std::fs::remove_file(&taken);
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+            continue;
+        };
+        let url = v.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            continue;
+        }
+        let ts = v.get("ts").and_then(|t| t.as_u64());
+        let effective = ts.unwrap_or(mtime_ms);
+        if effective < stale_before {
+            continue;
+        }
+        if items.len() >= 10 {
+            continue;
+        }
+        items.push(serde_json::json!({
+            "url": url,
+            "filename": v.get("filename").and_then(|f| f.as_str()).unwrap_or(""),
+            "referrer": v.get("referrer").and_then(|f| f.as_str()).unwrap_or(""),
+            "ts": ts.unwrap_or(0),
+        }));
+    }
+    items
+}
+
 fn handle(msg: &serde_json::Value) -> serde_json::Value {
     let ty = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
     // Echo request `id` verbatim when present; harmless for old clients that ignore it.
@@ -218,6 +309,14 @@ fn handle(msg: &serde_json::Value) -> serde_json::Value {
         // browser download. allow=false -> browser keeps file (filter is
         // webcraft Settings via capture-filter.json, host is sole decider).
         // No inbox write here; actual send is separate "download" msg.
+        "pollResume" => {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let items = take_resume_items(&browser_resume_dir(), now_ms);
+            with_id(serde_json::json!({"type":"pollResume","items":items}))
+        }
         "captureCheck" => {
             let (exts, min_bytes) = load_capture_filter();
             let filename = msg.get("filename").and_then(|f| f.as_str()).unwrap_or("");
@@ -248,6 +347,13 @@ fn handle(msg: &serde_json::Value) -> serde_json::Value {
                 let size = msg.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
                 if !capture_allowed(&exts, min_bytes, filename, url, mime, size) {
                     return with_id(serde_json::json!({"type":"ok","skipped":"filtered"}));
+                }
+                // Backstop vs double-fire (two extension paths / double-click
+                // racing pause-first probe): same URL queued <10s ago and
+                // still unconsumed. Extension treats skipped as resume-browser,
+                // so duplicate browser copy restarts; original stays queued.
+                if recent_duplicate(&inbox_dir(), url, std::time::SystemTime::now()) {
+                    return with_id(serde_json::json!({"type":"ok","skipped":"duplicate"}));
                 }
             }
             let dir = inbox_dir();
@@ -494,14 +600,138 @@ mod tests {
             "",
             10 * 1024 * 1024
         ));
-        assert!(capture_allowed(
+        assert!(!capture_allowed(
             &[],
             10 * 1024 * 1024,
             "a.zip",
             "https://x/a.zip",
             "",
             0
-        )); // unknown size: cannot prove small
+        )); // unknown size with min set: cannot prove large enough
+        assert!(capture_allowed(&[], 0, "a.zip", "https://x/a.zip", "", 0)); // unknown size, no minimum: allow
         assert!(capture_allowed(&[], 0, "a.zip", "https://x/a.zip", "", 1)); // 0 = no minimum
+    }
+
+    fn temp_resume(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "webcraft-host-resume-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn take_resume_items_takes_only_fresh_http_and_consumes() {
+        let dir = temp_resume("mixed");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let w = |name: &str, body: String| std::fs::write(dir.join(name), body).unwrap();
+        w(
+            "resume-1.json",
+            serde_json::json!({"url":"https://x/a.zip","filename":"a.zip","referrer":"https://r/","ts":now_ms}).to_string(),
+        );
+        w(
+            "resume-2.json",
+            serde_json::json!({"url":"http://x/b.zip","ts":now_ms}).to_string(),
+        );
+        w(
+            "resume-3.json",
+            serde_json::json!({"url":"https://x/stale.zip","ts":now_ms-601_000}).to_string(),
+        );
+        w("resume-4.json", "not json{".into());
+        w(
+            "resume-5.json",
+            serde_json::json!({"url":"ftp://x/c.zip","ts":now_ms}).to_string(),
+        );
+        w("other.json", serde_json::json!({"url":"https://x/d.zip","ts":now_ms}).to_string());
+        let items = take_resume_items(&dir, now_ms);
+        assert_eq!(items.len(), 2);
+        let mut urls: Vec<&str> = items.iter().filter_map(|i| i["url"].as_str()).collect();
+        urls.sort();
+        assert_eq!(urls, ["http://x/b.zip", "https://x/a.zip"]);
+        let a = items.iter().find(|i| i["url"] == "https://x/a.zip").unwrap();
+        assert_eq!(a["filename"], "a.zip");
+        assert_eq!(a["referrer"], "https://r/");
+        assert_eq!(a["ts"], now_ms);
+        let b = items.iter().find(|i| i["url"] == "http://x/b.zip").unwrap();
+        assert_eq!(b["filename"], "");
+        assert_eq!(b["referrer"], "");
+        // Claimed files consumed; unclaimed non-resume file untouched.
+        assert!(take_resume_items(&dir, now_ms).is_empty());
+        assert!(dir.join("other.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn take_resume_items_missing_dir_and_cap() {
+        assert!(take_resume_items(
+            &std::env::temp_dir().join("webcraft-host-resume-nope"),
+            0
+        )
+        .is_empty());
+        let dir = temp_resume("cap");
+        let now_ms = 1_000_000u64;
+        for i in 0..12 {
+            std::fs::write(
+                dir.join(format!("resume-{i}.json")),
+                serde_json::json!({"url":format!("https://x/{i}.zip"),"ts":now_ms}).to_string(),
+            )
+            .unwrap();
+        }
+        assert_eq!(take_resume_items(&dir, now_ms).len(), 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn temp_inbox(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "webcraft-host-dedupe-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn recent_duplicate_matches_url_within_10s() {
+        let dir = temp_inbox("fresh");
+        std::fs::write(
+            dir.join("msg-1-0.txt"),
+            "url=https://x/a.zip?n=1\nreferrer=\n",
+        )
+        .unwrap();
+        let now = std::time::SystemTime::now();
+        assert!(recent_duplicate(&dir, "https://x/a.zip?n=1", now));
+        assert!(!recent_duplicate(&dir, "https://x/other.zip", now));
+        // Only first line counts.
+        assert!(!recent_duplicate(&dir, "", now));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recent_duplicate_ignores_stale_and_non_msg() {
+        let dir = temp_inbox("stale");
+        std::fs::write(dir.join("msg-1-0.txt"), "url=https://x/a.zip\n").unwrap();
+        std::fs::write(dir.join("other.txt"), "url=https://x/b.zip\n").unwrap();
+        let now = std::time::SystemTime::now();
+        // 11s later: stale.
+        assert!(!recent_duplicate(
+            &dir,
+            "https://x/a.zip",
+            now + std::time::Duration::from_secs(11)
+        ));
+        // Non-msg file never matches.
+        assert!(!recent_duplicate(&dir, "https://x/b.zip", now));
+        // Missing dir: no dup.
+        assert!(!recent_duplicate(
+            &dir.join("nope"),
+            "https://x/a.zip",
+            now
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

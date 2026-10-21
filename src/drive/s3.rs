@@ -47,11 +47,22 @@ pub fn sign(
     hs.push(("x-amz-content-sha256".into(), body_sha.into()));
     hs.push(("x-amz-date".into(), amzdate.clone()));
     hs.sort_by(|a, b| a.0.cmp(&b.0));
-    let signed_headers = hs.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
-    let canon_headers = hs.iter().map(|(k, v)| format!("{}:{}\n", k, v.trim())).collect::<String>();
+    let signed_headers = hs
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
+    let canon_headers = hs
+        .iter()
+        .map(|(k, v)| format!("{}:{}\n", k, v.trim()))
+        .collect::<String>();
     let query = url.query().unwrap_or("");
     // Canonical query: already encoded by url crate; sort pairs.
-    let mut pairs: Vec<&str> = if query.is_empty() { vec![] } else { query.split('&').collect() };
+    let mut pairs: Vec<&str> = if query.is_empty() {
+        vec![]
+    } else {
+        query.split('&').collect()
+    };
     pairs.sort();
     let canon = format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
@@ -63,7 +74,10 @@ pub fn sign(
         body_sha
     );
     let scope = format!("{datestamp}/{}/{}/aws4_request", s.region, s.service);
-    let to_sign = format!("AWS4-HMAC-SHA256\n{amzdate}\n{scope}\n{}", sha256_hex(canon.as_bytes()));
+    let to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amzdate}\n{scope}\n{}",
+        sha256_hex(canon.as_bytes())
+    );
     let k_date = hmac(format!("AWS4{}", s.secret).as_bytes(), datestamp.as_bytes());
     let k_region = hmac(&k_date, s.region.as_bytes());
     let k_service = hmac(&k_region, s.service.as_bytes());
@@ -102,7 +116,14 @@ fn civil(secs: u64) -> (i64, i64, i64, i64, i64, i64) {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d, (rem / 3600) as i64, ((rem % 3600) / 60) as i64, (rem % 60) as i64)
+    (
+        if m <= 2 { y + 1 } else { y },
+        m,
+        d,
+        (rem / 3600) as i64,
+        ((rem % 3600) / 60) as i64,
+        (rem % 60) as i64,
+    )
 }
 
 pub struct S3 {
@@ -123,7 +144,11 @@ impl S3 {
     fn endpoint(&self) -> String {
         let e = self.acc.endpoint.trim().trim_end_matches('/');
         if e.is_empty() {
-            let region = if self.acc.region.is_empty() { "us-east-1" } else { &self.acc.region };
+            let region = if self.acc.region.is_empty() {
+                "us-east-1"
+            } else {
+                &self.acc.region
+            };
             format!("https://s3.{region}.amazonaws.com")
         } else if e.starts_with("http") {
             e.to_string()
@@ -174,7 +199,14 @@ impl S3 {
         } else {
             sha256_hex(&body)
         };
-        let headers = sign(&self.signer(), method.as_str(), &url, &extra, &body_sha, now_amz());
+        let headers = sign(
+            &self.signer(),
+            method.as_str(),
+            &url,
+            &extra,
+            &body_sha,
+            now_amz(),
+        );
         let mut r = self.client.request(method, url.as_str());
         for (k, v) in headers.iter().chain(extra.iter()) {
             r = r.header(k.as_str(), v.as_str());
@@ -207,15 +239,14 @@ impl DriveBackend for S3 {
         let mut out = Vec::new();
         let mut token = String::new();
         loop {
-            let mut q = format!(
-                "list-type=2&delimiter=/&prefix={}",
-                super::pct(&prefix)
-            );
+            let mut q = format!("list-type=2&delimiter=/&prefix={}", super::pct(&prefix));
             if !token.is_empty() {
                 q.push_str(&format!("&continuation-token={}", super::pct(&token)));
             }
             let url = self.url("", &q);
-            let resp = self.signed_send(reqwest::Method::GET, url, vec![], vec![]).await?;
+            let resp = self
+                .signed_send(reqwest::Method::GET, url, vec![], vec![])
+                .await?;
             if !resp.status().is_success() {
                 return Err(http_util::err_text(resp).await);
             }
@@ -224,9 +255,24 @@ impl DriveBackend for S3 {
             for n in doc.descendants() {
                 match n.tag_name().name() {
                     "Contents" => {
-                        let key = n.descendants().find(|x| x.tag_name().name() == "Key").and_then(|x| x.text()).unwrap_or("").to_string();
-                        let size: u64 = n.descendants().find(|x| x.tag_name().name() == "Size").and_then(|x| x.text()).and_then(|t| t.parse().ok()).unwrap_or(0);
-                        let modified = n.descendants().find(|x| x.tag_name().name() == "LastModified").and_then(|x| x.text()).map(super::parse_time).unwrap_or(0);
+                        let key = n
+                            .descendants()
+                            .find(|x| x.tag_name().name() == "Key")
+                            .and_then(|x| x.text())
+                            .unwrap_or("")
+                            .to_string();
+                        let size: u64 = n
+                            .descendants()
+                            .find(|x| x.tag_name().name() == "Size")
+                            .and_then(|x| x.text())
+                            .and_then(|t| t.parse().ok())
+                            .unwrap_or(0);
+                        let modified = n
+                            .descendants()
+                            .find(|x| x.tag_name().name() == "LastModified")
+                            .and_then(|x| x.text())
+                            .map(super::parse_time)
+                            .unwrap_or(0);
                         if key == prefix {
                             continue;
                         }
@@ -241,7 +287,11 @@ impl DriveBackend for S3 {
                         });
                     }
                     "CommonPrefixes" => {
-                        let p = n.descendants().find(|x| x.tag_name().name() == "Prefix").and_then(|x| x.text()).unwrap_or("");
+                        let p = n
+                            .descendants()
+                            .find(|x| x.tag_name().name() == "Prefix")
+                            .and_then(|x| x.text())
+                            .unwrap_or("");
                         let trimmed = p.trim_end_matches('/');
                         out.push(RemoteEntry {
                             name: super::base_name(trimmed),
@@ -256,8 +306,15 @@ impl DriveBackend for S3 {
                     _ => {}
                 }
             }
-            let truncated = doc.descendants().any(|n| n.tag_name().name() == "IsTruncated" && n.text() == Some("true"));
-            token = doc.descendants().find(|n| n.tag_name().name() == "NextContinuationToken").and_then(|n| n.text()).unwrap_or("").to_string();
+            let truncated = doc
+                .descendants()
+                .any(|n| n.tag_name().name() == "IsTruncated" && n.text() == Some("true"));
+            token = doc
+                .descendants()
+                .find(|n| n.tag_name().name() == "NextContinuationToken")
+                .and_then(|n| n.text())
+                .unwrap_or("")
+                .to_string();
             if !truncated || token.is_empty() {
                 break;
             }
@@ -269,8 +326,14 @@ impl DriveBackend for S3 {
         // Zero-byte "folder" marker object.
         let key = format!("{}/", path.trim_matches('/'));
         let url = self.url(&key, "");
-        let resp = self.signed_send(reqwest::Method::PUT, url, vec![], vec![]).await?;
-        if resp.status().is_success() { Ok(()) } else { Err(http_util::err_text(resp).await) }
+        let resp = self
+            .signed_send(reqwest::Method::PUT, url, vec![], vec![])
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(http_util::err_text(resp).await)
+        }
     }
     async fn delete(&self, entry: &RemoteEntry) -> Result<(), String> {
         if entry.is_dir {
@@ -281,12 +344,20 @@ impl DriveBackend for S3 {
             }
             let key = format!("{}/", entry.path.trim_matches('/'));
             let url = self.url(&key, "");
-            let _ = self.signed_send(reqwest::Method::DELETE, url, vec![], vec![]).await?;
+            let _ = self
+                .signed_send(reqwest::Method::DELETE, url, vec![], vec![])
+                .await?;
             Ok(())
         } else {
             let url = self.url(&entry.path, "");
-            let resp = self.signed_send(reqwest::Method::DELETE, url, vec![], vec![]).await?;
-            if resp.status().is_success() { Ok(()) } else { Err(http_util::err_text(resp).await) }
+            let resp = self
+                .signed_send(reqwest::Method::DELETE, url, vec![], vec![])
+                .await?;
+            if resp.status().is_success() {
+                Ok(())
+            } else {
+                Err(http_util::err_text(resp).await)
+            }
         }
     }
     async fn rename(&self, entry: &RemoteEntry, new_name: &str) -> Result<(), String> {
@@ -294,7 +365,14 @@ impl DriveBackend for S3 {
         let dst = super::join_path(&super::parent_path(&entry.path), new_name);
         let src = format!("/{}/{}", self.bucket(), super::pct_path(&entry.path));
         let url = self.url(&dst, "");
-        let resp = self.signed_send(reqwest::Method::PUT, url, vec![("x-amz-copy-source".into(), src)], vec![]).await?;
+        let resp = self
+            .signed_send(
+                reqwest::Method::PUT,
+                url,
+                vec![("x-amz-copy-source".into(), src)],
+                vec![],
+            )
+            .await?;
         if !resp.status().is_success() {
             return Err(http_util::err_text(resp).await);
         }
@@ -302,12 +380,20 @@ impl DriveBackend for S3 {
         e.path = entry.path.clone();
         if !entry.is_dir {
             let url = self.url(&entry.path, "");
-            let _ = self.signed_send(reqwest::Method::DELETE, url, vec![], vec![]).await?;
+            let _ = self
+                .signed_send(reqwest::Method::DELETE, url, vec![], vec![])
+                .await?;
         }
         let _ = &mut e;
         Ok(())
     }
-    async fn download(&self, entry: &RemoteEntry, dest: &std::path::Path, parallel: u32, prog: &Progress) -> Result<(), String> {
+    async fn download(
+        &self,
+        entry: &RemoteEntry,
+        dest: &std::path::Path,
+        parallel: u32,
+        prog: &Progress,
+    ) -> Result<(), String> {
         let url = self.url(&entry.path, "");
         let signer = self.signer();
         let client = self.client.clone();
@@ -322,7 +408,13 @@ impl DriveBackend for S3 {
         };
         http_util::download_url(&self.client, &mk, dest, parallel, prog).await
     }
-    async fn upload(&self, local: &std::path::Path, dest_dir: &str, name: &str, prog: &Progress) -> Result<RemoteEntry, String> {
+    async fn upload(
+        &self,
+        local: &std::path::Path,
+        dest_dir: &str,
+        name: &str,
+        prog: &Progress,
+    ) -> Result<RemoteEntry, String> {
         let key = super::join_path(dest_dir, name);
         let size = http_util::file_len(local);
         prog.set_total(size);
@@ -330,23 +422,40 @@ impl DriveBackend for S3 {
         if size <= PART {
             let bytes = http_util::read_file(local).await?;
             let url = self.url(&key, "");
-            let resp = self.signed_send(reqwest::Method::PUT, url, vec![], bytes).await?;
+            let resp = self
+                .signed_send(reqwest::Method::PUT, url, vec![], bytes)
+                .await?;
             if !resp.status().is_success() {
                 return Err(http_util::err_text(resp).await);
             }
             prog.add(size);
-            return Ok(RemoteEntry { id: key.clone(), name: name.into(), path: key, is_dir: false, size, modified: 0, mime: String::new() });
+            return Ok(RemoteEntry {
+                id: key.clone(),
+                name: name.into(),
+                path: key,
+                is_dir: false,
+                size,
+                modified: 0,
+                mime: String::new(),
+            });
         }
         // Multipart: create -> parts (sequential; server presign-free) -> complete.
         // ponytail: sequential parts; parallel needs signed part URLs batching.
         let url = self.url(&key, "uploads=");
-        let resp = self.signed_send(reqwest::Method::POST, url, vec![], vec![]).await?;
+        let resp = self
+            .signed_send(reqwest::Method::POST, url, vec![], vec![])
+            .await?;
         if !resp.status().is_success() {
             return Err(http_util::err_text(resp).await);
         }
         let xml = resp.text().await.map_err(|e| e.to_string())?;
         let doc = roxmltree::Document::parse(&xml).map_err(|e| e.to_string())?;
-        let upload_id = doc.descendants().find(|n| n.tag_name().name() == "UploadId").and_then(|n| n.text()).ok_or("S3: no UploadId")?.to_string();
+        let upload_id = doc
+            .descendants()
+            .find(|n| n.tag_name().name() == "UploadId")
+            .and_then(|n| n.text())
+            .ok_or("S3: no UploadId")?
+            .to_string();
         let data = std::sync::Arc::new(tokio::fs::read(local).await.map_err(|e| e.to_string())?);
         // ponytail: multipart loads RAM; stream parts later if OOM reports.
         let parts: Vec<(u32, usize, usize)> = {
@@ -414,17 +523,35 @@ impl DriveBackend for S3 {
         etags.sort_by_key(|(n, _)| *n);
         let mut body = String::from("<CompleteMultipartUpload>");
         for (n, e) in &etags {
-            body.push_str(&format!("<Part><PartNumber>{n}</PartNumber><ETag>{e}</ETag></Part>"));
+            body.push_str(&format!(
+                "<Part><PartNumber>{n}</PartNumber><ETag>{e}</ETag></Part>"
+            ));
         }
         body.push_str("</CompleteMultipartUpload>");
         let url = self.url(&key, &format!("uploadId={}", super::pct(&upload_id)));
-        let resp = self.signed_send(reqwest::Method::POST, url, vec![], body.into_bytes()).await?;
+        let resp = self
+            .signed_send(reqwest::Method::POST, url, vec![], body.into_bytes())
+            .await?;
         if !resp.status().is_success() {
             return Err(http_util::err_text(resp).await);
         }
-        Ok(RemoteEntry { id: key.clone(), name: name.into(), path: key, is_dir: false, size, modified: 0, mime: String::new() })
+        Ok(RemoteEntry {
+            id: key.clone(),
+            name: name.into(),
+            path: key,
+            is_dir: false,
+            size,
+            modified: 0,
+            mime: String::new(),
+        })
     }
-    async fn copy_to(&self, _entry: &RemoteEntry, dst: &dyn DriveBackend, _dst_dir: &str, _prog: &Progress) -> Result<(), String> {
+    async fn copy_to(
+        &self,
+        _entry: &RemoteEntry,
+        dst: &dyn DriveBackend,
+        _dst_dir: &str,
+        _prog: &Progress,
+    ) -> Result<(), String> {
         if dst.kind() != DriveKind::S3 {
             return Err("cross-provider via jobs".into());
         }
@@ -444,13 +571,39 @@ mod tests {
             region: "us-east-1".into(),
             service: "iam".into(),
         };
-        let url = url::Url::parse("https://iam.amazonaws.com/?Action=ListUsers&Version=2010-05-08").unwrap();
-        let hdrs = sign(&s, "GET", &url, &[("content-type".into(), "application/x-www-form-urlencoded; charset=utf-8".into())], &sha256_hex(b""), ("20150830T123600Z".into(), "20150830".into()));
-        let auth = hdrs.iter().find(|(k, _)| k == "Authorization").unwrap().1.clone();
+        let url = url::Url::parse("https://iam.amazonaws.com/?Action=ListUsers&Version=2010-05-08")
+            .unwrap();
+        let hdrs = sign(
+            &s,
+            "GET",
+            &url,
+            &[(
+                "content-type".into(),
+                "application/x-www-form-urlencoded; charset=utf-8".into(),
+            )],
+            &sha256_hex(b""),
+            ("20150830T123600Z".into(), "20150830".into()),
+        );
+        let auth = hdrs
+            .iter()
+            .find(|(k, _)| k == "Authorization")
+            .unwrap()
+            .1
+            .clone();
         // AWS docs SigV4 example (with x-amz-content-sha256 added by us):
         // deterministic re-sign must match, scope format exact.
         assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, Signature="), "{auth}");
-        let hdrs2 = sign(&s, "GET", &url, &[("content-type".into(), "application/x-www-form-urlencoded; charset=utf-8".into())], &sha256_hex(b""), ("20150830T123600Z".into(), "20150830".into()));
+        let hdrs2 = sign(
+            &s,
+            "GET",
+            &url,
+            &[(
+                "content-type".into(),
+                "application/x-www-form-urlencoded; charset=utf-8".into(),
+            )],
+            &sha256_hex(b""),
+            ("20150830T123600Z".into(), "20150830".into()),
+        );
         assert_eq!(hdrs, hdrs2, "signing must be deterministic");
     }
     #[test]

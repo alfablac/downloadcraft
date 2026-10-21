@@ -23,7 +23,12 @@ impl Dropbox {
         Ok(acc.access_token)
     }
     fn full(&self, path: &str) -> String {
-        let root = self.acc.lock().unwrap_or_else(|e| e.into_inner()).root.clone();
+        let root = self
+            .acc
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .root
+            .clone();
         let root = root.trim_matches('/');
         let p = path.trim_matches('/');
         let joined = if root.is_empty() {
@@ -40,11 +45,14 @@ impl Dropbox {
         }
     }
     async fn rpc(&self, ep: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
-        let resp = self.client
+        let resp = self
+            .client
             .post(format!("https://api.dropboxapi.com/2/{ep}"))
             .bearer_auth(self.token().await?)
             .json(&body)
-            .send().await.map_err(|e| e.to_string())?;
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
             return Err(http_util::err_text(resp).await);
         }
@@ -58,13 +66,24 @@ impl DriveBackend for Dropbox {
         DriveKind::Dropbox
     }
     async fn about(&self) -> Result<String, String> {
-        let v = self.rpc("users/get_space_usage", serde_json::Value::Null).await?;
+        let v = self
+            .rpc("users/get_space_usage", serde_json::Value::Null)
+            .await?;
         let used = v["used"].as_u64().unwrap_or(0);
         let total = v["allocation"]["allocated"].as_u64().unwrap_or(0);
-        Ok(format!("{} / {}", super::fmt_bytes(used), super::fmt_bytes(total)))
+        Ok(format!(
+            "{} / {}",
+            super::fmt_bytes(used),
+            super::fmt_bytes(total)
+        ))
     }
     async fn list(&self, path: &str) -> Result<Vec<RemoteEntry>, String> {
-        let mut v = self.rpc("files/list_folder", serde_json::json!({"path": self.full(path), "recursive": false, "limit": 2000})).await?;
+        let mut v = self
+            .rpc(
+                "files/list_folder",
+                serde_json::json!({"path": self.full(path), "recursive": false, "limit": 2000}),
+            )
+            .await?;
         let mut out = Vec::new();
         loop {
             if let Some(entries) = v["entries"].as_array() {
@@ -84,7 +103,12 @@ impl DriveBackend for Dropbox {
             }
             if v["has_more"].as_bool() == Some(true) {
                 let cursor = v["cursor"].as_str().unwrap_or("").to_string();
-                v = self.rpc("files/list_folder/continue", serde_json::json!({"cursor": cursor})).await?;
+                v = self
+                    .rpc(
+                        "files/list_folder/continue",
+                        serde_json::json!({"cursor": cursor}),
+                    )
+                    .await?;
             } else {
                 break;
             }
@@ -93,11 +117,19 @@ impl DriveBackend for Dropbox {
         Ok(out)
     }
     async fn mkdir(&self, path: &str) -> Result<(), String> {
-        self.rpc("files/create_folder_v2", serde_json::json!({"path": self.full(path), "autorename": false})).await?;
+        self.rpc(
+            "files/create_folder_v2",
+            serde_json::json!({"path": self.full(path), "autorename": false}),
+        )
+        .await?;
         Ok(())
     }
     async fn delete(&self, entry: &RemoteEntry) -> Result<(), String> {
-        self.rpc("files/delete_v2", serde_json::json!({"path": self.full(&entry.path)})).await?;
+        self.rpc(
+            "files/delete_v2",
+            serde_json::json!({"path": self.full(&entry.path)}),
+        )
+        .await?;
         Ok(())
     }
     async fn rename(&self, entry: &RemoteEntry, new_name: &str) -> Result<(), String> {
@@ -105,7 +137,13 @@ impl DriveBackend for Dropbox {
         self.rpc("files/move_v2", serde_json::json!({"from_path": self.full(&entry.path), "to_path": self.full(&to), "autorename": false})).await?;
         Ok(())
     }
-    async fn download(&self, entry: &RemoteEntry, dest: &std::path::Path, parallel: u32, prog: &Progress) -> Result<(), String> {
+    async fn download(
+        &self,
+        entry: &RemoteEntry,
+        dest: &std::path::Path,
+        parallel: u32,
+        prog: &Progress,
+    ) -> Result<(), String> {
         let token = self.token().await?;
         let client = self.client.clone();
         let arg = serde_json::json!({"path": self.full(&entry.path)}).to_string();
@@ -117,7 +155,13 @@ impl DriveBackend for Dropbox {
         };
         http_util::download_url(&self.client, &mk, dest, parallel, prog).await
     }
-    async fn upload(&self, local: &std::path::Path, dest_dir: &str, name: &str, prog: &Progress) -> Result<RemoteEntry, String> {
+    async fn upload(
+        &self,
+        local: &std::path::Path,
+        dest_dir: &str,
+        name: &str,
+        prog: &Progress,
+    ) -> Result<RemoteEntry, String> {
         let size = http_util::file_len(local);
         prog.set_total(size);
         let path = super::join_path(dest_dir, name);
@@ -151,17 +195,27 @@ impl DriveBackend for Dropbox {
         // ponytail: session path loads file in RAM; chunked-file streaming
         // adds later if giant Dropbox uploads OOM.
         const CHUNK: usize = 8 * 1024 * 1024;
-        let resp = self.client.post("https://content.dropboxapi.com/2/files/upload_session/start")
+        let resp = self
+            .client
+            .post("https://content.dropboxapi.com/2/files/upload_session/start")
             .bearer_auth(&token)
-            .header("Dropbox-API-Arg", serde_json::json!({"close": false}).to_string())
+            .header(
+                "Dropbox-API-Arg",
+                serde_json::json!({"close": false}).to_string(),
+            )
             .header("Content-Type", "application/octet-stream")
             .body(data[..CHUNK.min(data.len())].to_vec())
-            .send().await.map_err(|e| e.to_string())?;
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
             return Err(http_util::err_text(resp).await);
         }
         let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-        let session = v["session_id"].as_str().ok_or("Dropbox: no session")?.to_string();
+        let session = v["session_id"]
+            .as_str()
+            .ok_or("Dropbox: no session")?
+            .to_string();
         prog.add(CHUNK.min(data.len()) as u64);
         let mut off = CHUNK.min(data.len());
         while off < data.len() {
@@ -170,21 +224,31 @@ impl DriveBackend for Dropbox {
             let end = (off + CHUNK).min(data.len());
             let last = end == data.len();
             let (ep, arg) = if last {
-                ("files/upload_session/finish", serde_json::json!({
-                    "cursor": {"session_id": session, "offset": off},
-                    "commit": {"path": full, "mode": "overwrite", "autorename": false, "mute": true}
-                }))
+                (
+                    "files/upload_session/finish",
+                    serde_json::json!({
+                        "cursor": {"session_id": session, "offset": off},
+                        "commit": {"path": full, "mode": "overwrite", "autorename": false, "mute": true}
+                    }),
+                )
             } else {
-                ("files/upload_session/append_v2", serde_json::json!({
-                    "cursor": {"session_id": session, "offset": off}, "close": false
-                }))
+                (
+                    "files/upload_session/append_v2",
+                    serde_json::json!({
+                        "cursor": {"session_id": session, "offset": off}, "close": false
+                    }),
+                )
             };
-            let resp = self.client.post(format!("https://content.dropboxapi.com/2/{ep}"))
+            let resp = self
+                .client
+                .post(format!("https://content.dropboxapi.com/2/{ep}"))
                 .bearer_auth(&token)
                 .header("Dropbox-API-Arg", arg.to_string())
                 .header("Content-Type", "application/octet-stream")
                 .body(data[off..end].to_vec())
-                .send().await.map_err(|e| e.to_string())?;
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
             if !resp.status().is_success() {
                 return Err(http_util::err_text(resp).await);
             }

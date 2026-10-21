@@ -148,11 +148,7 @@ pub async fn copy_file(
 
 /// Delete partial destination file after error/cancel so half files
 /// don't look complete. Best effort.
-pub async fn remove_dest(
-    dst_be: &Arc<dyn DriveBackend>,
-    dst_dir: &str,
-    name: &str,
-) {
+pub async fn remove_dest(dst_be: &Arc<dyn DriveBackend>, dst_dir: &str, name: &str) {
     let e = RemoteEntry {
         id: super::join_path(dst_dir, name),
         name: name.to_string(),
@@ -211,7 +207,10 @@ pub async fn run_job(
     prog.set_total(total);
     // Create every destination dir once, sequentially, shallow-first.
     // Per-file ensure_dir duplicated folders on Google Drive.
-    if matches!(kind, JobKind::Upload | JobKind::Copy | JobKind::Sync | JobKind::Move) {
+    if matches!(
+        kind,
+        JobKind::Upload | JobKind::Copy | JobKind::Sync | JobKind::Move
+    ) {
         let mut dirs: Vec<String> = files.iter().map(|(_, d)| d.clone()).collect();
         dirs.sort();
         dirs.dedup();
@@ -221,39 +220,39 @@ pub async fn run_job(
         }
     }
     let conc = concurrency.clamp(1, 16);
-    let results: Vec<Result<(), String>> = futures_util::stream::iter(files.into_iter().map(|(f, d)| {
-        let src_be = src_be.clone();
-        let dst_be = dst_be.clone();
-        let prog = prog.clone();
-        let local_dest = local_dest.map(|p| p.to_path_buf());
-        async move {
-            prog.check()?;
-            match kind {
-                JobKind::Download => {
-                    let dest = local_dest
-                        .ok_or("download needs local dest")?
-                        .join(&f.name);
-                    let r = src_be.download(&f, &dest, streams.max(1), &prog).await;
-                    if r.is_err() {
-                        let _ = tokio::fs::remove_file(&dest).await;
-                        let _ = tokio::fs::remove_file(dest.with_extension("wc-crypt-tmp")).await;
+    let results: Vec<Result<(), String>> =
+        futures_util::stream::iter(files.into_iter().map(|(f, d)| {
+            let src_be = src_be.clone();
+            let dst_be = dst_be.clone();
+            let prog = prog.clone();
+            let local_dest = local_dest.map(|p| p.to_path_buf());
+            async move {
+                prog.check()?;
+                match kind {
+                    JobKind::Download => {
+                        let dest = local_dest.ok_or("download needs local dest")?.join(&f.name);
+                        let r = src_be.download(&f, &dest, streams.max(1), &prog).await;
+                        if r.is_err() {
+                            let _ = tokio::fs::remove_file(&dest).await;
+                            let _ =
+                                tokio::fs::remove_file(dest.with_extension("wc-crypt-tmp")).await;
+                        }
+                        r
                     }
-                    r
-                }
-                JobKind::Delete => src_be.delete(&f).await,
-                JobKind::Upload | JobKind::Copy | JobKind::Sync => {
-                    copy_file(&src_be, &f, &dst_be, &d, streams, &prog).await
-                }
-                JobKind::Move => {
-                    copy_file(&src_be, &f, &dst_be, &d, streams, &prog).await?;
-                    src_be.delete(&f).await
+                    JobKind::Delete => src_be.delete(&f).await,
+                    JobKind::Upload | JobKind::Copy | JobKind::Sync => {
+                        copy_file(&src_be, &f, &dst_be, &d, streams, &prog).await
+                    }
+                    JobKind::Move => {
+                        copy_file(&src_be, &f, &dst_be, &d, streams, &prog).await?;
+                        src_be.delete(&f).await
+                    }
                 }
             }
-        }
-    }))
-    .buffer_unordered(conc)
-    .collect()
-    .await;
+        }))
+        .buffer_unordered(conc)
+        .collect()
+        .await;
     let ok = results.iter().filter(|r| r.is_ok()).count();
     let _ = ok;
     let first_err = results.into_iter().find_map(|r| r.err());

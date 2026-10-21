@@ -6,6 +6,7 @@ use crate::platform;
 use crate::queue::plan_starts;
 use crate::scheduler::{missed_run, next_run_in, should_start, should_stop};
 use crate::theme;
+use crate::ui;
 use crate::Runtime;
 use downloadcraft_lib::update::{self, CheckOutcome};
 use downloadcraft_lib::ytdlp;
@@ -46,6 +47,9 @@ struct PrewarmState {
     url: String,
     loading: bool,
     text: String,
+    total: Option<u64>,
+    content_type: String,
+    accept_ranges: Option<bool>,
 }
 
 /// Prewarm gate: plain http(s) files only. Skips FTP/SFTP/torrent/NZB,
@@ -101,9 +105,15 @@ fn spawn_prewarm(
                     Some(t) => format!("{} · single connection", fmt_bytes(t)),
                     None => "Size unknown".into(),
                 };
+                let payload = (
+                    text,
+                    cache.total,
+                    cache.content_type.clone().unwrap_or_default(),
+                    Some(cache.accept_ranges),
+                );
                 engine::prewarm_store(cache);
                 if let Ok(mut g) = slot.lock() {
-                    *g = Some((url, Ok(text)));
+                    *g = Some((url, Ok(payload)));
                 }
             }
             Err(e) => {
@@ -116,7 +126,10 @@ fn spawn_prewarm(
 }
 
 /// Prewarm UI result slot: (url, display text). Same stale-drop as yt probe.
-type PrewarmSlot = std::sync::Arc<std::sync::Mutex<Option<(String, Result<String, String>)>>>;
+// (url, Ok((label, total, content_type)) | Err)
+type PrewarmSlot = std::sync::Arc<
+    std::sync::Mutex<Option<(String, Result<(String, Option<u64>, String, Option<bool>), String>)>>,
+>;
 static PREWARM_UI: std::sync::OnceLock<PrewarmSlot> = std::sync::OnceLock::new();
 
 fn prewarm_ui_slot() -> PrewarmSlot {
@@ -132,6 +145,9 @@ fn prewarm_poll(st: &mut PrewarmState, url: &str) {
         st.url = url.to_string();
         st.loading = false;
         st.text.clear();
+        st.total = None;
+        st.content_type.clear();
+        st.accept_ranges = None;
         return;
     }
     if !st.loading {
@@ -141,8 +157,50 @@ fn prewarm_poll(st: &mut PrewarmState, url: &str) {
     if let Some((tag, res)) = done {
         if tag == url {
             st.loading = false;
-            st.text = res.unwrap_or_default(); // probe failure silent: confirm does normal probe
+            match res {
+                Ok((text, total, content_type, accept_ranges)) => {
+                    st.text = text;
+                    st.total = total;
+                    st.content_type = content_type;
+                    st.accept_ranges = accept_ranges;
+                }
+                Err(_) => st.text.clear(), // probe failure silent: confirm does normal probe
+            }
         }
+    }
+}
+
+/// Capture-window cancel -> browser fallback (IDM behaviour): native host polls
+/// `browser-resume/resume-<id>.json` and extension re-downloads natively.
+/// Gate: http(s) only; yt-dlp/page-intent URLs point at a page, not a file —
+/// browser would download HTML. Atomic tmp+rename (host claims by rename).
+fn browser_resume_eligible(t: &DownloadTask) -> bool {
+    let lower = t.url.trim().to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return false;
+    }
+    !t.headers.contains_key("x-ytdlp")
+        && !t.headers.get("x-page-intent").is_some_and(|s| s.trim() == "page")
+}
+
+fn write_browser_resume(t: &DownloadTask, filename: &str) {
+    if !browser_resume_eligible(t) {
+        return;
+    }
+    let dir = crate::platform::browser_resume_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let body = serde_json::json!({"url": t.url, "filename": filename, "referrer": t.referrer, "ts": ts})
+        .to_string();
+    let path = dir.join(format!("resume-{}.json", t.id));
+    let tmp = dir.join(format!("resume-{}.tmp", t.id));
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
     }
 }
 
@@ -261,6 +319,8 @@ pub struct SegView {
     pub kind: crate::stream::ProtoKind,
     /// Torrent swarm snapshot (torrent kind only).
     pub torrent: Option<crate::engine::TorrentSnap>,
+    /// Debrid live info snapshot (memory only, URLs carry tokens).
+    pub live: Option<crate::engine::LiveInfo>,
 }
 impl SegView {
     fn label(&self) -> String {
@@ -625,6 +685,9 @@ pub struct DownloadApp {
     #[allow(dead_code)]
     tray: Option<TrayState>,
     hidden: bool,
+    /// Last-seen OS minimized state: hide-to-tray fires on the transition
+    /// only, so restoring from the tray never re-hides on a stale flag.
+    was_minimized: bool,
     ytdlp_checked: bool,
     update_check: Option<CheckOutcome>,
     update_slot: std::sync::Arc<std::sync::Mutex<Option<CheckOutcome>>>,
@@ -706,8 +769,6 @@ pub struct DownloadApp {
     task_hist: std::collections::HashMap<String, std::collections::VecDeque<(f64, u64)>>,
     /// Spawned download tasks; Remove aborts handle so background work really stops.
     handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
-    /// Tray Quit / Tasks Quit set this so close-to-tray intercept lets window close.
-    allow_close: bool,
     /// User-dragged column widths, downloads table per layout mode
     /// (persisted in Settings). One vec per mode: lengths differ
     /// (full 8, compact 5), mixing them discards widths on breakpoint cross.
@@ -1011,7 +1072,7 @@ impl DownloadApp {
             rate_smooth: std::collections::HashMap::new(),
             task_hist: std::collections::HashMap::new(),
             handles: std::collections::HashMap::new(),
-            allow_close: false,
+            was_minimized: false,
             dl_widths: saved_settings
                 .as_ref()
                 .and_then(|s| (!s.dl_col_widths.is_empty()).then(|| s.dl_col_widths.clone())),
@@ -1295,8 +1356,8 @@ impl DownloadApp {
         let title = "Filename already exists".to_string();
         let builder = egui::ViewportBuilder::default()
             .with_title(&title)
-            .with_inner_size([560.0, 280.0])
-            .with_min_inner_size([480.0, 240.0])
+            .with_inner_size(ui::viewport_size(ctx, ui::size::MD, 240.0))
+            .with_min_inner_size([ui::size::MIN_W, ui::size::MIN_H])
             .with_resizable(true);
         if self.collision_raise_frames > 0 {
             self.collision_raise_frames -= 1;
@@ -1311,23 +1372,23 @@ impl DownloadApp {
             if ctx.input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape)) {
                 close = true;
             }
-            if matches!(class, egui::ViewportClass::Embedded) {
-                egui::Window::new(&title)
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .default_size([560.0, 280.0])
-                    .show(ctx, |ui| {
-                        collision_body(ui, &p);
-                        collision_buttons(ui, &mut action, &p.unique);
-                    });
-            } else {
-                egui::CentralPanel::default()
-                    .frame(dialog_frame())
-                    .show(ctx, |ui| {
-                        collision_body(ui, &p);
-                        collision_buttons(ui, &mut action, &p.unique);
-                    });
+            let modal = ui::Modal::new("collision", &title)
+                .width(ui::size::MD)
+                .show_in_viewport(ctx, class, |ui| {
+                    ui::dialog_body_footer(
+                        ui,
+                        "collision-body",
+                        |ui| collision_body(ui, &p),
+                        |ui| collision_buttons(ui, &mut action),
+                    );
+                });
+            close |= modal.close;
+            // Enter = rename to unique name (non-destructive default).
+            if modal.enter
+                || (ctx.input(|i| i.key_pressed(egui::Key::Enter))
+                    && ctx.memory(|m| m.focused().is_none()))
+            {
+                action.get_or_insert(1);
             }
         });
         if focused {
@@ -1408,6 +1469,10 @@ impl DownloadApp {
         } else {
             settings.speed_limit_kbps
         }));
+        // Seed floor: bar must not drop to 0 during probe-before-resume.
+        // Engine raises to checkpointed sum on resume-load; poll max()s.
+        ctrl.downloaded
+            .store(task.downloaded, std::sync::atomic::Ordering::Relaxed);
         crate::lock_unpoison(&self.rt)
             .controls
             .insert(id.to_string(), ctrl.clone());
@@ -1567,6 +1632,7 @@ impl DownloadApp {
             bool,
             Option<crate::engine::TorrentSnap>,
             Vec<(usize, String)>,
+            Option<crate::engine::LiveInfo>,
         );
         let snap: Vec<Snap> = {
             let g = crate::lock_unpoison(&self.rt);
@@ -1585,11 +1651,12 @@ impl DownloadApp {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .clone(),
+                        c.live.lock().unwrap_or_else(|e| e.into_inner()).clone(),
                     )
                 })
                 .collect()
         };
-        for (id, n, _total, parts, manifest, torrent_snap, files) in &snap {
+        for (id, n, _total, parts, manifest, torrent_snap, files, live) in &snap {
             let v = self.rate_map.entry(id.clone()).or_default();
             if v.last()
                 .map(|(t, b)| now.duration_since(*t).as_millis() >= 100 && *b != *n)
@@ -1598,7 +1665,7 @@ impl DownloadApp {
                 v.push((now, *n));
             }
             v.retain(|(t, _)| now.duration_since(*t).as_secs_f64() <= 6.0);
-            if !parts.is_empty() {
+            if !parts.is_empty() || live.is_some() {
                 self.seg_info.insert(
                     id.clone(),
                     SegView {
@@ -1606,6 +1673,7 @@ impl DownloadApp {
                         files: files.clone(),
                         manifest: *manifest,
                         torrent: torrent_snap.clone(),
+                        live: live.clone(),
                         kind: crate::lock_unpoison(&self.rt)
                             .state
                             .tasks
@@ -1708,6 +1776,7 @@ impl DownloadApp {
                             manifest: false,
                             kind: crate::stream::ProtoKind::Http,
                             torrent: None,
+                            live: None,
                         },
                     );
                 }
@@ -1813,45 +1882,52 @@ impl DownloadApp {
         let n = ids.len();
         let mut confirm = false;
         let mut cancel = false;
-        egui::Window::new("Delete downloads")
-            .collapsible(false)
-            .resizable(false)
-            .default_width(440.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        let modal = ui::Modal::new("delete-downloads", "Delete downloads?")
+            .width(ui::size::SM)
             .show(ctx, |ui| {
-                ui.label(format!("Delete {n} download(s) from the list?"));
-                ui.checkbox(&mut self.delete_from_disk, "Also delete files from disk");
-                // Reserve warning height always: buttons must not jump when
-                // checkbox toggles (checked/unchecked pixel-same size).
-                // Height mirrors warning label (small text, may wrap at modal
-                // width); allocate fixed region, draw only when checked.
-                let (warn_rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 28.0),
-                    egui::Sense::hover(),
+                ui::dialog_text(
+                    ui,
+                    format!("{n} download(s) will be removed from the list."),
+                    false,
                 );
-                if self.delete_from_disk {
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(warn_rect), |ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "Removes downloaded files, partial data and temp files. Cannot be undone.",
-                            )
-                            .color(theme::TEXT_MUTED)
-                            .small(),
-                        );
-                    });
-                }
-                ui.horizontal(|ui| {
-                    if theme::primary_btn(ui, "Delete").clicked() {
+                ui.add_space(theme::SP_SM);
+                ui.checkbox(&mut self.delete_from_disk, "Also delete files from disk");
+                // Consequence line always laid out (transparent when off): the
+                // footer never jumps when the checkbox toggles.
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "Removes downloaded files, partial data and temp files. Cannot be undone.",
+                        )
+                        .color(if self.delete_from_disk {
+                            theme::ERR
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        })
+                        .small(),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(theme::SP_SM);
+                ui.separator();
+                // No Enter default on a destructive action.
+                ui::footer_row(ui, |ui| {
+                    let label = if self.delete_from_disk {
+                        "Delete files"
+                    } else {
+                        "Remove"
+                    };
+                    if ui::destructive_button(ui, label).clicked() {
                         confirm = true;
                     }
-                    if theme::ghost_btn(ui, "Cancel").clicked() {
+                    let c = ui::secondary_button(ui, "Cancel");
+                    ui::focus_on_open(ui, &c);
+                    if c.clicked() {
                         cancel = true;
                     }
                 });
-                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    cancel = true;
-                }
             });
+        cancel |= modal.close;
         if confirm {
             self.pending_delete = None;
             let delete_files = self.delete_from_disk;
@@ -1894,22 +1970,30 @@ impl DownloadApp {
         };
         let mut execute = false;
         let mut cancel = false;
-        egui::Window::new("Confirm power action")
-            .collapsible(false)
-            .resizable(false)
-            .default_width(400.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        let modal = ui::Modal::new("confirm-power", format!("{label} this computer?"))
+            .width(ui::size::SM)
             .show(ctx, |ui| {
-                ui.label(format!("Downloads complete. {label} this computer now?"));
-                ui.horizontal(|ui| {
-                    if ui.button(format!("{label} now")).clicked() {
+                ui::dialog_text(
+                    ui,
+                    format!(
+                        "Downloads are complete. {label} now? Unsaved work in other apps may be lost."
+                    ),
+                    false,
+                );
+                ui.add_space(theme::SP_SM);
+                ui.separator();
+                ui::footer_row(ui, |ui| {
+                    if ui::destructive_button(ui, &format!("{label} now")).clicked() {
                         execute = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    let c = ui::secondary_button(ui, "Cancel");
+                    ui::focus_on_open(ui, &c);
+                    if c.clicked() {
                         cancel = true;
                     }
                 });
             });
+        cancel |= modal.close;
         if execute {
             self.pending_power_confirm = None;
             let _ = crate::platform::execute_power(action);
@@ -1995,7 +2079,6 @@ impl DownloadApp {
                 }
             }
             "quit" => {
-                self.allow_close = true;
                 crate::lock_unpoison(&self.rt).save();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -2125,8 +2208,43 @@ impl DownloadApp {
                 .collect();
             for (id, n) in ctrls {
                 if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) {
-                    t.downloaded = n;
+                    // Never regress below persisted value: fresh Controls
+                    // start at seeded floor, engine raises on resume-load.
+                    t.downloaded = t.downloaded.max(n);
                 }
+            }
+            // Debrid feedback as soon as resolved: live display string +
+            // persisted links land on shared task now, not at finish.
+            let lives: Vec<(String, crate::engine::LiveInfo)> = g
+                .controls
+                .iter()
+                .filter_map(|(k, c)| {
+                    c.live
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                        .map(|l| (k.clone(), l))
+                })
+                .collect();
+            let mut live_changed = false;
+            for (id, l) in &lives {
+                if let Some(t) = g.state.tasks.iter_mut().find(|t| &t.id == id) {
+                    if t.debrid_info.is_empty() && !l.debrid_info.is_empty() {
+                        t.debrid_info = l.debrid_info.clone();
+                        live_changed = true;
+                    }
+                    if !l.resolved_url.is_empty() && t.debrided_url != l.resolved_url {
+                        t.debrided_url = l.resolved_url.clone();
+                        live_changed = true;
+                    }
+                    if !l.final_url.is_empty() && t.final_url != l.final_url {
+                        t.final_url = l.final_url.clone();
+                        live_changed = true;
+                    }
+                }
+            }
+            if live_changed {
+                g.save();
             }
             let totals: Vec<(String, u64)> = g
                 .controls
@@ -2747,7 +2865,7 @@ impl DownloadApp {
         };
         let builder = egui::ViewportBuilder::default()
             .with_title(title)
-            .with_inner_size([1024.0, 640.0])
+            .with_inner_size(ui::viewport_size(ctx, ui::size::XL, 600.0))
             .with_min_inner_size([640.0, 400.0]);
         let mut close = false;
         let mut stop_req = false;
@@ -2932,7 +3050,11 @@ impl DownloadApp {
                                 self.player_seek_dragging = false;
                                 seek_req = Some((self.player_seek, true));
                             }
-                            if icon_btn(ui, Icon::Video, "Full", false, 52.0).clicked() {
+                            if ui::Btn::secondary("Full")
+                                .icon(Icon::Video)
+                                .show(ui)
+                                .clicked()
+                            {
                                 ctx.send_viewport_cmd_to(
                                     vp_id("webcraft-player"),
                                     egui::ViewportCommand::Fullscreen(true),
@@ -2945,20 +3067,29 @@ impl DownloadApp {
                             } else {
                                 (Icon::Pause, "Pause")
                             };
-                            if icon_btn(ui, ic, lbl, true, 76.0).clicked() {
+                            if ui::Btn::primary(lbl)
+                                .icon(ic)
+                                .min_width(PAUSE_W)
+                                .show(ui)
+                                .clicked()
+                            {
                                 toggle_req = true;
                             }
                             // No Stop icon in set; Delete glyph = stop track.
-                            if icon_btn(ui, Icon::Delete, "Stop", false, 64.0).clicked() {
+                            if ui::Btn::secondary("Stop")
+                                .icon(Icon::Delete)
+                                .show(ui)
+                                .clicked()
+                            {
                                 stop_req = true;
                             }
-                            if theme::ghost_btn(ui, "-10s").clicked() {
+                            if ui::secondary_button(ui, "-10s").clicked() {
                                 seek_req = Some((-10.0, false));
                             }
-                            if theme::ghost_btn(ui, "+10s").clicked() {
+                            if ui::secondary_button(ui, "+10s").clicked() {
                                 seek_req = Some((10.0, false));
                             }
-                            if theme::ghost_btn(ui, if *muted { "Unmute" } else { "Mute" })
+                            if ui::secondary_button(ui, if *muted { "Unmute" } else { "Mute" })
                                 .clicked()
                             {
                                 mute_req = Some(!muted);
@@ -3126,15 +3257,19 @@ impl eframe::App for DownloadApp {
             theme::BG,
         );
         self.poll(ctx);
-        // Close-to-tray: window X hides to tray (setting existed but was never wired).
-        if !self.allow_close && ctx.input(|i| i.viewport().close_requested()) {
-            let to_tray = {
-                let g = crate::lock_unpoison(&self.rt);
-                g.state.settings.close_to_tray
-            } && self.tray.as_ref().and_then(|t| t._nav.as_ref()).is_some();
+        // X quits: no CancelClose, eframe exits and on_exit saves/cleans up.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.quit_player();
+        }
+        // Minimize hides to tray (when enabled and a tray icon exists).
+        let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
+        if minimized && !self.was_minimized && !self.hidden {
+            let to_tray = crate::lock_unpoison(&self.rt)
+                .state
+                .settings
+                .minimize_to_tray
+                && self.tray.as_ref().and_then(|t| t._nav.as_ref()).is_some();
             if to_tray {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                 self.hide_window(ctx);
                 // One-shot trim on hide: pages go to standby (Private unchanged, fault back on use).
                 #[cfg(windows)]
@@ -3146,12 +3281,9 @@ impl eframe::App for DownloadApp {
                     }
                     EmptyWorkingSet(GetCurrentProcess());
                 }
-                return;
             }
         }
-        if self.allow_close && ctx.input(|i| i.viewport().close_requested()) {
-            self.quit_player();
-        }
+        self.was_minimized = minimized;
         if self.hidden {
             return;
         }
@@ -3176,7 +3308,10 @@ impl eframe::App for DownloadApp {
             || self.show_about
             || self.pending_power_confirm.is_some()
             || self.show_progress_for.is_some()
-            || self.pending_delete.is_some();
+            || self.pending_delete.is_some()
+            || self.pending_collision.is_some()
+            || self.completed_notice.is_some()
+            || ui::any_modal_open(ctx);
         if !text_focused && !modal_open {
             if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::A)) {
                 self.tab = Tab::Downloads;
@@ -3325,7 +3460,7 @@ impl eframe::App for DownloadApp {
                                 .clicked()
                             {
                                 if let Some(id) = &sel {
-                                    self.start_task(id);
+                                    redownload_task(self, id);
                                 }
                                 ui.close_menu();
                             }
@@ -3396,7 +3531,7 @@ impl eframe::App for DownloadApp {
                                 ui.close_menu();
                             }
                         });
-                        ui.add_space(12.0);
+                        ui.add_space(theme::SP_MD);
                         let active = {
                             let g = crate::lock_unpoison(&self.rt);
                             g.state
@@ -3406,10 +3541,10 @@ impl eframe::App for DownloadApp {
                                 .count()
                         };
                         let speed = self.speed_hist.last().copied().unwrap_or(0.0);
-                        theme::badge(
+                        ui::badge(
                             ui,
                             &format!("{active} active · {}", fmt_rate(speed)),
-                            theme::TEXT_MUTED,
+                            ui::BadgeKind::Neutral,
                         );
                         // Search MUST live inside menu::bar closure: bar()
                         // claims full row width (set_min_size avail width),
@@ -3434,12 +3569,12 @@ impl eframe::App for DownloadApp {
                             let w = (avail_w - reserve).clamp(96.0, 320.0);
                             if avail_w >= 96.0 {
                                 ui.add_space(theme::SP_SM);
-                                if busy && theme::ghost_btn(ui, "Clear").clicked() {
+                                if busy && ui::secondary_button(ui, "Clear").clicked() {
                                     self.search.clear();
                                 }
                                 let resp = ui.add_sized(
                                     [w, theme::BTN_H],
-                                    egui::TextEdit::singleline(&mut self.search)
+                                    ui::text_field(&mut self.search)
                                         .id(egui::Id::new("main-search"))
                                         .hint_text("Search downloads…")
                                         .desired_width(w),
@@ -3463,7 +3598,7 @@ impl eframe::App for DownloadApp {
                                     ui.label(
                                         egui::RichText::new(format!("{shown} of {total}"))
                                             .color(theme::TEXT_MUTED)
-                                            .size(11.0),
+                                            .text_style(egui::TextStyle::Body),
                                     );
                                     ui.add_space(theme::SP_XS);
                                 }
@@ -3509,7 +3644,7 @@ impl eframe::App for DownloadApp {
                                     .small()
                                     .strong(),
                             );
-                            ui.add_space(4.0);
+                            ui.add_space(theme::SP_XS);
                         }
                         for (tab, label, ic) in [
                             (Tab::Downloads, "Downloads", Icon::Download),
@@ -3526,7 +3661,7 @@ impl eframe::App for DownloadApp {
                                 self.tab = tab;
                             }
                         }
-                        ui.add_space(8.0);
+                        ui.add_space(theme::SP_SM);
                         ui.separator();
                         if !rail_compact {
                             ui.horizontal(|ui| {
@@ -3542,7 +3677,7 @@ impl eframe::App for DownloadApp {
                                         .strong(),
                                 );
                             });
-                            ui.add_space(4.0);
+                            ui.add_space(theme::SP_XS);
                         }
                         let cats: &[(&str, Icon)] = &[
                             ("All Downloads", Icon::Download),
@@ -3610,7 +3745,7 @@ impl eframe::App for DownloadApp {
                                 self.tab = Tab::Downloads;
                             }
                         }
-                        ui.add_space(8.0);
+                        ui.add_space(theme::SP_SM);
                         ui.separator();
                         if !rail_compact {
                             ui.horizontal(|ui| {
@@ -3626,7 +3761,7 @@ impl eframe::App for DownloadApp {
                                         .strong(),
                                 );
                             });
-                            ui.add_space(4.0);
+                            ui.add_space(theme::SP_XS);
                         }
                         // Single pass over tasks (proto_kind may stat local files).
                         let type_counts: [usize; 7] = {
@@ -3676,7 +3811,7 @@ impl eframe::App for DownloadApp {
                                 self.tab = Tab::Downloads;
                             }
                         }
-                        ui.add_space(8.0);
+                        ui.add_space(theme::SP_SM);
                         ui.separator();
                         if !rail_compact {
                             ui.label(
@@ -3699,7 +3834,7 @@ impl eframe::App for DownloadApp {
                 egui::Frame::none()
                     .fill(theme::SURFACE)
                     .stroke(egui::Stroke::NONE)
-                    .inner_margin(egui::Margin::symmetric(12.0, 3.0)),
+                    .inner_margin(egui::Margin::symmetric(theme::SP_MD, theme::SP_XS)),
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
@@ -3726,7 +3861,7 @@ impl eframe::App for DownloadApp {
                         .color(theme::TEXT_MUTED)
                         .small(),
                     );
-                    ui.spacing_mut().item_spacing.x = 12.0;
+                    ui.spacing_mut().item_spacing.x = theme::SP_MD;
                     ui.separator();
                     // speed sparkline (last 40 ticks)
                     let (id, rect) = ui.allocate_space(egui::vec2(120.0, 18.0));
@@ -3752,7 +3887,7 @@ impl eframe::App for DownloadApp {
                         .small(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 12.0;
+                        ui.spacing_mut().item_spacing.x = theme::SP_MD;
                         ui.label(
                             egui::RichText::new(format!("webcraft v{}", env!("CARGO_PKG_VERSION")))
                                 .color(theme::TEXT_FAINT)
@@ -3801,12 +3936,40 @@ impl eframe::App for DownloadApp {
             });
 
         if self.show_about {
-            egui::Window::new("About webcraft").collapsible(false).resizable(false).default_width(460.0).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-                ui.label(format!("webcraft {} — clean-room cross-platform download manager.", env!("CARGO_PKG_VERSION")));
-                ui.label("Rust + egui. Segmented downloads, DASH/HLS, queues, scheduler, Site Grabber.");
-                ui.label("No proprietary code, binaries, icons, or activation logic.");
-                if ui.button("Close").clicked() { self.show_about = false; }
-            });
+            let mut close = false;
+            let modal = ui::Modal::new("about", "About webcraft")
+                .width(ui::size::SM)
+                .show(ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("webcraft {}", env!("CARGO_PKG_VERSION")))
+                            .text_style(egui::TextStyle::Heading)
+                            .color(theme::TEXT),
+                    );
+                    ui.add_space(theme::SP_XS);
+                    ui::dialog_text(ui, "Clean-room cross-platform download manager.", false);
+                    ui::dialog_text(
+                        ui,
+                        "Rust + egui. Segmented downloads, DASH/HLS, queues, scheduler, Site Grabber.",
+                        true,
+                    );
+                    ui::dialog_text(
+                        ui,
+                        "No proprietary code, binaries, icons, or activation logic.",
+                        true,
+                    );
+                    ui.add_space(theme::SP_SM);
+                    ui.separator();
+                    ui::footer_row(ui, |ui| {
+                        let c = ui::primary_button(ui, "Close");
+                        ui::focus_on_open(ui, &c);
+                        if c.clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if close || modal.close || modal.enter {
+                self.show_about = false;
+            }
         }
         self.show_pending_delete(ctx);
         self.show_pending_power(ctx);
@@ -3859,44 +4022,66 @@ impl eframe::App for DownloadApp {
                 }
                 _ => None,
             };
-            egui::Window::new("Download complete")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .default_width(380.0)
-                .max_width((ctx.screen_rect().width() - 48.0).clamp(260.0, 480.0))
+            let mut close = false;
+            let mut open_file = false;
+            let modal = ui::Modal::new("download-complete", "Download complete")
+                .width(ui::size::SM)
                 .show(ctx, |ui| {
-                    ui.add(egui::Label::new(format!("{name} finished.")).truncate())
-                        .on_hover_text(name.clone());
-                    ui.add_space(theme::SP_XS);
-                    ui.horizontal_wrapped(|ui| {
-                        if let Some((label, p)) = &proto {
-                            if theme::primary_btn(ui, label).clicked() {
-                                self.add_url = p.clone();
-                                self.show_add = true;
-                                self.add_just_opened = true;
-                                self.add_raise_frames = 90;
-                                self.add_focus_done = false;
-                                self.completed_notice = None;
-                            }
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&name).color(theme::TEXT).strong())
+                            .truncate(),
+                    )
+                    .on_hover_text(name.clone());
+                    if let Some(p) = &path {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(p.display().to_string())
+                                    .color(theme::TEXT_FAINT)
+                                    .small(),
+                            )
+                            .truncate(),
+                        );
+                    }
+                    if let Some((label, p)) = &proto {
+                        ui.add_space(theme::SP_SM);
+                        if ui::secondary_button(ui, label).clicked() {
+                            self.add_url = p.clone();
+                            self.show_add = true;
+                            self.add_just_opened = true;
+                            self.add_raise_frames = 90;
+                            self.add_focus_done = false;
+                            close = true;
                         }
-                        if theme::primary_btn(ui, "Open file").clicked() {
-                            if let Some(p) = &path {
-                                let _ = crate::platform::open_path(p);
-                            }
-                            self.completed_notice = None;
+                    }
+                    ui.add_space(theme::SP_SM);
+                    ui.separator();
+                    ui::footer_row(ui, |ui| {
+                        let o = ui::primary_button(ui, "Open file");
+                        ui::focus_on_open(ui, &o);
+                        if o.clicked() {
+                            open_file = true;
                         }
-                        if theme::ghost_btn(ui, "Open folder").clicked() {
+                        if ui::secondary_button(ui, "Open folder").clicked() {
                             if let Some(p) = &path {
                                 let _ = crate::platform::reveal_path(p);
                             }
-                            self.completed_notice = None;
+                            close = true;
                         }
-                        if theme::ghost_btn(ui, "Close").clicked() {
-                            self.completed_notice = None;
+                        if ui::ghost_button(ui, "Close").clicked() {
+                            close = true;
                         }
                     });
                 });
+            // Enter = Open file (safe, non-destructive default).
+            if open_file || modal.enter {
+                if let Some(p) = &path {
+                    let _ = crate::platform::open_path(p);
+                }
+                close = true;
+            }
+            if close || modal.close {
+                self.completed_notice = None;
+            }
         }
         // Dialog per-task history: reuse rate_map samples (already
         // (Instant, downloaded)); convert to (epoch_s, bytes).
@@ -4155,6 +4340,34 @@ fn delete_task_files(task: &crate::model::DownloadTask) {
     }
 }
 
+/// True redownload: delete dest + all part/temp state, reset progress and
+/// retry budget, then start fresh. Complete-only (no live worker).
+fn redownload_task(app: &mut DownloadApp, id: &str) {
+    let task = {
+        let g = crate::lock_unpoison(&app.rt);
+        g.state.tasks.iter().find(|t| t.id == id).cloned()
+    };
+    let Some(task) = task else { return };
+    if task.status != TaskStatus::Complete || app.handles.contains_key(id) {
+        return;
+    }
+    delete_task_files(&task);
+    {
+        let mut g = crate::lock_unpoison(&app.rt);
+        if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) {
+            t.downloaded = 0;
+            t.status = TaskStatus::Queued;
+            t.error.clear();
+            t.attempts = 0;
+            t.next_retry_at = 0;
+            t.debrided_url.clear();
+            t.final_url.clear();
+        }
+        g.save();
+    }
+    app.start_task(id);
+}
+
 fn remove_task(app: &mut DownloadApp, id: &str) {
     if let Some(h) = app.handles.remove(id) {
         h.abort();
@@ -4388,11 +4601,14 @@ fn nav_row_c(
         }
         return resp.on_hover_text(label.to_string());
     }
-    let font = egui::FontId::proportional(13.5);
+    let font = egui::TextStyle::Heading.resolve(ui.style());
     // Count badge: measured, not guessed; label truncation reserves its width + gap.
     // Badged: smaller font + pill pads (7+7); plain keeps 13.5 selected/faint.
     let (count_font, count_color) = match badge {
-        Some(base) => (egui::FontId::proportional(10.5), theme::badge_text(base)),
+        Some(base) => (
+            egui::TextStyle::Small.resolve(ui.style()),
+            theme::badge_text(base),
+        ),
         None if selected => (font.clone(), egui::Color32::WHITE),
         None => (font.clone(), theme::TEXT_FAINT),
     };
@@ -4452,113 +4668,6 @@ fn nav_row_c(
     resp
 }
 
-fn icon_btn(ui: &mut egui::Ui, ic: Icon, label: &str, primary: bool, min_w: f32) -> egui::Response {
-    icon_btn_enabled(ui, ic, label, primary, min_w, true)
-}
-
-fn icon_btn_enabled(
-    ui: &mut egui::Ui,
-    ic: Icon,
-    label: &str,
-    primary: bool,
-    min_w: f32,
-    enabled: bool,
-) -> egui::Response {
-    paint_btn(ui, Some(ic), label, primary, min_w, enabled)
-}
-
-/// Shared painted button (toolbar + dialogs): same fill/stroke per state everywhere.
-fn paint_btn(
-    ui: &mut egui::Ui,
-    ic: Option<Icon>,
-    label: &str,
-    primary: bool,
-    min_w: f32,
-    enabled: bool,
-) -> egui::Response {
-    let enabled = enabled && ui.is_enabled();
-    // Allocate first, paint after state known: previous Frame-then-interact painted
-    // one flat box regardless of hover/press (buttons looked dead, clicks unreliable).
-    let sense = if enabled {
-        egui::Sense::click()
-    } else {
-        egui::Sense::hover()
-    };
-    // Fixed min_w under-measured icon+padding: label painted past border. Grow to fit text.
-    let text_w = ui
-        .painter()
-        .layout_no_wrap(
-            label.to_owned(),
-            egui::TextStyle::Body.resolve(ui.style()),
-            egui::Color32::WHITE,
-        )
-        .size()
-        .x;
-    let w = if ic.is_some() {
-        min_w.max(8.0 + 16.0 + 6.0 + text_w + 8.0)
-    } else {
-        min_w.max(12.0 + text_w + 12.0)
-    };
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, theme::BTN_H), sense);
-    let (fill, stroke, fg) = if !enabled {
-        (theme::SURFACE, theme::BORDER, theme::TEXT_FAINT)
-    } else if primary {
-        if resp.is_pointer_button_down_on() {
-            (theme::STEEL_DIM, theme::STEEL, egui::Color32::WHITE)
-        } else if resp.hovered() {
-            (theme::STEEL_DIM, theme::STEEL_TEXT, egui::Color32::WHITE)
-        } else {
-            (theme::STEEL, theme::STEEL, egui::Color32::WHITE)
-        }
-    } else if resp.is_pointer_button_down_on() {
-        (theme::STEEL_DIM, theme::STEEL, theme::TEXT)
-    } else if resp.hovered() {
-        (theme::SURFACE_HOVER, theme::BORDER_STRONG, theme::TEXT)
-    } else {
-        (theme::SURFACE_RAISED, theme::BORDER, theme::TEXT)
-    };
-    ui.painter().rect(
-        rect,
-        egui::Rounding::same(theme::R_CTRL),
-        fill,
-        egui::Stroke::new(1.0f32, stroke),
-    );
-    if enabled && resp.has_focus() {
-        ui.painter().rect_stroke(
-            rect.expand(2.0),
-            egui::Rounding::same(theme::R_CTRL + 2.0),
-            egui::Stroke::new(2.0f32, theme::STEEL_TEXT),
-        );
-    }
-    if enabled && resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let Some(ic) = ic else {
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            label,
-            egui::TextStyle::Body.resolve(ui.style()),
-            fg,
-        );
-        return resp;
-    };
-    let mut child = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(rect.shrink2(egui::vec2(8.0, 0.0)))
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-    );
-    child.spacing_mut().item_spacing.x = 6.0;
-    let (irect, _) = child.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-    icon(child.painter(), &ic, irect, fg);
-    child.add(
-        egui::Label::new(egui::RichText::new(label).color(fg))
-            .truncate()
-            .selectable(false),
-    );
-    resp
-}
-
 /// Download-table column widths shared by header and rows (separate Grids auto-sized
 /// independently, so header and row columns never lined up). Name column takes remainder.
 /// Fixed widths follow live IDM ListSettings (File Name|Q 30|Size 75|Status 65|
@@ -4567,12 +4676,14 @@ fn paint_btn(
 /// capture/Add reveals grow a smaller restored window back to this.
 pub(crate) const FULL_MAIN_W: f32 = 1440.0;
 pub(crate) const FULL_MAIN_H: f32 = 900.0;
+/// Stable width for Pause/Resume toggles (label swap never shifts the row).
+const PAUSE_W: f32 = 96.0;
 const COL_GAP: f32 = 10.0; // header/rows use item_spacing.x = 10; leading cell at row_origin_x
 const COL_MIN: f32 = 36.0;
 const NAME_MIN: f32 = 120.0;
 
 /// Per-column non-Name minima (full mode idx: 1=Q, 2=Size, 3=Status, 4=ETA, 5=Rate,
-/// 6=Progress, 7=Actions; compact: 1=Size, 2=Status, 3=Progress, 4=Actions).
+/// 6=Progress, 7=Resumable, 8=Actions; compact: 1=Size, 2=Status, 3=Progress, 4=Actions).
 /// Blanket COL_MIN let drags shrink columns below own content = clipped text.
 fn col_min(idx: usize, compact: bool) -> f32 {
     if idx == 0 {
@@ -4582,7 +4693,8 @@ fn col_min(idx: usize, compact: bool) -> f32 {
         (false, 1) => 44.0,  // Q: "main"
         (false, 3) => 76.0,  // Status: "Downloading"
         (false, 6) => 132.0, // Progress: bar + %
-        (false, 7) => 58.0,  // Actions: 2 buttons
+        (false, 7) => 36.0,  // Resumable: 16px icon fits blanket min
+        (false, 8) => 58.0,  // Actions: 2 buttons
         (true, 2) => 76.0,
         (true, 3) => 132.0,
         (true, 4) => 58.0,
@@ -4594,7 +4706,7 @@ fn dl_cols(avail: f32, compact: bool, stored: Option<&[f32]>) -> Vec<f32> {
     let fixed: &[f32] = if compact {
         &[75.0, 76.0, 132.0, 58.0]
     } else {
-        &[44.0, 75.0, 76.0, 73.0, 82.0, 132.0, 58.0]
+        &[44.0, 75.0, 76.0, 73.0, 82.0, 132.0, 76.0, 58.0]
     };
     if let Some(s) = stored.filter(|s| s.len() == fixed.len() + 1) {
         // User widths: clamp per-column; Name = remainder when total fits
@@ -4757,28 +4869,6 @@ fn sheet_header(ui: &mut egui::Ui, rect: egui::Rect) {
 /// small text needs ~15px line, so 20px cell + 1px borders = 22px pitch.
 pub const ROW_H: f32 = 20.0;
 /// Compact square row action (Play/Pause/Info glyph only; labels live in tooltips).
-fn row_icon_btn(ui: &mut egui::Ui, ic: Icon, tip: &str) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
-    let (fill, stroke, fg) = if resp.is_pointer_button_down_on() {
-        (theme::STEEL_DIM, theme::STEEL, theme::TEXT)
-    } else if resp.hovered() {
-        (theme::SURFACE_HOVER, theme::BORDER_STRONG, theme::TEXT)
-    } else {
-        (theme::SURFACE_RAISED, theme::BORDER, theme::TEXT_MUTED)
-    };
-    ui.painter().rect(
-        rect,
-        egui::Rounding::same(theme::R_CHIP),
-        fill,
-        egui::Stroke::new(1.0f32, stroke),
-    );
-    if resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let irect = egui::Rect::from_center_size(rect.center(), egui::vec2(12.0, 12.0));
-    icon(ui.painter(), &ic, irect, fg);
-    resp.on_hover_text(tip)
-}
 fn cell<R>(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     cell_align(ui, w, false, add)
 }
@@ -4812,8 +4902,7 @@ fn cell_align<R>(
     add(&mut child)
 }
 
-/// Form constants: label col 120 right-aligned, [12,6] gap, DragValue 90.
-const LABEL_W: f32 = 120.0;
+/// Form constant: DragValue width (labels: `ui::LABEL_W`).
 const DRAG_W: f32 = 90.0;
 
 /// Download filename derived from URL (segment after last `/`, decoded).
@@ -4829,29 +4918,6 @@ fn fit_content_h(base_h: f32, content_h: f32, monitor_h: f32) -> f32 {
     (base_h.max(content_h)).min(cap)
 }
 
-/// 2-col form grid: label col fixed 120 (right-aligned via col layout), field fills.
-/// No max_col_width: egui caps the LAST col at max_cell_size, so any finite cap
-/// froze fields (1024) once the window grew past it — resize did nothing.
-fn form_grid(id: &str) -> egui::Grid {
-    egui::Grid::new(id)
-        .num_columns(2)
-        .spacing([12.0, 6.0])
-        .min_col_width(LABEL_W)
-}
-
-/// Right-aligned muted form label (use inside `form_grid` col 0).
-fn form_label(ui: &mut egui::Ui, text: &str) {
-    // Fixed LABEL_W cell: RTL in a non-last Grid col can paint the label
-    // off-screen and widen the parent (right-aligned footers vanish).
-    ui.allocate_ui_with_layout(
-        egui::vec2(LABEL_W, theme::BTN_H),
-        egui::Layout::right_to_left(egui::Align::Center),
-        |ui| {
-            ui.label(egui::RichText::new(text).color(theme::TEXT_MUTED));
-        },
-    );
-}
-
 /// One badge-color row (inside form_grid): swatch edits override for key;
 /// untouched rows show theme default, changed rows insert-or-replace.
 fn badge_color_row(
@@ -4861,7 +4927,7 @@ fn badge_color_row(
     default: egui::Color32,
     overrides: &mut Vec<(String, [u8; 3])>,
 ) {
-    form_label(ui, label);
+    ui::form_label(ui, label);
     let mut rgb = overrides
         .iter()
         .find(|(k, _)| k == key)
@@ -4880,7 +4946,7 @@ fn badge_color_row(
 /// Section header: label + 6px + separator (Options / editor groups).
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.label(egui::RichText::new(title).color(theme::TEXT).strong());
-    ui.add_space(6.0);
+    ui.add_space(theme::SP_SM);
     ui.separator();
 }
 
@@ -5091,7 +5157,7 @@ fn ui_yt_probe_section(
                         );
                     });
             });
-        if ghost_btn_w(ui, "Retry probe").clicked() {
+        if ui::secondary_button(ui, "Retry probe").clicked() {
             st.proxy_used = proxy.to_string();
             start_yt_probe(st, rt, url, referrer, cookies, cookies_json, proxy);
         }
@@ -5105,7 +5171,7 @@ fn ui_yt_probe_section(
                     .small(),
             );
         }
-        if ghost_btn_w(ui, "Probe formats (quality / audio / subtitles)").clicked() {
+        if ui::secondary_button(ui, "Probe formats (quality / audio / subtitles)").clicked() {
             st.proxy_used = proxy.to_string();
             start_yt_probe(st, rt, url, referrer, cookies, cookies_json, proxy);
         }
@@ -5139,8 +5205,8 @@ fn ui_yt_probe_section(
     let videos = dump.video_formats();
     let audios = dump.audio_formats();
     let is_audio_sel = st.format.starts_with("audio:") || !st.extract.is_empty();
-    form_grid(&format!("{id}-yt")).show(ui, |ui| {
-        form_label(ui, "Quality");
+    ui::form_grid(&format!("{id}-yt")).show(ui, |ui| {
+        ui::form_label(ui, "Quality");
         egui::ComboBox::from_id_salt(format!("{id}-yt-q"))
             .selected_text(if st.format.is_empty() {
                 "Auto (best)".to_string()
@@ -5240,7 +5306,7 @@ fn ui_yt_probe_section(
         });
         ui.end_row();
         if !is_audio_sel {
-            form_label(ui, "Audio track");
+            ui::form_label(ui, "Audio track");
             let cur_audio = videos.iter().find(|f| f.format_id == st.format);
             let video_only = cur_audio.map(|f| f.is_video_only()).unwrap_or(false);
             ui.add_enabled_ui(st.format.is_empty() || video_only, |ui| {
@@ -5282,7 +5348,7 @@ fn ui_yt_probe_section(
             });
             ui.end_row();
         } else {
-            form_label(ui, "Audio format");
+            ui::form_label(ui, "Audio format");
             egui::ComboBox::from_id_salt(format!("{id}-yt-x"))
                 .selected_text(match st.extract.as_str() {
                     "mp3" => "MP3 (extract)",
@@ -5321,7 +5387,7 @@ fn ui_yt_probe_section(
     let man = dump.sub_langs();
     let auto = dump.auto_langs();
     if !man.is_empty() || !auto.is_empty() {
-        ui.add_space(4.0);
+        ui.add_space(theme::SP_XS);
         ui.label(
             egui::RichText::new("Subtitles (.srt sidecar)")
                 .color(theme::TEXT_MUTED)
@@ -5366,23 +5432,36 @@ fn vp_id(name: &str) -> egui::ViewportId {
 }
 
 fn collision_body(ui: &mut egui::Ui, p: &PendingCollision) {
-    ui.label(egui::RichText::new(format!("\"{}\" already exists in", p.filename)).strong());
-    ui.label(egui::RichText::new(p.dest_dir.display().to_string()).small());
-    ui.add_space(8.0);
+    ui::dialog_text(ui, format!("\"{}\" already exists in", p.filename), false);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(p.dest_dir.display().to_string())
+                .color(theme::TEXT_FAINT)
+                .small(),
+        )
+        .truncate(),
+    );
+    ui.add_space(theme::SP_SM);
+    ui::dialog_text(ui, format!("Rename saves as \"{}\".", p.unique), false);
+    ui::dialog_text(
+        ui,
+        "Overwrite replaces the existing file. Cancel removes this download.",
+        true,
+    );
 }
 
-fn collision_buttons(ui: &mut egui::Ui, action: &mut Option<u8>, unique: &str) {
-    ui.horizontal_wrapped(|ui| {
-        if theme::primary_btn(ui, &format!("Rename to {unique}")).clicked() {
-            *action = Some(1);
-        }
-        if theme::ghost_btn(ui, "Overwrite").clicked() {
-            *action = Some(2);
-        }
-        if theme::ghost_btn(ui, "Cancel").clicked() {
-            *action = Some(3);
-        }
-    });
+fn collision_buttons(ui: &mut egui::Ui, action: &mut Option<u8>) {
+    let r = ui::primary_button(ui, "Rename");
+    ui::focus_on_open(ui, &r);
+    if r.clicked() {
+        *action = Some(1);
+    }
+    if ui::destructive_button(ui, "Overwrite").clicked() {
+        *action = Some(2);
+    }
+    if ui::secondary_button(ui, "Cancel").clicked() {
+        *action = Some(3);
+    }
 }
 
 /// Compact stat tile: faint label above strong value (progress dialog).
@@ -5417,44 +5496,12 @@ fn header_row_error(name: &str, value: &str) -> Option<String> {
 }
 
 fn fill_edit<'a>(buf: &'a mut String) -> egui::TextEdit<'a> {
-    egui::TextEdit::singleline(buf).desired_width(f32::INFINITY)
+    ui::text_field(buf).desired_width(f32::INFINITY)
 }
 
 /// DragValue builder (width fixed via `drag_w` / add_sized at call site).
 fn drag<'a, T: egui::emath::Numeric>(val: &'a mut T) -> egui::DragValue<'a> {
     egui::DragValue::new(val)
-}
-
-/// Right-aligned button row. RTL: first added = rightmost, so primary first.
-/// Buttons: BTN_H height (theme), min width 72. Own top gap from preceding
-/// content so footers never glue to the separator above (was y=4 global).
-fn btn_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
-    ui.add_space(theme::SP_XS);
-    // One BTN_H row (was: whole remaining height, buttons floated mid-window).
-    ui.allocate_ui_with_layout(
-        egui::vec2(ui.available_width(), theme::BTN_H),
-        egui::Layout::right_to_left(egui::Align::Center),
-        add,
-    );
-}
-
-/// Native dialog viewport frame: window fill + margin (Frame::none left black bg, edge-to-edge content).
-fn dialog_frame() -> egui::Frame {
-    egui::Frame::none()
-        .fill(theme::SURFACE)
-        .inner_margin(egui::Margin::same(theme::SP_LG))
-}
-
-/// Pinned dialog footer height: separator + button row.
-const FOOTER_H: f32 = theme::BTN_H + theme::SP_SM + 12.0;
-
-/// Primary/ghost button with min width 72 (height = BTN_H via theme).
-/// Painted like toolbar icon_btn (fixed .fill() had no hover/pressed/disabled state).
-fn primary_btn_w(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    paint_btn(ui, None, label, true, 72.0, true)
-}
-fn ghost_btn_w(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    paint_btn(ui, None, label, false, 72.0, true)
 }
 
 /// Bordered action group: related controls stay together and wrap as one unit.
@@ -5468,7 +5515,7 @@ fn action_group(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui))
         );
         ui.horizontal_wrapped(add);
     });
-    ui.add_space(8.0);
+    ui.add_space(theme::SP_SM);
 }
 
 impl DownloadApp {
@@ -5476,13 +5523,13 @@ impl DownloadApp {
         // Header + actions (IDM toolbar: Add URL, Resume, Stop, Stop All, Delete, Options…)
         ui.horizontal_wrapped(|ui| {
             ui.heading("Downloads");
-            theme::badge(
+            ui::badge(
                 ui,
                 &self.category.clone(),
-                theme::category_color(&self.category),
+                ui::BadgeKind::Hue(theme::category_color(&self.category)),
             );
         });
-        ui.add_space(4.0);
+        ui.add_space(theme::SP_XS);
         let selected_task = self.selected.as_ref().and_then(|id| {
             let g = crate::lock_unpoison(&self.rt);
             g.state.tasks.iter().find(|t| &t.id == id).cloned()
@@ -5503,7 +5550,11 @@ impl DownloadApp {
         };
         ui.horizontal_wrapped(|ui| {
             action_group(ui, "Add", |ui| {
-                if icon_btn(ui, Icon::Plus, "Add URL", true, 86.0).clicked() {
+                if ui::Btn::primary("Add URL")
+                    .icon(Icon::Plus)
+                    .show(ui)
+                    .clicked()
+                {
                     {
                         self.show_add = true;
                         self.add_just_opened = true;
@@ -5519,33 +5570,46 @@ impl DownloadApp {
                 let can_stop = selected_task
                     .as_ref()
                     .is_some_and(|t| t.status == TaskStatus::Downloading);
-                if icon_btn_enabled(ui, Icon::Play, "Resume", false, 78.0, can_resume).clicked() {
+                if ui::Btn::secondary("Resume")
+                    .icon(Icon::Play)
+                    .enabled(can_resume)
+                    .show(ui)
+                    .clicked()
+                {
                     if let Some(id) = self.selected.clone() {
                         self.start_task(&id);
                     }
                 }
-                if icon_btn_enabled(ui, Icon::Pause, "Stop", false, 62.0, can_stop).clicked() {
+                if ui::Btn::secondary("Stop")
+                    .icon(Icon::Pause)
+                    .enabled(can_stop)
+                    .show(ui)
+                    .clicked()
+                {
                     if let Some(id) = self.selected.clone() {
                         stop_task(self, &id);
                     }
                 }
                 if let Some(t) = &selected_task {
-                    if icon_btn(ui, Icon::Info, "Progress", false, 82.0).clicked() {
+                    if ui::Btn::secondary("Progress")
+                        .icon(Icon::Info)
+                        .show(ui)
+                        .clicked()
+                    {
                         self.show_progress_for = Some(t.id.clone());
                         self.progress_raise = true;
                     }
                 } else {
-                    let _ = icon_btn_enabled(ui, Icon::Info, "Progress", false, 82.0, false);
+                    let _ = ui::Btn::secondary("Progress")
+                        .icon(Icon::Info)
+                        .enabled(false)
+                        .show(ui);
                 }
-                if icon_btn_enabled(
-                    ui,
-                    Icon::Delete,
-                    "Delete",
-                    false,
-                    70.0,
-                    selected_task.is_some(),
-                )
-                .clicked()
+                if ui::Btn::secondary("Delete")
+                    .icon(Icon::Delete)
+                    .enabled(selected_task.is_some())
+                    .show(ui)
+                    .clicked()
                     && !self.selected_ids.is_empty()
                 {
                     self.pending_delete = Some(self.selected_ids.iter().cloned().collect());
@@ -5553,19 +5617,19 @@ impl DownloadApp {
                 }
             });
             action_group(ui, "All downloads", |ui| {
-                if icon_btn_enabled(ui, Icon::Pause, "Stop all", false, 74.0, has_active).clicked()
+                if ui::Btn::secondary("Stop all")
+                    .icon(Icon::Pause)
+                    .enabled(has_active)
+                    .show(ui)
+                    .clicked()
                 {
                     stop_all(self);
                 }
-                if icon_btn_enabled(
-                    ui,
-                    Icon::Check,
-                    "Delete completed",
-                    false,
-                    128.0,
-                    has_completed,
-                )
-                .clicked()
+                if ui::Btn::secondary("Delete completed")
+                    .icon(Icon::Check)
+                    .enabled(has_completed)
+                    .show(ui)
+                    .clicked()
                 {
                     delete_completed(self);
                 }
@@ -5586,7 +5650,7 @@ impl DownloadApp {
                 .color(theme::TEXT_MUTED)
                 .small(),
             );
-            if filtering && theme::ghost_btn(ui, "Clear filters").clicked() {
+            if filtering && ui::secondary_button(ui, "Clear filters").clicked() {
                 self.search.clear();
                 self.category = "All Downloads".into();
                 self.type_filter = None;
@@ -5683,6 +5747,7 @@ impl DownloadApp {
                     .unwrap_or(0.0)
                     .partial_cmp(&rates.get(&b.id).copied().unwrap_or(0.0))
                     .unwrap_or(Ordering::Equal),
+                7 => a.accept_ranges.cmp(&b.accept_ranges),
                 6 => {
                     let frac = |t: &DownloadTask| -> f64 {
                         t.total
@@ -5722,7 +5787,7 @@ impl DownloadApp {
             let ui = &mut c;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = COL_GAP;
-                for (i, (h, sc)) in if compact_table { vec![("File Name", Some(0u8)), ("Size", Some(2u8)), ("Status", Some(3u8)), ("Progress", Some(6u8)), ("", None)] } else { vec![("File Name", Some(0u8)), ("Q", Some(1u8)), ("Size", Some(2u8)), ("Status", Some(3u8)), ("Time left", Some(4u8)), ("Rate", Some(5u8)), ("Progress", Some(6u8)), ("", None)] }.iter().enumerate() {
+                for (i, (h, sc)) in if compact_table { vec![("File Name", Some(0u8)), ("Size", Some(2u8)), ("Status", Some(3u8)), ("Progress", Some(6u8)), ("", None)] } else { vec![("File Name", Some(0u8)), ("Q", Some(1u8)), ("Size", Some(2u8)), ("Status", Some(3u8)), ("Time left", Some(4u8)), ("Rate", Some(5u8)), ("Progress", Some(6u8)), ("Resumable", Some(7u8)), ("", None)] }.iter().enumerate() {
                     let arrow = if Some(self.sort_col) == *sc { if self.sort_asc { " ▲" } else { " ▼" } } else { "" };
                     let hdr = |ui: &mut egui::Ui, f: &dyn Fn(&mut egui::Ui) -> bool| -> bool {
                         if matches!(i, 2 | 4 | 5) { cell_r(ui, cols[i], |ui| f(ui)) } else { cell(ui, cols[i], |ui| f(ui)) }
@@ -5747,21 +5812,26 @@ impl DownloadApp {
                 || self.category != "All Downloads"
                 || self.type_filter.is_some();
             ui.vertical_centered(|ui| {
-                ui.add_space(24.0);
+                ui.add_space(theme::SP_XL);
                 if filtering {
-                    ui.label(egui::RichText::new("No downloads match filters").color(theme::TEXT_MUTED).size(14.0));
+                    ui.label(egui::RichText::new("No downloads match filters").color(theme::TEXT).text_style(egui::TextStyle::Heading));
                     ui.label(egui::RichText::new("Try different search terms, or clear filters.").color(theme::TEXT_MUTED));
-                    if theme::ghost_btn(ui, "Clear filters").clicked() {
+                    ui.add_space(theme::SP_SM);
+                    if ui::secondary_button(ui, "Clear filters").clicked() {
                         self.search.clear();
                         self.category = "All Downloads".into();
                         self.type_filter = None;
                     }
                 } else {
-                    ui.label(egui::RichText::new("No downloads here").color(theme::TEXT_MUTED).size(14.0));
+                    ui.label(egui::RichText::new("No downloads here").color(theme::TEXT).text_style(egui::TextStyle::Heading));
                     ui.label(egui::RichText::new("Add a URL, paste from clipboard (Tasks → Add batch), or send from browser extension.").color(theme::TEXT_MUTED));
-                    if theme::primary_btn(ui, "+ Add URL").clicked() { { self.show_add = true; self.add_just_opened = true; self.add_raise_frames = 90; self.add_focus_done = false; } }
+                    ui.add_space(theme::SP_SM);
+                    let add = ui::with_button_height(ui, theme::BTN_LG, |ui| {
+                        ui::Btn::primary("Add URL").icon(Icon::Plus).show(ui)
+                    });
+                    if add.clicked() { self.show_add = true; self.add_just_opened = true; self.add_raise_frames = 90; self.add_focus_done = false; }
                 }
-                ui.add_space(24.0);
+                ui.add_space(theme::SP_XL);
             });
             return;
         }
@@ -5781,11 +5851,11 @@ impl DownloadApp {
 
                     ui.horizontal(|ui| { ui.spacing_mut().item_spacing.x = COL_GAP; let mut ci = 0usize; let mut nw = || { ci += 1; cols[ci - 1] };
                         let task_rate = self.task_rate(&t.id);
-                        cell(ui, nw(), |ui| { let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover()); icon(ui.painter(), &cat_icon(&t.filename), irect, theme::TEXT_MUTED); let kind = crate::stream::proto_kind(&t); let bw = theme::badge_width(ui, kind.label()); let show_kind = ui.available_width() - bw >= 60.0; if show_kind { theme::badge(ui, kind.label(), theme::proto_color(kind)); } let has_debrid = !t.debrid_info.is_empty(); if has_debrid { let db = theme::badge_width(ui, "Debrid"); if ui.available_width() - db >= 60.0 { theme::badge(ui, "Debrid", theme::TEAL_500); } } ui.add(egui::Label::new(egui::RichText::new(&t.filename).color(theme::TEXT).small()).truncate().selectable(false)).on_hover_text(if t.error.is_empty() { format!("{} - {}\n{}{}", kind.full_name(), t.filename, t.url, if t.debrid_info.is_empty() { String::new() } else { format!("\nDebrid: {}", t.debrid_info) }) } else { format!("{}\nError: {}", t.filename, t.error) }); });
+                        cell(ui, nw(), |ui| { let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover()); icon(ui.painter(), &cat_icon(&t.filename), irect, theme::TEXT_MUTED); let kind = crate::stream::proto_kind(&t); let bw = ui::badge_width(ui, kind.label()); let show_kind = ui.available_width() - bw >= 60.0; if show_kind { ui::badge(ui, kind.label(), ui::BadgeKind::Hue(theme::proto_color(kind))); } let has_debrid = !t.debrid_info.is_empty(); if has_debrid { let db = ui::badge_width(ui, "Debrid"); if ui.available_width() - db >= 60.0 { ui::badge(ui, "Debrid", ui::BadgeKind::Info); } } ui.add(egui::Label::new(egui::RichText::new(&t.filename).color(theme::TEXT).small()).truncate().selectable(false)).on_hover_text(if t.error.is_empty() { format!("{} - {}\n{}{}", kind.full_name(), t.filename, t.url, if t.debrid_info.is_empty() { String::new() } else { format!("\nDebrid: {}", t.debrid_info) }) } else { format!("{}\nError: {}", t.filename, t.error) }); });
                         if !compact_table { let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(if t.queue_id.is_empty() { "main" } else { &t.queue_id }).color(theme::TEXT_MUTED).small()).truncate().selectable(false)).on_hover_text(if t.queue_id.is_empty() { "main".to_string() } else { t.queue_id.clone() })); }
                         let w = nw(); cell_r(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(match t.total { Some(n) => fmt_bytes(n), None => "—".into() }).color(theme::TEXT_MUTED).small()).truncate().selectable(false)).on_hover_text(match t.total { Some(n) => fmt_bytes(n), None => "unknown size".to_string() }));
                         let sc = theme::status_color(t.status);
-                        let phase_lbl = if t.status == TaskStatus::Downloading && (t.headers.contains_key("x-ytdlp") || ytdlp::is_video_page(&t.url)) { crate::engine::phase_name(self.phase_map.get(&t.id).copied().unwrap_or(0)) } else { "" };
+                        let phase_lbl = if t.status == TaskStatus::Downloading { crate::engine::phase_name(self.phase_map.get(&t.id).copied().unwrap_or(0)) } else { "" };
                         let w = nw(); cell(ui, w, |ui| ui.add(egui::Label::new(egui::RichText::new(if phase_lbl.is_empty() { format!("{:?}", t.status) } else { phase_lbl.to_string() }).color(sc).small().strong()).truncate().selectable(false)).on_hover_text(if phase_lbl.is_empty() { format!("{:?}", t.status) } else { phase_lbl.to_string() }));
                         if !compact_table {
                             // ETA from THIS task's own rate (was global rate for all rows)
@@ -5802,11 +5872,23 @@ impl DownloadApp {
                             ui.add(bar).on_hover_text(&hover);
                             ui.add(egui::Label::new(egui::RichText::new(if frac_opt.is_some() { format!("{:.1}%", frac * 100.0) } else { "?".into() }).color(theme::TEXT_MUTED).small()).truncate().selectable(false)).on_hover_text(&hover);
                         });
+                        if !compact_table {
+                            let w = nw(); cell(ui, w, |ui| {
+                                if resume_capable(&t) {
+                                    if let Some(ar) = t.accept_ranges {
+                                        let (ic, col, tip) = if ar { (Icon::Check, theme::OK, "Resumable") } else { (Icon::Error, theme::ERR, "Not resumable") };
+                                        let (irect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                                        icon(ui.painter(), &ic, irect, col);
+                                        ui.add(egui::Label::new(egui::RichText::new("").small()).selectable(false)).on_hover_text(tip);
+                                    }
+                                }
+                            });
+                        }
                         let w = nw(); cell(ui, w, |ui| {
                             if t.status == TaskStatus::Downloading {
-                                if row_icon_btn(ui, Icon::Pause, "Stop").clicked() { to_stop = Some(t.id.clone()); }
-                            } else if t.status != TaskStatus::Complete && row_icon_btn(ui, Icon::Play, "Start / Resume").clicked() { to_start = Some(t.id.clone()); }
-                            if row_icon_btn(ui, Icon::Info, "Progress details").clicked() { to_progress = Some(t.id.clone()); }
+                                if ui::row_icon_button(ui, Icon::Pause, "Stop").clicked() { to_stop = Some(t.id.clone()); }
+                            } else if t.status != TaskStatus::Complete && ui::row_icon_button(ui, Icon::Play, "Start / Resume").clicked() { to_start = Some(t.id.clone()); }
+                            if ui::row_icon_button(ui, Icon::Info, "Progress details").clicked() { to_progress = Some(t.id.clone()); }
                         });
                     });
 
@@ -5890,6 +5972,7 @@ impl DownloadApp {
     /// IDM-style "Download File Info" confirm window for browser captures.
     /// One at a time; confirming/dropping pops next from rt.pending_captures.
     fn ui_capture_dialog(&mut self, ctx: &egui::Context) {
+        const CAP_BASE: egui::Vec2 = egui::vec2(ui::size::MD, 700.0);
         // Pull next pending capture into editor state.
         if self.capture_task.is_none() {
             let next = {
@@ -5927,8 +6010,8 @@ impl DownloadApp {
                                                      // Independent native window: no main-rect clip / shrink-wrap.
         let builder = egui::ViewportBuilder::default()
             .with_title("Download file")
-            .with_inner_size([580.0, 700.0])
-            .with_min_inner_size([480.0, 420.0])
+            .with_inner_size(ui::viewport_size(ctx, CAP_BASE.x, CAP_BASE.y))
+            .with_min_inner_size([ui::size::MIN_W, 420.0])
             .with_max_inner_size([4096.0, 4096.0])
             .with_resizable(true);
         let cap_body = |ui: &mut egui::Ui, app: &mut DownloadApp| {
@@ -5940,27 +6023,37 @@ impl DownloadApp {
             );
             // Task clone edited locally; writes back into capture_task below.
             let mut t = task.clone();
-            ui.add(
-                egui::Label::new(egui::RichText::new(&t.url).color(theme::STEEL_TEXT).small())
-                    .wrap(),
-            );
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&t.url).color(theme::STEEL_TEXT).small())
+                        .wrap()
+                        .selectable(true),
+                );
+                if ui::secondary_button(ui, "Copy").clicked() {
+                    ui.output_mut(|o| o.copied_text = t.url.clone());
+                }
+            });
             ui.horizontal(|ui| {
                 let kind = crate::stream::proto_kind(&t);
-                theme::badge(ui, kind.label(), theme::proto_color(kind));
+                ui::badge(
+                    ui,
+                    kind.label(),
+                    ui::BadgeKind::Hue(theme::proto_color(kind)),
+                );
                 let cat = if t.category.is_empty() {
                     crate::model::category_for(&t.filename)
                 } else {
                     t.category.as_str()
                 };
-                theme::badge(ui, cat, theme::category_color(cat));
+                ui::badge(ui, cat, ui::BadgeKind::Hue(theme::category_color(cat)));
             });
-            ui.add_space(6.0);
-            ui.add_space(6.0);
+            ui.add_space(theme::SP_SM);
+            ui.add_space(theme::SP_SM);
             let mut focus_name = false;
-            form_grid("cap-grid").show(ui, |ui| {
-                form_label(ui, "Save as");
+            ui::form_grid("cap-grid").show(ui, |ui| {
+                ui::form_label(ui, "Save as");
                 let name_resp = ui.add(
-                    egui::TextEdit::singleline(&mut app.capture_name)
+                    ui::text_field(&mut app.capture_name)
                         .id(egui::Id::new("capture-name"))
                         .desired_width(f32::INFINITY),
                 );
@@ -5973,18 +6066,30 @@ impl DownloadApp {
                     }
                 }
                 ui.end_row();
-                if let Some(total) = t.total {
-                    if total > 0 {
-                        form_label(ui, "Size");
-                        ui.label(
-                            egui::RichText::new(fmt_bytes(total))
-                                .color(theme::TEXT)
-                                .small(),
-                        );
-                        ui.end_row();
-                    }
+                ui::form_label(ui, "Size");
+                ui.label(
+                    egui::RichText::new(match t.total {
+                        Some(total) if total > 0 => fmt_bytes(total),
+                        _ if app.prewarm_cap.loading && app.prewarm_cap.url == t.url => {
+                            "Probing…".to_string()
+                        }
+                        _ => "—".to_string(),
+                    })
+                    .color(theme::TEXT)
+                    .small(),
+                );
+                ui.end_row();
+                if !t.mime.is_empty() {
+                    ui::form_label(ui, "Type");
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&t.mime).color(theme::TEXT).small())
+                            .truncate()
+                            .selectable(true),
+                    )
+                    .on_hover_text(t.mime.clone());
+                    ui.end_row();
                 }
-                form_label(ui, "Folder");
+                ui::form_label(ui, "Folder");
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::Label::new(
@@ -5995,7 +6100,7 @@ impl DownloadApp {
                         .truncate(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ghost_btn_w(ui, "Browse…").clicked() {
+                        if ui::secondary_button(ui, "Browse…").clicked() {
                             if let Some(p) = rfd::FileDialog::new().pick_folder() {
                                 t.dest_dir = p;
                             }
@@ -6003,7 +6108,7 @@ impl DownloadApp {
                     });
                 });
                 ui.end_row();
-                form_label(ui, "Category");
+                ui::form_label(ui, "Category");
                 egui::ComboBox::from_id_salt("cap-cat")
                     .selected_text(t.category.clone())
                     .width(ui.available_width())
@@ -6020,7 +6125,7 @@ impl DownloadApp {
                         }
                     });
                 ui.end_row();
-                form_label(ui, "Queue");
+                ui::form_label(ui, "Queue");
                 let cur = queues
                     .iter()
                     .find(|(id, _)| *id == t.queue_id)
@@ -6037,9 +6142,9 @@ impl DownloadApp {
                         }
                     });
                 ui.end_row();
-                form_label(ui, "Proxy");
+                ui::form_label(ui, "Proxy");
                 ui.add(
-                    egui::TextEdit::singleline(&mut t.proxy_url)
+                    ui::text_field(&mut t.proxy_url)
                         .hint_text("empty = global proxy; http://user:pass@host:port or socks5://host:port")
                         .desired_width(ui.available_width()),
                 )
@@ -6089,6 +6194,21 @@ impl DownloadApp {
                             .color(theme::TEXT_MUTED),
                     );
                 }
+                // Landed probe -> task (survives write-back below; Size/Type
+                // rows pick it up next repaint). URL guard vs stale prior probe.
+                if app.prewarm_cap.url == t.url {
+                    if let Some(tot) = app.prewarm_cap.total {
+                        if tot > 0 {
+                            t.total = Some(tot);
+                        }
+                    }
+                    if !app.prewarm_cap.content_type.is_empty() {
+                        t.mime = app.prewarm_cap.content_type.clone();
+                    }
+                    if let Some(ar) = app.prewarm_cap.accept_ranges {
+                        t.accept_ranges = Some(ar);
+                    }
+                }
             }
             // yt-dlp picker: video page or explicit yt-dlp engine.
             // Auto-start probe once per capture (silent, cookies attached).
@@ -6134,7 +6254,7 @@ impl DownloadApp {
                         .clone();
                     let eff_proxy =
                         crate::model::effective_proxy(&t.proxy_url, &global_proxy).to_string();
-                    ui.add_space(6.0);
+                    ui.add_space(theme::SP_SM);
                     ui_yt_probe_section(
                         ui,
                         &mut app.yt_probe_cap,
@@ -6166,7 +6286,7 @@ impl DownloadApp {
                                     .color(theme::TEXT_FAINT)
                                     .small(),
                             );
-                            if ghost_btn_w(ui, "Use sniffed stream instead").clicked() {
+                            if ui::secondary_button(ui, "Use sniffed stream instead").clicked() {
                                 // Title-filled capture name belongs to page video, not stream.
                                 app.capture_name = crate::model::filename_from_url(&stream);
                                 t.url = stream;
@@ -6186,11 +6306,15 @@ impl DownloadApp {
                 app.capture_just_opened = false;
             }
             if !t.referrer.is_empty() {
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(format!("Referrer: {}", t.referrer))
-                        .color(theme::TEXT_FAINT)
-                        .small(),
+                ui.add_space(theme::SP_SM);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("Referrer: {}", t.referrer))
+                            .color(theme::TEXT_FAINT)
+                            .small(),
+                    )
+                    .wrap()
+                    .selectable(true),
                 );
             }
         };
@@ -6212,7 +6336,7 @@ impl DownloadApp {
                 fit_vp(
                     ctx,
                     vp_id("webcraft-capture"),
-                    egui::vec2(580.0, 700.0),
+                    CAP_BASE,
                     self.cap_body_h,
                     &mut self.cap_vp_sent,
                 );
@@ -6223,12 +6347,13 @@ impl DownloadApp {
             let bb = cap_body.as_mut().unwrap();
             let yt_loading = self.yt_probe_cap.loading;
             let footer = |ui: &mut egui::Ui, action: &mut Option<&'static str>| {
+                ui.add_space(theme::SP_SM);
                 ui.separator();
-                btn_row(ui, |ui| {
+                ui::footer_row(ui, |ui| {
                     // Start during probe would silently drop picker intent (Auto).
                     if ui
                         .add_enabled_ui(!yt_loading, |ui| {
-                            primary_btn_w(
+                            ui::primary_button(
                                 ui,
                                 if yt_loading {
                                     "Probing formats…"
@@ -6242,46 +6367,29 @@ impl DownloadApp {
                     {
                         *action = Some("start");
                     }
-                    if ghost_btn_w(ui, "Download later").clicked() {
+                    if ui::secondary_button(ui, "Download later").clicked() {
                         *action = Some("later");
                     }
-                    if ghost_btn_w(ui, "Cancel").clicked() {
+                    if ui::secondary_button(ui, "Cancel").clicked() {
                         *action = Some("cancel");
                     }
                 });
             };
-            if matches!(class, egui::ViewportClass::Embedded) {
-                let scr = ctx.screen_rect();
-                egui::Window::new("Download file")
-                    .collapsible(false)
-                    .resizable(true)
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .default_size([580.0, 700.0])
-                    .min_size([440.0, 360.0])
-                    .max_size([
-                        (scr.width() - 24.0).max(440.0),
-                        (scr.height() - 24.0).max(360.0),
-                    ])
-                    .show(ctx, |ui| {
-                        let max_h = (ui.available_height() - FOOTER_H).max(48.0);
-                        egui::ScrollArea::vertical()
-                            .id_salt("cap-main-embedded")
-                            .max_height(max_h)
-                            .show(ui, |ui| bb(ui, self));
-                        footer(ui, &mut action);
-                    });
-            } else {
-                egui::CentralPanel::default()
-                    .frame(dialog_frame())
-                    .show(ctx, |ui| {
-                        let avail = ui.available_height();
-                        let out = egui::ScrollArea::vertical()
-                            .id_salt("cap-main")
-                            .max_height((avail - FOOTER_H).max(48.0))
-                            .show(ui, |ui| bb(ui, self));
-                        self.cap_body_h = Some(out.content_size.y + FOOTER_H + 36.0);
-                        footer(ui, &mut action);
-                    });
+            let modal = ui::Modal::new("capture", "Download file")
+                .width(CAP_BASE.x)
+                .height(CAP_BASE.y)
+                .resizable(true)
+                .show_in_viewport(ctx, class, |ui| {
+                    let avail = ui.available_height();
+                    let out = egui::ScrollArea::vertical()
+                        .id_salt("cap-main")
+                        .max_height((avail - ui::FOOTER_H).max(48.0))
+                        .show(ui, |ui| bb(ui, self));
+                    self.cap_body_h = Some(out.content_size.y + ui::FOOTER_H + 36.0);
+                    footer(ui, &mut action);
+                });
+            if modal.close {
+                action = Some("cancel");
             }
         });
         if cap_focused {
@@ -6367,11 +6475,18 @@ impl DownloadApp {
             }
             _ => {
                 self.yt_probe_cap = YtProbeState::default();
+                // Cancel: drop task, hand http(s) file back to browser
+                // (host polls resume file; helper gates scheme/yt-dlp).
+                let fname = if name_input.trim().is_empty() {
+                    t.filename.clone()
+                } else {
+                    crate::model::sanitize_filename(&name_input)
+                };
+                write_browser_resume(&t, &fname);
                 if !self.prewarm_cap.url.is_empty() {
                     engine::prewarm_drop(&self.prewarm_cap.url.clone());
                 }
                 self.prewarm_cap = PrewarmState::default();
-                /* Cancel: drop task entirely. */
             }
         }
     }
@@ -6433,7 +6548,7 @@ impl DownloadApp {
                     .small(),
             );
             ui.horizontal(|ui| {
-                if ghost_btn_w(ui, "Retry").clicked() {
+                if ui::secondary_button(ui, "Retry").clicked() {
                     self.start_torrent_probe();
                 }
                 ui.label(
@@ -6445,7 +6560,7 @@ impl DownloadApp {
             return;
         }
         if self.add_torrent_files.is_empty() {
-            if primary_btn_w(ui, "Load files…").clicked() {
+            if ui::secondary_button(ui, "Load files…").clicked() {
                 self.start_torrent_probe();
             }
             return;
@@ -6476,12 +6591,12 @@ impl DownloadApp {
                 .color(theme::TEXT_MUTED)
                 .small(),
             );
-            if ghost_btn_w(ui, "Select all").clicked() {
+            if ui::secondary_button(ui, "Select all").clicked() {
                 for (_, s) in &mut self.add_torrent_files {
                     *s = true;
                 }
             }
-            if ghost_btn_w(ui, "Select none").clicked() {
+            if ui::secondary_button(ui, "Select none").clicked() {
                 for (_, s) in &mut self.add_torrent_files {
                     *s = false;
                 }
@@ -6600,7 +6715,7 @@ impl DownloadApp {
                     .small(),
             );
             ui.horizontal(|ui| {
-                if ghost_btn_w(ui, "Retry").clicked() {
+                if ui::secondary_button(ui, "Retry").clicked() {
                     self.start_nzb_probe();
                 }
                 ui.label(
@@ -6612,7 +6727,7 @@ impl DownloadApp {
             return;
         }
         let Some(nzb) = &self.add_nzb else {
-            if primary_btn_w(ui, "Load files…").clicked() {
+            if ui::secondary_button(ui, "Load files…").clicked() {
                 self.start_nzb_probe();
             }
             return;
@@ -6690,11 +6805,12 @@ impl DownloadApp {
     }
 
     fn ui_add_dialog(&mut self, ctx: &egui::Context) {
+        const ADD_BASE: egui::Vec2 = egui::vec2(ui::size::MD, 840.0);
         // Independent native window: no main-rect clip / shrink-wrap weirdness.
         let builder = egui::ViewportBuilder::default()
             .with_title("Add download")
-            .with_inner_size([620.0, 840.0])
-            .with_min_inner_size([520.0, 480.0])
+            .with_inner_size(ui::viewport_size(ctx, ADD_BASE.x, ADD_BASE.y))
+            .with_min_inner_size([ui::size::MIN_W, 420.0])
             .with_max_inner_size([4096.0, 4096.0])
             .with_resizable(true);
         let mut start: Option<bool> = None; // Some(true)=now, Some(false)=later
@@ -6714,7 +6830,7 @@ impl DownloadApp {
         ctx.show_viewport_immediate(vp_id("webcraft-add"), builder, |ctx, class| {
             add_focused = ctx.input(|i| i.focused);
             if !matches!(class, egui::ViewportClass::Embedded) {
-                fit_vp(ctx, vp_id("webcraft-add"), egui::vec2(620.0, 840.0), self.add_body_h, &mut self.add_vp_sent);
+                fit_vp(ctx, vp_id("webcraft-add"), ADD_BASE, self.add_body_h, &mut self.add_vp_sent);
             }
             if ctx.input(|i| i.viewport().close_requested()) {
                 cancel = true;
@@ -6731,14 +6847,14 @@ impl DownloadApp {
                 let out = egui::ScrollArea::vertical()
                     .id_salt("add-main")
                     .auto_shrink([false, false])
-                    .max_height((ui.available_height() - FOOTER_H).max(48.0))
+                    .max_height((ui.available_height() - ui::FOOTER_H).max(48.0))
                     .show(ui, |ui| {
                     section(ui, "Link");
                     ui.horizontal(|ui| {
                         let w = (ui.available_width() - 172.0).max(120.0);
                         let resp = ui.add_sized(
                             [w, theme::BTN_H],
-                            egui::TextEdit::singleline(&mut app.add_url)
+                            ui::text_field(&mut app.add_url)
                                 .id(egui::Id::new("add-url"))
                                 .hint_text("https://… or magnet:?xt=urn:btih:…"),
                         );
@@ -6765,7 +6881,7 @@ impl DownloadApp {
                         if app.add_url.contains('<') {
                             app.add_url = extract_pasted_url(&app.add_url.clone());
                         }
-                        if ghost_btn_w(ui, "Paste").clicked() {
+                        if ui::secondary_button(ui, "Paste").clicked() {
                             if let Ok(mut cb) = arboard::Clipboard::new() {
                                 if let Ok(text) = cb.get_text() {
                                     app.add_url = extract_pasted_url(&text);
@@ -6774,7 +6890,7 @@ impl DownloadApp {
                         }
                         // Local .torrent/.nzb file: backend dispatches on path
                         // in task.url (torrent build_add / nntp fetch_nzb_text).
-                        if ghost_btn_w(ui, "Browse…").clicked() {
+                        if ui::secondary_button(ui, "Browse…").clicked() {
                             if let Some(p) = rfd::FileDialog::new()
                                 .add_filter("Torrent / NZB", &["torrent", "nzb"])
                                 .add_filter("Torrent", &["torrent"])
@@ -6807,8 +6923,8 @@ impl DownloadApp {
                     }
                     ui.add_space(theme::SP_SM);
                     section(ui, "Destination");
-                    form_grid("add-grid").show(ui, |ui| {
-                        form_label(ui, "Queue");
+                    ui::form_grid("add-grid").show(ui, |ui| {
+                        ui::form_label(ui, "Queue");
                         {
                             let queues: Vec<(String, String)> = {
                                 let g = crate::lock_unpoison(&app.rt);
@@ -6829,7 +6945,7 @@ impl DownloadApp {
                                 });
                         }
                         ui.end_row();
-                        form_label(ui, "Save to");
+                        ui::form_label(ui, "Save to");
                         {
                             let dir = crate::lock_unpoison(&app.rt).state.settings.download_dir.display().to_string();
                             ui.add(
@@ -6838,10 +6954,10 @@ impl DownloadApp {
                             .on_hover_text(dir);
                         }
                         ui.end_row();
-                        form_label(ui, "Referrer");
+                        ui::form_label(ui, "Referrer");
                         ui.add(fill_edit(&mut app.add_referrer));
                         ui.end_row();
-                        form_label(ui, "Cookies");
+                        ui::form_label(ui, "Cookies");
                         ui.add(fill_edit(&mut app.add_cookies));
                         ui.end_row();
                     });
@@ -6884,26 +7000,26 @@ impl DownloadApp {
                     }
                     ui.add_space(theme::SP_SM);
                     section(ui, "Transfer");
-                    form_grid("add-transfer").show(ui, |ui| {
-                        form_label(ui, "Mirrors");
+                    ui::form_grid("add-transfer").show(ui, |ui| {
+                        ui::form_label(ui, "Mirrors");
                         ui.add(
-                            egui::TextEdit::singleline(&mut app.add_mirrors)
+                            ui::text_field(&mut app.add_mirrors)
                                 .hint_text("mirror URLs, comma separated (failover)")
                                 .desired_width(ui.available_width()),
                         );
                         ui.end_row();
-                        form_label(ui, "Proxy");
+                        ui::form_label(ui, "Proxy");
                         ui.add(
-                            egui::TextEdit::singleline(&mut app.add_proxy)
+                            ui::text_field(&mut app.add_proxy)
                                 .hint_text("empty = global proxy; http://user:pass@host:port or socks5://host:port")
                                 .desired_width(ui.available_width()),
                         )
                         .on_hover_text("Per-download proxy. Used for probing (incl. yt-dlp) and downloading this URL. HTTP/HLS/DASH/yt-dlp; FTP/SFTP/NNTP/torrent swarm stay direct.");
                         ui.end_row();
-                        form_label(ui, "Description");
+                        ui::form_label(ui, "Description");
                         ui.add(fill_edit(&mut app.add_desc));
                         ui.end_row();
-                        form_label(ui, "When");
+                        ui::form_label(ui, "When");
                         ui.horizontal(|ui| {
                             ui.radio_value(&mut app.add_start_now, true, "Start now");
                             ui.radio_value(&mut app.add_start_now, false, "Later");
@@ -6919,10 +7035,10 @@ impl DownloadApp {
                             let mut rm: Option<usize> = None;
                             for (i, (hn, hv)) in app.add_headers.iter_mut().enumerate() {
                                 ui.horizontal(|ui| {
-                                    ui.add(egui::TextEdit::singleline(hn).hint_text("Name").desired_width(150.0));
+                                    ui.add(ui::text_field(hn).hint_text("Name").desired_width(150.0));
                                     let is_auth = hn.trim().eq_ignore_ascii_case("authorization");
-                                    ui.add(egui::TextEdit::singleline(hv).hint_text(if is_auth { "Bearer <token>" } else { "Value" }).password(is_auth).desired_width(220.0));
-                                    if icon_btn(ui, Icon::Delete, "", false, 28.0).on_hover_text("Remove header").clicked() { rm = Some(i); }
+                                    ui.add(ui::text_field(hv).hint_text(if is_auth { "Bearer <token>" } else { "Value" }).password(is_auth).desired_width(220.0));
+                                    if ui::Btn::secondary("").icon(Icon::Delete).show(ui).on_hover_text("Remove header").clicked() { rm = Some(i); }
                                 });
                             }
                             if let Some(i) = rm { app.add_headers.remove(i); }
@@ -6930,9 +7046,9 @@ impl DownloadApp {
                                 ui.label(egui::RichText::new(e.clone()).color(theme::ERR).small());
                             }
                             ui.horizontal_wrapped(|ui| {
-                                if ui.small_button("+ Row").clicked() { app.add_headers.push((String::new(), String::new())); }
+                                if ui::ghost_button(ui, "+ Row").clicked() { app.add_headers.push((String::new(), String::new())); }
                                 for (pn, pv) in [("User-Agent", ""), ("Referer", ""), ("Authorization", "Bearer "), ("Accept", "")] {
-                                    if ui.small_button(pn).clicked() { app.add_headers.push((pn.into(), pv.into())); }
+                                    if ui::ghost_button(ui, pn).clicked() { app.add_headers.push((pn.into(), pv.into())); }
                                 }
                             });
                             ui.label(egui::RichText::new("Authorization preset: replace trailing text with your token — stored as \"Bearer <token>\". Rows editable/removable.").color(theme::TEXT_FAINT).small());
@@ -6941,20 +7057,20 @@ impl DownloadApp {
                         .id_salt("add-auth-hdr")
                         .default_open(false)
                         .show(ui, |ui| {
-                            form_grid("add-auth").show(ui, |ui| {
-                                form_label(ui, "Login");
+                            ui::form_grid("add-auth").show(ui, |ui| {
+                                ui::form_label(ui, "Login");
                                 ui.add(fill_edit(&mut app.add_user));
                                 ui.end_row();
-                                form_label(ui, "Password");
+                                ui::form_label(ui, "Password");
                                 ui.add(
-                                    egui::TextEdit::singleline(&mut app.add_pass)
+                                    ui::text_field(&mut app.add_pass)
                                         .password(true)
                                         .desired_width(ui.available_width()),
                                 );
                                 ui.end_row();
-                                form_label(ui, "SSH key");
+                                ui::form_label(ui, "SSH key");
                                 ui.add(
-                                    egui::TextEdit::singleline(&mut app.add_key)
+                                    ui::text_field(&mut app.add_key)
                                         .hint_text("path to private key, empty = ~/.ssh/id_*")
                                         .desired_width(ui.available_width()),
                                 );
@@ -6969,13 +7085,14 @@ impl DownloadApp {
                 if out.inner {
                     content_h += 96.0;
                 }
-                app.add_body_h = Some(content_h + FOOTER_H + 36.0);
+                app.add_body_h = Some(content_h + ui::FOOTER_H + 36.0);
+                ui.add_space(theme::SP_SM);
                 ui.separator();
                 // Zero-selected torrent files can never finish: gate confirm.
                 let torrent_blocked = crate::torrent::is_torrent_url(&app.add_url)
                     && app.add_torrent_files.len() > 1
                     && app.add_torrent_files.iter().all(|(_, s)| !s);
-                btn_row(ui, |ui| {
+                ui::footer_row(ui, |ui| {
                     if torrent_blocked {
                         ui.label(
                             egui::RichText::new("Select at least one file")
@@ -6986,35 +7103,26 @@ impl DownloadApp {
                     if ui
                         .add_enabled_ui(
                             !app.add_url.trim().is_empty() && !app.add_torrent_loading && !app.yt_probe_add.loading && !torrent_blocked && hdr_error.is_none(),
-                            |ui| primary_btn_w(ui, "Start download"),
+                            |ui| ui::primary_button(ui, "Start download"),
                         )
                         .inner
                         .clicked()
                     {
                         *start = Some(app.add_start_now);
                     }
-                    if ghost_btn_w(ui, "Cancel").clicked() {
+                    if ui::secondary_button(ui, "Cancel").clicked() {
                         *cancel = true;
                     }
                 });
             };
             let mut body = Some(body);
             let bb = body.as_mut().unwrap();
-            if matches!(class, egui::ViewportClass::Embedded) {
-                let scr = ctx.screen_rect();
-                egui::Window::new("Add download")
-                    .collapsible(false)
-                    .resizable(true)
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .default_size([620.0, 840.0])
-                    .min_size([480.0, 420.0])
-                    .max_size([(scr.width() - 24.0).max(480.0), (scr.height() - 24.0).max(420.0)])
-                    .show(ctx, |ui| bb(ui, self, &mut start, &mut cancel));
-            } else {
-                egui::CentralPanel::default().frame(dialog_frame()).show(ctx, |ui| {
-                    bb(ui, self, &mut start, &mut cancel)
-                });
-            }
+            let modal = ui::Modal::new("add", "Add download")
+                .width(ADD_BASE.x)
+                .height(ADD_BASE.y)
+                .resizable(true)
+                .show_in_viewport(ctx, class, |ui| bb(ui, self, &mut start, &mut cancel));
+            cancel |= modal.close;
         });
         if add_focused {
             self.add_raise_frames = 0;
@@ -7114,6 +7222,9 @@ impl DownloadApp {
                     };
                     if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) {
                         t.segments = segs;
+                        if self.prewarm_add.url == url.trim() {
+                            t.accept_ranges = self.prewarm_add.accept_ranges;
+                        }
                         t.username = user;
                         t.password = pass;
                         t.ssh_key_path = key;
@@ -7232,6 +7343,7 @@ impl DownloadApp {
     }
 
     fn ui_progress_dialog(&mut self, ctx: &egui::Context, id: &str) {
+        const PROG_BASE: egui::Vec2 = egui::vec2(ui::size::LG, 860.0);
         // New task in same viewport slot: drop stale measured height.
         if self.prog_task.as_deref() != Some(id) {
             self.prog_task = Some(id.to_owned());
@@ -7250,11 +7362,13 @@ impl DownloadApp {
         let mut close = false;
         let mut toggle_pause = false;
         let mut copy_link = false;
+        let mut copy_debrid = false;
+        let mut redownload = false;
         // Independent native window: content outgrows main window rect.
         let builder = egui::ViewportBuilder::default()
             .with_title(format!("Progress - {}", t.filename))
-            .with_inner_size([700.0, 860.0])
-            .with_min_inner_size([520.0, 480.0])
+            .with_inner_size(ui::viewport_size(ctx, PROG_BASE.x, PROG_BASE.y))
+            .with_min_inner_size([ui::size::MIN_W, 420.0])
             .with_max_inner_size([4096.0, 4096.0])
             .with_resizable(true);
         if self.progress_raise {
@@ -7294,8 +7408,9 @@ impl DownloadApp {
         // ride in as locals to avoid disjoint field captures conflicting.
         let prog_h_in = self.prog_body_h;
         let mut prog_sent = self.prog_vp_sent;
-        let body = |ui: &mut egui::Ui, app: &mut Self| -> (bool, bool, bool) {
-            let (mut b_close, mut b_toggle, mut b_copy) = (false, false, false);
+        let body = |ui: &mut egui::Ui, app: &mut Self| -> (bool, bool, bool, bool, bool) {
+            let (mut b_close, mut b_toggle, mut b_copy, mut b_copy_debrid, mut b_redownload) =
+                (false, false, false, false, false);
             // HEADER: icon + filename + chips; URL truncated, hover full.
             ui.horizontal(|ui| {
                 let (irect, _) =
@@ -7310,8 +7425,12 @@ impl DownloadApp {
                 );
                 ui.vertical(|ui| {
                     ui.add(
-                        egui::Label::new(egui::RichText::new(&t.filename).strong().size(13.0))
-                            .truncate(),
+                        egui::Label::new(
+                            egui::RichText::new(&t.filename)
+                                .strong()
+                                .text_style(egui::TextStyle::Heading),
+                        )
+                        .truncate(),
                     )
                     .on_hover_text(&t.filename);
                     ui.add(
@@ -7324,42 +7443,45 @@ impl DownloadApp {
                 });
             });
             ui.horizontal(|ui| {
-                // Raw STEEL as text fails contrast: use STEEL_TEXT for Downloading.
-                let sc = if t.status == TaskStatus::Downloading {
-                    theme::STEEL_TEXT
-                } else {
-                    theme::status_color(t.status)
-                };
-                let status_lbl = if t.status == TaskStatus::Downloading
-                    && (t.headers.contains_key("x-ytdlp") || ytdlp::is_video_page(&t.url))
-                {
+                let status_lbl = if t.status == TaskStatus::Downloading {
                     crate::engine::phase_name(app.phase_map.get(&t.id).copied().unwrap_or(0))
                         .to_string()
                 } else {
                     format!("{:?}", t.status)
                 };
-                theme::badge(ui, &status_lbl, sc);
-                theme::badge(ui, kind.label(), theme::proto_color(kind));
-                if !t.debrid_info.is_empty() {
+                ui::badge(ui, &status_lbl, ui::BadgeKind::status(t.status));
+                ui::badge(
+                    ui,
+                    kind.label(),
+                    ui::BadgeKind::Hue(theme::proto_color(kind)),
+                );
+                let chip_info = if !t.debrid_info.is_empty() {
+                    t.debrid_info.clone()
+                } else {
+                    seg_view
+                        .as_ref()
+                        .and_then(|v| v.live.as_ref())
+                        .map(|l| l.debrid_info.clone())
+                        .unwrap_or_default()
+                };
+                if !chip_info.is_empty() {
                     ui.label(
-                        egui::RichText::new(&t.debrid_info)
-                            .color(theme::TEAL_500)
-                            .small(),
+                        egui::RichText::new(&chip_info).color(theme::TEAL_500).small(),
                     )
-                    .on_hover_text(&t.debrid_info);
+                    .on_hover_text(&chip_info);
                 }
-                theme::badge(
+                ui::badge(
                     ui,
                     if t.category.is_empty() {
                         crate::model::category_for(&t.filename)
                     } else {
                         &t.category
                     },
-                    theme::category_color(if t.category.is_empty() {
+                    ui::BadgeKind::Hue(theme::category_color(if t.category.is_empty() {
                         crate::model::category_for(&t.filename)
                     } else {
                         &t.category
-                    }),
+                    })),
                 );
             });
             ui.add_space(theme::SP_SM);
@@ -7374,7 +7496,7 @@ impl DownloadApp {
                         "—".into()
                     })
                     .strong()
-                    .size(18.0),
+                    .text_style(theme::display_style()),
                 );
                 ui.label(
                     egui::RichText::new(format!("{:?}", t.status))
@@ -7463,7 +7585,7 @@ impl DownloadApp {
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
                             "—",
-                            egui::FontId::proportional(10.0),
+                            egui::TextStyle::Small.resolve(ui.style()),
                             theme::TEXT_FAINT,
                         );
                     }
@@ -7481,7 +7603,7 @@ impl DownloadApp {
             let prog_scroll = egui::ScrollArea::vertical()
                 .id_salt("prog-main")
                 .auto_shrink([false, false])
-                .max_height((ui.available_height() - FOOTER_H).max(48.0))
+                .max_height((ui.available_height() - ui::FOOTER_H).max(48.0))
                 .show(ui, |ui| {
                     section(ui, "Connection");
                     {
@@ -7599,6 +7721,49 @@ impl DownloadApp {
                         )
                         .on_hover_text(t.dest_dir.display().to_string());
                     });
+                    {
+                        let live = seg_view.as_ref().and_then(|v| v.live.clone());
+                        let resolved = live
+                            .as_ref()
+                            .map(|l| l.resolved_url.clone())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| t.debrided_url.clone());
+                        let final_u = live
+                            .as_ref()
+                            .map(|l| l.final_url.clone())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| t.final_url.clone());
+                        let mut link_rows: Vec<(&str, String, String)> = vec![
+                            ("Original", t.url.clone(), t.url.clone()),
+                        ];
+                        {
+                            let info = live
+                                .as_ref()
+                                .map(|l| l.debrid_info.clone())
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| t.debrid_info.clone());
+                            if !info.is_empty() {
+                                link_rows.insert(1, ("Debrid", info.clone(), info));
+                            }
+                        }
+                        if !resolved.is_empty() {
+                            link_rows.push(("Debrided", crate::engine::redact_url(&resolved), resolved.clone()));
+                        }
+                        if !final_u.is_empty() && final_u != resolved && final_u != t.url {
+                            link_rows.push(("Final", crate::engine::redact_url(&final_u), final_u));
+                        }
+                        if link_rows.len() > 1 || !t.debrid_info.is_empty() {
+                            section(ui, "Links");
+                        }
+                        for (k, disp, _full) in &link_rows {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(*k).color(theme::TEXT_FAINT).small());
+                                ui.add(egui::Label::new(egui::RichText::new(disp).small()).truncate())
+                                    .on_hover_text(if *k == "Original" { disp.clone() } else { format!("{disp} (token hidden)") });
+                            });
+                        }
+                        let _ = link_rows;
+                    }
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Limit").color(theme::TEXT_FAINT).small());
                         let mut lim = t.speed_limit_kbps;
@@ -7636,7 +7801,7 @@ impl DownloadApp {
                         // Client/yt-dlp proxy baked at start; edit applies on restart.
                         if ui
                             .add(
-                                egui::TextEdit::singleline(&mut px)
+                                ui::text_field(&mut px)
                                     .hint_text("empty = global proxy")
                                     .desired_width(ui.available_width().min(360.0)),
                             )
@@ -7941,40 +8106,74 @@ impl DownloadApp {
                 prog_h += 74.0;
             }
             app.prog_body_h = Some(prog_h);
+            ui.add_space(theme::SP_SM);
             ui.separator();
-            btn_row(ui, |ui| {
+            ui::footer_row(ui, |ui| {
                 if t.status == TaskStatus::Downloading {
-                    if icon_btn(ui, Icon::Pause, "Pause", true, 72.0).clicked() {
+                    if ui::Btn::primary("Pause")
+                        .icon(Icon::Pause)
+                        .min_width(PAUSE_W)
+                        .show(ui)
+                        .clicked()
+                    {
                         b_toggle = true;
                     }
+                } else if t.status == TaskStatus::Complete
+                    && ui::Btn::primary("Redownload")
+                        .icon(Icon::Download)
+                        .min_width(PAUSE_W)
+                        .show(ui)
+                        .clicked()
+                {
+                    b_redownload = true;
                 } else if t.status != TaskStatus::Complete
-                    && icon_btn(ui, Icon::Play, "Resume", true, 72.0).clicked()
+                    && ui::Btn::primary("Resume")
+                        .icon(Icon::Play)
+                        .min_width(PAUSE_W)
+                        .show(ui)
+                        .clicked()
                 {
                     b_toggle = true;
                 }
-                if icon_btn(ui, Icon::FolderOpen, "Open folder", false, 72.0).clicked() {
+                if ui::Btn::secondary("Open folder")
+                    .icon(Icon::FolderOpen)
+                    .show(ui)
+                    .clicked()
+                {
                     let _ = crate::platform::reveal_path(&t.dest_dir.join(&t.filename));
                 }
-                if icon_btn(
-                    ui,
-                    Icon::Link,
-                    if crate::torrent::is_magnet(&t.url) {
-                        "Copy magnet"
-                    } else {
-                        "Copy link"
-                    },
-                    false,
-                    72.0,
-                )
+                {
+                    let has_resolved = !t.debrided_url.is_empty()
+                        || seg_view
+                            .as_ref()
+                            .and_then(|v| v.live.as_ref())
+                            .is_some_and(|l| !l.resolved_url.is_empty());
+                    if has_resolved
+                        && ui::Btn::secondary("Copy debrided link (expires)")
+                            .icon(Icon::Link)
+                            .show(ui)
+                            .clicked()
+                    {
+                        b_copy_debrid = true;
+                    }
+                }
+                if ui::Btn::secondary(if crate::torrent::is_magnet(&t.url) {
+                    "Copy magnet"
+                } else {
+                    "Copy link"
+                })
+                .icon(Icon::Link)
+                .min_width(72.0)
+                .show(ui)
                 .clicked()
                 {
                     b_copy = true;
                 }
-                if ghost_btn_w(ui, "Close").clicked() {
+                if ui::secondary_button(ui, "Close").clicked() {
                     b_close = true;
                 }
             });
-            (b_close, b_toggle, b_copy)
+            (b_close, b_toggle, b_copy, b_copy_debrid, b_redownload)
         };
         let mut body = Some(body);
         let mut prog_focused = false;
@@ -7984,38 +8183,28 @@ impl DownloadApp {
                 close = true;
             }
             let bb = body.as_mut().unwrap();
-            let out = if matches!(class, egui::ViewportClass::Embedded) {
-                let scr = ctx.screen_rect();
-                egui::Window::new("Download progress")
-                    .collapsible(false)
-                    .resizable(true)
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .default_size([700.0, 860.0])
-                    .min_size([480.0, 420.0])
-                    .max_size([
-                        (scr.width() - 24.0).max(480.0),
-                        (scr.height() - 24.0).max(420.0),
-                    ])
-                    .show(ctx, |ui| bb(ui, self))
-                    .and_then(|r| r.inner)
-                    .unwrap_or((false, false, false))
-            } else {
+            if !matches!(class, egui::ViewportClass::Embedded) {
                 fit_vp(
                     ctx,
                     vp_id("webcraft-progress"),
-                    egui::vec2(700.0, 860.0),
+                    PROG_BASE,
                     prog_h_in,
                     &mut prog_sent,
                 );
-                egui::CentralPanel::default()
-                    .frame(dialog_frame())
-                    .show(ctx, |ui| bb(ui, self))
-                    .inner
-            };
+            }
+            let modal = ui::Modal::new("progress", "Download progress")
+                .width(PROG_BASE.x)
+                .height(PROG_BASE.y)
+                .resizable(true)
+                .show_in_viewport(ctx, class, |ui| bb(ui, self));
+            close |= modal.close;
+            let out = modal.inner.unwrap_or((false, false, false, false, false));
             // Accumulate: discarded extra pass must not erase click flags.
             close |= out.0;
             toggle_pause |= out.1;
             copy_link |= out.2;
+            copy_debrid |= out.3;
+            redownload |= out.4;
         });
         self.prog_vp_sent = prog_sent;
         if prog_focused {
@@ -8028,6 +8217,38 @@ impl DownloadApp {
             if let Ok(mut cb) = arboard::Clipboard::new() {
                 let _ = cb.set_text(t.url.clone());
             }
+        }
+        if copy_debrid {
+            // Live controls first; persisted task carries it after finish.
+            let full = {
+                let g = crate::lock_unpoison(&self.rt);
+                g.controls
+                    .get(id)
+                    .and_then(|c| {
+                        c.live
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone()
+                    })
+                    .map(|l| l.resolved_url)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        g.state
+                            .tasks
+                            .iter()
+                            .find(|x| x.id == id)
+                            .map(|x| x.debrided_url.clone())
+                    })
+                    .unwrap_or_default()
+            };
+            if !full.is_empty() {
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    let _ = cb.set_text(full);
+                }
+            }
+        }
+        if redownload {
+            redownload_task(self, id);
         }
         if toggle_pause {
             if t.status == TaskStatus::Downloading {
@@ -8044,18 +8265,18 @@ impl DownloadApp {
     fn ui_queues(&mut self, ui: &mut egui::Ui, scheduler_only: bool) {
         if !scheduler_only {
             ui.heading("Queues");
-            ui.add_space(4.0);
+            ui.add_space(theme::SP_XS);
             theme::panel().show(ui, |ui| {
-                form_grid("new-queue-grid").show(ui, |ui| {
-                    form_label(ui, "New queue");
+                ui::form_grid("new-queue-grid").show(ui, |ui| {
+                    ui::form_label(ui, "New queue");
                     ui.add(fill_edit(&mut self.new_queue_name));
                     ui.end_row();
                 });
                 ui.horizontal(|ui| {
-                    ui.add_space(LABEL_W + 12.0);
+                    ui.add_space(ui::LABEL_W + 12.0);
                     if ui
                         .add_enabled_ui(!self.new_queue_name.trim().is_empty(), |ui| {
-                            ghost_btn_w(ui, "Add queue")
+                            ui::secondary_button(ui, "Add queue")
                         })
                         .inner
                         .clicked()
@@ -8077,25 +8298,29 @@ impl DownloadApp {
                     }
                 });
             });
-            ui.add_space(6.0);
+            ui.add_space(theme::SP_SM);
             let queues = crate::lock_unpoison(&self.rt).state.queues.clone();
             for q in queues {
                 theme::panel().show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(&q.name).strong());
-                        theme::badge(ui, &format!("max {}", q.max_concurrent), theme::TEXT_MUTED);
+                        ui::badge(
+                            ui,
+                            &format!("max {}", q.max_concurrent),
+                            ui::BadgeKind::Neutral,
+                        );
                         if q.auto_start {
-                            theme::badge(ui, "auto-start", theme::TEAL_500);
+                            ui::badge(ui, "auto-start", ui::BadgeKind::Info);
                         }
-                        theme::badge(
+                        ui::badge(
                             ui,
                             &format!("retry {}x/{}s", q.retry_count, q.retry_interval_secs),
-                            theme::TEXT_MUTED,
+                            ui::BadgeKind::Neutral,
                         );
-                        theme::badge(
+                        ui::badge(
                             ui,
                             &format!("on complete: {:?}", q.on_complete),
-                            theme::TEXT_MUTED,
+                            ui::BadgeKind::Neutral,
                         );
                     });
                     ui.separator();
@@ -8145,16 +8370,24 @@ impl DownloadApp {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if icon_btn(ui, Icon::Play, "Start", false, 58.0).clicked() {
+                                    if ui::Btn::secondary("Start")
+                                        .icon(Icon::Play)
+                                        .show(ui)
+                                        .clicked()
+                                    {
                                         self.start_task(&t.id.clone());
                                     }
                                     ui.add_space(theme::SP_XS);
-                                    if icon_btn(ui, Icon::Down, "Down", false, 62.0).clicked() {
+                                    if ui::Btn::secondary("Down")
+                                        .icon(Icon::Down)
+                                        .show(ui)
+                                        .clicked()
+                                    {
                                         let mut g = crate::lock_unpoison(&self.rt);
                                         move_task(&mut g.state.tasks, &t.id, 1);
                                         g.save();
                                     }
-                                    if icon_btn(ui, Icon::Up, "Up", false, 48.0).clicked() {
+                                    if ui::Btn::secondary("Up").icon(Icon::Up).show(ui).clicked() {
                                         let mut g = crate::lock_unpoison(&self.rt);
                                         move_task(&mut g.state.tasks, &t.id, -1);
                                         g.save();
@@ -8164,7 +8397,7 @@ impl DownloadApp {
                         });
                         // Priority on its own row: never glued to move buttons.
                         ui.horizontal(|ui| {
-                            ui.add_space(52.0);
+                            ui.add_space(theme::SP_2XL + theme::SP_LG);
                             ui.label(
                                 egui::RichText::new("Priority")
                                     .color(theme::TEXT_FAINT)
@@ -8192,18 +8425,18 @@ impl DownloadApp {
                         ui.add_space(theme::SP_XS);
                     }
                     ui.separator();
-                    form_grid(&format!("queue-grid-{}", q.id)).show(ui, |ui| {
+                    ui::form_grid(&format!("queue-grid-{}", q.id)).show(ui, |ui| {
                         let mut maxc = q.max_concurrent;
                         let mut auto = q.auto_start;
                         let mut retry = q.retry_count;
                         let mut interval = q.retry_interval_secs;
-                        form_label(ui, "Max concurrent");
+                        ui::form_label(ui, "Max concurrent");
                         ui.horizontal(|ui| {
                             ui.add_sized([DRAG_W, theme::BTN_H], drag(&mut maxc).range(1..=16));
                             ui.checkbox(&mut auto, "Auto-start");
                         });
                         ui.end_row();
-                        form_label(ui, "Retries");
+                        ui::form_label(ui, "Retries");
                         ui.horizontal(|ui| {
                             ui.add_sized([DRAG_W, theme::BTN_H], drag(&mut retry).range(0..=20));
                             ui.label("every (s):");
@@ -8230,7 +8463,7 @@ impl DownloadApp {
                         }
                     });
                 });
-                ui.add_space(6.0);
+                ui.add_space(theme::SP_SM);
             }
         } else {
             // IDM Scheduler layout: left list (New/Delete), right grouped editor.
@@ -8249,7 +8482,7 @@ impl DownloadApp {
                     }
                 });
             });
-            ui.add_space(8.0);
+            ui.add_space(theme::SP_SM);
             let schedules = crate::lock_unpoison(&self.rt).state.schedules.clone();
             let queues = crate::lock_unpoison(&self.rt).state.queues.clone();
             let (day, secs) = self.minutes_today;
@@ -8296,7 +8529,7 @@ impl DownloadApp {
                             }
                         });
                     ui.horizontal(|ui| {
-                        if theme::primary_btn(ui, "New").clicked() {
+                        if ui::primary_button(ui, "New").clicked() {
                             let id = crate::model::new_id();
                             let mut g = crate::lock_unpoison(&self.rt);
                             g.state.schedules.push(Schedule {
@@ -8313,7 +8546,7 @@ impl DownloadApp {
                             self.selected_schedule = Some(id);
                         }
                         ui.add_enabled_ui(self.selected_schedule.is_some(), |ui| {
-                            if theme::ghost_btn(ui, "Delete").clicked() {
+                            if ui::secondary_button(ui, "Delete").clicked() {
                                 if let Some(id) = self.selected_schedule.take() {
                                     let mut g = crate::lock_unpoison(&self.rt);
                                     g.state.schedules.retain(|x| x.id != id);
@@ -8343,15 +8576,12 @@ impl DownloadApp {
                         }
                         g.save();
                     };
-                    form_grid("sch-name-grid").show(ui, |ui| {
-                        form_label(ui, "Name");
+                    ui::form_grid("sch-name-grid").show(ui, |ui| {
+                        ui::form_label(ui, "Name");
                         ui.horizontal(|ui| {
                             let mut name = sch.name.clone();
                             if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut name)
-                                        .desired_width(f32::INFINITY),
-                                )
+                                .add(ui::text_field(&mut name).desired_width(f32::INFINITY))
                                 .changed()
                             {
                                 edit(self, &move |x: &mut Schedule| x.name = name.clone());
@@ -8364,22 +8594,22 @@ impl DownloadApp {
                         ui.end_row();
                     });
                     ui.horizontal(|ui| match next_run_in(&sch, day, secs) {
-                        Some(n) => theme::badge(
+                        Some(n) => ui::badge(
                             ui,
                             &format!("next in {}", eta(n as f64)),
-                            theme::STEEL_TEXT,
+                            ui::BadgeKind::Info,
                         ),
-                        None => theme::badge(ui, "no next run", theme::TEXT_FAINT),
+                        None => ui::badge(ui, "no next run", ui::BadgeKind::Neutral),
                     });
-                    ui.add_space(4.0);
+                    ui.add_space(theme::SP_XS);
                     ui.label(
                         egui::RichText::new("Start time")
                             .color(theme::TEXT_MUTED)
                             .small()
                             .strong(),
                     );
-                    form_grid("sch-start-grid").show(ui, |ui| {
-                        form_label(ui, "Queue");
+                    ui::form_grid("sch-start-grid").show(ui, |ui| {
+                        ui::form_label(ui, "Queue");
                         ui.horizontal_wrapped(|ui| {
                             egui::ComboBox::from_id_salt("sch-queue")
                                 .selected_text(
@@ -8481,7 +8711,7 @@ impl DownloadApp {
                             }
                         });
                     }
-                    ui.add_space(4.0);
+                    ui.add_space(theme::SP_XS);
                     ui.label(
                         egui::RichText::new("Stop time")
                             .color(theme::TEXT_MUTED)
@@ -8538,15 +8768,15 @@ impl DownloadApp {
                             );
                         }
                     });
-                    ui.add_space(4.0);
+                    ui.add_space(theme::SP_XS);
                     ui.label(
                         egui::RichText::new("Files in queue")
                             .color(theme::TEXT_MUTED)
                             .small()
                             .strong(),
                     );
-                    form_grid("sch-files-grid").show(ui, |ui| {
-                        form_label(ui, "Simultaneous");
+                    ui::form_grid("sch-files-grid").show(ui, |ui| {
+                        ui::form_label(ui, "Simultaneous");
                         ui.horizontal(|ui| {
                             let mut f = sch.files_at_once;
                             ui.add_sized([DRAG_W, theme::BTN_H], drag(&mut f).range(0..=32));
@@ -8556,7 +8786,7 @@ impl DownloadApp {
                             }
                         });
                         ui.end_row();
-                        form_label(ui, "On finish");
+                        ui::form_label(ui, "On finish");
                         ui.horizontal_wrapped(|ui| {
                             let mut oc = sch.on_complete;
                             egui::ComboBox::from_id_salt("sch-oncomplete")
@@ -8585,7 +8815,7 @@ impl DownloadApp {
                                 // back to queue (run_completion reads q.on_complete_arg).
                                 if ui
                                     .add(
-                                        egui::TextEdit::singleline(&mut arg)
+                                        ui::text_field(&mut arg)
                                             .hint_text("command, {file} = file")
                                             .desired_width(f32::INFINITY),
                                     )
@@ -8611,7 +8841,7 @@ impl DownloadApp {
                             }
                         });
                         ui.end_row();
-                        form_label(ui, "Speed limit KB/s");
+                        ui::form_label(ui, "Speed limit KB/s");
                         ui.horizontal(|ui| {
                             let mut lim = sch.limit_kbps;
                             if ui
@@ -8626,7 +8856,7 @@ impl DownloadApp {
                             ui.label("(0 = unlimited)");
                         });
                         ui.end_row();
-                        form_label(ui, "Quota MB / hours");
+                        ui::form_label(ui, "Quota MB / hours");
                         ui.horizontal_wrapped(|ui| {
                             let (mut qmb, mut qh) = (sch.quota_mb, sch.quota_hours);
                             ui.add_sized(
@@ -8654,7 +8884,11 @@ impl DownloadApp {
                         ui.end_row();
                     });
                     ui.horizontal(|ui| {
-                        if icon_btn(ui, Icon::Play, "Start now", false, 96.0).clicked() {
+                        if ui::Btn::secondary("Start now")
+                            .icon(Icon::Play)
+                            .show(ui)
+                            .clicked()
+                        {
                             let ids: Vec<String> = crate::lock_unpoison(&self.rt)
                                 .state
                                 .tasks
@@ -8709,16 +8943,16 @@ impl DownloadApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add_space(8.0);
+                ui.add_space(theme::SP_SM);
                 ui.heading("Streams");
-                ui.add_space(6.0);
+                ui.add_space(theme::SP_SM);
                 theme::panel().show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     section(ui, "Play in mpv (embedded in app)");
-                    form_grid("streams-grid").show(ui, |ui| {
-                        form_label(ui, "Video URL");
+                    ui::form_grid("streams-grid").show(ui, |ui| {
+                        ui::form_label(ui, "Video URL");
                         ui.add(
-                            egui::TextEdit::singleline(&mut self.stream_url)
+                            ui::text_field(&mut self.stream_url)
                                 .hint_text(
                                     "https://example.com/video.mp4, .m3u8, or local file path",
                                 )
@@ -8729,20 +8963,16 @@ impl DownloadApp {
                     let url = self.stream_url.trim().to_string();
                     let ctx = ui.ctx().clone();
                     ui.horizontal_wrapped(|ui| {
-                        if icon_btn_enabled(
-                            ui,
-                            Icon::Play,
-                            "Play in mpv",
-                            true,
-                            120.0,
-                            !url.is_empty(),
-                        )
-                        .clicked()
+                        if ui::Btn::primary("Play in mpv")
+                            .icon(Icon::Play)
+                            .enabled(!url.is_empty())
+                            .show(ui)
+                            .clicked()
                         {
                             self.play_embedded(&url);
                             self.stream_status_err = self.stream_status.starts_with("ERR ");
                         }
-                        if theme::ghost_btn(ui, "Paste").clicked() {
+                        if ui::secondary_button(ui, "Paste").clicked() {
                             if let Ok(mut cb) = arboard::Clipboard::new() {
                                 if let Ok(txt) = cb.get_text() {
                                     if !txt.trim().is_empty() {
@@ -8752,13 +8982,13 @@ impl DownloadApp {
                             }
                             ctx.request_repaint();
                         }
-                        if theme::ghost_btn(ui, "Clear").clicked() {
+                        if ui::secondary_button(ui, "Clear").clicked() {
                             self.stream_url.clear();
                             self.stream_status.clear();
                             self.stream_status_err = false;
                             ctx.request_repaint();
                         }
-                        if theme::ghost_btn(ui, "Download").clicked() && !url.is_empty() {
+                        if ui::secondary_button(ui, "Download").clicked() && !url.is_empty() {
                             let id = {
                                 let mut g = crate::lock_unpoison(&self.rt);
                                 g.add_url(&url, "main", "", "")
@@ -8780,7 +9010,7 @@ impl DownloadApp {
                         }
                     });
                     if !self.stream_status.is_empty() {
-                        ui.add_space(4.0);
+                        ui.add_space(theme::SP_XS);
                         ui.label(
                             egui::RichText::new(self.stream_status.clone())
                                 .color(if self.stream_status_err {
@@ -8791,7 +9021,7 @@ impl DownloadApp {
                                 .small(),
                         );
                     }
-                    ui.add_space(6.0);
+                    ui.add_space(theme::SP_SM);
                     let mpv_found = {
                         let g = crate::lock_unpoison(&self.rt);
                         downloadcraft_lib::mpv::find_mpv(&g.state.settings.mpv_path)
@@ -8818,7 +9048,7 @@ impl DownloadApp {
                         }
                     }
                 });
-                ui.add_space(10.0);
+                ui.add_space(theme::SP_MD);
                 theme::panel().show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     section(ui, "Stream downloads");
@@ -8866,17 +9096,21 @@ impl DownloadApp {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    theme::badge(
+                                    ui::badge(
                                         ui,
                                         &format!("{status:?}"),
-                                        theme::status_color(*status),
+                                        ui::BadgeKind::status(*status),
                                     );
                                     if *status != TaskStatus::Downloading
-                                        && theme::ghost_btn(ui, "Start download").clicked()
+                                        && ui::secondary_button(ui, "Start download").clicked()
                                     {
                                         to_start = Some(id.clone());
                                     }
-                                    if icon_btn(ui, Icon::Play, "Play", false, 78.0).clicked() {
+                                    if ui::Btn::secondary("Play")
+                                        .icon(Icon::Play)
+                                        .show(ui)
+                                        .clicked()
+                                    {
                                         to_play = Some(url.clone());
                                     }
                                 },
@@ -8895,69 +9129,69 @@ impl DownloadApp {
             });
     }
     fn ui_grabber(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
+        ui.add_space(theme::SP_SM);
         ui.horizontal(|ui| {
-            ui.add_space(8.0);
+            ui.add_space(theme::SP_SM);
             ui.heading("Site Grabber");
         });
-        ui.add_space(4.0);
-        ui.add_space(4.0);
+        ui.add_space(theme::SP_XS);
+        ui.add_space(theme::SP_XS);
         theme::panel().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            form_grid("grab-grid").show(ui, |ui| {
-                form_label(ui, "Start URL");
+            ui::form_grid("grab-grid").show(ui, |ui| {
+                ui::form_label(ui, "Start URL");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.grab_url)
+                    ui::text_field(&mut self.grab_url)
                         .hint_text("https://example.com/")
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
-                form_label(ui, "Extensions");
+                ui::form_label(ui, "Extensions");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.grab_exts)
+                    ui::text_field(&mut self.grab_exts)
                         .hint_text("zip,mp4,pdf (empty = all)")
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
-                form_label(ui, "Depth");
+                ui::form_label(ui, "Depth");
                 ui.horizontal(|ui| {
                     ui.add_sized([DRAG_W, theme::BTN_H], drag(&mut self.grab_depth).range(0..=10));
                     ui.label("External levels:");
                     ui.add_sized([DRAG_W, theme::BTN_H], drag(&mut self.grab_ext_depth).range(0..=10));
                 });
                 ui.end_row();
-                form_label(ui, "Scope");
+                ui::form_label(ui, "Scope");
                 ui.horizontal_wrapped(|ui| {
                     egui::ComboBox::from_id_salt("grab-scope").width(ui.available_width()).selected_text(["Same host", "Same domain", "Any host"][self.grab_scope.min(2) as usize]).show_ui(ui, |ui| { for (i, l) in ["Same host", "Same domain", "Any host"].iter().enumerate() { ui.selectable_value(&mut self.grab_scope, i as u8, *l); } });
                     ui.checkbox(&mut self.grab_parent_dirs, "Don't explore parent dirs");
                 });
                 ui.end_row();
-                form_label(ui, "Only paths");
+                ui::form_label(ui, "Only paths");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.grab_only_paths)
+                    ui::text_field(&mut self.grab_only_paths)
                         .hint_text("/files/;cdn.example.com (; separated)")
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
-                form_label(ui, "Exclude paths");
+                ui::form_label(ui, "Exclude paths");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.grab_exclude_paths)
+                    ui::text_field(&mut self.grab_exclude_paths)
                         .hint_text("/logout;/ads/ (; separated)")
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
-                form_label(ui, "Cookies");
+                ui::form_label(ui, "Cookies");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.grab_cookies)
+                    ui::text_field(&mut self.grab_cookies)
                         .hint_text("name=value; ... (browser Grab site fills this; SharePoint needs it)")
                         .password(true)
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
             });
-            ui.add_space(6.0);
+            ui.add_space(theme::SP_SM);
             ui.horizontal_wrapped(|ui| {
-                if icon_btn_enabled(ui, Icon::Search, "Explore", true, 92.0, !self.grab_url.trim().is_empty()).clicked() || (self.grab_auto_explore && !self.grab_busy && !self.grab_url.trim().is_empty()) {
+                if ui::Btn::primary("Explore").icon(Icon::Search).enabled(!self.grab_url.trim().is_empty()).show(ui).clicked() || (self.grab_auto_explore && !self.grab_busy && !self.grab_url.trim().is_empty()) {
                     self.grab_auto_explore = false;
                     let proj = self.grab_project(false);
                     // Never show/persist session cookies in project JSON.
@@ -8981,7 +9215,7 @@ impl DownloadApp {
                     GRAB_SLOT.with(|s| *s.borrow_mut() = Some(files_slot));
                 }
                 ui.label(egui::RichText::new("Results update automatically").color(theme::TEXT_MUTED).small());
-                if icon_btn_enabled(ui, Icon::Globe, "Mirror site", false, 104.0, !self.grab_url.trim().is_empty()).clicked() {
+                if ui::Btn::secondary("Mirror site").icon(Icon::Globe).enabled(!self.grab_url.trim().is_empty()).show(ui).clicked() {
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                         let proj = self.grab_project(true);
                         self.grab_busy = true;
@@ -8997,7 +9231,7 @@ impl DownloadApp {
                 ui.label(egui::RichText::new(&self.grab_status).color(if self.grab_busy { theme::TEAL_500 } else { theme::TEXT_MUTED }).small());
             });
         });
-        ui.add_space(6.0);
+        ui.add_space(theme::SP_SM);
         theme::panel().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
@@ -9009,18 +9243,14 @@ impl DownloadApp {
                     .strong(),
                 );
             });
-            ui.add_space(4.0);
+            ui.add_space(theme::SP_XS);
             ui.horizontal_wrapped(|ui| {
                 action_group(ui, "Download", |ui| {
-                    if icon_btn_enabled(
-                        ui,
-                        Icon::Download,
-                        "Enqueue selected",
-                        true,
-                        140.0,
-                        self.grab_files.iter().any(|f| f.selected),
-                    )
-                    .clicked()
+                    if ui::Btn::secondary("Enqueue selected")
+                        .icon(Icon::Download)
+                        .enabled(self.grab_files.iter().any(|f| f.selected))
+                        .show(ui)
+                        .clicked()
                     {
                         // Collect owned rows first: add_url + gate_collision
                         // (&mut self) cannot run under grab_files iterator.
@@ -9056,29 +9286,21 @@ impl DownloadApp {
                     }
                 });
                 action_group(ui, "Selection", |ui| {
-                    if icon_btn_enabled(
-                        ui,
-                        Icon::Check,
-                        "Select all",
-                        false,
-                        92.0,
-                        !self.grab_files.is_empty(),
-                    )
-                    .clicked()
+                    if ui::Btn::secondary("Select all")
+                        .icon(Icon::Check)
+                        .enabled(!self.grab_files.is_empty())
+                        .show(ui)
+                        .clicked()
                     {
                         for f in &mut self.grab_files {
                             f.selected = true;
                         }
                     }
-                    if icon_btn_enabled(
-                        ui,
-                        Icon::Delete,
-                        "Select none",
-                        false,
-                        102.0,
-                        self.grab_files.iter().any(|f| f.selected),
-                    )
-                    .clicked()
+                    if ui::Btn::secondary("Select none")
+                        .icon(Icon::Delete)
+                        .enabled(self.grab_files.iter().any(|f| f.selected))
+                        .show(ui)
+                        .clicked()
                     {
                         for f in &mut self.grab_files {
                             f.selected = false;
@@ -9086,15 +9308,11 @@ impl DownloadApp {
                     }
                 });
                 action_group(ui, "Files", |ui| {
-                    if icon_btn_enabled(
-                        ui,
-                        Icon::Document,
-                        "Export .txt",
-                        false,
-                        102.0,
-                        !self.grab_files.is_empty(),
-                    )
-                    .clicked()
+                    if ui::Btn::secondary("Export .txt")
+                        .icon(Icon::Document)
+                        .enabled(!self.grab_files.is_empty())
+                        .show(ui)
+                        .clicked()
                     {
                         if let Some(p) = rfd::FileDialog::new()
                             .add_filter("txt", &["txt"])
@@ -9110,15 +9328,11 @@ impl DownloadApp {
                             );
                         }
                     }
-                    if icon_btn_enabled(
-                        ui,
-                        Icon::Document,
-                        "Export CSV",
-                        false,
-                        102.0,
-                        !self.grab_files.is_empty(),
-                    )
-                    .clicked()
+                    if ui::Btn::secondary("Export CSV")
+                        .icon(Icon::Document)
+                        .enabled(!self.grab_files.is_empty())
+                        .show(ui)
+                        .clicked()
                     {
                         if let Some(p) = rfd::FileDialog::new()
                             .add_filter("csv", &["csv"])
@@ -9137,15 +9351,11 @@ impl DownloadApp {
                             let _ = std::fs::write(p, s);
                         }
                     }
-                    if icon_btn_enabled(
-                        ui,
-                        Icon::FolderOpen,
-                        "Save project",
-                        false,
-                        112.0,
-                        !self.grab_files.is_empty(),
-                    )
-                    .clicked()
+                    if ui::Btn::secondary("Save project")
+                        .icon(Icon::FolderOpen)
+                        .enabled(!self.grab_files.is_empty())
+                        .show(ui)
+                        .clicked()
                     {
                         if let Some(p) = rfd::FileDialog::new()
                             .add_filter("json", &["json"])
@@ -9154,7 +9364,11 @@ impl DownloadApp {
                             let _ = std::fs::write(p, &self.grab_project_json);
                         }
                     }
-                    if icon_btn(ui, Icon::FolderOpen, "Load project", false, 112.0).clicked() {
+                    if ui::Btn::secondary("Load project")
+                        .icon(Icon::FolderOpen)
+                        .show(ui)
+                        .clicked()
+                    {
                         if let Some(p) = rfd::FileDialog::new().pick_file() {
                             if let Ok(t) = std::fs::read_to_string(p) {
                                 self.grab_project_json = t.clone();
@@ -9430,7 +9644,7 @@ impl DownloadApp {
                         });
                 });
         });
-        ui.add_space(6.0);
+        ui.add_space(theme::SP_SM);
         ui.collapsing("Project JSON", |ui| {
             ui.add(
                 egui::TextEdit::multiline(&mut self.grab_project_json)
@@ -9447,7 +9661,7 @@ impl DownloadApp {
                 .color(theme::TEAL_500)
                 .small(),
         );
-        ui.add_space(6.0);
+        ui.add_space(theme::SP_SM);
 
         // Section navigation: icon + label in one control. Wraps on narrow windows.
         ui.horizontal_wrapped(|ui| {
@@ -9463,12 +9677,24 @@ impl DownloadApp {
                 (9, "mpv", Icon::Play),
                 (7, "About", Icon::Info),
             ] {
-                if icon_btn(ui, ic, name, self.options_tab == i, 104.0).clicked() {
+                if ui::Btn::new(
+                    if self.options_tab == i {
+                        ui::ButtonKind::Primary
+                    } else {
+                        ui::ButtonKind::Secondary
+                    },
+                    name,
+                )
+                .icon(ic)
+                .min_width(104.0)
+                .show(ui)
+                .clicked()
+                {
                     self.options_tab = i;
                 }
             }
         });
-        ui.add_space(8.0);
+        ui.add_space(theme::SP_SM);
 
         let mut settings = {
             let g = crate::lock_unpoison(&self.rt);
@@ -9492,69 +9718,69 @@ impl DownloadApp {
                     section(ui, "General");
                     // Checkboxes aligned under label col (120 + 12 gap).
                     ui.horizontal(|ui| {
-                        ui.add_space(LABEL_W + 12.0);
+                        ui.add_space(ui::LABEL_W + 12.0);
                         ui.vertical(|ui| {
                             ui.checkbox(&mut settings.start_minimized, "Start minimized");
                             ui.checkbox(&mut settings.notifications, "Desktop notifications");
-                            ui.checkbox(&mut settings.close_to_tray, "Close to tray");
+                            ui.checkbox(&mut settings.minimize_to_tray, "Minimize to tray");
                             ui.checkbox(&mut settings.clipboard_monitor, "Start downloads for URLs copied to clipboard");
                             ui.checkbox(&mut settings.autostart, "Launch on OS startup");
                         });
                     });
-                    ui.add_space(6.0);
+                    ui.add_space(theme::SP_SM);
                     section(ui, "Download directory");
-                    form_grid("opts-dir-grid").show(ui, |ui| {
-                        form_label(ui, "Directory");
+                    ui::form_grid("opts-dir-grid").show(ui, |ui| {
+                        ui::form_label(ui, "Directory");
                         ui.horizontal_wrapped(|ui| {
                             ui.add(egui::Label::new(egui::RichText::new(settings.download_dir.display().to_string()).monospace().small()).truncate()).on_hover_text(settings.download_dir.display().to_string());
-                            if icon_btn(ui, Icon::FolderOpen, "Browse", false, 96.0).clicked() { if let Some(path) = rfd::FileDialog::new().pick_folder() { settings.download_dir = path; } }
+                            if ui::Btn::secondary("Browse").icon(Icon::FolderOpen).show(ui).clicked() { if let Some(path) = rfd::FileDialog::new().pick_folder() { settings.download_dir = path; } }
                         });
                         ui.end_row();
                     });
                     ui.label(egui::RichText::new(format!("Config directory: {}", platform::config_dir().display())).color(theme::TEXT_FAINT).small());
-                    ui.add_space(10.0);
+                    ui.add_space(theme::SP_MD);
                     section(ui, "Backup (settings only)");
                     ui.horizontal_wrapped(|ui| {
-                        if icon_btn(ui, Icon::Download, "Export Settings", false, 140.0).clicked() { export_settings_flag = true; }
-                        if icon_btn(ui, Icon::FolderOpen, "Import Settings", false, 140.0).clicked() { import_settings_flag = true; }
+                        if ui::Btn::secondary("Export Settings").icon(Icon::Download).show(ui).clicked() { export_settings_flag = true; }
+                        if ui::Btn::secondary("Import Settings").icon(Icon::FolderOpen).show(ui).clicked() { import_settings_flag = true; }
                     });
                     ui.label(egui::RichText::new("Exported file contains API tokens and passwords in plain text. Keep it private. Import replaces all settings; downloads and queues unchanged.").color(theme::ERR).small());
                 }
                 1 => {
                     section(ui, "File types");
-                    form_grid("opts-types-grid").show(ui, |ui| {
+                    ui::form_grid("opts-types-grid").show(ui, |ui| {
                         for (cat, exts) in [("Compressed", "zip rar 7z tar gz bz2 xz"), ("Documents", "pdf doc docx xls xlsx ppt pptx txt epub"), ("Music", "mp3 flac ogg wav m4a aac"), ("Programs", "exe msi dmg pkg deb rpm appimage"), ("Video", "mp4 mkv avi mov webm ts m3u8 mpd")] {
-                            form_label(ui, cat);
+                            ui::form_label(ui, cat);
                             ui.label(egui::RichText::new(exts).color(theme::TEXT_MUTED).monospace().small());
                             ui.end_row();
                         }
                     });
                     ui.label(egui::RichText::new("Category comes from the file name when a download is added. The sidebar filters by category.").color(theme::TEXT_FAINT).small());
-                    ui.add_space(10.0);
+                    ui.add_space(theme::SP_MD);
                     section(ui, "Sidebar count badges");
                     ui.horizontal(|ui| {
-                        ui.add_space(LABEL_W + 12.0);
+                        ui.add_space(ui::LABEL_W + 12.0);
                         ui.checkbox(&mut settings.nav_count_badges, "Colored count badges");
                     });
                     if settings.nav_count_badges {
-                    ui.add_space(6.0);
+                    ui.add_space(theme::SP_SM);
                     section(ui, "Category colors");
-                    form_grid("opts-cat-colors-grid").show(ui, |ui| {
+                    ui::form_grid("opts-cat-colors-grid").show(ui, |ui| {
                         for name in ["All Downloads", "Compressed", "Documents", "Programs", "Video", "Audio", "General", "Unfinished", "Finished"] {
                             badge_color_row(ui, name, name, theme::category_color(name), &mut settings.category_colors);
                         }
                     });
-                    ui.add_space(6.0);
+                    ui.add_space(theme::SP_SM);
                     section(ui, "Type colors");
-                    form_grid("opts-type-colors-grid").show(ui, |ui| {
+                    ui::form_grid("opts-type-colors-grid").show(ui, |ui| {
                         for sel in TypeSel::ALL {
                             badge_color_row(ui, sel.label(), sel.key(), theme::type_key_color(sel.key()), &mut settings.type_colors);
                         }
                     });
-                    ui.add_space(6.0);
+                    ui.add_space(theme::SP_SM);
                     ui.horizontal(|ui| {
-                        ui.add_space(LABEL_W + 12.0);
-                        if theme::ghost_btn(ui, "Reset badge colors").clicked() {
+                        ui.add_space(ui::LABEL_W + 12.0);
+                        if ui::secondary_button(ui, "Reset badge colors").clicked() {
                             settings.category_colors.clear();
                             settings.type_colors.clear();
                         }
@@ -9563,11 +9789,11 @@ impl DownloadApp {
                 }
                 2 => {
                     section(ui, "Save to");
-                    form_grid("opts-saveto-grid").show(ui, |ui| {
-                        form_label(ui, "Directory");
+                    ui::form_grid("opts-saveto-grid").show(ui, |ui| {
+                        ui::form_label(ui, "Directory");
                         ui.horizontal_wrapped(|ui| {
                             ui.add(egui::Label::new(egui::RichText::new(settings.download_dir.display().to_string()).monospace().small()).truncate()).on_hover_text(settings.download_dir.display().to_string());
-                            if icon_btn(ui, Icon::FolderOpen, "Browse", false, 96.0).clicked() { if let Some(path) = rfd::FileDialog::new().pick_folder() { settings.download_dir = path; } }
+                            if ui::Btn::secondary("Browse").icon(Icon::FolderOpen).show(ui).clicked() { if let Some(path) = rfd::FileDialog::new().pick_folder() { settings.download_dir = path; } }
                         });
                         ui.end_row();
                     });
@@ -9579,12 +9805,12 @@ impl DownloadApp {
                     ui.add(egui::Slider::new(&mut settings.global_max_concurrent, 1..=16).text("Simultaneous downloads"));
                     ui.add(egui::Slider::new(&mut settings.speed_limit_kbps, 0..=100_000).text("Speed limit KB/s (0 = unlimited)"));
                     ui.label(egui::RichText::new("Double-click a download to open its progress window.").color(theme::TEXT_FAINT).small());
-                    ui.add_space(8.0);
+                    ui.add_space(theme::SP_SM);
                     section(ui, "Rename template");
-                    form_grid("opts-rename-grid").show(ui, |ui| {
-                        form_label(ui, "Template");
+                    ui::form_grid("opts-rename-grid").show(ui, |ui| {
+                        ui::form_label(ui, "Template");
                         ui.add(
-                            egui::TextEdit::singleline(&mut settings.folder_template)
+                            ui::text_field(&mut settings.folder_template)
                                 .hint_text("{name}-{date}{ext}")
                                 .desired_width(f32::INFINITY),
                         );
@@ -9592,7 +9818,7 @@ impl DownloadApp {
                     });
                     ui.label(egui::RichText::new("Tokens: {name} stem, {ext} with dot, {date} YYYY-MM-DD, {host}, {category}. Empty keeps original name. New downloads only.").color(theme::TEXT_FAINT).small());
                     ui.horizontal(|ui| {
-                        ui.add_space(LABEL_W + 12.0);
+                        ui.add_space(ui::LABEL_W + 12.0);
                         ui.checkbox(&mut settings.category_subfolders, "Category subfolders");
                     });
                     ui.label(egui::RichText::new("Save new downloads under download folder / category (Video, Music, …). General stays in download folder.").color(theme::TEXT_FAINT).small());
@@ -9601,10 +9827,10 @@ impl DownloadApp {
                     section(ui, "Connection");
                     ui.add(egui::Slider::new(&mut settings.max_connections, 1..=32).text("Connections per file"));
                     ui.label(egui::RichText::new("Connect timeout 15 seconds. Read timeout 60 seconds. A failed segment retries with backoff.").color(theme::TEXT_FAINT).small());
-                    ui.add_space(10.0);
+                    ui.add_space(theme::SP_MD);
                     section(ui, "BitTorrent");
-                    form_grid("opts-bt-grid").show(ui, |ui| {
-                        form_label(ui, "Listen port");
+                    ui::form_grid("opts-bt-grid").show(ui, |ui| {
+                        ui::form_label(ui, "Listen port");
                         ui.horizontal(|ui| {
                             ui.add_sized([DRAG_W, theme::BTN_H], drag(&mut settings.torrent_listen_port).range(0..=65535));
                             ui.label("(0 = auto)");
@@ -9612,45 +9838,45 @@ impl DownloadApp {
                         ui.end_row();
                     });
                     ui.horizontal(|ui| {
-                        ui.add_space(LABEL_W + 12.0);
+                        ui.add_space(ui::LABEL_W + 12.0);
                         ui.checkbox(&mut settings.torrent_seed_after_complete, "Seed after download completes");
                     });
                     ui.label(egui::RichText::new("Applies on restart. Speed limit above also caps torrent upload + download.").color(theme::TEXT_FAINT).small());
                 }
                 5 => {
                     section(ui, "Proxy / SOCKS");
-                    form_grid("opts-proxy-grid").show(ui, |ui| {
-                        form_label(ui, "Proxy");
+                    ui::form_grid("opts-proxy-grid").show(ui, |ui| {
+                        ui::form_label(ui, "Proxy");
                         ui.add(
-                            egui::TextEdit::singleline(&mut settings.proxy_url)
+                            ui::text_field(&mut settings.proxy_url)
                                 .hint_text("http://user:pass@host:port or socks5://host:port")
                                 .desired_width(f32::INFINITY),
                         );
                         ui.end_row();
                     });
                     ui.label(egui::RichText::new("Leave empty for a direct connection. Default for all downloads; override per download in Add URL (Transfer → Proxy), browser Capture, or Progress dialog. SOCKS needs no extra setup.").color(theme::TEXT_FAINT).small());
-                    ui.add_space(10.0);
+                    ui.add_space(theme::SP_MD);
                     section(ui, "NNTP (Usenet / NZB)");
-                    form_grid("opts-nntp-grid").show(ui, |ui| {
-                        form_label(ui, "Server");
+                    ui::form_grid("opts-nntp-grid").show(ui, |ui| {
+                        ui::form_label(ui, "Server");
                         ui.add(
-                            egui::TextEdit::singleline(&mut settings.nntp_host)
+                            ui::text_field(&mut settings.nntp_host)
                                 .hint_text("news.example.com")
                                 .desired_width(f32::INFINITY),
                         );
                         ui.end_row();
-                        form_label(ui, "Port");
+                        ui::form_label(ui, "Port");
                         ui.horizontal(|ui| {
                             ui.add_sized([DRAG_W, theme::BTN_H], drag(&mut settings.nntp_port).range(1..=65535));
                             ui.checkbox(&mut settings.nntp_tls, "TLS");
                         });
                         ui.end_row();
-                        form_label(ui, "Username");
+                        ui::form_label(ui, "Username");
                         ui.add(fill_edit(&mut settings.nntp_user));
                         ui.end_row();
-                        form_label(ui, "Password");
+                        ui::form_label(ui, "Password");
                         ui.add(
-                            egui::TextEdit::singleline(&mut settings.nntp_pass)
+                            ui::text_field(&mut settings.nntp_pass)
                                 .password(true)
                                 .desired_width(f32::INFINITY),
                         );
@@ -9665,34 +9891,34 @@ impl DownloadApp {
                     section(ui, "Browser integration");
                     ui.horizontal_wrapped(|ui| {
                         action_group(ui, "Native host", |ui| {
-                            if icon_btn(ui, Icon::Check, "Repair integration", false, 148.0).clicked() { repair_hosts = true; }
-                            if icon_btn(ui, Icon::Delete, "Remove integration", false, 156.0).clicked() { remove_hosts = true; }
+                            if ui::Btn::secondary("Repair integration").icon(Icon::Check).show(ui).clicked() { repair_hosts = true; }
+                            if ui::Btn::secondary("Remove integration").icon(Icon::Delete).show(ui).clicked() { remove_hosts = true; }
                         });
                     });
                     ui.label(egui::RichText::new(format!("Chromium extension ID: {}", downloadcraft_lib::platform::CHROME_EXT_ID)).color(theme::TEXT_FAINT).small().monospace());
                     ui.label(egui::RichText::new("Load extensions/chromium in Chromium browsers or extensions/firefox in Firefox. Native host: webcraft-host.").color(theme::TEXT_FAINT).small());
-                    ui.add_space(10.0);
+                    ui.add_space(theme::SP_MD);
                     section(ui, "Browser capture filter");
-                    form_grid("opts_capture_filter").show(ui, |ui| {
-                        form_label(ui, "Allowed exts");
+                    ui::form_grid("opts_capture_filter").show(ui, |ui| {
+                        ui::form_label(ui, "Allowed exts");
                         ui.add(
-                            egui::TextEdit::singleline(&mut settings.capture_exts)
+                            ui::text_field(&mut settings.capture_exts)
                                 .hint_text("mp4,zip,pdf,mp3")
                                 .desired_width(f32::INFINITY),
                         );
                         ui.end_row();
-                        form_label(ui, "Min size MB");
+                        ui::form_label(ui, "Min size MB");
                         ui.add_sized([DRAG_W, theme::BTN_H], drag(&mut settings.capture_min_mb).range(0..=100_000));
                         ui.end_row();
                     });
-                    ui.label(egui::RichText::new("Empty extensions = all types. Size filter only skips files with known size below limit; unknown size still captured. Explicit browser sends (context menu, video panel) bypass filter.").color(theme::TEXT_FAINT).small());
-                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("Empty extensions = all types. Size filter skips files below limit and files with unknown size (no size to prove large enough) when minimum set. Explicit browser sends (context menu, video panel) bypass filter.").color(theme::TEXT_FAINT).small());
+                    ui.add_space(theme::SP_MD);
                     section(ui, "yt-dlp (video pages)");
                     ui.horizontal(|ui| {
-                        ui.add_space(LABEL_W + 12.0);
+                        ui.add_space(ui::LABEL_W + 12.0);
                         ui.vertical(|ui| {
                             ui.checkbox(&mut settings.ytdlp_auto_update, "Auto-update yt-dlp");
-                            if ghost_btn_w(ui, "Update yt-dlp now").clicked() { update_ytdlp = true; }
+                            if ui::secondary_button(ui, "Update yt-dlp now").clicked() { update_ytdlp = true; }
                         });
                     });
                     ui.label(egui::RichText::new("Downloads video-page URLs (YouTube, Vimeo, ...). Binary: bundled next to exe, config bin/, or PATH; fetched on first use.").color(theme::TEXT_FAINT).small());
@@ -9700,8 +9926,8 @@ impl DownloadApp {
                 8 => {
                     section(ui, "Debrid providers");
                     ui.label(egui::RichText::new("Magnets and supported hoster links resolve to direct HTTP downloads. Failure falls back to local torrent / direct HTTP. Tokens stored plain in state.json (like NNTP creds), masked here, never logged. Resolved links expire/IP-bound: tasks keep original URL and re-resolve on every start.").color(theme::TEXT_FAINT).small());
-                    form_grid("opts-debrid-pref").show(ui, |ui| {
-                        form_label(ui, "Preferred");
+                    ui::form_grid("opts-debrid-pref").show(ui, |ui| {
+                        ui::form_label(ui, "Preferred");
                         let mut pref = crate::debrid::Provider::from_id(&settings.debrid_preferred);
                         egui::ComboBox::from_id_salt("debrid-pref")
                             .selected_text(match pref { Some(p) => p.label(), None => "Auto (RD, AD, TorBox order)" })
@@ -9747,9 +9973,9 @@ impl DownloadApp {
                             ui.checkbox(&mut cfg.use_for_magnets, "Use for magnets");
                             ui.checkbox(&mut cfg.cached_only, "Magnets: cached only");
                         });
-                        form_grid(&format!("opts-debrid-{pid}")).show(ui, |ui| {
-                            form_label(ui, "API token");
-                            ui.add(egui::TextEdit::singleline(&mut cfg.api_key).password(true).desired_width(f32::INFINITY));
+                        ui::form_grid(&format!("opts-debrid-{pid}")).show(ui, |ui| {
+                            ui::form_label(ui, "API token");
+                            ui.add(ui::text_field(&mut cfg.api_key).password(true).desired_width(f32::INFINITY));
                             ui.end_row();
                         });
                         ui.label(egui::RichText::new(match p {
@@ -9759,10 +9985,10 @@ impl DownloadApp {
                         }).color(theme::TEXT_FAINT).small());
                         let busy = self.debrid_ui.busy.contains(pid);
                         ui.horizontal(|ui| {
-                            if ui.add_enabled(!busy && cfg.usable(), egui::Button::new(if busy { "Testing..." } else { "Test connection" })).clicked() {
+                            if ui::Btn::secondary(if busy { "Testing..." } else { "Test connection" }).enabled(!busy && cfg.usable()).show(ui).clicked() {
                                 test_provider = Some(p);
                             }
-                            if ui.add_enabled(!busy && cfg.usable(), egui::Button::new("Refresh hosters")).clicked() {
+                            if ui::Btn::secondary("Refresh hosters").enabled(!busy && cfg.usable()).show(ui).clicked() {
                                 refresh_provider = Some(p);
                             }
                             if let Some(ts) = self.debrid_ui.checked_at.get(pid) {
@@ -9802,27 +10028,27 @@ impl DownloadApp {
                 }
                 9 => {
                     section(ui, "mpv player");
-                    form_grid("opts-mpv-grid").show(ui, |ui| {
-                        form_label(ui, "Path");
+                    ui::form_grid("opts-mpv-grid").show(ui, |ui| {
+                        ui::form_label(ui, "Path");
                         ui.horizontal_wrapped(|ui| {
-                            ui.add(egui::TextEdit::singleline(&mut settings.mpv_path).hint_text("empty = auto-detect beside exe / config bin / PATH").desired_width(f32::INFINITY));
-                            if icon_btn(ui, Icon::FolderOpen, "Browse", false, 96.0).clicked() {
+                            ui.add(ui::text_field(&mut settings.mpv_path).hint_text("empty = auto-detect beside exe / config bin / PATH").desired_width(f32::INFINITY));
+                            if ui::Btn::secondary("Browse").icon(Icon::FolderOpen).show(ui).clicked() {
                                 if let Some(path) = rfd::FileDialog::new().pick_file() {
                                     settings.mpv_path = path.display().to_string();
                                 }
                             }
                         });
                         ui.end_row();
-                        form_label(ui, "Volume");
+                        ui::form_label(ui, "Volume");
                         ui.add(egui::Slider::new(&mut settings.mpv_volume, 0..=100).text("Volume"));
                         ui.end_row();
-                        form_label(ui, "Speed");
+                        ui::form_label(ui, "Speed");
                         ui.add_sized([DRAG_W, theme::BTN_H], drag(&mut settings.mpv_speed).range(0.25..=4.0).speed(0.05));
                         ui.end_row();
-                        form_label(ui, "Start position");
-                        ui.add(egui::TextEdit::singleline(&mut settings.mpv_start).hint_text("90 or 00:01:30 or 50%").desired_width(f32::INFINITY));
+                        ui::form_label(ui, "Start position");
+                        ui.add(ui::text_field(&mut settings.mpv_start).hint_text("90 or 00:01:30 or 50%").desired_width(f32::INFINITY));
                         ui.end_row();
-                        form_label(ui, "Hardware decoding");
+                        ui::form_label(ui, "Hardware decoding");
                         egui::ComboBox::from_id_salt("mpv-hwdec")
                             .selected_text(if settings.mpv_hwdec.is_empty() { "Auto" } else { settings.mpv_hwdec.as_str() })
                             .show_ui(ui, |ui| {
@@ -9831,7 +10057,7 @@ impl DownloadApp {
                                 }
                             });
                         ui.end_row();
-                        form_label(ui, "Subtitles");
+                        ui::form_label(ui, "Subtitles");
                         egui::ComboBox::from_id_salt("mpv-sub-auto")
                             .selected_text(if settings.mpv_sub_auto.is_empty() { "Auto" } else { settings.mpv_sub_auto.as_str() })
                             .show_ui(ui, |ui| {
@@ -9840,15 +10066,15 @@ impl DownloadApp {
                                 }
                             });
                         ui.end_row();
-                        form_label(ui, "Cache seconds");
+                        ui::form_label(ui, "Cache seconds");
                         ui.add_sized([DRAG_W, theme::BTN_H], drag(&mut settings.mpv_cache_secs).range(0..=600));
                         ui.end_row();
-                        form_label(ui, "Extra flags");
-                        ui.add(egui::TextEdit::singleline(&mut settings.mpv_extra_args).hint_text("--profile=fast (advanced)").desired_width(f32::INFINITY));
+                        ui::form_label(ui, "Extra flags");
+                        ui.add(ui::text_field(&mut settings.mpv_extra_args).hint_text("--profile=fast (advanced)").desired_width(f32::INFINITY));
                         ui.end_row();
                     });
                     ui.horizontal(|ui| {
-                        ui.add_space(LABEL_W + 12.0);
+                        ui.add_space(ui::LABEL_W + 12.0);
                         ui.vertical(|ui| {
                             ui.checkbox(&mut settings.mpv_fullscreen, "Fullscreen");
                             ui.checkbox(&mut settings.mpv_keep_open, "Keep open (--keep-open)");
@@ -9864,8 +10090,9 @@ impl DownloadApp {
                     // ponytail: manual check only (no silent startup check / self-replace in v1);
                     // download lands as a normal task, user runs the installer.
                     let checking = matches!(self.update_check, Some(CheckOutcome::Checking));
-                    if ui
-                        .add_enabled(!checking, egui::Button::new("Check updates"))
+                    if ui::Btn::secondary(if checking { "Checking…" } else { "Check updates" })
+                        .enabled(!checking)
+                        .show(ui)
                         .clicked()
                     {
                         self.update_check = Some(CheckOutcome::Checking);
@@ -9894,29 +10121,32 @@ impl DownloadApp {
                     match self.update_check.clone() {
                         None => {}
                         Some(CheckOutcome::Checking) => {
-                            ui.label("Checking for updates...");
+                            ui.horizontal(|ui| {
+                                ui.add(egui::Spinner::new());
+                                ui.label("Checking for updates…");
+                            });
                         }
                         Some(CheckOutcome::UpToDate { latest }) => {
                             ui.colored_label(
-                                egui::Color32::from_rgb(80, 200, 120),
+                                theme::OK,
                                 format!("Up to date (latest {latest})"),
                             );
                         }
                         Some(CheckOutcome::Failed(e)) => {
                             ui.colored_label(
-                                egui::Color32::from_rgb(230, 90, 90),
+                                theme::ERR,
                                 format!("Update check failed: {e}"),
                             );
                         }
                         Some(CheckOutcome::Available { latest, asset }) => {
                             ui.colored_label(
-                                egui::Color32::from_rgb(240, 190, 80),
+                                theme::WARN,
                                 format!("New version {latest} available"),
                             );
                             match asset {
                                 Some((name, url)) => {
                                     ui.label(format!("Asset: {name}"));
-                                    if ui.button("Download update").clicked() {
+                                    if ui::primary_button(ui, "Download update").clicked() {
                                         let id = crate::lock_unpoison(&self.rt)
                                             .add_url(&url, "main", "", "");
                                         // Never self-replace: plain download task.
@@ -10092,6 +10322,36 @@ pub fn fmt_bytes(n: u64) -> String {
         i += 1;
     }
     format!("{v:.1} {}", U[i])
+}
+
+#[cfg(test)]
+mod browser_resume_tests {
+    use super::browser_resume_eligible;
+    use crate::model::DownloadTask;
+
+    fn task(url: &str) -> DownloadTask {
+        DownloadTask {
+            url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn browser_resume_gate() {
+        assert!(browser_resume_eligible(&task("https://ex.com/f.zip")));
+        assert!(browser_resume_eligible(&task("http://ex.com/f.zip")));
+        assert!(!browser_resume_eligible(&task("ftp://ex.com/f.zip")));
+        assert!(!browser_resume_eligible(&task("webcraft://add?url=x")));
+        let mut yt = task("https://youtube.com/watch?v=1");
+        yt.headers.insert("x-ytdlp".into(), "1".into());
+        assert!(!browser_resume_eligible(&yt));
+        let mut page = task("https://ex.com/watch");
+        page.headers.insert("x-page-intent".into(), "page".into());
+        assert!(!browser_resume_eligible(&page));
+        let mut stream = task("https://ex.com/v.mp4");
+        stream.headers.insert("x-page-intent".into(), "stream".into());
+        assert!(browser_resume_eligible(&stream));
+    }
 }
 
 #[cfg(test)]
@@ -10441,8 +10701,8 @@ mod progress_tests {
     fn dl_cols_stored_overflow_shrinks_to_fit() {
         // Persisted widths from a large window must fit a smaller avail:
         // full table visible, no h-scroll overflow.
-        let stored = [900.0, 44.0, 200.0, 150.0, 120.0, 150.0, 300.0, 58.0];
-        for avail in [620.0, 760.0, 980.0] {
+        let stored = [900.0, 44.0, 200.0, 150.0, 120.0, 150.0, 300.0, 76.0, 58.0];
+        for avail in [700.0, 760.0, 980.0] {
             let v = dl_cols(avail, false, Some(&stored));
             let total: f32 = v.iter().sum::<f32>() + COL_GAP * (v.len() - 1) as f32;
             assert!(

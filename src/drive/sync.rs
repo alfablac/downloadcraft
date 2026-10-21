@@ -29,7 +29,7 @@ impl SyncMode {
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct SyncPlan {
-    pub to_copy: Vec<RemoteEntry>, // src entries needing transfer
+    pub to_copy: Vec<RemoteEntry>,   // src entries needing transfer
     pub to_delete: Vec<RemoteEntry>, // dst entries (mirror only)
     pub unchanged: usize,
     pub src_total: u64,
@@ -77,7 +77,10 @@ pub fn plan(
             Some(de) => {
                 let changed = match mode {
                     SyncMode::Copy => false,
-                    _ => se.size != de.size || (se.modified > 0 && de.modified > 0 && se.modified > de.modified + 2),
+                    _ => {
+                        se.size != de.size
+                            || (se.modified > 0 && de.modified > 0 && se.modified > de.modified + 2)
+                    }
                 };
                 if changed {
                     out.to_copy.push(se.clone());
@@ -113,8 +116,16 @@ mod tests {
     }
     #[test]
     fn planner_modes() {
-        let src = vec![f("r/a.txt", 10, 100), f("r/b.txt", 20, 100), f("r/c.txt", 5, 100)];
-        let dst = vec![f("x/a.txt", 10, 100), f("x/b.txt", 99, 50), f("x/old.txt", 1, 1)];
+        let src = vec![
+            f("r/a.txt", 10, 100),
+            f("r/b.txt", 20, 100),
+            f("r/c.txt", 5, 100),
+        ];
+        let dst = vec![
+            f("x/a.txt", 10, 100),
+            f("x/b.txt", 99, 50),
+            f("x/old.txt", 1, 1),
+        ];
         let p = plan(SyncMode::Copy, &src, "r", &dst, "x");
         assert_eq!(p.to_copy.len(), 1); // c only
         assert_eq!(p.to_delete.len(), 0);

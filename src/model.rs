@@ -47,6 +47,12 @@ pub struct DownloadTask {
     /// Structured browser cookies (JSON array from extension getAll) for yt-dlp cookie jar.
     #[serde(default)]
     pub cookies_json: String,
+    /// Probed Content-Type (capture prewarm / download probe). Display + host KV round-trip only.
+    #[serde(default)]
+    pub mime: String,
+    /// Probed HTTP Range support: None = never probed / not HTTP, Some = probe result.
+    #[serde(default)]
+    pub accept_ranges: Option<bool>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
@@ -86,9 +92,17 @@ pub struct DownloadTask {
     pub proxy_url: String,
     /// Display-only debrid route info:
     /// `"<Provider> · <host> · <cached|cached: unknown|not cached>"`.
-    /// Empty = not debrid. Never holds resolved URL/token.
+    /// Empty = not debrid.
     #[serde(default)]
     pub debrid_info: String,
+    /// Last resolved debrid URL. BEARER TOKEN (path/query) persisted in
+    /// state.json per user choice so progress modal can copy it after
+    /// completion; expires server-side. Cleared on redownload/remove.
+    #[serde(default)]
+    pub debrided_url: String,
+    /// Last final (post-redirect) fetch URL. May also carry signed token.
+    #[serde(default)]
+    pub final_url: String,
     /// Torrent file indices to download (empty = all files).
     #[serde(default)]
     pub torrent_files: Vec<usize>,
@@ -233,8 +247,10 @@ pub struct Settings {
     pub autostart: bool,
     #[serde(default)]
     pub start_minimized: bool,
-    #[serde(default)]
-    pub close_to_tray: bool,
+    /// Minimize button hides the window to the tray (X always quits).
+    /// Alias keeps the old `close_to_tray` value from existing state files.
+    #[serde(default = "def_true", alias = "close_to_tray")]
+    pub minimize_to_tray: bool,
     #[serde(default = "def_true")]
     pub notifications: bool,
     #[serde(default)]
@@ -249,7 +265,8 @@ pub struct Settings {
     #[serde(default)]
     pub capture_exts: String,
     /// Browser-capture minimum size in MB. 0 = no minimum. Files with unknown
-    /// size (missing Content-Length) still captured: cannot prove small.
+    /// size (missing Content-Length) denied when a minimum is set: cannot
+    /// prove large enough. Allowed when no minimum set.
     #[serde(default)]
     pub capture_min_mb: u64,
     #[serde(default = "def_true")]
@@ -582,7 +599,7 @@ impl Default for Settings {
             speed_limit_kbps: 0,
             autostart: false,
             start_minimized: false,
-            close_to_tray: true,
+            minimize_to_tray: true,
             notifications: true,
             clipboard_monitor: false,
             proxy_url: String::new(),
@@ -1077,12 +1094,18 @@ mod tests {
         };
         let back: DownloadTask = serde_json::from_value(serde_json::to_value(&t).unwrap()).unwrap();
         assert_eq!(back.torrent_files, vec![0, 2]);
-        // Old state.json without field -> empty (all files).
+        assert_eq!(back.accept_ranges, None);
+        assert!(back.debrided_url.is_empty());
+        assert!(back.final_url.is_empty());
+        // Old state.json without field -> empty (all files) / accept_ranges None.
         t.torrent_files.clear();
         let mut v = serde_json::to_value(&t).unwrap();
         v.as_object_mut().unwrap().remove("torrent_files");
+        // accept_ranges absent in old state -> None (unknown, blank cell).
+        v.as_object_mut().unwrap().remove("accept_ranges");
         let old: DownloadTask = serde_json::from_value(v).unwrap();
         assert!(old.torrent_files.is_empty());
+        assert_eq!(old.accept_ranges, None);
         assert!(old.proxy_url.is_empty());
     }
 

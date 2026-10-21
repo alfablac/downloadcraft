@@ -117,8 +117,7 @@ fn parse_ini(text: &str) -> Vec<Section> {
         }
         if let Some(cur) = out.last_mut() {
             if let Some((k, v)) = l.split_once('=') {
-                cur.kv
-                    .push((k.trim().to_string(), v.trim().to_string()));
+                cur.kv.push((k.trim().to_string(), v.trim().to_string()));
             }
         }
     }
@@ -176,7 +175,10 @@ pub fn parse_rclone_config(text: &str) -> (Vec<DriveAccount>, Vec<String>) {
                 acc.root = sec.get("root_folder_id").into();
                 token_fields(&mut acc, sec);
                 if !sec.get("service_account_file").is_empty() {
-                    warns.push(format!("{}: service account unsupported (ignored)", sec.name));
+                    warns.push(format!(
+                        "{}: service account unsupported (ignored)",
+                        sec.name
+                    ));
                 }
             }
             "onedrive" => {
@@ -185,7 +187,10 @@ pub fn parse_rclone_config(text: &str) -> (Vec<DriveAccount>, Vec<String>) {
                 acc.client_secret = sec.get("client_secret").into();
                 token_fields(&mut acc, sec);
                 if !sec.get("drive_id").is_empty() {
-                    warns.push(format!("{}: OneDrive drive_id not honored (default drive used)", sec.name));
+                    warns.push(format!(
+                        "{}: OneDrive drive_id not honored (default drive used)",
+                        sec.name
+                    ));
                 }
             }
             "dropbox" => {
@@ -218,10 +223,21 @@ pub fn parse_rclone_config(text: &str) -> (Vec<DriveAccount>, Vec<String>) {
                 acc.endpoint = sec.get("endpoint").into();
                 acc.region = {
                     let r = sec.get("region");
-                    if r.is_empty() { "auto".into() } else { r.into() }
+                    if r.is_empty() {
+                        "auto".into()
+                    } else {
+                        r.into()
+                    }
                 };
-                if acc.endpoint.is_empty() && !sec.get("provider").is_empty() && sec.get("provider") != "AWS" {
-                    warns.push(format!("{}: set endpoint for provider {}", sec.name, sec.get("provider")));
+                if acc.endpoint.is_empty()
+                    && !sec.get("provider").is_empty()
+                    && sec.get("provider") != "AWS"
+                {
+                    warns.push(format!(
+                        "{}: set endpoint for provider {}",
+                        sec.name,
+                        sec.get("provider")
+                    ));
                 }
                 warns.push(format!("{}: set Bucket (Root) after import", sec.name));
             }
@@ -233,12 +249,18 @@ pub fn parse_rclone_config(text: &str) -> (Vec<DriveAccount>, Vec<String>) {
                 acc.secret = pw(sec, "pass", &mut warns, &sec.name);
                 acc.ssh_key_path = sec.get("key_file").into();
                 if !sec.get("key_pem").is_empty() {
-                    warns.push(format!("{}: inline key_pem unsupported, use key_file", sec.name));
+                    warns.push(format!(
+                        "{}: inline key_pem unsupported, use key_file",
+                        sec.name
+                    ));
                 }
             }
             "ftp" => {
                 acc.kind = DriveKind::Ftp;
-                let host = sec.get("host").trim_start_matches("ftp://").trim_start_matches("ftps://");
+                let host = sec
+                    .get("host")
+                    .trim_start_matches("ftp://")
+                    .trim_start_matches("ftps://");
                 acc.username = sec.get("user").into();
                 acc.port = sec.get("port").parse().unwrap_or(0);
                 acc.secret = pw(sec, "pass", &mut warns, &sec.name);

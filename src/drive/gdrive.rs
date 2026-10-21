@@ -18,7 +18,14 @@ pub fn parse_drive_id(pasted: &str) -> String {
         return String::new();
     }
     // Full folder marker first: "/drive/u/0/folders/<id>" must not cut at "u/0".
-    for marker in ["/drive/folders/", "folders/", "/drive/u/", "?id=", "&id=", "id="] {
+    for marker in [
+        "/drive/folders/",
+        "folders/",
+        "/drive/u/",
+        "?id=",
+        "&id=",
+        "id=",
+    ] {
         if let Some(pos) = s.find(marker) {
             let rest = &s[pos + marker.len()..];
             let id: String = rest
@@ -69,11 +76,7 @@ impl GDrive {
         }
     }
     async fn token(&self) -> Result<String, String> {
-        let mut acc = self
-            .acc
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let mut acc = self.acc.lock().unwrap_or_else(|e| e.into_inner()).clone();
         super::oauth::ensure_fresh(&mut acc).await?;
         *self.acc.lock().unwrap_or_else(|e| e.into_inner()) = acc.clone();
         Ok(acc.access_token)
@@ -153,11 +156,7 @@ impl GDrive {
         }
         Ok(out)
     }
-    async fn req(
-        &self,
-        m: reqwest::Method,
-        url: &str,
-    ) -> Result<reqwest::RequestBuilder, String> {
+    async fn req(&self, m: reqwest::Method, url: &str) -> Result<reqwest::RequestBuilder, String> {
         Ok(self.client.request(m, url).bearer_auth(self.token().await?))
     }
     /// Resolve display path -> folder id (walk names). Cache-free walk.
@@ -179,12 +178,19 @@ impl GDrive {
                 super::pct(&q),
                 Self::scope_params(&team)
             );
-            let resp = self.req(reqwest::Method::GET, &url).await?.send().await.map_err(|e| e.to_string())?;
+            let resp = self
+                .req(reqwest::Method::GET, &url)
+                .await?
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
             if !resp.status().is_success() {
                 return Err(http_util::err_text(resp).await);
             }
             let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-            let id = v["files"][0]["id"].as_str().ok_or_else(|| format!("Google Drive folder not found: {seg} in {path}"))?;
+            let id = v["files"][0]["id"]
+                .as_str()
+                .ok_or_else(|| format!("Google Drive folder not found: {seg} in {path}"))?;
             cur = id.to_string();
         }
         Ok(cur)
@@ -198,15 +204,34 @@ impl DriveBackend for GDrive {
     }
     async fn about(&self) -> Result<String, String> {
         let url = "https://www.googleapis.com/drive/v3/about?fields=storageQuota,user";
-        let resp = self.req(reqwest::Method::GET, url).await?.send().await.map_err(|e| e.to_string())?;
+        let resp = self
+            .req(reqwest::Method::GET, url)
+            .await?
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
             return Err(http_util::err_text(resp).await);
         }
         let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
         let email = v["user"]["emailAddress"].as_str().unwrap_or("");
-        let limit: u64 = v["storageQuota"]["limit"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let usage: u64 = v["storageQuota"]["usage"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
-        Ok(format!("{email} · {} / {}", super::fmt_bytes(usage), if limit>0 { super::fmt_bytes(limit) } else { "unlimited".into() }))
+        let limit: u64 = v["storageQuota"]["limit"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let usage: u64 = v["storageQuota"]["usage"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        Ok(format!(
+            "{email} · {} / {}",
+            super::fmt_bytes(usage),
+            if limit > 0 {
+                super::fmt_bytes(limit)
+            } else {
+                "unlimited".into()
+            }
+        ))
     }
     async fn list(&self, path: &str) -> Result<Vec<RemoteEntry>, String> {
         let parent = self.folder_id(path).await?;
@@ -223,14 +248,20 @@ impl DriveBackend for GDrive {
             if !page_token.is_empty() {
                 url.push_str(&format!("&pageToken={}", super::pct(&page_token)));
             }
-            let resp = self.req(reqwest::Method::GET, &url).await?.send().await.map_err(|e| e.to_string())?;
+            let resp = self
+                .req(reqwest::Method::GET, &url)
+                .await?
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
             if !resp.status().is_success() {
                 return Err(http_util::err_text(resp).await);
             }
             let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
             if let Some(files) = v["files"].as_array() {
                 for f in files {
-                    let is_dir = f["mimeType"].as_str() == Some("application/vnd.google-apps.folder");
+                    let is_dir =
+                        f["mimeType"].as_str() == Some("application/vnd.google-apps.folder");
                     let name = f["name"].as_str().unwrap_or("").to_string();
                     out.push(RemoteEntry {
                         id: f["id"].as_str().unwrap_or("").into(),
@@ -259,34 +290,87 @@ impl DriveBackend for GDrive {
         let (parent_path, name) = (super::parent_path(path), super::base_name(path));
         let parent = self.folder_id(&parent_path).await?;
         let body = serde_json::json!({"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent]});
-        let resp = self.req(reqwest::Method::POST, "https://www.googleapis.com/drive/v3/files?supportsAllDrives=true").await?
-            .json(&body).send().await.map_err(|e| e.to_string())?;
-        if resp.status().is_success() { Ok(()) } else { Err(http_util::err_text(resp).await) }
+        let resp = self
+            .req(
+                reqwest::Method::POST,
+                "https://www.googleapis.com/drive/v3/files?supportsAllDrives=true",
+            )
+            .await?
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(http_util::err_text(resp).await)
+        }
     }
     async fn delete(&self, entry: &RemoteEntry) -> Result<(), String> {
         // Trash (recoverable) rather than permanent delete.
-        let url = format!("https://www.googleapis.com/drive/v3/files/{}?supportsAllDrives=true", super::pct(&entry.id));
-        let resp = self.req(reqwest::Method::PATCH, &url).await?
-            .json(&serde_json::json!({"trashed": true})).send().await.map_err(|e| e.to_string())?;
-        if resp.status().is_success() { Ok(()) } else { Err(http_util::err_text(resp).await) }
+        let url = format!(
+            "https://www.googleapis.com/drive/v3/files/{}?supportsAllDrives=true",
+            super::pct(&entry.id)
+        );
+        let resp = self
+            .req(reqwest::Method::PATCH, &url)
+            .await?
+            .json(&serde_json::json!({"trashed": true}))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(http_util::err_text(resp).await)
+        }
     }
     async fn rename(&self, entry: &RemoteEntry, new_name: &str) -> Result<(), String> {
-        let url = format!("https://www.googleapis.com/drive/v3/files/{}?supportsAllDrives=true", super::pct(&entry.id));
-        let resp = self.req(reqwest::Method::PATCH, &url).await?
-            .json(&serde_json::json!({"name": new_name})).send().await.map_err(|e| e.to_string())?;
-        if resp.status().is_success() { Ok(()) } else { Err(http_util::err_text(resp).await) }
-    }
-    async fn download(&self, entry: &RemoteEntry, dest: &std::path::Path, parallel: u32, prog: &Progress) -> Result<(), String> {
-        if entry.mime.starts_with("application/vnd.google-apps.") && !entry.is_dir {
-            return Err("Google Docs/Sheets files need export; download from drive.google.com".into());
+        let url = format!(
+            "https://www.googleapis.com/drive/v3/files/{}?supportsAllDrives=true",
+            super::pct(&entry.id)
+        );
+        let resp = self
+            .req(reqwest::Method::PATCH, &url)
+            .await?
+            .json(&serde_json::json!({"name": new_name}))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(http_util::err_text(resp).await)
         }
-        let url = format!("https://www.googleapis.com/drive/v3/files/{}?alt=media&supportsAllDrives=true", super::pct(&entry.id));
+    }
+    async fn download(
+        &self,
+        entry: &RemoteEntry,
+        dest: &std::path::Path,
+        parallel: u32,
+        prog: &Progress,
+    ) -> Result<(), String> {
+        if entry.mime.starts_with("application/vnd.google-apps.") && !entry.is_dir {
+            return Err(
+                "Google Docs/Sheets files need export; download from drive.google.com".into(),
+            );
+        }
+        let url = format!(
+            "https://www.googleapis.com/drive/v3/files/{}?alt=media&supportsAllDrives=true",
+            super::pct(&entry.id)
+        );
         let token = self.token().await?;
         let client = self.client.clone();
         let mk = move || client.get(&url).bearer_auth(&token);
         http_util::download_url(&self.client, &mk, dest, parallel, prog).await
     }
-    async fn upload(&self, local: &std::path::Path, dest_dir: &str, name: &str, prog: &Progress) -> Result<RemoteEntry, String> {
+    async fn upload(
+        &self,
+        local: &std::path::Path,
+        dest_dir: &str,
+        name: &str,
+        prog: &Progress,
+    ) -> Result<RemoteEntry, String> {
         let parent = self.folder_id(dest_dir).await?;
         let size = http_util::file_len(local);
         prog.set_total(size);
@@ -298,32 +382,66 @@ impl DriveBackend for GDrive {
         if !init.status().is_success() {
             return Err(http_util::err_text(init).await);
         }
-        let session = init.headers().get("location").and_then(|v| v.to_str().ok()).ok_or("Drive upload: no session URL")?.to_string();
+        let session = init
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .ok_or("Drive upload: no session URL")?
+            .to_string();
         const CHUNK: u64 = 8 * 1024 * 1024; // multiple of 256KiB required
         let token = self.token().await?;
         let client = self.client.clone();
         let session2 = session.clone();
-        http_util::upload_bytes_chunked(local, CHUNK as usize, move |off, bytes| {
-            let client = client.clone();
-            let session = session2.clone();
-            let token = token.clone();
-            let end = off + bytes.len() as u64 - 1;
-            Box::pin(async move {
-                let resp = client.put(&session)
-                    .bearer_auth(&token)
-                    .header("Content-Range", if bytes.is_empty() { format!("bytes */{off}") } else { format!("bytes {off}-{end}/*") })
-                    .header("Content-Length", bytes.len())
-                    .body(bytes)
-                    .send().await.map_err(|e| e.to_string())?;
-                let st = resp.status().as_u16();
-                if st == 308 || st == 200 || st == 201 { Ok(()) } else { Err(http_util::err_text(resp).await) }
-            })
-        }, prog).await?;
+        http_util::upload_bytes_chunked(
+            local,
+            CHUNK as usize,
+            move |off, bytes| {
+                let client = client.clone();
+                let session = session2.clone();
+                let token = token.clone();
+                let end = off + bytes.len() as u64 - 1;
+                Box::pin(async move {
+                    let resp = client
+                        .put(&session)
+                        .bearer_auth(&token)
+                        .header(
+                            "Content-Range",
+                            if bytes.is_empty() {
+                                format!("bytes */{off}")
+                            } else {
+                                format!("bytes {off}-{end}/*")
+                            },
+                        )
+                        .header("Content-Length", bytes.len())
+                        .body(bytes)
+                        .send()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let st = resp.status().as_u16();
+                    if st == 308 || st == 200 || st == 201 {
+                        Ok(())
+                    } else {
+                        Err(http_util::err_text(resp).await)
+                    }
+                })
+            },
+            prog,
+        )
+        .await?;
         // Final id lookup by name in parent (session response body lost in chunk closure).
         let entries = self.list(dest_dir).await.unwrap_or_default();
-        entries.into_iter().find(|e| e.name == name).ok_or_else(|| "Drive upload done but file not listed".to_string())
+        entries
+            .into_iter()
+            .find(|e| e.name == name)
+            .ok_or_else(|| "Drive upload done but file not listed".to_string())
     }
-    async fn copy_to(&self, _entry: &RemoteEntry, dst: &dyn DriveBackend, _dst_dir: &str, _prog: &Progress) -> Result<(), String> {
+    async fn copy_to(
+        &self,
+        _entry: &RemoteEntry,
+        dst: &dyn DriveBackend,
+        _dst_dir: &str,
+        _prog: &Progress,
+    ) -> Result<(), String> {
         if dst.kind() != DriveKind::GoogleDrive {
             return Err("cross-provider copy: use transfer job".into());
         }
@@ -351,6 +469,9 @@ mod tests {
     #[test]
     fn drives_parse() {
         let v = serde_json::json!({"drives":[{"id":"0A1","name":"Team"}]});
-        assert_eq!(parse_drives(&v), vec![("0A1".to_string(), "Team".to_string())]);
+        assert_eq!(
+            parse_drives(&v),
+            vec![("0A1".to_string(), "Team".to_string())]
+        );
     }
 }

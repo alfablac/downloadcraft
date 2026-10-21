@@ -59,10 +59,7 @@ impl DriveBackend for LocalDrive {
     }
     async fn rename(&self, entry: &RemoteEntry, new_name: &str) -> Result<(), String> {
         let src = self.resolve(&entry.id);
-        let dst = src
-            .parent()
-            .map(|p| p.join(new_name))
-            .ok_or("no parent")?;
+        let dst = src.parent().map(|p| p.join(new_name)).ok_or("no parent")?;
         tokio::fs::rename(src, dst).await.map_err(|e| e.to_string())
     }
     async fn download(

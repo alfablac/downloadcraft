@@ -8,8 +8,8 @@ use super::{DriveBackend, Progress, RemoteEntry};
 use crate::model::DriveKind;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes256;
-use crypto_secretbox::{Key as SbKey, Nonce as SbNonce, XSalsa20Poly1305};
 use crypto_secretbox::aead::{Aead, Payload};
+use crypto_secretbox::{Key as SbKey, Nonce as SbNonce, XSalsa20Poly1305};
 use std::sync::Arc;
 
 const MAGIC: &[u8; 8] = b"RCLONE\x00\x00";
@@ -143,11 +143,7 @@ impl Cipher {
         Ok(out)
     }
 
-    pub fn encrypt_file(
-        &self,
-        src: &std::path::Path,
-        dst: &std::path::Path,
-    ) -> Result<(), String> {
+    pub fn encrypt_file(&self, src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
         use std::io::{Read, Write};
         let mut inp = std::fs::File::open(src).map_err(|e| e.to_string())?;
         let mut out = std::fs::File::create(dst).map_err(|e| e.to_string())?;
@@ -185,15 +181,12 @@ impl Cipher {
         Ok(())
     }
 
-    pub fn decrypt_file(
-        &self,
-        src: &std::path::Path,
-        dst: &std::path::Path,
-    ) -> Result<(), String> {
+    pub fn decrypt_file(&self, src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
         use std::io::{Read, Write};
         let mut inp = std::fs::File::open(src).map_err(|e| e.to_string())?;
         let mut hdr = [0u8; 32];
-        inp.read_exact(&mut hdr).map_err(|_| "crypt: file too short".to_string())?;
+        inp.read_exact(&mut hdr)
+            .map_err(|_| "crypt: file too short".to_string())?;
         if &hdr[..8] != MAGIC {
             return Err("crypt: bad magic (not rclone-crypt file / wrong password)".into());
         }
@@ -549,10 +542,20 @@ mod tests {
     #[test]
     fn name_roundtrip_and_file_roundtrip() {
         let c = Cipher::new("correct horse battery staple", "").unwrap();
-        for name in ["a", "hello.txt", "My Documents", "ünïcödé file.mp4", "12345678901234567890-long-name-for-multiblock-eme-test.bin"] {
+        for name in [
+            "a",
+            "hello.txt",
+            "My Documents",
+            "ünïcödé file.mp4",
+            "12345678901234567890-long-name-for-multiblock-eme-test.bin",
+        ] {
             let enc = c.encrypt_segment(name);
             assert_ne!(enc, name);
-            assert_eq!(c.decrypt_segment(&enc).unwrap(), name, "eme roundtrip {name}");
+            assert_eq!(
+                c.decrypt_segment(&enc).unwrap(),
+                name,
+                "eme roundtrip {name}"
+            );
         }
         let p = c.encrypt_path("dir/sub/file.txt");
         assert_eq!(c.decrypt_path(&p).unwrap(), "dir/sub/file.txt");
@@ -580,7 +583,9 @@ mod tests {
         let a = Cipher::new("pw-one", "").unwrap();
         let b = Cipher::new("pw-two", "").unwrap();
         let enc = a.encrypt_segment("secret.txt");
-        assert!(b.decrypt_segment(&enc).is_err() || b.decrypt_segment(&enc).unwrap() != "secret.txt");
+        assert!(
+            b.decrypt_segment(&enc).is_err() || b.decrypt_segment(&enc).unwrap() != "secret.txt"
+        );
     }
     #[test]
     fn rclone_zero_key_vectors() {
@@ -596,7 +601,10 @@ mod tests {
             c.encrypt_segment("1234567890123456"),
             "mijbj0frqf6ms7frcr6bd9h0env53jv96pjaaoirk7forcgpt70g"
         );
-        assert_eq!(c.decrypt_segment("p0e52nreeaj0a5ea7s64m4j72s").unwrap(), "1");
+        assert_eq!(
+            c.decrypt_segment("p0e52nreeaj0a5ea7s64m4j72s").unwrap(),
+            "1"
+        );
     }
     #[test]
     fn base32_roundtrip() {

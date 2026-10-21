@@ -56,20 +56,37 @@ impl DriveBackend for OneDrive {
         DriveKind::OneDrive
     }
     async fn about(&self) -> Result<String, String> {
-        let resp = self.req(reqwest::Method::GET, "https://graph.microsoft.com/v1.0/me/drive?$select=quota,owner").await?.send().await.map_err(|e| e.to_string())?;
+        let resp = self
+            .req(
+                reqwest::Method::GET,
+                "https://graph.microsoft.com/v1.0/me/drive?$select=quota,owner",
+            )
+            .await?
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
             return Err(http_util::err_text(resp).await);
         }
         let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
         let used = v["quota"]["used"].as_u64().unwrap_or(0);
         let total = v["quota"]["total"].as_u64().unwrap_or(0);
-        Ok(format!("{} / {}", super::fmt_bytes(used), super::fmt_bytes(total)))
+        Ok(format!(
+            "{} / {}",
+            super::fmt_bytes(used),
+            super::fmt_bytes(total)
+        ))
     }
     async fn list(&self, path: &str) -> Result<Vec<RemoteEntry>, String> {
         let mut out = Vec::new();
         let mut url = item_url(path);
         loop {
-            let resp = self.req(reqwest::Method::GET, &url).await?.send().await.map_err(|e| e.to_string())?;
+            let resp = self
+                .req(reqwest::Method::GET, &url)
+                .await?
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
             if !resp.status().is_success() {
                 return Err(http_util::err_text(resp).await);
             }
@@ -84,7 +101,9 @@ impl DriveBackend for OneDrive {
                         path: super::join_path(path, &name),
                         is_dir,
                         size: f["size"].as_u64().unwrap_or(0),
-                        modified: super::parse_time(f["lastModifiedDateTime"].as_str().unwrap_or("")),
+                        modified: super::parse_time(
+                            f["lastModifiedDateTime"].as_str().unwrap_or(""),
+                        ),
                         mime: f["file"]["mimeType"].as_str().unwrap_or("").into(),
                     });
                 }
@@ -103,34 +122,83 @@ impl DriveBackend for OneDrive {
         let resp = self.req(reqwest::Method::POST, &url).await?
             .json(&serde_json::json!({"name": name, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"}))
             .send().await.map_err(|e| e.to_string())?;
-        if resp.status().is_success() { Ok(()) } else { Err(http_util::err_text(resp).await) }
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(http_util::err_text(resp).await)
+        }
     }
     async fn delete(&self, entry: &RemoteEntry) -> Result<(), String> {
-        let url = format!("https://graph.microsoft.com/v1.0/me/drive/items/{}", super::pct(&entry.id));
-        let resp = self.req(reqwest::Method::DELETE, &url).await?.send().await.map_err(|e| e.to_string())?;
-        if resp.status().is_success() || resp.status().as_u16() == 404 { Ok(()) } else { Err(http_util::err_text(resp).await) }
+        let url = format!(
+            "https://graph.microsoft.com/v1.0/me/drive/items/{}",
+            super::pct(&entry.id)
+        );
+        let resp = self
+            .req(reqwest::Method::DELETE, &url)
+            .await?
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.status().is_success() || resp.status().as_u16() == 404 {
+            Ok(())
+        } else {
+            Err(http_util::err_text(resp).await)
+        }
     }
     async fn rename(&self, entry: &RemoteEntry, new_name: &str) -> Result<(), String> {
-        let url = format!("https://graph.microsoft.com/v1.0/me/drive/items/{}", super::pct(&entry.id));
-        let resp = self.req(reqwest::Method::PATCH, &url).await?
-            .json(&serde_json::json!({"name": new_name})).send().await.map_err(|e| e.to_string())?;
-        if resp.status().is_success() { Ok(()) } else { Err(http_util::err_text(resp).await) }
+        let url = format!(
+            "https://graph.microsoft.com/v1.0/me/drive/items/{}",
+            super::pct(&entry.id)
+        );
+        let resp = self
+            .req(reqwest::Method::PATCH, &url)
+            .await?
+            .json(&serde_json::json!({"name": new_name}))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(http_util::err_text(resp).await)
+        }
     }
-    async fn download(&self, entry: &RemoteEntry, dest: &std::path::Path, parallel: u32, prog: &Progress) -> Result<(), String> {
-        let url = format!("https://graph.microsoft.com/v1.0/me/drive/items/{}/content", super::pct(&entry.id));
+    async fn download(
+        &self,
+        entry: &RemoteEntry,
+        dest: &std::path::Path,
+        parallel: u32,
+        prog: &Progress,
+    ) -> Result<(), String> {
+        let url = format!(
+            "https://graph.microsoft.com/v1.0/me/drive/items/{}/content",
+            super::pct(&entry.id)
+        );
         let token = self.token().await?;
         let client = self.client.clone();
         let mk = move || client.get(&url).bearer_auth(&token);
         http_util::download_url(&self.client, &mk, dest, parallel, prog).await
     }
-    async fn upload(&self, local: &std::path::Path, dest_dir: &str, name: &str, prog: &Progress) -> Result<RemoteEntry, String> {
+    async fn upload(
+        &self,
+        local: &std::path::Path,
+        dest_dir: &str,
+        name: &str,
+        prog: &Progress,
+    ) -> Result<RemoteEntry, String> {
         let size = http_util::file_len(local);
         prog.set_total(size);
         let path = super::join_path(dest_dir, name);
         if size <= 4 * 1024 * 1024 {
             let bytes = http_util::read_file(local).await?;
             let url = format!("{}:/content", file_url(&path));
-            let resp = self.req(reqwest::Method::PUT, &url).await?.body(bytes).send().await.map_err(|e| e.to_string())?;
+            let resp = self
+                .req(reqwest::Method::PUT, &url)
+                .await?
+                .body(bytes)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
             if !resp.status().is_success() {
                 return Err(http_util::err_text(resp).await);
             }
@@ -147,33 +215,64 @@ impl DriveBackend for OneDrive {
         }
         // Upload session, 5MiB chunks (multiple of 320KiB required).
         let url = format!("{}:/createUploadSession", file_url(&path));
-        let resp = self.req(reqwest::Method::POST, &url).await?
+        let resp = self
+            .req(reqwest::Method::POST, &url)
+            .await?
             .json(&serde_json::json!({"item": {"@microsoft.graph.conflictBehavior": "replace"}}))
-            .send().await.map_err(|e| e.to_string())?;
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
             return Err(http_util::err_text(resp).await);
         }
         let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-        let session = v["uploadUrl"].as_str().ok_or("OneDrive: no uploadUrl")?.to_string();
+        let session = v["uploadUrl"]
+            .as_str()
+            .ok_or("OneDrive: no uploadUrl")?
+            .to_string();
         const CHUNK: u64 = 5 * 1024 * 1024;
         let client = self.client.clone();
         let session2 = session.clone();
         let total_for_range = size;
-        http_util::upload_bytes_chunked(local, CHUNK as usize, move |off, bytes| {
-            let client = client.clone();
-            let session = session2.clone();
-            let end = off + bytes.len() as u64;
-            Box::pin(async move {
-                let resp = client.put(&session)
-                    .header("Content-Range", format!("bytes {}-{}/{}", off, end.saturating_sub(1), total_for_range))
-                    .header("Content-Length", bytes.len())
-                    .body(bytes)
-                    .send().await.map_err(|e| e.to_string())?;
-                let st = resp.status().as_u16();
-                if st == 202 || st == 200 || st == 201 { Ok(()) } else { Err(http_util::err_text(resp).await) }
-            })
-        }, prog).await?;
+        http_util::upload_bytes_chunked(
+            local,
+            CHUNK as usize,
+            move |off, bytes| {
+                let client = client.clone();
+                let session = session2.clone();
+                let end = off + bytes.len() as u64;
+                Box::pin(async move {
+                    let resp = client
+                        .put(&session)
+                        .header(
+                            "Content-Range",
+                            format!(
+                                "bytes {}-{}/{}",
+                                off,
+                                end.saturating_sub(1),
+                                total_for_range
+                            ),
+                        )
+                        .header("Content-Length", bytes.len())
+                        .body(bytes)
+                        .send()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let st = resp.status().as_u16();
+                    if st == 202 || st == 200 || st == 201 {
+                        Ok(())
+                    } else {
+                        Err(http_util::err_text(resp).await)
+                    }
+                })
+            },
+            prog,
+        )
+        .await?;
         let entries = self.list(dest_dir).await.unwrap_or_default();
-        entries.into_iter().find(|e| e.name == name).ok_or_else(|| "OneDrive upload done but not listed".to_string())
+        entries
+            .into_iter()
+            .find(|e| e.name == name)
+            .ok_or_else(|| "OneDrive upload done but not listed".to_string())
     }
 }

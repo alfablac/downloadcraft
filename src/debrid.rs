@@ -872,30 +872,48 @@ pub async fn download_via_debrid(
         // in UI, so literal "magnet" placeholder keeps format shape.
         // Downloaded stream path restores original URL (match spec).
         let cached = chosen.cached;
-        task.url = chosen.url;
+        task.url = chosen.url.clone();
         task.debrid_info = format_debrid_info(p.label(), "magnet", cached);
+        if let Ok(mut l) = ctrl.live.lock() {
+            *l = Some(crate::engine::LiveInfo {
+                debrid_info: task.debrid_info.clone(),
+                resolved_url: chosen.url.clone(),
+                final_url: String::new(),
+            });
+        }
         let debrid_info = task.debrid_info.clone();
         if !chosen.name.is_empty() {
             task.filename = crate::model::sanitize_filename(&chosen.name);
         }
+        let resolved = task.url.clone();
         let mut done = crate::engine::download_http(http, task, ctrl).await?;
         done.url = original_url;
         done.debrid_info = debrid_info;
+        done.debrided_url = resolved;
         // keep resolved filename (done.filename already correct)
         return Ok(done);
     }
     // hoster URL
     let (p, f) = resolve_hoster(http.clone(), settings, &original_url).await?;
     let host = url_host(&original_url);
-    task.url = f.url;
+    task.url = f.url.clone();
     task.debrid_info = format_debrid_info(p.label(), &host, f.cached);
+    if let Ok(mut l) = ctrl.live.lock() {
+        *l = Some(crate::engine::LiveInfo {
+            debrid_info: task.debrid_info.clone(),
+            resolved_url: f.url.clone(),
+            final_url: String::new(),
+        });
+    }
     let debrid_info = task.debrid_info.clone();
     if !f.name.is_empty() {
         task.filename = crate::model::sanitize_filename(&f.name);
     }
+    let resolved = f.url.clone();
     let mut done = crate::engine::download_http(http, task, ctrl).await?;
     done.url = original_url;
     done.debrid_info = debrid_info;
+    done.debrided_url = resolved;
     Ok(done)
 }
 

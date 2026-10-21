@@ -13,9 +13,22 @@ impl FtpDrive {
     }
     async fn conn(&self) -> Result<crate::ftp::DriveFtpConn, String> {
         // explicit_tls only from impossible-to-encode flag: endpoint prefix.
-        let host = self.acc.endpoint.trim().trim_start_matches("ftp://").trim_start_matches("ftps://").to_string();
+        let host = self
+            .acc
+            .endpoint
+            .trim()
+            .trim_start_matches("ftp://")
+            .trim_start_matches("ftps://")
+            .to_string();
         let explicit = self.acc.endpoint.starts_with("ftps://");
-        crate::ftp::drive_connect(&host, self.acc.port, &self.acc.username, &self.acc.secret, explicit).await
+        crate::ftp::drive_connect(
+            &host,
+            self.acc.port,
+            &self.acc.username,
+            &self.acc.secret,
+            explicit,
+        )
+        .await
     }
     fn full(&self, path: &str) -> String {
         let root = self.acc.root.trim_matches('/');
@@ -60,7 +73,9 @@ impl DriveBackend for FtpDrive {
     }
     async fn mkdir(&self, path: &str) -> Result<(), String> {
         let mut c = self.conn().await?;
-        let r = c.simple(&format!("MKD {}", self.full(path)), &[257, 250]).await;
+        let r = c
+            .simple(&format!("MKD {}", self.full(path)), &[257, 250])
+            .await;
         c.quit().await;
         r
     }
@@ -78,7 +93,10 @@ impl DriveBackend for FtpDrive {
     async fn rename(&self, entry: &RemoteEntry, new_name: &str) -> Result<(), String> {
         let mut c = self.conn().await?;
         let src = self.full(&entry.path);
-        let dst = self.full(&super::join_path(&super::parent_path(&entry.path), new_name));
+        let dst = self.full(&super::join_path(
+            &super::parent_path(&entry.path),
+            new_name,
+        ));
         let r = async {
             c.simple(&format!("RNFR {src}"), &[350]).await?;
             c.simple(&format!("RNTO {dst}"), &[250, 200]).await
@@ -87,14 +105,26 @@ impl DriveBackend for FtpDrive {
         c.quit().await;
         r
     }
-    async fn download(&self, entry: &RemoteEntry, dest: &std::path::Path, _parallel: u32, prog: &Progress) -> Result<(), String> {
+    async fn download(
+        &self,
+        entry: &RemoteEntry,
+        dest: &std::path::Path,
+        _parallel: u32,
+        prog: &Progress,
+    ) -> Result<(), String> {
         let mut c = self.conn().await?;
         let remote = self.full(&entry.path);
         let r = c.retr_to_file(&remote, dest, prog, entry.size).await;
         c.quit().await;
         r
     }
-    async fn upload(&self, local: &std::path::Path, dest_dir: &str, name: &str, prog: &Progress) -> Result<RemoteEntry, String> {
+    async fn upload(
+        &self,
+        local: &std::path::Path,
+        dest_dir: &str,
+        name: &str,
+        prog: &Progress,
+    ) -> Result<RemoteEntry, String> {
         let mut c = self.conn().await?;
         let remote = self.full(&super::join_path(dest_dir, name));
         let r = c.stor_file(local, &remote, prog).await;

@@ -545,7 +545,10 @@ async fn retr_exact(
 /// Parse 227 "(h1,h2,h3,h4,p1,p2)" -> (ip override from local_ip, port).
 fn parse_pasv(text: &str, local_ip: Option<IpAddr>) -> Option<(IpAddr, u16)> {
     let inside = text.split('(').nth(1)?.split(')').next()?;
-    let n: Vec<u16> = inside.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+    let n: Vec<u16> = inside
+        .split(',')
+        .filter_map(|p| p.trim().parse().ok())
+        .collect();
     if n.len() != 6 {
         return None;
     }
@@ -576,8 +579,16 @@ pub async fn drive_connect(
         host: host.to_string(),
         port,
         mode,
-        user: if user.is_empty() { "anonymous".into() } else { user.to_string() },
-        pass: if pass.is_empty() { "anonymous@".into() } else { pass.to_string() },
+        user: if user.is_empty() {
+            "anonymous".into()
+        } else {
+            user.to_string()
+        },
+        pass: if pass.is_empty() {
+            "anonymous@".into()
+        } else {
+            pass.to_string()
+        },
         path: String::new(),
     };
     let ftp = login(&lg).await?;
@@ -592,19 +603,47 @@ pub fn parse_list_line(line: &str) -> Option<(String, bool, u64, u64)> {
     if line.contains(';') && (line.contains("type=") || line.contains("Type=")) {
         // MLSD: type=file;size=..;modify=YYYYMMDDHHMMSS; name
         let (facts, name) = line.rsplit_once("; ")?;
-        let is_dir = facts.to_ascii_lowercase().contains("type=dir") || facts.to_ascii_lowercase().contains("type=cdir") || facts.to_ascii_lowercase().contains("type=pdir");
-        if facts.to_ascii_lowercase().contains("type=cdir") || facts.to_ascii_lowercase().contains("type=pdir") {
+        let is_dir = facts.to_ascii_lowercase().contains("type=dir")
+            || facts.to_ascii_lowercase().contains("type=cdir")
+            || facts.to_ascii_lowercase().contains("type=pdir");
+        if facts.to_ascii_lowercase().contains("type=cdir")
+            || facts.to_ascii_lowercase().contains("type=pdir")
+        {
             return None;
         }
-        let size = facts.split(';').find_map(|f| f.to_ascii_lowercase().strip_prefix("size=").and_then(|v| v.parse().ok())).unwrap_or(0);
-        let modified = facts.split(';').find_map(|f| f.to_ascii_lowercase().strip_prefix("modify=").map(|v| {
-            // YYYYMMDDHHMMSS
-            if v.len() >= 14 {
-                crate::drive::parse_time(&format!("{}-{}-{}T{}:{}:{}Z", &v[0..4], &v[4..6], &v[6..8], &v[8..10], &v[10..12], &v[12..14]))
-            } else { 0 }
-        })).unwrap_or(0);
+        let size = facts
+            .split(';')
+            .find_map(|f| {
+                f.to_ascii_lowercase()
+                    .strip_prefix("size=")
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(0);
+        let modified = facts
+            .split(';')
+            .find_map(|f| {
+                f.to_ascii_lowercase().strip_prefix("modify=").map(|v| {
+                    // YYYYMMDDHHMMSS
+                    if v.len() >= 14 {
+                        crate::drive::parse_time(&format!(
+                            "{}-{}-{}T{}:{}:{}Z",
+                            &v[0..4],
+                            &v[4..6],
+                            &v[6..8],
+                            &v[8..10],
+                            &v[10..12],
+                            &v[12..14]
+                        ))
+                    } else {
+                        0
+                    }
+                })
+            })
+            .unwrap_or(0);
         let name = name.trim().to_string();
-        if name == "." || name == ".." { return None; }
+        if name == "." || name == ".." {
+            return None;
+        }
         return Some((name, is_dir, size, modified));
     }
     // Unix: -rw-r--r-- 1 user group 123 Jan 02 2024 name / drwxr-xr-x ...
@@ -628,11 +667,17 @@ pub fn parse_list_line(line: &str) -> Option<(String, bool, u64, u64)> {
 impl DriveFtpConn {
     pub async fn list(&mut self, dir: &str) -> Result<Vec<(String, bool, u64, u64)>, String> {
         let chan = open_data(&mut self.ftp, &self.lg.host, self.lg.mode).await?;
-        let wire = if dir.is_empty() { "LIST".to_string() } else { format!("LIST {dir}") };
+        let wire = if dir.is_empty() {
+            "LIST".to_string()
+        } else {
+            format!("LIST {dir}")
+        };
         self.ftp.expect("LIST", &wire, &[125, 150]).await?;
         let mut data = accept_data(chan, self.lg.mode, &self.lg.host).await?;
         let mut buf = Vec::new();
-        data.read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
+        data.read_to_end(&mut buf)
+            .await
+            .map_err(|e| e.to_string())?;
         let (code, text) = self.ftp.reply("list-complete").await?;
         if code != 226 && code != 250 {
             return Err(format!("FTP LIST -> {text}"));
@@ -640,34 +685,62 @@ impl DriveFtpConn {
         let txt = String::from_utf8_lossy(&buf);
         Ok(txt.lines().filter_map(parse_list_line).collect())
     }
-    pub async fn retr_to_file(&mut self, path: &str, dest: &std::path::Path, prog: &crate::drive::Progress, entry_size: u64) -> Result<(), String> {
+    pub async fn retr_to_file(
+        &mut self,
+        path: &str,
+        dest: &std::path::Path,
+        prog: &crate::drive::Progress,
+        entry_size: u64,
+    ) -> Result<(), String> {
         prog.set_total(entry_size);
         if let Some(p) = dest.parent() {
-            tokio::fs::create_dir_all(p).await.map_err(|e| e.to_string())?;
+            tokio::fs::create_dir_all(p)
+                .await
+                .map_err(|e| e.to_string())?;
         }
-        let mut f = tokio::fs::File::create(dest).await.map_err(|e| e.to_string())?;
-        let mut lg = Login { host: self.lg.host.clone(), port: self.lg.port, mode: self.lg.mode, user: self.lg.user.clone(), pass: self.lg.pass.clone(), path: path.to_string() };
+        let mut f = tokio::fs::File::create(dest)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut lg = Login {
+            host: self.lg.host.clone(),
+            port: self.lg.port,
+            mode: self.lg.mode,
+            user: self.lg.user.clone(),
+            pass: self.lg.pass.clone(),
+            path: path.to_string(),
+        };
         let _ = &mut lg;
         // Reuse retr_exact with temp Controls bridged to Progress via downloaded polling is
         // overkill: manual RETR stream.
         let chan = open_data(&mut self.ftp, &self.lg.host, self.lg.mode).await?;
-        self.ftp.expect("RETR", &format!("RETR {path}"), &[125, 150]).await?;
+        self.ftp
+            .expect("RETR", &format!("RETR {path}"), &[125, 150])
+            .await?;
         let mut data = accept_data(chan, self.lg.mode, &self.lg.host).await?;
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             prog.wait().await;
             prog.check()?;
             let n = data.read(&mut buf).await.map_err(|e| e.to_string())?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             f.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
             prog.add(n as u64);
         }
         f.flush().await.map_err(|e| e.to_string())?;
         let (code, text) = self.ftp.reply("retr-complete").await?;
-        if code != 226 && code != 250 { return Err(format!("FTP RETR -> {text}")); }
+        if code != 226 && code != 250 {
+            return Err(format!("FTP RETR -> {text}"));
+        }
         Ok(())
     }
-    pub async fn stor_file(&mut self, local: &std::path::Path, remote_path: &str, prog: &crate::drive::Progress) -> Result<(), String> {
+    pub async fn stor_file(
+        &mut self,
+        local: &std::path::Path,
+        remote_path: &str,
+        prog: &crate::drive::Progress,
+    ) -> Result<(), String> {
         let size = std::fs::metadata(local).map(|m| m.len()).unwrap_or(0);
         prog.set_total(size);
         // PASV data socket opened before STOR; write side needs raw socket
@@ -681,8 +754,12 @@ impl DriveFtpConn {
             self.ftp.expect("PBSZ", "PBSZ 0", &[200]).await?;
             self.ftp.expect("PROT", "PROT P", &[200]).await?;
         }
-        let mut sock = TcpStream::connect((self.lg.host.as_str(), dport)).await.map_err(|e| e.to_string())?;
-        self.ftp.expect("STOR", &format!("STOR {remote_path}"), &[125, 150]).await?;
+        let mut sock = TcpStream::connect((self.lg.host.as_str(), dport))
+            .await
+            .map_err(|e| e.to_string())?;
+        self.ftp
+            .expect("STOR", &format!("STOR {remote_path}"), &[125, 150])
+            .await?;
         let bytes = tokio::fs::read(local).await.map_err(|e| e.to_string())?;
         if self.lg.mode == TlsMode::Plain {
             sock.write_all(&bytes).await.map_err(|e| e.to_string())?;
@@ -695,7 +772,9 @@ impl DriveFtpConn {
             tls.shutdown().await.map_err(|e| e.to_string())?;
         }
         let (code, text) = self.ftp.reply("stor-complete").await?;
-        if code != 226 && code != 250 { return Err(format!("FTP STOR -> {text}")); }
+        if code != 226 && code != 250 {
+            return Err(format!("FTP STOR -> {text}"));
+        }
         Ok(())
     }
     pub async fn simple(&mut self, wire: &str, ok: &[u16]) -> Result<(), String> {

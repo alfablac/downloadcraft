@@ -34,6 +34,8 @@ pub const BORDER_STRONG: Color32 = G_600;
 pub const TEXT: Color32 = G_100;
 pub const TEXT_MUTED: Color32 = G_300;
 pub const TEXT_FAINT: Color32 = G_400;
+/// Disabled control label (exempt from contrast minimum; ~3:1 reads inert).
+pub const TEXT_DISABLED: Color32 = Color32::from_rgb(0x6A, 0x6A, 0x6A);
 pub const PRIMARY: Color32 = STEEL;
 #[allow(dead_code)]
 pub const ACCENT: Color32 = STEEL;
@@ -41,23 +43,45 @@ pub const TEAL_500: Color32 = STEEL; // legacy alias (app.rs sparkline/status)
 #[allow(dead_code)]
 pub const RED_600: Color32 = ERR;
 
+// Spacing scale (4/8pt): every margin, gap and padding draws from these.
 pub const SP_XS: f32 = 4.0;
 pub const SP_SM: f32 = 8.0;
-#[allow(dead_code)]
 pub const SP_MD: f32 = 12.0;
-#[allow(dead_code)]
 pub const SP_LG: f32 = 16.0;
+pub const SP_XL: f32 = 24.0;
+pub const SP_2XL: f32 = 32.0;
 // Radius: single 6px token for controls/panels/windows; 4px chips only.
 pub const R_CTRL: f32 = 6.0;
 pub const R_CHIP: f32 = 4.0;
 pub const R_PANEL: f32 = R_CTRL;
+/// Button height tiers. SM = inline/toolbar/forms (also the global
+/// `interact_size.y`, so TextEdit/ComboBox/DragValue line up with buttons),
+/// MD = dialog footers, LG = empty-state call to action.
+pub const BTN_SM: f32 = 28.0;
+pub const BTN_MD: f32 = 32.0;
+pub const BTN_LG: f32 = 36.0;
+/// Icon button height inside dense table rows (row height 22).
+pub const ROW_BTN_H: f32 = 20.0;
 /// Uniform clickable-control height (buttons, TextEdit, ComboBox, DragValue).
-/// 24 = 6*4pt-grid.
-pub const BTN_H: f32 = 24.0;
+pub const BTN_H: f32 = BTN_SM;
+/// Minimum width of a labelled button (stable footers, short labels).
+pub const BTN_MIN_W: f32 = 64.0;
 /// Sidebar nav row height (IDM-compact density).
 pub const ROW_H_NAV: f32 = 20.0;
 /// STEEL as text (links, status, accents): STEEL fill color is 3.0-3.5:1 as text (fail); this is 6.1-7.3:1.
 pub const STEEL_TEXT: Color32 = Color32::from_rgb(0x7F, 0xB3, 0xAA);
+/// Destructive button fills (white text >= 5.4:1 on all three).
+pub const DANGER: Color32 = Color32::from_rgb(0x9E, 0x3F, 0x36);
+pub const DANGER_HOVER: Color32 = Color32::from_rgb(0xB0, 0x4A, 0x40);
+pub const DANGER_PRESSED: Color32 = Color32::from_rgb(0x84, 0x34, 0x2D);
+/// Modal backdrop: dims and blocks everything behind a dialog.
+pub const SCRIM: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 150);
+/// Named text style for large numeric readouts (progress %), part of the
+/// central type scale set in `apply`.
+pub const DISPLAY: &str = "Display";
+pub fn display_style() -> TextStyle {
+    TextStyle::Name(DISPLAY.into())
+}
 
 pub fn status_color(s: crate::model::TaskStatus) -> Color32 {
     use crate::model::TaskStatus::*;
@@ -73,7 +97,10 @@ pub fn status_color(s: crate::model::TaskStatus) -> Color32 {
 
 /// Table header text: 11px semibold. Named body size, so call sites drop `.small()`.
 pub fn table_header_text(s: &str) -> egui::RichText {
-    egui::RichText::new(s).color(TEXT_MUTED).size(11.0).strong()
+    egui::RichText::new(s)
+        .color(TEXT_MUTED)
+        .text_style(TextStyle::Body)
+        .strong()
 }
 
 pub fn apply(ctx: &egui::Context) {
@@ -145,9 +172,10 @@ pub fn apply(ctx: &egui::Context) {
     style.interaction.selectable_labels = false;
     style.spacing.item_spacing = egui::vec2(SP_SM, SP_XS);
     style.spacing.button_padding = egui::vec2(SP_SM, SP_XS);
-    style.spacing.interact_size = egui::vec2(32.0, BTN_H);
-    style.spacing.window_margin = egui::Margin::same(SP_MD);
+    style.spacing.interact_size = egui::vec2(SP_2XL, BTN_H);
+    style.spacing.window_margin = egui::Margin::same(SP_LG);
     style.spacing.menu_margin = egui::Margin::same(SP_SM);
+    style.spacing.menu_spacing = SP_XS;
     style.spacing.slider_width = 160.0;
     style.spacing.indent = SP_LG;
     // Floating thin scrollbars: no layout width, transparent track (all bg opacities 0).
@@ -177,28 +205,12 @@ pub fn apply(ctx: &egui::Context) {
         (TextStyle::Button, FontId::proportional(11.0)),
         (TextStyle::Small, FontId::proportional(10.0)),
         (TextStyle::Monospace, FontId::monospace(11.0)),
+        (display_style(), FontId::proportional(18.0)),
     ]
     .into();
     ctx.set_style(style);
 }
 
-/// Primary action button: STEEL fill (white text 4.8:1 on it), global hover/pressed.
-pub fn primary_btn(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(egui::RichText::new(label).color(Color32::WHITE).strong())
-            .fill(STEEL)
-            .rounding(R_CTRL)
-            .min_size(egui::vec2(0.0, BTN_H)),
-    )
-}
-/// Secondary button: no .fill() — global inactive/hovered/active visuals paint it.
-pub fn ghost_btn(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(egui::RichText::new(label).color(TEXT))
-            .rounding(R_CTRL)
-            .min_size(egui::vec2(0.0, BTN_H)),
-    )
-}
 /// Darken base toward BG for badge fill. Text-safe hues stay legible on tint:
 /// fill ~20% base over BG, border ~55% base. No new palette entries.
 fn mixc(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -214,45 +226,6 @@ pub fn badge_tint(base: Color32) -> (Color32, Color32) {
 /// 4.5:1 on the tinted fill (raw hues measured 2.8-4.4:1).
 pub fn badge_text(base: Color32) -> Color32 {
     mixc(base, Color32::WHITE, 0.38)
-}
-
-/// Small non-interactive badge: tinted fill + colored border/text, 4px radius.
-/// Replaces button-like chips for tags (category, type, status, queue meta).
-/// Fixed small font keeps badge <= ROW_H; proportional would overflow 22px rows.
-const BADGE_FONT: f32 = 9.0;
-
-pub fn badge(ui: &mut egui::Ui, label: &str, color: Color32) {
-    let (fill, border) = badge_tint(color);
-    egui::Frame::none()
-        .fill(fill)
-        .stroke(egui::Stroke::new(1.0f32, border))
-        .rounding(R_CHIP)
-        .inner_margin(egui::Margin::symmetric(6.0, 1.0))
-        .show(ui, |ui| {
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(label)
-                        .color(badge_text(color))
-                        .size(BADGE_FONT)
-                        .strong(),
-                )
-                .truncate()
-                .selectable(false),
-            );
-        });
-}
-
-/// Natural badge width for label at BADGE_FONT (for fixed table cells).
-pub fn badge_width(ui: &egui::Ui, label: &str) -> f32 {
-    ui.fonts(|f| {
-        f.layout_no_wrap(
-            label.into(),
-            egui::FontId::proportional(BADGE_FONT),
-            Color32::WHITE,
-        )
-        .size()
-        .x
-    }) + 14.0 // 6+6 inner margin + 1+1 border
 }
 
 /// File category -> badge hue. Distinct hues per category; General neutral.

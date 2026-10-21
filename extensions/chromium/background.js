@@ -155,20 +155,80 @@ if (chrome.webRequest) {
     if (chrome.webRequest.onErrorOccurred) chrome.webRequest.onErrorOccurred.addListener(kill, F);
   } catch (e) {}
 }
+function headerOf(headers, name) { const h = (headers || []).find((x) => x.name.toLowerCase() === name); return h ? h.value || "" : ""; }
+function totalSizeFromHeaders(headers, statusCode) {
+  // 206 Content-Length is range length, not total; Content-Range total wins.
+  const h = headers || [];
+  if (statusCode === 206) {
+    const cr = h.find((x) => x.name.toLowerCase() === "content-range");
+    const m = cr && /\/(\d+)\s*$/.exec(cr.value || "");
+    if (m) { const n = parseInt(m[1], 10); if (n > 0) return n; } // total '*' falls through
+  }
+  const lh = h.find((x) => x.name.toLowerCase() === "content-length");
+  return lh ? parseInt(lh.value, 10) || 0 : 0;
+}
+function filenameFromDisp(disp, url) {
+  const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(disp || "");
+  if (m) { try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; } }
+  return filenameFromUrl(url);
+}
+// Download probes from response headers (onCreated has no headers and
+// item.totalBytes is often 0 at creation). Persisted like candidates:
+// SW death between headers and onCreated loses probe -> size 0 verdict.
+const downloadProbes = new Map(); // url -> {size, mime, filename, referrer, time}
+const PROBE_TTL_MS = 5 * 60 * 1000;
+const PROBE_MAX = 100;
+function persistProbes() {
+  try {
+    const o = {};
+    for (const [u, p] of downloadProbes) o[u] = p;
+    chrome.storage.session.set({ wcProbes: o });
+  } catch (e) {}
+}
+function pruneProbes(now = Date.now()) {
+  let changed = false;
+  for (const [url, p] of downloadProbes) if (now - p.time > PROBE_TTL_MS) { downloadProbes.delete(url); changed = true; }
+  while (downloadProbes.size > PROBE_MAX) { downloadProbes.delete(downloadProbes.keys().next().value); changed = true; }
+  if (changed) persistProbes();
+}
+let probesLoaded = false;
+async function loadProbes() {
+  if (probesLoaded) return;
+  probesLoaded = true;
+  try {
+    const s = await chrome.storage.session.get(["wcProbes"]);
+    if (s && s.wcProbes) for (const [u, p] of Object.entries(s.wcProbes)) if (p) downloadProbes.set(u, p);
+    pruneProbes();
+  } catch (e) {}
+}
 if (chrome.webRequest && chrome.webRequest.onHeadersReceived) {
   chrome.webRequest.onHeadersReceived.addListener(async (details) => {
     recordRequest(details);
     const rec2 = requestRecords.get(details.requestId);
-    if (rec2) { rec2.status = details.statusCode || 0; const lh = (details.responseHeaders || []).find((h) => h.name.toLowerCase() === "content-length"); if (lh) rec2.size = parseInt(lh.value, 10) || 0; const ch = (details.responseHeaders || []).find((h) => h.name.toLowerCase() === "content-type"); if (ch && ch.value) rec2.type = ch.value.split(";")[0].trim().toLowerCase(); }
+    if (rec2) { rec2.status = details.statusCode || 0; rec2.size = totalSizeFromHeaders(details.responseHeaders, details.statusCode) || rec2.size || 0; const ch = (details.responseHeaders || []).find((h) => h.name.toLowerCase() === "content-type"); if (ch && ch.value) rec2.type = ch.value.split(";")[0].trim().toLowerCase(); }
+    // Probe before isSniff early return: any 200/206 response may become a download.
+    try {
+      if (details && [200, 206].includes(details.statusCode)) {
+        const headers = details.responseHeaders || [];
+        downloadProbes.set(details.url, {
+          size: totalSizeFromHeaders(headers, details.statusCode),
+          mime: headerOf(headers, "content-type").split(";")[0].trim().toLowerCase(),
+          filename: filenameFromDisp(headerOf(headers, "content-disposition"), details.url),
+          referrer: details.originUrl || details.documentUrl || "",
+          time: Date.now(),
+        });
+        pruneProbes();
+        persistProbes();
+      }
+    } catch (e) {}
     await loadCandidates();
     if (details.statusCode && ![200, 206].includes(details.statusCode)) return; // 404/redirect bodies poison panel
     if (!(details.tabId >= 0)) return; // non-tab leaks into every tab list
     const header = (details.responseHeaders || []).find((h) => h.name.toLowerCase() === "content-type");
     const type = header && header.value ? header.value.split(";")[0].trim().toLowerCase() : "";
     if (!isSniff(details, type)) return;
-    const lenH = (details.responseHeaders || []).find((h) => h.name.toLowerCase() === "content-length");
     const rec = requestRecords.get(details.requestId);
-    candidates.set(details.url, { url: details.url, type, status: details.statusCode || 0, tabId: details.tabId, frameId: details.frameId != null ? details.frameId : null, redirectFrom: (rec && rec.redirectFrom) || "", hops: (rec && rec.hops) || [], time: (rec && rec.time) || Date.now(), size: lenH ? parseInt(lenH.value, 10) || 0 : 0 });
+    candidates.set(details.url, { url: details.url, type, status: details.statusCode || 0, tabId: details.tabId, frameId: details.frameId != null ? details.frameId : null, redirectFrom: (rec && rec.redirectFrom) || "", hops: (rec && rec.hops) || [], time: (rec && rec.time) || Date.now(), size: totalSizeFromHeaders(details.responseHeaders, details.statusCode) });
     persistCandidates();
     pruneCandidates();
   }, { urls: ["<all_urls>"], types: ["main_frame", "sub_frame", "media", "object", "xmlhttprequest", "other"] }, ["responseHeaders"]);
@@ -250,24 +310,74 @@ async function captureCheck(entry) {
     return !!(r && r.allow === true); // fail-closed: garbage/down -> browser keeps file
   } catch (e) { return false; }
 }
-chrome.downloads.onCreated.addListener(async (item) => {
-  if (isAssetDownload(item)) return;
-  if (!item.url || item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
-  const url = item.finalUrl || item.url;
-  if (takeBypass(url) || takeBypass(item.url)) return;
+// Cancel-first capture (IDM Chrome pattern): onCreated cancels sync, before
+// any await/native call, so no body progress races verdict. probe (headers
+// map, persisted in chrome.storage.session) supplies size/mime/filename;
+// captureCheck verdict: valid -> send webcraft; invalid/host-down ->
+// resumeBrowser() restarts in browser (Firefox semantics in spirit, MV3
+// limits accepted: bytes leaked until sync cancel lands; if file already
+// complete before cancel, browser won, no send).
+chrome.downloads.onCreated.addListener((item) => {
   try {
-    const entry = { id: item.id, url, filename: basename(item.filename), mime: item.mime || "", referrer: item.referrer || "", size: item.totalBytes > 0 ? item.totalBytes : 0 };
-    // Host filter decides (webcraft Settings). Deny/unreachable: do not
-    // cancel — browser download proceeds untouched, no resume needed.
-    if (!(await captureCheck(entry))) return;
-    await chrome.downloads.cancel(item.id).catch(() => {});
+    if (isAssetDownload(item)) return;
+    if (!item || item.id == null) return;
+    const url0 = item.finalUrl || item.url || "";
+    if (!url0 || url0.startsWith("blob:") || url0.startsWith("data:")) return;
+    if (takeBypass(url0) || (item.url && takeBypass(item.url))) return;
+  } catch (e) { return; }
+  // CANCEL FIRST: sync, after sync guards only, before any await/native call.
+  try { const p = chrome.downloads.cancel(item.id); if (p && p.catch) p.catch(() => {}); } catch (e) {} // completed item rejects: fire-and-forget
+  const url = item.finalUrl || item.url || "";
+  const id = item.id;
+  (async () => {
+    await loadProbes();
+    const probe = downloadProbes.get(url) || downloadProbes.get(item.url);
+    const size = probe && probe.size > 0 ? probe.size : (item.totalBytes > 0 ? item.totalBytes : 0);
+    const entry = {
+      url,
+      filename: basename(item.filename) || (probe && probe.filename) || filenameFromUrl(url),
+      mime: item.mime || (probe && probe.mime) || "",
+      size,
+      referrer: item.referrer || (probe && probe.referrer) || "",
+    };
     try {
+      const items = await chrome.downloads.search({ id }).catch(() => null);
+      if (!items || !items.length) return; // deleted between cancel and check: nothing to resume
+      if (items[0].state === "complete") return; // browser won: already complete before cancel landed. interrupted = our cancel (proceed)
+    } catch (e) {}
+    try {
+      if (!(await captureCheck(entry))) { resumeBrowser(entry.url, entry.filename); return; } // invalid/host-down: restart in browser
+      bypass.set(entry.url, Date.now()); // BEFORE send: re-entrant onCreated hits bypass
       const resp = await sendDownload(entry.url, null, { referrer: entry.referrer, filename: entry.filename, mime: entry.mime, size: entry.size, captured: true });
-      // Race filter change / host write error — never lose file.
-      if (!resp || resp.skipped || resp.type === "error") resumeBrowser(entry.url, entry.filename);
-    } catch (e) { resumeBrowser(entry.url, entry.filename); }
-  } catch (e) {}
+      if (!resp || resp.skipped || resp.type === "error") resumeBrowser(entry.url, entry.filename); // skipped/error: item already cancelled, re-download
+    } catch (e) { resumeBrowser(entry.url, entry.filename); } // host died mid-send: file must not vanish
+    pollResumeOnce().catch(() => {}); // poll on onCreated too (guarded skip-when-busy inside)
+  })().catch(() => {});
 });
+
+// Resume poll: Ask box "resume in browser" (and host restart) queues URL in
+// native host; extension polls and restarts it in the browser. Old host reply
+// (unknown-type/error) has no items -> no-op. Comment: poll skip-when-busy
+// mandatory (queue flood) - nativeSend would enqueue behind captures/sends
+// forever, so if capture in-flight/queued, skip this tick entirely.
+async function pollResumeOnce() {
+  if (nativeInFlight || nativeQueue.length) return; // skip-when-busy mandatory (queue flood)
+  try {
+    const r = await nativeSend({ type: "pollResume" });
+    const items = r && Array.isArray(r.items) ? r.items : [];
+    for (const it of items) {
+      if (!it || !it.url || !/^https?:/i.test(it.url)) continue;
+      if (!(Date.now() - (it.ts || 0) < 10 * 60 * 1000)) continue; // fresh only (<10min)
+      resumeBrowser(it.url, it.filename);
+    }
+  } catch (e) {} // host down/old host: silently no-op
+}
+try {
+  chrome.alarms.create("wcPollResume", { periodInMinutes: 0.5 }); // 30s MV3 floor; setInterval unreliable in SW
+  if (chrome.alarms.onAlarm) chrome.alarms.onAlarm.addListener((a) => { if (a && a.name === "wcPollResume") pollResumeOnce().catch(() => {}); });
+} catch (e) {}
+try { pollResumeOnce().catch(() => {}); } catch (e) {} // poll on startup; onCreated handles also wake host
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Legacy stale content scripts may still answer removed ask box: ignore.
   if (msg && msg.type === "downloadcraft-confirm-result") return;

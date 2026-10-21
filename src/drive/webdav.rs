@@ -116,7 +116,8 @@ fn pct_decode(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16)
+            if let Ok(v) =
+                u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16)
             {
                 out.push(v);
                 i += 3;
@@ -150,13 +151,7 @@ fn parse_http_date(s: &str) -> u64 {
         "Dec" => 12,
         _ => return 0,
     };
-    let iso = format!(
-        "{}-{:02}-{}T{}Z",
-        parts[3],
-        mon,
-        parts[1],
-        parts[4]
-    );
+    let iso = format!("{}-{:02}-{}T{}Z", parts[3], mon, parts[1], parts[4]);
     super::parse_time(&iso)
 }
 

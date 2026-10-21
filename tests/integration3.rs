@@ -519,3 +519,109 @@ async fn segmented_parts_publish_live_bytes_before_part_finishes() {
     assert_eq!(done.status, TaskStatus::Paused, "err={}", done.error);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn serve_throttled(body: Vec<u8>, limit: usize) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let live = Arc::new(AtomicUsize::new(0));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let live = live.clone();
+            let body = body.clone();
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 16384];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let range = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                    .map(|l| l.to_string());
+                let Some(r) = range else {
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    let _ = s.write_all(resp.as_bytes());
+                    let _ = s.write_all(&body);
+                    return;
+                };
+                let cur = live.fetch_add(1, Ordering::SeqCst) + 1;
+                if cur > limit {
+                    live.fetch_sub(1, Ordering::SeqCst);
+                    let _ = s.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    return;
+                }
+                let spec = r.split("bytes=").nth(1).unwrap_or("0-");
+                let mut it = spec.trim().split('-');
+                let start: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                let end: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+                let end = end.min(body.len().saturating_sub(1));
+                let slice = &body[start..=end];
+                let resp = format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n", slice.len(), body.len());
+                let _ = s.write_all(resp.as_bytes());
+                // Slow drip so concurrency actually overlaps.
+                for ch in slice.chunks(8192) {
+                    if s.write_all(ch).is_err() { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                live.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+#[tokio::test]
+async fn throttled_server_429_adaptive_completes() {
+    // 2 allowed, 8 wanted, Retry-After 1: must complete, resumable probed.
+    let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let base = serve_throttled(body.clone(), 2);
+    let dir = tmpdir("throttle");
+    let task = DownloadTask {
+        id: "th1".into(),
+        url: format!("{base}/file.bin"),
+        filename: "file.bin".into(),
+        dest_dir: dir.clone(),
+        segments: 8,
+        ..Default::default()
+    };
+    let done = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        download_url(build_client(""), task, Arc::new(Controls::new(0))),
+    )
+    .await
+    .expect("timeout: 429 handling deadlocked")
+    .unwrap();
+    assert_eq!(done.status, TaskStatus::Complete, "{}", done.error);
+    assert_eq!(done.accept_ranges, Some(true));
+    assert_eq!(std::fs::read(dir.join("file.bin")).unwrap(), body);
+}
+
+#[tokio::test]
+async fn checkpoint_state_survives_concurrent_writers() {
+    // Many parallel save_state writers must never leave torn JSON.
+    let dir = tmpdir("atomic");
+    let part_dir = dir.join(".downloadcraft-at");
+    std::fs::create_dir_all(&part_dir).unwrap();
+    // Real throttled download: heavy checkpoints race.
+    let body: Vec<u8> = (0..2_000_000u32).map(|i| (i % 251) as u8).collect();
+    let base = serve_throttled(body.clone(), 8);
+    let task = DownloadTask {
+        id: "at1".into(),
+        url: format!("{base}/file.bin"),
+        filename: "file.bin".into(),
+        dest_dir: dir.clone(),
+        segments: 8,
+        ..Default::default()
+    };
+    let done = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        download_url(build_client(""), task, Arc::new(Controls::new(0))),
+    )
+    .await
+    .expect("timeout")
+    .unwrap();
+    assert_eq!(done.status, TaskStatus::Complete, "{}", done.error);
+    assert_eq!(std::fs::read(dir.join("file.bin")).unwrap(), body);
+    // Part dir removed on success; no torn tmp left behind anywhere.
+    assert!(!dir.join(".downloadcraft-at1").exists());
+}

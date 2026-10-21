@@ -3,6 +3,7 @@
 //! sync 620x840, panes split 50/50, job panel 168px.
 use crate::icons::{icon, Icon};
 use crate::theme;
+use crate::ui;
 use crate::Runtime;
 use downloadcraft_lib::drive::jobs::JobKind;
 use downloadcraft_lib::drive::sync::{plan as sync_plan, SyncMode, SyncPlan};
@@ -13,6 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const LOCAL_ID: &str = "__local";
+/// Stable width for Pause/Resume toggles (label swap never shifts the row).
+const PAUSE_W: f32 = 72.0;
 
 fn lock<T>(m: &Arc<Mutex<T>>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -128,7 +131,9 @@ impl WizardState {
         self.status = "Testing…".into();
         let slot = self.test_slot.clone();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
             let res = match rt {
                 Ok(rt) => rt.block_on(downloadcraft_lib::drive::test_account(&acc)),
                 Err(e) => Err(e.to_string()),
@@ -141,7 +146,9 @@ impl WizardState {
         let slot = self.final_slot.clone();
         self.status = "Final test at picked root…".into();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
             let res = match rt {
                 Ok(rt) => rt.block_on(downloadcraft_lib::drive::test_account(&acc)),
                 Err(e) => Err(e.to_string()),
@@ -156,7 +163,9 @@ impl WizardState {
         self.root_loading = true;
         self.status = "Fetching Shared Drive list…".into();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
             let res = match rt {
                 Ok(rt) => rt.block_on(downloadcraft_lib::drive::shared_drives(&acc)),
                 Err(e) => Err(e.to_string()),
@@ -269,6 +278,16 @@ pub struct DrivesUi {
     pub sync_preview: Option<SyncPlan>,
     pub sync_slot: Option<SyncSlot>,
     pub pending_download_tasks: Vec<(String, String, String)>, // url,user,pass
+    /// Pending destructive confirmation (remote delete / account removal).
+    pub confirm: Option<DriveConfirm>,
+}
+
+/// Destructive drive actions routed through a confirmation modal.
+pub enum DriveConfirm {
+    /// Delete selected entries of pane idx.
+    Files(usize),
+    /// Remove account (id, display name).
+    Account(String, String),
 }
 
 impl Default for DrivesUi {
@@ -307,6 +326,7 @@ impl Default for DrivesUi {
             sync_preview: None,
             sync_slot: None,
             pending_download_tasks: Vec::new(),
+            confirm: None,
         }
     }
 }
@@ -347,21 +367,25 @@ fn fmt_time(secs: u64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", rem / 3600, (rem % 3600) / 60)
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+        rem / 3600,
+        (rem % 3600) / 60
+    )
 }
 
 impl DrivesUi {
-    pub fn backend(settings: &Settings, id: &str) -> Result<(DriveAccount, Arc<dyn DriveBackend>), String> {
+    pub fn backend(
+        settings: &Settings,
+        id: &str,
+    ) -> Result<(DriveAccount, Arc<dyn DriveBackend>), String> {
         let acc = account_by_id(settings, id).ok_or("account not found")?;
         let be = backend_for(&acc)?;
         Ok((acc, be))
     }
 
     fn poll_pane(&mut self, idx: usize, settings: &Settings) {
-        let done = self.panes[idx]
-            .slot
-            .as_ref()
-            .and_then(|s| lock(s).take());
+        let done = self.panes[idx].slot.as_ref().and_then(|s| lock(s).take());
         if let Some((seq, res)) = done {
             if seq == self.panes[idx].seq {
                 self.panes[idx].loading = false;
@@ -402,7 +426,10 @@ impl DrivesUi {
 
     fn ensure_loaded(&mut self, rt: &Arc<tokio::runtime::Runtime>, settings: &Settings) {
         for i in 0..2 {
-            if self.panes[i].slot.is_none() && self.panes[i].entries.is_empty() && !self.panes[i].loading {
+            if self.panes[i].slot.is_none()
+                && self.panes[i].entries.is_empty()
+                && !self.panes[i].loading
+            {
                 self.refresh(rt, settings, i);
             }
         }
@@ -473,50 +500,78 @@ impl DrivesUi {
         let prog = Progress::new();
         let prog2 = prog.clone();
         let overwrite = self.overwrite;
-        let src_label = account_by_id(settings, &src_id).map(|a| a.display()).unwrap_or(src_id.clone());
-        let dst_label = account_by_id(settings, &dst_id).map(|a| a.display()).unwrap_or(dst_id.clone());
+        let src_label = account_by_id(settings, &src_id)
+            .map(|a| a.display())
+            .unwrap_or(src_id.clone());
+        let dst_label = account_by_id(settings, &dst_id)
+            .map(|a| a.display())
+            .unwrap_or(dst_id.clone());
         let first = entries.first().map(|e| e.name.clone()).unwrap_or_default();
-        let verb = match kind { JobKind::Move => "Move", _ => "Copy" };
+        let verb = match kind {
+            JobKind::Move => "Move",
+            _ => "Copy",
+        };
         let label = if entries.len() == 1 {
-            format!("{verb} {first} → {dst_label}:{}", if dst_dir.is_empty() { "/" } else { &dst_dir })
+            format!(
+                "{verb} {first} → {dst_label}:{}",
+                if dst_dir.is_empty() { "/" } else { &dst_dir }
+            )
         } else {
-            format!("{verb} {} items (first {first}) {} → {dst_label}:{}", entries.len(), src_label, if dst_dir.is_empty() { "/" } else { &dst_dir })
+            format!(
+                "{verb} {} items (first {first}) {} → {dst_label}:{}",
+                entries.len(),
+                src_label,
+                if dst_dir.is_empty() { "/" } else { &dst_dir }
+            )
         };
         // Per-account "Parallel streams" = both: segments per file (streams)
         // and concurrent files per job (conc). One knob, no duplicate setting.
-        let streams = account_by_id(settings, &src_id).map(|a| a.streams.max(1)).unwrap_or(4);
+        let streams = account_by_id(settings, &src_id)
+            .map(|a| a.streams.max(1))
+            .unwrap_or(4);
         let conc = streams as usize;
         let dst_names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
         let dst_id2 = dst_id.clone();
         let dst_dir2 = dst_dir.clone();
-        self.spawn_job(rt, label, async move {
-            let (_, src_be) = Self::backend(&settings2, &src_id)?;
-            let (_, dst_be) = Self::backend(&settings2, &dst_id)?;
-            if !overwrite {
-                let existing: HashSet<String> = dst_be
-                    .list(&dst_dir)
-                    .await
-                    .map_err(|e| format!("list destination before copy: {e}"))?
-                    .into_iter()
-                    .map(|e| e.name)
-                    .collect();
-                let mut kept = Vec::new();
-                let mut skipped = 0usize;
-                for e in &entries {
-                    if existing.contains(&e.name) {
-                        skipped += 1;
-                    } else {
-                        kept.push(e.clone());
+        self.spawn_job(
+            rt,
+            label,
+            async move {
+                let (_, src_be) = Self::backend(&settings2, &src_id)?;
+                let (_, dst_be) = Self::backend(&settings2, &dst_id)?;
+                if !overwrite {
+                    let existing: HashSet<String> = dst_be
+                        .list(&dst_dir)
+                        .await
+                        .map_err(|e| format!("list destination before copy: {e}"))?
+                        .into_iter()
+                        .map(|e| e.name)
+                        .collect();
+                    let mut kept = Vec::new();
+                    let mut skipped = 0usize;
+                    for e in &entries {
+                        if existing.contains(&e.name) {
+                            skipped += 1;
+                        } else {
+                            kept.push(e.clone());
+                        }
                     }
+                    if kept.is_empty() {
+                        return Ok("all skipped (exist, Overwrite off)".to_string());
+                    }
+                    let r = jobs::run_job(
+                        kind, &src_be, &kept, &dst_be, &dst_dir, None, streams, conc, &prog2,
+                    )
+                    .await;
+                    return r.map(|m| format!("{m}; {skipped} skipped (exist)"));
                 }
-                if kept.is_empty() {
-                    return Ok("all skipped (exist, Overwrite off)".to_string());
-                }
-                let r = jobs::run_job(kind, &src_be, &kept, &dst_be, &dst_dir, None, streams, conc, &prog2).await;
-                return r.map(|m| format!("{m}; {skipped} skipped (exist)"));
-            }
-            jobs::run_job(kind, &src_be, &entries, &dst_be, &dst_dir, None, streams, conc, &prog2).await
-        }, prog);
+                jobs::run_job(
+                    kind, &src_be, &entries, &dst_be, &dst_dir, None, streams, conc, &prog2,
+                )
+                .await
+            },
+            prog,
+        );
         if let Some(j) = self.jobs.last_mut() {
             j.dst_account = dst_id2;
             j.dst_dir = dst_dir2;
@@ -525,7 +580,12 @@ impl DrivesUi {
         }
     }
 
-    fn delete_selected(&mut self, rt: &Arc<tokio::runtime::Runtime>, settings: &Settings, pane_idx: usize) {
+    fn delete_selected(
+        &mut self,
+        rt: &Arc<tokio::runtime::Runtime>,
+        settings: &Settings,
+        pane_idx: usize,
+    ) {
         let acc_id = self.panes[pane_idx].account_id.clone();
         let entries: Vec<RemoteEntry> = self.panes[pane_idx]
             .entries
@@ -539,14 +599,19 @@ impl DrivesUi {
         let settings2 = settings.clone();
         let prog = Progress::new();
         let prog2 = prog.clone();
-        self.spawn_job(rt, format!("Delete {} item(s)", entries.len()), async move {
-            let (_, be) = Self::backend(&settings2, &acc_id)?;
-            for e in &entries {
-                prog2.check()?;
-                be.delete(e).await?;
-            }
-            Ok(format!("deleted {}", entries.len()))
-        }, prog);
+        self.spawn_job(
+            rt,
+            format!("Delete {} item(s)", entries.len()),
+            async move {
+                let (_, be) = Self::backend(&settings2, &acc_id)?;
+                for e in &entries {
+                    prog2.check()?;
+                    be.delete(e).await?;
+                }
+                Ok(format!("deleted {}", entries.len()))
+            },
+            prog,
+        );
     }
 
     fn simple_op(
@@ -555,14 +620,24 @@ impl DrivesUi {
         settings: &Settings,
         acc_id: String,
         label: String,
-        f: impl FnOnce(Arc<dyn DriveBackend>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>> + Send + 'static,
+        f: impl FnOnce(
+                Arc<dyn DriveBackend>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<String, String>> + Send>,
+            > + Send
+            + 'static,
     ) {
         let settings2 = settings.clone();
         let prog = Progress::new();
-        self.spawn_job(rt, label, async move {
-            let (_, be) = Self::backend(&settings2, &acc_id)?;
-            f(be).await
-        }, prog);
+        self.spawn_job(
+            rt,
+            label,
+            async move {
+                let (_, be) = Self::backend(&settings2, &acc_id)?;
+                f(be).await
+            },
+            prog,
+        );
     }
 
     pub fn ui(
@@ -582,14 +657,14 @@ impl DrivesUi {
             self.poll_pane(i, &settings);
         }
         self.poll_oauth(app_rt);
-        ui.add_space(8.0);
+        ui.add_space(theme::SP_SM);
         ui.horizontal(|ui| {
             ui.heading("Drives");
-            ui.add_space(8.0);
-            if theme::ghost_btn(ui, "Accounts").clicked() {
+            ui.add_space(theme::SP_SM);
+            if ui::secondary_button(ui, "Accounts").clicked() {
                 self.show_accounts = true;
             }
-            if theme::ghost_btn(ui, "Sync").clicked() {
+            if ui::secondary_button(ui, "Sync").clicked() {
                 self.show_sync = true;
             }
             ui.checkbox(&mut self.overwrite, "Overwrite");
@@ -609,7 +684,7 @@ impl DrivesUi {
             );
         }
         if settings.drive_accounts.is_empty() {
-            ui.add_space(4.0);
+            ui.add_space(theme::SP_XS);
             theme::panel().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
@@ -619,19 +694,21 @@ impl DrivesUi {
                             .color(theme::TEXT),
                     );
                     ui.label(
-                        egui::RichText::new("Wizard: provider > credentials > sign-in > root (Shared Drive).")
-                            .color(theme::TEXT_MUTED)
-                            .small(),
+                        egui::RichText::new(
+                            "Wizard: provider > credentials > sign-in > root (Shared Drive).",
+                        )
+                        .color(theme::TEXT_MUTED)
+                        .small(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::primary_btn(ui, "Add account").clicked() {
+                        if ui::primary_button(ui, "Add account").clicked() {
                             self.wizard = Some(WizardState::new());
                         }
                     });
                 });
             });
         }
-        ui.add_space(6.0);
+        ui.add_space(theme::SP_SM);
 
         // Two panes 50/50: use columns via available width halves.
         let total_h = ui.available_height();
@@ -651,7 +728,7 @@ impl DrivesUi {
                             self.pane_ui(ui, idx, &settings, &mut actions);
                         },
                     );
-                    ui.add_space(8.0);
+                    ui.add_space(theme::SP_SM);
                 }
             },
         );
@@ -672,21 +749,32 @@ impl DrivesUi {
                     };
                     self.refresh(tokio_rt, &settings, i);
                 }
-                PaneAction::Copy(i) => self.transfer_selected(tokio_rt, &settings, i, JobKind::Copy),
-                PaneAction::Move(i) => self.transfer_selected(tokio_rt, &settings, i, JobKind::Move),
-                PaneAction::Delete(i) => self.delete_selected(tokio_rt, &settings, i),
+                PaneAction::Copy(i) => {
+                    self.transfer_selected(tokio_rt, &settings, i, JobKind::Copy)
+                }
+                PaneAction::Move(i) => {
+                    self.transfer_selected(tokio_rt, &settings, i, JobKind::Move)
+                }
+                PaneAction::Delete(i) => self.confirm = Some(DriveConfirm::Files(i)),
                 PaneAction::Mkdir(i) => {
                     let name = self.panes[i].new_name.trim().to_string();
                     if !name.is_empty() {
                         let parent = self.panes[i].path.clone();
                         let acc = self.panes[i].account_id.clone();
                         self.panes[i].new_name.clear();
-                        self.simple_op(tokio_rt, &settings, acc, format!("New folder {name}"), move |be| {
-                            Box::pin(async move {
-                                be.mkdir(&downloadcraft_lib::drive::join_path(&parent, &name)).await?;
-                                Ok("folder created (Refresh)".into())
-                            })
-                        });
+                        self.simple_op(
+                            tokio_rt,
+                            &settings,
+                            acc,
+                            format!("New folder {name}"),
+                            move |be| {
+                                Box::pin(async move {
+                                    be.mkdir(&downloadcraft_lib::drive::join_path(&parent, &name))
+                                        .await?;
+                                    Ok("folder created (Refresh)".into())
+                                })
+                            },
+                        );
                     }
                 }
                 PaneAction::Rename(i) => {
@@ -699,12 +787,18 @@ impl DrivesUi {
                     if let (false, Some(e)) = (name.is_empty(), entry) {
                         let acc = self.panes[i].account_id.clone();
                         self.panes[i].rename_name.clear();
-                        self.simple_op(tokio_rt, &settings, acc, format!("Rename -> {name}"), move |be| {
-                            Box::pin(async move {
-                                be.rename(&e, &name).await?;
-                                Ok("renamed (Refresh)".into())
-                            })
-                        });
+                        self.simple_op(
+                            tokio_rt,
+                            &settings,
+                            acc,
+                            format!("Rename -> {name}"),
+                            move |be| {
+                                Box::pin(async move {
+                                    be.rename(&e, &name).await?;
+                                    Ok("renamed (Refresh)".into())
+                                })
+                            },
+                        );
                     }
                 }
                 PaneAction::DownloadTask(i) => {
@@ -719,7 +813,10 @@ impl DrivesUi {
                             if acc.kind == DriveKind::WebDav {
                                 let base = acc.endpoint.trim_end_matches('/');
                                 self.pending_download_tasks.push((
-                                    format!("{base}/{}", downloadcraft_lib::drive::pct_path(&e.path)),
+                                    format!(
+                                        "{base}/{}",
+                                        downloadcraft_lib::drive::pct_path(&e.path)
+                                    ),
                                     acc.username.clone(),
                                     acc.secret.clone(),
                                 ));
@@ -734,9 +831,13 @@ impl DrivesUi {
         }
 
         // Jobs panel.
-        let any_running = self.jobs.iter().any(|j| !j.done_flag.load(Ordering::Relaxed));
+        let any_running = self
+            .jobs
+            .iter()
+            .any(|j| !j.done_flag.load(Ordering::Relaxed));
         if any_running {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(250));
         }
         let mut remove_jobs: Vec<(usize, bool)> = Vec::new(); // (idx, delete_files)
         theme::panel().show(ui, |ui| {
@@ -754,7 +855,7 @@ impl DrivesUi {
                         .small(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::ghost_btn(ui, "Clear finished").clicked() {
+                    if ui::secondary_button(ui, "Clear finished").clicked() {
                         self.jobs.retain(|j| !j.done_flag.load(Ordering::Relaxed));
                     }
                 });
@@ -810,19 +911,19 @@ impl DrivesUi {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if is_done_flag {
                                     // Stopped rows removable; Cancelled/Error can delete data.
-                                    if theme::ghost_btn(ui, "Remove").clicked() {
+                                    if ui::secondary_button(ui, "Remove").clicked() {
                                         remove_click.push((ji, is_err || st.starts_with("Cancelled")));
                                     }
-                                } else if theme::ghost_btn(ui, "Cancel").clicked() {
+                                } else if ui::secondary_button(ui, "Cancel").clicked() {
                                     j.prog.cancelled.store(true, Ordering::Relaxed);
                                 }
                                 if !is_done_flag {
                                     let paused = j.prog.paused.load(Ordering::Relaxed);
-                                    if theme::ghost_btn(ui, if paused { "Resume" } else { "Pause" }).clicked() {
+                                    if ui::Btn::secondary(if paused { "Resume" } else { "Pause" }).min_width(PAUSE_W).show(ui).clicked() {
                                         j.prog.paused.store(!paused, Ordering::Relaxed);
                                     }
                                 }
-                                if theme::ghost_btn(ui, "ⓘ").clicked() {
+                                if ui::icon_button(ui, Icon::Info, "Details").clicked() {
                                     j.show_info = !j.show_info;
                                 }
                                 ui.add(
@@ -903,14 +1004,81 @@ impl DrivesUi {
             }
         }
 
-        if self.wizard.is_some() {
-            self.wizard_window(ui, app_rt, tokio_rt);
-        }
+        // Draw order = stacking order: wizard opens from Accounts, the
+        // confirmation from either, so each later modal sits on top.
         if self.show_accounts || self.edit.is_some() {
             self.accounts_window(ui, app_rt, tokio_rt);
         }
         if self.show_sync {
             self.sync_window(ui, app_rt, tokio_rt);
+        }
+        if self.wizard.is_some() {
+            self.wizard_window(ui, app_rt, tokio_rt);
+        }
+        if self.confirm.is_some() {
+            self.confirm_window(ui.ctx(), app_rt, tokio_rt, &settings);
+        }
+    }
+
+    fn confirm_window(
+        &mut self,
+        ctx: &egui::Context,
+        app_rt: &Arc<Mutex<Runtime>>,
+        tokio_rt: &Arc<tokio::runtime::Runtime>,
+        settings: &Settings,
+    ) {
+        let Some(c) = &self.confirm else {
+            return;
+        };
+        let (title, body, action) = match c {
+            DriveConfirm::Files(i) => {
+                let n = self.panes[*i].selected.len();
+                let acc = account_by_id(settings, &self.panes[*i].account_id)
+                    .map(|a| a.display())
+                    .unwrap_or_default();
+                (
+                    format!("Delete {n} item(s)?"),
+                    format!("Permanently deletes the selected files and folders from {acc}. This cannot be undone."),
+                    "Delete",
+                )
+            }
+            DriveConfirm::Account(_, name) => (
+                "Remove account?".to_string(),
+                format!("Removes \"{name}\" and its stored credentials from webcraft. Files on the remote are not touched."),
+                "Remove account",
+            ),
+        };
+        let mut confirm = false;
+        let mut cancel = false;
+        let modal = ui::Modal::new("drive-confirm", title)
+            .width(ui::size::SM)
+            .show(ctx, |ui| {
+                ui::dialog_text(ui, body, false);
+                ui.add_space(theme::SP_SM);
+                ui.separator();
+                ui::footer_row(ui, |ui| {
+                    if ui::destructive_button(ui, action).clicked() {
+                        confirm = true;
+                    }
+                    let c = ui::secondary_button(ui, "Cancel");
+                    ui::focus_on_open(ui, &c);
+                    if c.clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            match self.confirm.take() {
+                Some(DriveConfirm::Files(i)) => self.delete_selected(tokio_rt, settings, i),
+                Some(DriveConfirm::Account(id, _)) => {
+                    let mut g = crate::lock_unpoison(app_rt);
+                    g.state.settings.drive_accounts.retain(|a| a.id != id);
+                    g.save();
+                }
+                None => {}
+            }
+        } else if cancel || modal.close {
+            self.confirm = None;
         }
     }
 
@@ -934,21 +1102,29 @@ impl DrivesUi {
                     .width(180.0)
                     .show_ui(ui, |ui| {
                         if ui
-                            .selectable_value(&mut self.panes[idx].account_id, LOCAL_ID.to_string(), "This PC (download folder)")
+                            .selectable_value(
+                                &mut self.panes[idx].account_id,
+                                LOCAL_ID.to_string(),
+                                "This PC (download folder)",
+                            )
                             .clicked()
                         {
                             changed_account = Some(LOCAL_ID.to_string());
                         }
                         for acc in &settings.drive_accounts {
                             if ui
-                                .selectable_value(&mut self.panes[idx].account_id, acc.id.clone(), acc.display())
+                                .selectable_value(
+                                    &mut self.panes[idx].account_id,
+                                    acc.id.clone(),
+                                    acc.display(),
+                                )
                                 .clicked()
                             {
                                 changed_account = Some(acc.id.clone());
                             }
                         }
                     });
-                if icon_small(ui, Icon::Up, "Up (parent folder)").clicked() {
+                if ui::icon_button(ui, Icon::Up, "Up (parent folder)").clicked() {
                     let p = self.panes[idx].path.clone();
                     let parent = if self.panes[idx].account_id == LOCAL_ID {
                         std::path::Path::new(&p)
@@ -960,7 +1136,7 @@ impl DrivesUi {
                     };
                     actions.push(PaneAction::Navigate(idx, parent));
                 }
-                if theme::ghost_btn(ui, "Refresh").clicked() {
+                if ui::secondary_button(ui, "Refresh").clicked() {
                     actions.push(PaneAction::Refresh(idx));
                 }
                 if self.panes[idx].loading {
@@ -979,7 +1155,7 @@ impl DrivesUi {
                         self.panes[idx].path_edit.clone()
                     };
                     let resp = ui.add(
-                        egui::TextEdit::singleline(&mut p)
+                        ui::text_field(&mut p)
                             .hint_text("Local folder path")
                             .desired_width(f32::INFINITY),
                     );
@@ -1027,37 +1203,39 @@ impl DrivesUi {
             ui.horizontal_wrapped(|ui| {
                 let has_sel = !self.panes[idx].selected.is_empty();
                 ui.add_enabled_ui(has_sel, |ui| {
-                    if theme::ghost_btn(ui, if idx == 0 { "Copy →" } else { "← Copy" }).clicked() {
+                    if ui::secondary_button(ui, if idx == 0 { "Copy →" } else { "← Copy" })
+                        .clicked()
+                    {
                         actions.push(PaneAction::Copy(idx));
                     }
-                    if theme::ghost_btn(ui, "Move").clicked() {
+                    if ui::secondary_button(ui, "Move").clicked() {
                         actions.push(PaneAction::Move(idx));
                     }
-                    if theme::ghost_btn(ui, "Delete").clicked() {
+                    if ui::secondary_button(ui, "Delete").clicked() {
                         actions.push(PaneAction::Delete(idx));
                     }
-                    if theme::ghost_btn(ui, "To Downloads").clicked() {
+                    if ui::secondary_button(ui, "To Downloads").clicked() {
                         actions.push(PaneAction::DownloadTask(idx));
                     }
                 });
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.panes[idx].new_name)
+                    ui::text_field(&mut self.panes[idx].new_name)
                         .hint_text("New folder")
                         .desired_width(110.0),
                 );
-                if theme::ghost_btn(ui, "Mkdir").clicked() {
+                if ui::secondary_button(ui, "Mkdir").clicked() {
                     actions.push(PaneAction::Mkdir(idx));
                 }
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.panes[idx].rename_name)
+                    ui::text_field(&mut self.panes[idx].rename_name)
                         .hint_text("Rename to")
                         .desired_width(110.0),
                 );
-                if theme::ghost_btn(ui, "Rename").clicked() {
+                if ui::secondary_button(ui, "Rename").clicked() {
                     actions.push(PaneAction::Rename(idx));
                 }
             });
-            ui.add_space(4.0);
+            ui.add_space(theme::SP_XS);
             // File list.
             let avail_h = ui.available_height().max(120.0);
             theme::list_frame().show(ui, |ui| {
@@ -1068,10 +1246,22 @@ impl DrivesUi {
                         ui.set_width(ui.available_width());
                         // Header row
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Name").strong().small().color(theme::TEXT_MUTED));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(egui::RichText::new("Modified    Size").small().color(theme::TEXT_FAINT));
-                            });
+                            ui.label(
+                                egui::RichText::new("Name")
+                                    .strong()
+                                    .small()
+                                    .color(theme::TEXT_MUTED),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new("Modified    Size")
+                                            .small()
+                                            .color(theme::TEXT_FAINT),
+                                    );
+                                },
+                            );
                         });
                         ui.separator();
                         let entries = self.panes[idx].entries.clone();
@@ -1086,14 +1276,22 @@ impl DrivesUi {
                             } else if resp.hovered() {
                                 ui.painter().rect_filled(rect, 4.0, theme::SURFACE_HOVER);
                             }
-                            let fg = if selected { egui::Color32::WHITE } else { theme::TEXT };
+                            let fg = if selected {
+                                egui::Color32::WHITE
+                            } else {
+                                theme::TEXT
+                            };
                             let irect = egui::Rect::from_min_size(
                                 egui::pos2(rect.left() + 4.0, rect.top() + 3.0),
                                 egui::vec2(16.0, 16.0),
                             );
                             icon(
                                 ui.painter(),
-                                &if e.is_dir { Icon::Folder } else { crate::app::cat_icon_pub(&e.name) },
+                                &if e.is_dir {
+                                    Icon::Folder
+                                } else {
+                                    crate::app::cat_icon_pub(&e.name)
+                                },
                                 irect,
                                 fg,
                             );
@@ -1106,27 +1304,32 @@ impl DrivesUi {
                                 name_rect.left_top() + egui::vec2(0.0, 3.0),
                                 egui::Align2::LEFT_TOP,
                                 &e.name,
-                                egui::FontId::proportional(11.0),
+                                egui::TextStyle::Body.resolve(ui.style()),
                                 fg,
                             );
                             ui.painter().text(
                                 egui::pos2(rect.right() - 160.0, rect.top() + 3.0),
                                 egui::Align2::LEFT_TOP,
                                 fmt_time(e.modified),
-                                egui::FontId::proportional(9.0),
+                                egui::TextStyle::Small.resolve(ui.style()),
                                 theme::TEXT_FAINT,
                             );
                             ui.painter().text(
                                 egui::pos2(rect.right() - 8.0, rect.top() + 3.0),
                                 egui::Align2::RIGHT_TOP,
-                                if e.is_dir { "—".into() } else { fmt_bytes(e.size) },
-                                egui::FontId::proportional(9.0),
+                                if e.is_dir {
+                                    "—".into()
+                                } else {
+                                    fmt_bytes(e.size)
+                                },
+                                egui::TextStyle::Small.resolve(ui.style()),
                                 theme::TEXT_MUTED,
                             );
                             if resp.clicked() {
                                 self.focus = idx;
-                                let (ctrl, shift) =
-                                    ui.input(|i| (i.modifiers.ctrl || i.modifiers.command, i.modifiers.shift));
+                                let (ctrl, shift) = ui.input(|i| {
+                                    (i.modifiers.ctrl || i.modifiers.command, i.modifiers.shift)
+                                });
                                 if shift {
                                     if let Some(a) = self.panes[idx].anchor {
                                         let (lo, hi) = (a.min(ei), a.max(ei));
@@ -1251,7 +1454,11 @@ impl DrivesUi {
         });
     }
 
-    fn persist_tokens(app_rt: &Arc<Mutex<Runtime>>, acc_id: &str, tok: &downloadcraft_lib::drive::oauth::TokenOut) -> Result<String, String> {
+    fn persist_tokens(
+        app_rt: &Arc<Mutex<Runtime>>,
+        acc_id: &str,
+        tok: &downloadcraft_lib::drive::oauth::TokenOut,
+    ) -> Result<String, String> {
         if tok.refresh_token.is_empty() {
             return Err("provider returned no refresh token — check offline access / consent prompt, then Connect again".into());
         }
@@ -1341,29 +1548,25 @@ impl DrivesUi {
         };
         self.wz_poll(&mut wz);
         let ctx = ui.ctx().clone();
-        let mut open = true;
         let mut close_cancel = false;
         let mut finish = false;
-        egui::Window::new("Add account wizard")
-            .open(&mut open)
-            .collapsible(false)
-            .default_size([580.0, 700.0])
-            .min_size([480.0, 420.0])
-            .max_size([580.0, 700.0])
+        let modal = ui::Modal::new("drive-wizard", "Add account")
+            .width(ui::size::MD)
+            .height(700.0)
             .resizable(true)
             .show(&ctx, |ui| {
                 const STEPS: [&str; 5] = ["Provider", "Details", "Connect", "Root", "Review"];
                 ui.horizontal(|ui| {
                     for (i, s) in STEPS.iter().enumerate() {
                         let cur = wz.step as usize == i;
-                        theme::badge(
+                        ui::badge(
                             ui,
                             &format!("{} {s}", i + 1),
-                            if cur { theme::STEEL_TEXT } else { theme::TEXT_FAINT },
+                            if cur { ui::BadgeKind::Info } else { ui::BadgeKind::Neutral },
                         );
                     }
                 });
-                ui.add_space(4.0);
+                ui.add_space(theme::SP_XS);
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(wz.status.clone())
@@ -1376,7 +1579,8 @@ impl DrivesUi {
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .id_salt("wz-body")
-                    .max_height(480.0)
+                    .auto_shrink([false, false])
+                    .max_height((ui.available_height() - ui::FOOTER_H).max(48.0))
                     .show(ui, |ui| {
                         match wz.step {
                             0 => {
@@ -1415,13 +1619,13 @@ impl DrivesUi {
                                 if wz.is_oauth() {
                                     ui.label("Use web browser to authenticate? webcraft opens browser, redirect http://127.0.0.1:53682/ must be registered (Dropbox/OneDrive; Google: Desktop app).");
                                     ui.horizontal(|ui| {
-                                        if theme::primary_btn(ui, "Connect (open browser)").clicked() && !wz.oauth_busy {
+                                        if ui::secondary_button(ui, "Connect (open browser)").clicked() && !wz.oauth_busy {
                                             wz.start_oauth();
                                         }
-                                        if theme::ghost_btn(ui, "Copy sign-in link").clicked() {
+                                        if ui::secondary_button(ui, "Copy sign-in link").clicked() {
                                             copy_text(&wz.auth_url.clone());
                                         }
-                                        if wz.oauth_busy && theme::ghost_btn(ui, "Cancel").clicked() {
+                                        if wz.oauth_busy && ui::secondary_button(ui, "Cancel").clicked() {
                                             if let Some(c) = &wz.cancel {
                                                 c.store(true, Ordering::Relaxed);
                                             }
@@ -1433,15 +1637,15 @@ impl DrivesUi {
                                     if wz.oauth_busy {
                                         ui.label("Waiting for browser… or paste fallback:");
                                         ui.horizontal(|ui| {
-                                            ui.add(egui::TextEdit::singleline(&mut wz.code_input).hint_text("http://127.0.0.1:53682/?code=...").desired_width((ui.available_width() - 130.0).max(140.0)));
-                                            if theme::primary_btn(ui, "Finish paste").clicked() {
+                                            ui.add(ui::text_field(&mut wz.code_input).hint_text("http://127.0.0.1:53682/?code=...").desired_width((ui.available_width() - 130.0).max(140.0)));
+                                            if ui::secondary_button(ui, "Finish paste").clicked() {
                                                 wz.paste_finish();
                                             }
                                         });
                                     }
                                 } else {
                                     ui.label("Test credentials before root pick.");
-                                    if theme::primary_btn(ui, "Test connection").clicked() && !wz.test_busy {
+                                    if ui::secondary_button(ui, "Test connection").clicked() && !wz.test_busy {
                                         wz.start_test(false);
                                     }
                                 }
@@ -1490,7 +1694,7 @@ impl DrivesUi {
                                                             ui.selectable_value(&mut wz.draft.team_drive, id, name);
                                                         }
                                                     });
-                                                if theme::ghost_btn(ui, "Load").clicked() && !wz.root_loading {
+                                                if ui::secondary_button(ui, "Load").clicked() && !wz.root_loading {
                                                     wz.fetch_drives();
                                                 }
                                                 if wz.root_loading {
@@ -1535,7 +1739,7 @@ impl DrivesUi {
                                     ui.label(egui::RichText::new("Final test passed. Finish saves.").color(theme::OK).small());
                                 } else {
                                     ui.horizontal(|ui| {
-                                        if theme::ghost_btn(ui, "Re-test").clicked() {
+                                        if ui::secondary_button(ui, "Re-test").clicked() {
                                             wz.final_started = true;
                                             wz.start_final_test();
                                         }
@@ -1545,12 +1749,10 @@ impl DrivesUi {
                             }
                         }
                     });
+                ui.add_space(theme::SP_SM);
                 ui.separator();
-                ui.horizontal(|ui| {
-                    if theme::ghost_btn(ui, "Cancel").clicked() {
-                        close_cancel = true;
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui::footer_row(ui, |ui| {
+                    {
                         let (next_label, can_next) = match wz.step {
                             0 => ("Next", true),
                             1 => ("Next", details_valid(&wz.draft)),
@@ -1559,7 +1761,7 @@ impl DrivesUi {
                             _ => ("Finish", wz.final_ok),
                         };
                         ui.add_enabled_ui(can_next, |ui| {
-                            if theme::primary_btn(ui, next_label).clicked() {
+                            if ui::primary_button(ui, next_label).clicked() {
                                 if wz.step == 4 {
                                     finish = true;
                                 } else {
@@ -1576,7 +1778,7 @@ impl DrivesUi {
                                 }
                             }
                         });
-                        if wz.step > 0 && theme::ghost_btn(ui, "Back").clicked() {
+                        if wz.step > 0 && ui::secondary_button(ui, "Back").clicked() {
                             if let Some(c) = &wz.cancel {
                                 c.store(true, Ordering::Relaxed);
                             }
@@ -1585,9 +1787,13 @@ impl DrivesUi {
                             wz.cancel = None;
                             wz.step -= 1;
                         }
-                    });
+                        if ui::ghost_button(ui, "Cancel").clicked() {
+                            close_cancel = true;
+                        }
+                    }
                 });
             });
+        let open = !modal.close;
         if finish {
             let mut draft = wz.draft.clone();
             if draft.kind == DriveKind::GoogleDrive {
@@ -1635,21 +1841,19 @@ impl DrivesUi {
         tokio_rt: &Arc<tokio::runtime::Runtime>,
     ) {
         let ctx = ui.ctx().clone();
-        let mut open = true;
-        egui::Window::new("Drive accounts")
-            .open(&mut open)
-            .collapsible(false)
-            .default_size([580.0, 700.0])
-            .min_size([480.0, 420.0])
-            .max_size([580.0, 700.0])
+        let mut close_clicked = false;
+        let modal = ui::Modal::new("drive-accounts", "Drive accounts")
+            .width(ui::size::MD)
+            .height(700.0)
             .resizable(true)
             .show(&ctx, |ui| {
+              ui::dialog_body_footer(ui, "drive-accounts-body", |ui| {
                 let accounts: Vec<DriveAccount> = crate::lock_unpoison(app_rt).state.settings.drive_accounts.clone();
                 ui.horizontal(|ui| {
-                    if theme::primary_btn(ui, "Add account").clicked() {
+                    if ui::Btn::new(if self.edit.is_some() { ui::ButtonKind::Secondary } else { ui::ButtonKind::Primary }, "Add account").show(ui).clicked() {
                         self.wizard = Some(WizardState::new());
                     }
-                    if theme::ghost_btn(ui, "Import rclone").clicked() {
+                    if ui::secondary_button(ui, "Import rclone").clicked() {
                         self.show_import = !self.show_import;
                     }
                     ui.label(
@@ -1670,7 +1874,7 @@ impl DrivesUi {
                                 .desired_rows(8),
                         );
                         ui.horizontal(|ui| {
-                            if theme::primary_btn(ui, "Import").clicked() {
+                            if ui::secondary_button(ui, "Import").clicked() {
                                 let (accs, warns) = downloadcraft_lib::drive::rclone_import::parse_rclone_config(&self.import_text);
                                 let n = accs.len();
                                 if n > 0 {
@@ -1686,28 +1890,26 @@ impl DrivesUi {
                                     format!("Imported {n} · warnings: {}", warns.join("; "))
                                 };
                             }
-                            if theme::ghost_btn(ui, "Cancel").clicked() {
+                            if ui::secondary_button(ui, "Cancel").clicked() {
                                 self.import_text.clear();
                                 self.show_import = false;
                             }
                         });
                     });
                 }
-                ui.add_space(6.0);
+                ui.add_space(theme::SP_SM);
                 for acc in &accounts {
                     ui.horizontal(|ui| {
-                        theme::badge(ui, acc.kind.label(), theme::STEEL_TEXT);
+                        ui::badge(ui, acc.kind.label(), ui::BadgeKind::Info);
                         ui.label(egui::RichText::new(acc.display()).color(theme::TEXT));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::ghost_btn(ui, "Delete").clicked() {
-                                let mut g = crate::lock_unpoison(app_rt);
-                                g.state.settings.drive_accounts.retain(|a| a.id != acc.id);
-                                g.save();
+                            if ui::ghost_button(ui, "Remove").clicked() {
+                                self.confirm = Some(DriveConfirm::Account(acc.id.clone(), acc.display()));
                             }
-                            if theme::ghost_btn(ui, "Test").clicked() {
+                            if ui::secondary_button(ui, "Test").clicked() {
                                 self.test_account(acc.clone());
                             }
-                            if theme::ghost_btn(ui, "Duplicate").clicked() {
+                            if ui::secondary_button(ui, "Duplicate").clicked() {
                                 let mut dup = acc.clone();
                                 dup.id = downloadcraft_lib::model::new_id();
                                 dup.name = format!("{} copy", acc.name);
@@ -1720,7 +1922,7 @@ impl DrivesUi {
                                 self.edit = Some(dup);
                                 self.edit_is_new = false;
                             }
-                            if theme::ghost_btn(ui, "Edit").clicked() {
+                            if ui::secondary_button(ui, "Edit").clicked() {
                                 self.edit = Some(acc.clone());
                                 self.edit_is_new = false;
                                 if acc.kind == DriveKind::GoogleDrive && !acc.refresh_token.is_empty() {
@@ -1728,7 +1930,7 @@ impl DrivesUi {
                                 }
                             }
                             if matches!(acc.kind, DriveKind::GoogleDrive | DriveKind::OneDrive | DriveKind::Dropbox)
-                                && theme::ghost_btn(ui, if acc.refresh_token.is_empty() { "Connect" } else { "Reconnect" }).clicked()
+                                && ui::secondary_button(ui, if acc.refresh_token.is_empty() { "Connect" } else { "Reconnect" }).clicked()
                             {
                                 self.start_oauth(app_rt, acc.clone());
                             }
@@ -1752,7 +1954,7 @@ impl DrivesUi {
                 let mut cancel_edit = false;
                 let mut fetch_shared_edit: Option<DriveAccount> = None;
                 if let Some(edit) = &mut self.edit {
-                    ui.add_space(8.0);
+                    ui.add_space(theme::SP_SM);
                     theme::panel().show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(egui::RichText::new(if self.edit_is_new { "Add account" } else { "Edit account" }).strong());
@@ -1785,7 +1987,7 @@ impl DrivesUi {
                                             .color(theme::STEEL_TEXT)
                                             .small(),
                                     );
-                                    if theme::ghost_btn(ui, "Copy redirect URI").clicked() {
+                                    if ui::secondary_button(ui, "Copy redirect URI").clicked() {
                                         copy_text(
                                             downloadcraft_lib::drive::oauth::REDIRECT_URI,
                                         );
@@ -1841,7 +2043,7 @@ impl DrivesUi {
                                                     ui.selectable_value(&mut edit.team_drive, id, name);
                                                 }
                                             });
-                                        if theme::ghost_btn(ui, "Load").clicked() {
+                                        if ui::secondary_button(ui, "Load").clicked() {
                                             fetch_shared_edit = Some(edit.clone());
                                         }
                                     });
@@ -1902,10 +2104,10 @@ impl DrivesUi {
                         form_row(ui, "Crypt password", &mut edit.crypt_password, true, "rclone-crypt; empty=off");
                         form_row(ui, "Crypt salt", &mut edit.crypt_salt, true, "rclone password2; empty=default salt");
                         ui.horizontal(|ui| {
-                            if theme::primary_btn(ui, "Save account").clicked() {
+                            if ui::primary_button(ui, "Save account").clicked() {
                                 save_edit = true;
                             }
-                            if theme::ghost_btn(ui, "Cancel").clicked() {
+                            if ui::secondary_button(ui, "Cancel").clicked() {
                                 cancel_edit = true;
                             }
                         });
@@ -1944,20 +2146,20 @@ impl DrivesUi {
                         ui.label(egui::RichText::new("Sign-in waiting").strong().color(theme::TEXT));
                         ui.label(egui::RichText::new("1) Browser opened — sign in there, this fills itself.").color(theme::TEXT_MUTED).small());
                         ui.horizontal(|ui| {
-                            if theme::ghost_btn(ui, "Open browser again").clicked() {
+                            if ui::secondary_button(ui, "Open browser again").clicked() {
                                 downloadcraft_lib::platform::open_url(&self.oauth_auth_url);
                             }
-                            if theme::ghost_btn(ui, "Copy sign-in link").clicked() {
+                            if ui::secondary_button(ui, "Copy sign-in link").clicked() {
                                 copy_text(&self.oauth_auth_url.clone());
                             }
-                            if theme::ghost_btn(ui, "Cancel sign-in").clicked() {
+                            if ui::secondary_button(ui, "Cancel sign-in").clicked() {
                                 oauth_cancel_click = true;
                             }
                         });
                         ui.label(egui::RichText::new("2) Stuck paste fallback: copy full address-bar URL after sign-in (127.0.0.1 page may fail to load — URL still works) or code, paste here.").color(theme::TEXT_MUTED).small());
                         ui.horizontal(|ui| {
-                            ui.add(egui::TextEdit::singleline(&mut self.oauth_code_input).hint_text("http://127.0.0.1:53682/?code=...").desired_width((ui.available_width() - 230.0).max(140.0)));
-                            if theme::primary_btn(ui, "Finish with pasted code").clicked() {
+                            ui.add(ui::text_field(&mut self.oauth_code_input).hint_text("http://127.0.0.1:53682/?code=...").desired_width((ui.available_width() - 230.0).max(140.0)));
+                            if ui::secondary_button(ui, "Finish with pasted code").clicked() {
                                 oauth_paste_click = true;
                             }
                         });
@@ -1973,8 +2175,13 @@ impl DrivesUi {
                     self.oauth_paste_request = false;
                     self.oauth_paste_finish(app_rt);
                 }
+              }, |ui| {
+                if ui::secondary_button(ui, "Close").clicked() {
+                    close_clicked = true;
+                }
+              });
             });
-        if !open {
+        if modal.close || close_clicked {
             self.show_accounts = false;
             self.edit = None;
         }
@@ -1990,7 +2197,8 @@ impl DrivesUi {
             return;
         };
         if app.client_id.trim().is_empty() {
-            self.status = "Paste Client ID + secret first (Setup steps in Edit), Save, then Connect.".into();
+            self.status =
+                "Paste Client ID + secret first (Setup steps in Edit), Save, then Connect.".into();
             self.edit = Some(acc);
             self.edit_is_new = false;
             return;
@@ -2059,30 +2267,28 @@ impl DrivesUi {
         tokio_rt: &Arc<tokio::runtime::Runtime>,
     ) {
         let ctx = ui.ctx().clone();
-        let mut open = true;
-        egui::Window::new("Drive sync")
-            .open(&mut open)
-            .collapsible(false)
-            .default_size([620.0, 700.0])
-            .min_size([480.0, 420.0])
-            .max_size([620.0, 700.0])
+        let mut close_clicked = false;
+        let modal = ui::Modal::new("drive-sync", "Drive sync")
+            .width(ui::size::MD)
+            .height(700.0)
             .resizable(true)
             .show(&ctx, |ui| {
+              ui::dialog_body_footer(ui, "drive-sync-body", |ui| {
                 let settings: Settings = crate::lock_unpoison(app_rt).state.settings.clone();
                 ui.label(egui::RichText::new("Compare folders, then copy/update/mirror. Mirror deletes destination extras — preview first.").color(theme::TEXT_MUTED).small());
-                ui.add_space(6.0);
+                ui.add_space(theme::SP_SM);
                 // Saved syncs
                 let syncs = settings.drive_syncs.clone();
                 for s in &syncs {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(format!("{} · {}:{} -> {}:{} · {}", if s.name.is_empty() { "sync" } else { &s.name }, s.src_account, s.src_path, s.dst_account, s.dst_path, s.mode)).small());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::ghost_btn(ui, "Delete").clicked() {
+                            if ui::secondary_button(ui, "Delete").clicked() {
                                 let mut g = crate::lock_unpoison(app_rt);
                                 g.state.settings.drive_syncs.retain(|x| x.id != s.id);
                                 g.save();
                             }
-                            if theme::ghost_btn(ui, "Load").clicked() {
+                            if ui::secondary_button(ui, "Load").clicked() {
                                 self.sync_src_account = s.src_account.clone();
                                 self.sync_src_path = s.src_path.clone();
                                 self.sync_dst_account = s.dst_account.clone();
@@ -2132,7 +2338,7 @@ impl DrivesUi {
                     self.sync_slot = None;
                 }
                 ui.horizontal(|ui| {
-                    if theme::primary_btn(ui, "Preview compare").clicked() {
+                    if ui::secondary_button(ui, "Preview compare").clicked() {
                         let slot: SyncSlot = Arc::new(Mutex::new(None));
                         self.sync_slot = Some(slot.clone());
                         self.sync_preview = None;
@@ -2152,8 +2358,12 @@ impl DrivesUi {
                         self.status = "Comparing…".into();
                     }
                     let can_run = self.sync_preview.is_some();
+                    // Run deletes destination extras when the plan has any:
+                    // destructive styling, consequence listed in preview below.
+                    let deletes = self.sync_preview.as_ref().is_some_and(|p| !p.to_delete.is_empty());
                     ui.add_enabled_ui(can_run, |ui| {
-                        if theme::primary_btn(ui, "Run sync").clicked() {
+                        let kind = if deletes { ui::ButtonKind::Destructive } else { ui::ButtonKind::Primary };
+                        if ui::Btn::new(kind, "Run sync").show(ui).clicked() {
                             if let Some(p) = self.sync_preview.take() {
                                 let (sa, da, dp) = (self.sync_src_account.clone(), self.sync_dst_account.clone(), self.sync_dst_path.clone());
                                 let settings2 = settings.clone();
@@ -2186,7 +2396,7 @@ impl DrivesUi {
                             }
                         }
                     });
-                    if theme::ghost_btn(ui, "Save sync").clicked() {
+                    if ui::secondary_button(ui, "Save sync").clicked() {
                         let mut g = crate::lock_unpoison(app_rt);
                         g.state.settings.drive_syncs.push(DriveSync {
                             id: downloadcraft_lib::model::new_id(),
@@ -2202,9 +2412,9 @@ impl DrivesUi {
                     }
                 });
                 if let Some(p) = &self.sync_preview {
-                    ui.add_space(6.0);
+                    ui.add_space(theme::SP_SM);
                     ui.label(egui::RichText::new(format!("Copy {} file(s) · {} bytes · delete {} · unchanged {}", p.to_copy.len(), fmt_bytes(p.to_copy.iter().map(|e| e.size).sum()), p.to_delete.len(), p.unchanged)).small());
-                    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("sync-preview").max_height(260.0).show(ui, |ui| {
                         for e in p.to_copy.iter().take(200) {
                             ui.label(egui::RichText::new(format!("copy  {} ({})", e.path, fmt_bytes(e.size))).small().color(theme::TEXT_MUTED));
                         }
@@ -2213,8 +2423,13 @@ impl DrivesUi {
                         }
                     });
                 }
+              }, |ui| {
+                if ui::secondary_button(ui, "Close").clicked() {
+                    close_clicked = true;
+                }
+              });
             });
-        if !open {
+        if modal.close || close_clicked {
             self.show_sync = false;
         }
     }
@@ -2265,12 +2480,23 @@ fn setup_panel(ui: &mut egui::Ui, kind: DriveKind) {
     theme::panel().show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Setup steps").strong().color(theme::TEXT));
-            ui.label(egui::RichText::new(console).color(theme::STEEL_TEXT).small());
-            if matches!(kind, DriveKind::GoogleDrive | DriveKind::OneDrive | DriveKind::Dropbox)
-                && theme::ghost_btn(ui, "Copy redirect URI").clicked() {
-                    copy_text(downloadcraft_lib::drive::oauth::REDIRECT_URI);
-                }
+            ui.label(
+                egui::RichText::new("Setup steps")
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            ui.label(
+                egui::RichText::new(console)
+                    .color(theme::STEEL_TEXT)
+                    .small(),
+            );
+            if matches!(
+                kind,
+                DriveKind::GoogleDrive | DriveKind::OneDrive | DriveKind::Dropbox
+            ) && ui::secondary_button(ui, "Copy redirect URI").clicked()
+            {
+                copy_text(downloadcraft_lib::drive::oauth::REDIRECT_URI);
+            }
         });
         for (i, s) in steps.iter().enumerate() {
             ui.label(
@@ -2279,7 +2505,10 @@ fn setup_panel(ui: &mut egui::Ui, kind: DriveKind) {
                     .small(),
             );
         }
-        if matches!(kind, DriveKind::GoogleDrive | DriveKind::OneDrive | DriveKind::Dropbox) {
+        if matches!(
+            kind,
+            DriveKind::GoogleDrive | DriveKind::OneDrive | DriveKind::Dropbox
+        ) {
             ui.label(
                 egui::RichText::new(format!(
                     "Redirect to register (exact): {}",
@@ -2295,20 +2524,56 @@ fn setup_panel(ui: &mut egui::Ui, kind: DriveKind) {
 fn credential_fields(ui: &mut egui::Ui, edit: &mut DriveAccount, in_wizard: bool) {
     match edit.kind {
         DriveKind::GoogleDrive | DriveKind::OneDrive | DriveKind::Dropbox => {
-            form_row(ui, "Client ID", &mut edit.client_id, false, "client id / Azure app ID / Dropbox App key");
-            form_row(ui, "Client secret", &mut edit.client_secret, true, "Value shown once at creation");
+            form_row(
+                ui,
+                "Client ID",
+                &mut edit.client_id,
+                false,
+                "client id / Azure app ID / Dropbox App key",
+            );
+            form_row(
+                ui,
+                "Client secret",
+                &mut edit.client_secret,
+                true,
+                "Value shown once at creation",
+            );
             if edit.kind != DriveKind::GoogleDrive && !in_wizard {
-                form_row(ui, "Root (optional)", &mut edit.root, false, "folder prefix / empty");
+                form_row(
+                    ui,
+                    "Root (optional)",
+                    &mut edit.root,
+                    false,
+                    "folder prefix / empty",
+                );
             }
         }
         DriveKind::WebDav => {
-            form_row(ui, "URL", &mut edit.endpoint, false, "https://host/remote.php/dav/files/user/");
+            form_row(
+                ui,
+                "URL",
+                &mut edit.endpoint,
+                false,
+                "https://host/remote.php/dav/files/user/",
+            );
             form_row(ui, "Username", &mut edit.username, false, "");
             form_row(ui, "Password/app-pw", &mut edit.secret, true, "");
         }
         DriveKind::S3 => {
-            form_row(ui, "Endpoint", &mut edit.endpoint, false, "empty=AWS; https://<acct>.r2.cloudflarestorage.com");
-            form_row(ui, "Region", &mut edit.region, false, "auto (R2) / us-east-1");
+            form_row(
+                ui,
+                "Endpoint",
+                &mut edit.endpoint,
+                false,
+                "empty=AWS; https://<acct>.r2.cloudflarestorage.com",
+            );
+            form_row(
+                ui,
+                "Region",
+                &mut edit.region,
+                false,
+                "auto (R2) / us-east-1",
+            );
             if !in_wizard {
                 form_row(ui, "Bucket (Root)", &mut edit.root, false, "");
             }
@@ -2324,8 +2589,20 @@ fn credential_fields(ui: &mut egui::Ui, edit: &mut DriveAccount, in_wizard: bool
             });
             edit.port = port as u16;
             form_row(ui, "Username", &mut edit.username, false, "");
-            form_row(ui, "Password", &mut edit.secret, true, "key passphrase if key below");
-            form_row(ui, "SSH key path", &mut edit.ssh_key_path, false, "~/.ssh/id_ed25519 (not .pub)");
+            form_row(
+                ui,
+                "Password",
+                &mut edit.secret,
+                true,
+                "key passphrase if key below",
+            );
+            form_row(
+                ui,
+                "SSH key path",
+                &mut edit.ssh_key_path,
+                false,
+                "~/.ssh/id_ed25519 (not .pub)",
+            );
             if !in_wizard {
                 form_row(ui, "Root path", &mut edit.root, false, "/home/user");
             }
@@ -2345,8 +2622,20 @@ fn credential_fields(ui: &mut egui::Ui, edit: &mut DriveAccount, in_wizard: bool
             }
         }
         DriveKind::Teldrive => {
-            form_row(ui, "Server URL", &mut edit.endpoint, false, "https://teldrive.example.com");
-            form_row(ui, "API key/token", &mut edit.secret, true, "api_key:XXXX from teldrive Settings > API Keys");
+            form_row(
+                ui,
+                "Server URL",
+                &mut edit.endpoint,
+                false,
+                "https://teldrive.example.com",
+            );
+            form_row(
+                ui,
+                "API key/token",
+                &mut edit.secret,
+                true,
+                "api_key:XXXX from teldrive Settings > API Keys",
+            );
         }
         DriveKind::Local => {
             form_row(ui, "Folder", &mut edit.root, false, "C:\\data");
@@ -2359,14 +2648,28 @@ fn credential_fields(ui: &mut egui::Ui, edit: &mut DriveAccount, in_wizard: bool
             ui.label("Parallel streams");
             ui.add(egui::DragValue::new(&mut streams).range(1..=16));
             ui.label(
-                egui::RichText::new("files at once + segments per file (rclone --transfers / multi-thread)")
-                    .color(theme::TEXT_FAINT)
-                    .small(),
+                egui::RichText::new(
+                    "files at once + segments per file (rclone --transfers / multi-thread)",
+                )
+                .color(theme::TEXT_FAINT)
+                .small(),
             );
         });
         edit.streams = streams as u32;
-        form_row(ui, "Crypt password", &mut edit.crypt_password, true, "rclone-crypt; empty=off");
-        form_row(ui, "Crypt salt", &mut edit.crypt_salt, true, "rclone password2; empty=default salt");
+        form_row(
+            ui,
+            "Crypt password",
+            &mut edit.crypt_password,
+            true,
+            "rclone-crypt; empty=off",
+        );
+        form_row(
+            ui,
+            "Crypt salt",
+            &mut edit.crypt_salt,
+            true,
+            "rclone password2; empty=default salt",
+        );
     }
 }
 
@@ -2375,10 +2678,14 @@ fn details_valid(a: &DriveAccount) -> bool {
         return false;
     }
     match a.kind {
-        DriveKind::GoogleDrive | DriveKind::OneDrive | DriveKind::Dropbox => !a.client_id.trim().is_empty(),
+        DriveKind::GoogleDrive | DriveKind::OneDrive | DriveKind::Dropbox => {
+            !a.client_id.trim().is_empty()
+        }
         DriveKind::WebDav | DriveKind::Teldrive => !a.endpoint.trim().is_empty(),
         DriveKind::S3 => !a.username.trim().is_empty() && !a.secret.is_empty(),
-        DriveKind::Sftp | DriveKind::Ftp => !a.endpoint.trim().is_empty() && !a.username.trim().is_empty(),
+        DriveKind::Sftp | DriveKind::Ftp => {
+            !a.endpoint.trim().is_empty() && !a.username.trim().is_empty()
+        }
         DriveKind::Local => !a.root.trim().is_empty(),
     }
 }
@@ -2411,16 +2718,32 @@ fn review_rows(a: &DriveAccount) -> Vec<(&'static str, String)> {
     vec![
         ("Type", a.kind.label().to_string()),
         ("Name", a.name.clone()),
-        ("Endpoint", if a.endpoint.is_empty() { "—".into() } else { a.endpoint.clone() }),
+        (
+            "Endpoint",
+            if a.endpoint.is_empty() {
+                "—".into()
+            } else {
+                a.endpoint.clone()
+            },
+        ),
         ("Root", root),
-        ("Signed in", if a.refresh_token.is_empty() { "credentials entered".into() } else { "token saved at Finish".into() }),
+        (
+            "Signed in",
+            if a.refresh_token.is_empty() {
+                "credentials entered".into()
+            } else {
+                "token saved at Finish".into()
+            },
+        ),
     ]
 }
 
 fn account_picker(ui: &mut egui::Ui, label: &str, cur: &mut String, settings: &Settings) {
     ui.horizontal(|ui| {
         ui.label(label);
-        let text = account_by_id(settings, cur).map(|a| a.display()).unwrap_or_else(|| "pick".into());
+        let text = account_by_id(settings, cur)
+            .map(|a| a.display())
+            .unwrap_or_else(|| "pick".into());
         egui::ComboBox::from_id_salt(label)
             .selected_text(text)
             .show_ui(ui, |ui| {
@@ -2434,8 +2757,8 @@ fn account_picker(ui: &mut egui::Ui, label: &str, cur: &mut String, settings: &S
 
 fn form_row(ui: &mut egui::Ui, label: &str, val: &mut String, password: bool, hint: &str) {
     ui.horizontal(|ui| {
-        ui.add_sized([110.0, 20.0], egui::Label::new(egui::RichText::new(label).color(theme::TEXT_MUTED)));
-        let mut t = egui::TextEdit::singleline(val).desired_width((ui.available_width() - 118.0).max(120.0));
+        ui::form_label(ui, label);
+        let mut t = ui::text_field(val).desired_width(ui.available_width().max(120.0));
         if password {
             t = t.password(true);
         }
@@ -2444,16 +2767,6 @@ fn form_row(ui: &mut egui::Ui, label: &str, val: &mut String, password: bool, hi
         }
         ui.add(t);
     });
-}
-
-fn icon_small(ui: &mut egui::Ui, ic: Icon, tip: &str) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, theme::BTN_H), egui::Sense::click());
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, theme::R_CTRL, theme::SURFACE_HOVER);
-    }
-    let irect = egui::Rect::from_center_size(rect.center(), egui::vec2(16.0, 16.0));
-    icon(ui.painter(), &ic, irect, theme::TEXT);
-    resp.on_hover_text(tip)
 }
 
 fn fmt_elapsed(secs: u64) -> String {
