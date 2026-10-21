@@ -2,6 +2,23 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.18.0] - 2026-10-21
+
+### Added
+
+- Per-download debrid selection: Add URL/File dialog and browser capture dialog show a Debrid section (Auto default, Local/no-debrid, or force Real-Debrid/AllDebrid/TorBox) for hoster URLs, magnets and .torrent files. Choice persists on task and honored at download start; defaults follow Options provider settings.
+- .torrent downloads can route through debrid: infohash probed and resolved as magnet at download start, local torrent fallback on failure.
+- Chatbot assistant (bring-your-own LLM) with web widgets; docs/privacy-policy.md for extension store listing.
+
+### Changed
+
+- "Add URL" renamed "Add URL/File" where dialog accepts files.
+- Firefox extension published to addons.mozilla.org (automatic updates); manifest requires Firefox 140+ and declares data collection (browsing activity + website content sent to local native host only).
+
+### Fixed
+
+- Debrid hoster routing uses domain similarity (>85%) with exact/alias matches first: near-miss domains (mega.nz vs mega.co.nz) now resolve through a capable provider instead of first-enabled provider failing.
+
 ## [0.17.0] - 2026-10-21
 
 ### Changed

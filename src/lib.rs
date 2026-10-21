@@ -1,3 +1,4 @@
+pub mod chat_core;
 pub mod debrid;
 pub mod debrid_ad;
 pub mod debrid_rd;

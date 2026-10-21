@@ -461,30 +461,72 @@ fn split_point_min(start: u64, end: u64, done: u64, min_half: u64) -> Option<u64
 }
 
 /// Pool part sizing: parts are a percentage of file, never infinitesimal.
-/// target = total/(pool * PARTS_PER_CONN), clamped [MIN_SPLIT, MAX_PART].
+/// target = total/(pool * PARTS_PER_CONN), clamped [MIN_SPLIT, cap].
 pub const PARTS_PER_CONN: u64 = 4;
 pub const MAX_PART: u64 = 64 * 1024 * 1024;
+/// Auto cap ceiling for huge files (Settings override 0 = auto).
+pub const MAX_PART_AUTO: u64 = 256 * 1024 * 1024;
+/// Configured override ceiling (Settings slider max 1024 MiB).
+pub const MAX_PART_LIMIT: u64 = 1024 * 1024 * 1024;
+
+/// Auto part cap scales with file size: small/medium files keep 64 MiB
+/// (parallelism + work-stealing), huge files grow to fewer, larger parts
+/// so simultaneous finishes, checkpoints and assembly shrink.
+/// ponytail: static size tiers; speed/RTT-adaptive sizing needs measured
+/// throughput model — add when tiers prove wrong.
+pub fn auto_max_part(total: u64) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    match total {
+        0..=4294967296 => MAX_PART,               // <= 4 GiB
+        4294967297..=17179869184 => 128 * 1024 * 1024, // <= 16 GiB
+        _ if total <= 64 * GIB => 192 * 1024 * 1024,   // <= 64 GiB
+        _ => MAX_PART_AUTO,
+    }
+}
+
+/// Effective cap: `override_bytes` > 0 = Settings manual cap, else auto.
+pub fn effective_max_part(total: u64, override_bytes: u64) -> u64 {
+    if override_bytes > 0 {
+        override_bytes.clamp(MIN_SPLIT, MAX_PART_LIMIT)
+    } else {
+        auto_max_part(total)
+    }
+}
+
 pub fn target_part_size(total: u64, pool: u32) -> u64 {
+    target_part_size_with(total, pool, 0)
+}
+
+pub fn target_part_size_with(total: u64, pool: u32, override_bytes: u64) -> u64 {
     let waves = (pool.max(1) as u64) * PARTS_PER_CONN;
     // Small files: floor relaxes to per-connection share so pool still
     // parallelizes (parts never fewer than pool on fresh plan).
     let floor = MIN_SPLIT.min(total / (pool.max(1) as u64).max(1));
-    (total / waves.max(1)).clamp(floor, MAX_PART)
+    (total / waves.max(1)).clamp(floor, effective_max_part(total, override_bytes))
 }
 /// Plan with pool-relative part size (fresh downloads only; resume keeps
 /// saved segmentation so part files stay valid).
 pub fn plan_parts(total: u64, pool: u32) -> Vec<(u64, u64)> {
+    plan_parts_with(total, pool, 0)
+}
+
+pub fn plan_parts_with(total: u64, pool: u32, override_bytes: u64) -> Vec<(u64, u64)> {
     if total == 0 {
         return vec![];
     }
-    let target = target_part_size(total, pool);
+    let target = target_part_size_with(total, pool, override_bytes);
     let n = total.div_ceil(target).max(1);
     plan_segments(total, n as u32)
 }
 /// Hard cap on non-merged segment count: pool*K waves plus slack so part
 /// size (not count) is binding on huge files.
 pub fn parts_cap(total: u64, pool: u32) -> usize {
-    let by_size = total.div_ceil(MAX_PART).max(1) as usize;
+    parts_cap_with(total, pool, 0)
+}
+
+pub fn parts_cap_with(total: u64, pool: u32, override_bytes: u64) -> usize {
+    let cap = effective_max_part(total, override_bytes);
+    let by_size = total.div_ceil(cap).max(1) as usize;
     let by_waves = (pool.max(1) as usize) * (PARTS_PER_CONN as usize);
     by_size.max(by_waves)
 }
@@ -1051,14 +1093,16 @@ pub async fn download_http(
     task: DownloadTask,
     ctrl: Arc<Controls>,
 ) -> Result<DownloadTask, String> {
-    download_http_with_prewarm(client, task, ctrl, None).await
+    download_http_with_prewarm(client, task, ctrl, None, 0).await
 }
 
+// `max_part`: max part bytes override; 0 = auto (see `effective_max_part`).
 pub async fn download_http_with_prewarm(
     client: reqwest::Client,
     mut task: DownloadTask,
     ctrl: Arc<Controls>,
     prewarm: Option<CachedProbe>,
+    max_part: u64,
 ) -> Result<DownloadTask, String> {
     // Mirror failover (IDM Url0..UrlN): first URL whose probe succeeds wins; task.url rewritten to it.
     let mut urls = vec![task.url.clone()];
@@ -1341,7 +1385,7 @@ pub async fn download_http_with_prewarm(
         task.segments
     };
     if segs.is_empty() {
-        segs = plan_parts(total, pool)
+        segs = plan_parts_with(total, pool, max_part)
             .into_iter()
             .map(|(start, end)| SegmentState {
                 start,
@@ -1351,8 +1395,8 @@ pub async fn download_http_with_prewarm(
             })
             .collect();
     }
-    let target = target_part_size(total, pool);
-    let pcap = parts_cap(total, pool);
+    let target = target_part_size_with(total, pool, max_part);
+    let pcap = parts_cap_with(total, pool, max_part);
     {
         if let Ok(mut l) = ctrl.live.lock() {
             let e = l.get_or_insert_with(Default::default);
@@ -3237,6 +3281,23 @@ mod tests {
     fn part_size_scales_with_file() {
         let gib = 1024u64 * 1024 * 1024;
         // 100MiB @8: floor-bound 4MiB parts, 25 parts (not 8).
+        // Auto cap tiers: 64 -> 128 -> 192 -> 256 MiB.
+        assert_eq!(auto_max_part(2 * gib), 64 * 1024 * 1024);
+        assert_eq!(auto_max_part(8 * gib), 128 * 1024 * 1024);
+        assert_eq!(auto_max_part(32 * gib), 192 * 1024 * 1024);
+        assert_eq!(auto_max_part(100 * gib), 256 * 1024 * 1024);
+        // Override wins and clamps; 0 = auto.
+        assert_eq!(effective_max_part(100 * gib, 64 * 1024 * 1024), 64 * 1024 * 1024);
+        assert_eq!(effective_max_part(100 * gib, 0), 256 * 1024 * 1024);
+        assert_eq!(effective_max_part(gib, 9999 * 1024 * 1024), MAX_PART_LIMIT);
+        // Huge file auto: far fewer parts than 64 MiB cap would give.
+        assert_eq!(target_part_size(100 * gib, 8), 256 * 1024 * 1024);
+        assert_eq!(plan_parts(100 * gib, 8).len(), 400);
+        // Manual 64 MiB on huge file restores old count.
+        assert_eq!(
+            plan_parts_with(100 * gib, 8, 64 * 1024 * 1024).len(),
+            1600
+        );
         assert_eq!(target_part_size(100 * 1024 * 1024, 8), MIN_SPLIT);
         assert_eq!(plan_parts(100 * 1024 * 1024, 8).len(), 25);
         // 2GiB @8: 64MiB cap-bound, 32 parts (no 1MiB shredding).

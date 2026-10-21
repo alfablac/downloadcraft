@@ -111,6 +111,23 @@ pub struct DownloadTask {
     /// magnet URL; stream matches resolved file by this name, not task filename).
     #[serde(default)]
     pub debrid_file_name: String,
+    /// Per-download debrid override (set in Add/capture dialog):
+    /// `""`/`"auto"` = Options defaults, `"none"` = never debrid (local),
+    /// `"rd"`/`"ad"`/`"tb"` = force that provider (must be usable).
+    #[serde(default)]
+    pub debrid_choice: String,
+}
+
+/// Effective debrid choice for a task: raw override when recognized,
+/// else `"auto"` (Options defaults).
+pub fn debrid_choice_of(task: &DownloadTask) -> &'static str {
+    match task.debrid_choice.trim().to_ascii_lowercase().as_str() {
+        "none" => "none",
+        "rd" => "rd",
+        "ad" => "ad",
+        "tb" => "tb",
+        _ => "auto",
+    }
 }
 
 /// Effective egress proxy: per-task override when non-empty, else global.
@@ -241,6 +258,9 @@ pub struct Settings {
     pub max_connections: u32,
     #[serde(default = "def_global")]
     pub global_max_concurrent: usize,
+    /// HTTP max part size in MiB. 0 = auto (64 MiB, up to 256 MiB huge files).
+    #[serde(default)]
+    pub max_part_mb: u64,
     #[serde(default)]
     pub speed_limit_kbps: u64,
     #[serde(default)]
@@ -380,6 +400,22 @@ pub struct Settings {
     /// Drives: saved sync jobs.
     #[serde(default)]
     pub drive_syncs: Vec<DriveSync>,
+    /// Chatbot: any OpenAI-compatible API. Default = TokenHarbor free model.
+    /// Key stored plain in state.json like debrid tokens — ponytail: no OS
+    /// keychain; never logged, never included in bug reports.
+    #[serde(default = "def_chatbot_base_url")]
+    pub chatbot_base_url: String,
+    #[serde(default)]
+    pub chatbot_api_key: String,
+    #[serde(default = "def_chatbot_model")]
+    pub chatbot_model: String,
+}
+
+fn def_chatbot_base_url() -> String {
+    "https://tokenharbor.ai/v1".to_string()
+}
+fn def_chatbot_model() -> String {
+    "deepseek-v4.1-flash:free".to_string()
 }
 
 /// Saved Drives sync job. Mode: mirror|update|copy.
@@ -596,6 +632,7 @@ impl Default for Settings {
             download_dir: crate::platform::default_download_dir(),
             max_connections: 8,
             global_max_concurrent: 3,
+            max_part_mb: 0,
             speed_limit_kbps: 0,
             autostart: false,
             start_minimized: false,
@@ -645,6 +682,9 @@ impl Default for Settings {
             drive_accounts: Vec::new(),
             drive_syncs: Vec::new(),
             drive_transfers: 4,
+            chatbot_base_url: def_chatbot_base_url(),
+            chatbot_api_key: String::new(),
+            chatbot_model: def_chatbot_model(),
         }
     }
 }
@@ -1110,6 +1150,23 @@ mod tests {
     }
 
     #[test]
+    fn chatbot_settings_default_and_absent_fields() {
+        let s = Settings::default();
+        assert_eq!(s.chatbot_base_url, "https://tokenharbor.ai/v1");
+        assert_eq!(s.chatbot_model, "deepseek-v4.1-flash:free");
+        assert!(s.chatbot_api_key.is_empty());
+        // Old state.json without chatbot fields loads with defaults.
+        let mut v = serde_json::to_value(&s).unwrap();
+        for k in ["chatbot_base_url", "chatbot_api_key", "chatbot_model"] {
+            v.as_object_mut().unwrap().remove(k);
+        }
+        let old: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(old.chatbot_base_url, "https://tokenharbor.ai/v1");
+        assert_eq!(old.chatbot_model, "deepseek-v4.1-flash:free");
+        assert!(old.chatbot_api_key.is_empty());
+    }
+
+    #[test]
     fn effective_proxy_prefers_task_override() {
         assert_eq!(effective_proxy("", "http://g:1"), "http://g:1");
         assert_eq!(effective_proxy("  ", "http://g:1"), "http://g:1");
@@ -1334,6 +1391,21 @@ mod tests {
         ));
         // Stem == non-final path segment -> weak.
         assert!(filename_stem_is_weak_for_title("status.mp4", x));
+    }
+
+    #[test]
+    fn debrid_choice_parsing() {
+        let mut task = DownloadTask::default();
+        assert_eq!(debrid_choice_of(&task), "auto");
+        task.debrid_choice = " RD ".into();
+        assert_eq!(debrid_choice_of(&task), "rd");
+        task.debrid_choice = "none".into();
+        assert_eq!(debrid_choice_of(&task), "none");
+        task.debrid_choice = "junk".into();
+        assert_eq!(debrid_choice_of(&task), "auto");
+        // old state without field still parses
+        let old: DownloadTask = serde_json::from_str(r#"{"id":"x","url":"https://e/f.bin","filename":"f.bin","dest_dir":"."}"#).unwrap();
+        assert_eq!(debrid_choice_of(&old), "auto");
     }
 
     #[test]

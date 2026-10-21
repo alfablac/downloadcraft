@@ -180,6 +180,51 @@ pub async fn list_torrent_files(
     }
 }
 
+/// Infohash (hex) of a torrent task source via list-only probe.
+/// Used to route .torrent downloads through debrid as magnets.
+pub async fn torrent_infohash_hex(
+    client: reqwest::Client,
+    task: &DownloadTask,
+    settings: &Settings,
+) -> Result<String, String> {
+    let session = shared_session(settings).await?;
+    let add = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        build_add(&client, task),
+    )
+    .await
+    .map_err(|_| "timed out fetching torrent metadata (120s)".to_string())??;
+    let fut = session.add_torrent(
+        add,
+        Some(AddTorrentOptions {
+            list_only: true,
+            ..Default::default()
+        }),
+    );
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(120), fut)
+        .await
+        .map_err(|_| "timed out fetching torrent metadata (120s)".to_string())?
+        .map_err(|e| format!("add torrent: {e:#}"))?;
+    match resp {
+        librqbit::AddTorrentResponse::ListOnly(l) => Ok(l.info_hash.as_string()),
+        other => match other.into_handle() {
+            Some(h) => Ok(h.info_hash().as_string()),
+            None => Err("unexpected torrent add response".into()),
+        },
+    }
+}
+
+/// Build magnet URL from torrent source (infohash only; providers
+/// resolve trackers/files themselves).
+pub async fn torrent_magnet(
+    client: reqwest::Client,
+    task: &DownloadTask,
+    settings: &Settings,
+) -> Result<String, String> {
+    let hex = torrent_infohash_hex(client, task, settings).await?;
+    Ok(format!("magnet:?xt=urn:btih:{hex}"))
+}
+
 /// Normalize selection against torrent file count -> concrete set for
 /// librqbit (which instant-finishes on empty). Empty/out-of-range-clamped-to-
 /// nothing selections become the full set.

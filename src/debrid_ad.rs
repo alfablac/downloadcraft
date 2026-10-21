@@ -370,9 +370,18 @@ fn parse_host(key: &str, h: &serde_json::Value) -> AdHost {
         )),
         _ => None,
     };
+    // Live /v4/hosts map shape: key is bare name ("mega"), no `host`
+    // field; real domains only in `domains`. Don't let name pose as host.
+    let host = str_of(h, &["host", "domain"]).unwrap_or_else(|| {
+        if key.contains('.') {
+            key.to_string()
+        } else {
+            domains.first().cloned().unwrap_or_else(|| key.to_string())
+        }
+    });
     AdHost {
         name: str_of(h, &["name"]).unwrap_or_else(|| key.to_string()),
-        host: str_of(h, &["host", "domain"]).unwrap_or_else(|| key.to_string()),
+        host,
         domains,
         status,
         quota: i64_of(h, &["quota", "quotaMax", "maxQuota"]),
@@ -528,6 +537,16 @@ mod tests {
         }}))
         .unwrap();
         assert_eq!(map[0].host, "rapidgator.net");
+
+        // Live /v4/hosts shape: key is bare name, no `host` field.
+        let live = parse_hosts(&json!({"hosts":{
+            "mega":{"name":"mega","status":true,
+             "domains":["mega.co.nz","mega.nz"]}
+        }}))
+        .unwrap();
+        assert_eq!(live[0].host, "mega.co.nz");
+        assert_eq!(live[0].domains, vec!["mega.co.nz", "mega.nz"]);
+        assert!(host_supported(&live, "https://mega.nz/file/dXQTFSqT#key"));
 
         // Fixture: GET /v4.1/user/hosts per-account quota shape.
         let acct = parse_hosts(&json!({"hosts":[

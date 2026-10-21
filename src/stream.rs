@@ -302,10 +302,16 @@ pub async fn download_url_with_settings(
     // (same client = same egress IP); persisted task keeps original URL
     // (download_via_debrid restores it). Any debrid failure falls through
     // to local torrent / plain HTTP below.
-    if (crate::debrid::is_magnet(&task.url) && crate::debrid::any_for_magnets(settings))
-        || (!crate::torrent::is_torrent_task(&task)
-            && (lower.starts_with("http://") || lower.starts_with("https://"))
-            && crate::debrid::any_for_hosters(settings))
+    let choice = crate::model::debrid_choice_of(&task);
+    if choice != "none"
+        && ((crate::debrid::is_magnet(&task.url)
+            && crate::debrid::any_for_magnets_choice(settings, choice))
+            || (crate::torrent::is_torrent_task(&task)
+                && !crate::debrid::is_magnet(&task.url)
+                && crate::debrid::any_for_magnets_choice(settings, choice))
+            || (!crate::torrent::is_torrent_task(&task)
+                && (lower.starts_with("http://") || lower.starts_with("https://"))
+                && !crate::debrid::providers_for(settings, choice).is_empty()))
     {
         // Hoster route only when URL is not plain file/manifest/video-page:
         // cheap gate = debrid hosts check is provider-side on unrestrict;
@@ -351,7 +357,7 @@ pub async fn download_url_with_settings(
         return crate::nntp::download_nzb(client, task, ctrl, &cfg).await;
     }
     if is_metalink_url(&task.url) {
-        return download_metalink(client, task, ctrl).await;
+        return download_metalink(client, task, ctrl, settings.max_part_mb * 1024 * 1024).await;
     }
     // yt-dlp for manifests: sniffed signed manifests are where native pipeline
     // corrupts (playlist saved as media file). Picker choice (x-yt-*) fails
@@ -404,7 +410,7 @@ pub async fn download_url_with_settings(
             .map_err(|e| format!("yt-dlp failed: {e}"));
     }
     match probe_manifest(&client, &task).await {
-        Manifest::Metalink => download_metalink(client, task, ctrl).await,
+        Manifest::Metalink => download_metalink(client, task, ctrl, settings.max_part_mb * 1024 * 1024).await,
         Manifest::Dash => download_dash(client, task, ctrl, false).await,
         Manifest::Hls => download_hls(client, task, ctrl).await,
         // Prewarm hit (Add/capture dialog probe, runtime-only registry):
@@ -415,6 +421,7 @@ pub async fn download_url_with_settings(
                 task.clone(),
                 ctrl,
                 engine::prewarm_take(&task.url),
+                settings.max_part_mb * 1024 * 1024,
             )
             .await
         }
@@ -449,6 +456,7 @@ async fn download_metalink(
     client: reqwest::Client,
     mut task: DownloadTask,
     ctrl: Arc<engine::Controls>,
+    max_part: u64,
 ) -> Result<DownloadTask, String> {
     // No silent fallback: bad fetch/parse/empty-url-list must error the task.
     let xml = fetch_text(&client, &task, &task.url)
@@ -472,7 +480,13 @@ async fn download_metalink(
     if f.sha256.is_some() {
         task.sha256 = f.sha256;
     }
-    engine::download_http_with_prewarm(client, task.clone(), ctrl, engine::prewarm_take(&task.url))
+    engine::download_http_with_prewarm(
+        client,
+        task.clone(),
+        ctrl,
+        engine::prewarm_take(&task.url),
+        max_part,
+    )
         .await
 }
 

@@ -77,6 +77,31 @@ pub fn any_for_magnets(s: &Settings) -> bool {
         .any(|p| p.cfg(s).use_for_magnets)
 }
 
+/// Per-download providers allowed by `choice` (task `debrid_choice`):
+/// `"none"` -> none; `"rd"|"ad"|"tb"` -> just that provider when usable;
+/// anything else (`"auto"`) -> `enabled_providers`. Magnet/hoster
+/// `use_for_*` flags still gate inside resolvers, so a forced provider
+/// with that flag off errors and caller falls back (local for hosters,
+/// local torrent for magnets when start-path resolution fails).
+pub fn providers_for(s: &Settings, choice: &str) -> Vec<Provider> {
+    match choice {
+        "none" => Vec::new(),
+        "rd" | "ad" | "tb" => Provider::from_id(choice)
+            .filter(|p| p.cfg(s).usable())
+            .into_iter()
+            .collect(),
+        _ => enabled_providers(s),
+    }
+}
+
+/// Mirrors resolvers' gating for one kind without network: hosters need a
+/// provider match anyway, so hoster UI key is provider allowance only.
+pub fn any_for_magnets_choice(s: &Settings, choice: &str) -> bool {
+    providers_for(s, choice)
+        .iter()
+        .any(|p| p.cfg(s).use_for_magnets)
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Account {
     pub provider: &'static str,
@@ -115,9 +140,204 @@ impl Account {
 #[derive(Clone, Debug)]
 pub struct HostStatus {
     pub name: String,
+    /// Primary domain (first known), kept for display/back-compat.
     pub domain: String,
+    /// All alias domains for this hoster, incl. `domain`.
+    pub domains: Vec<String>,
     pub up: bool,
     pub supported: bool,
+}
+
+/// Well-known alias groups providers report inconsistently. RD `/hosts`
+/// keys Mega only as `mega.co.nz` and Rapidgator only as `rapidgator.net`,
+/// while user links use `mega.nz` / `rg.to`; AD/TB list all of these.
+/// ponytail: static groups for known mismatches; expand when a provider
+/// reports a new alias split that breaks routing.
+const ALIAS_GROUPS: &[&[&str]] = &[
+    &["mega.nz", "mega.co.nz", "mega.io"],
+    &["rapidgator.net", "rg.to", "rapidgator.asia"],
+];
+
+fn alias_group(domain: &str) -> Option<&'static [&'static str]> {
+    let d = domain.trim().to_ascii_lowercase();
+    ALIAS_GROUPS.iter().find(|g| g.contains(&d.as_str())).copied()
+}
+
+/// Lowercase/dedupe domains and expand any known alias group members.
+fn expand_domains<I: IntoIterator<Item = String>>(src: I) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for d in src {
+        let d = url_host(&d);
+        if d.is_empty() || out.contains(&d) {
+            continue;
+        }
+        out.push(d.clone());
+        if let Some(g) = alias_group(&d) {
+            for a in g {
+                if !out.iter().any(|x| x == a) {
+                    out.push((*a).to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn domain_matches(want: &str, listed: &str) -> bool {
+    let listed = url_host(listed);
+    if listed.is_empty() {
+        return false;
+    }
+    if want == listed || want.ends_with(&format!(".{listed}")) {
+        return true;
+    }
+    // Alias equivalence: want is (subdomain of) an alias of listed.
+    if let Some(g) = alias_group(&listed) {
+        return g.iter().any(|a| want == *a || want.ends_with(&format!(".{a}")));
+    }
+    false
+}
+
+/// Jaro similarity 0..1 (hand-rolled; no dep for one metric).
+fn jaro(a: &str, b: &str) -> f64 {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    if a.is_empty() || b.is_empty() {
+        return if a.is_empty() && b.is_empty() { 1.0 } else { 0.0 };
+    }
+    if a == b {
+        return 1.0;
+    }
+    let dist = (a.len().max(b.len()) / 2).saturating_sub(1);
+    let (mut am, mut bm) = (vec![false; a.len()], vec![false; b.len()]);
+    let mut m = 0usize;
+    for i in 0..a.len() {
+        let lo = i.saturating_sub(dist);
+        let hi = (i + dist + 1).min(b.len());
+        for j in lo..hi {
+            if !bm[j] && a[i] == b[j] {
+                am[i] = true;
+                bm[j] = true;
+                m += 1;
+                break;
+            }
+        }
+    }
+    if m == 0 {
+        return 0.0;
+    }
+    let mut t = 0usize;
+    let mut k = 0usize;
+    for i in 0..a.len() {
+        if am[i] {
+            while !bm[k] {
+                k += 1;
+            }
+            if a[i] != b[k] {
+                t += 1;
+            }
+            k += 1;
+        }
+    }
+    let m = m as f64;
+    (m / a.len() as f64 + m / b.len() as f64 + (m - t as f64 / 2.0) / m) / 3.0
+}
+
+/// Jaro-Winkler: prefix boost (domains share TLD starts often; still
+/// gated below by label+family rules).
+fn jaro_winkler(a: &str, b: &str) -> f64 {
+    let j = jaro(a, b);
+    let prefix = a
+        .chars()
+        .zip(b.chars())
+        .take(4)
+        .take_while(|(x, y)| x == y)
+        .count();
+    j + prefix as f64 * 0.1 * (1.0 - j)
+}
+
+/// Registrable-ish split: label = SLD, family = suffix. Known
+/// multi-label suffixes (co.nz, co.uk, com.au...) collapse first:
+/// mega.co.nz -> (mega, co.nz). ponytail: short suffix table, not full
+/// public-suffix list; unknown multi-label suffixes just miss fuzzy.
+const MULTI_SUFFIXES: &[&str] = &[
+    "co.nz", "co.uk", "com.au", "co.in", "com.br", "co.za", "co.kr",
+    "com.cn", "com.tw", "com.mx", "co.jp", "com.sg", "com.hk",
+];
+
+fn domain_parts(host: &str) -> (String, String) {
+    let h = url_host(host);
+    for sfx in MULTI_SUFFIXES {
+        if h == *sfx {
+            return (String::new(), sfx.to_string());
+        }
+        if let Some(label) = h
+            .strip_suffix(&format!(".{sfx}"))
+            .and_then(|p| p.rsplit('.').next())
+            .filter(|l| !l.is_empty())
+        {
+            return (label.to_string(), sfx.to_string());
+        }
+    }
+    let mut it = h.rsplitn(3, '.');
+    let tld = it.next().unwrap_or("").to_string();
+    let label = it.next().unwrap_or("").to_string();
+    (label, tld)
+}
+
+/// Suffix family: trailing bare TLD (nz from co.nz) for ccTLD-family
+/// check; full suffix when equal.
+fn suffix_family(a: &str, b: &str) -> bool {
+    a == b
+        || (a.rsplit('.').next() == b.rsplit('.').next()
+            && a.rsplit('.').next().is_some_and(|t| t.len() == 2)
+            && b.rsplit('.').next().is_some_and(|t| t.len() == 2))
+}
+
+/// Domain similarity 0..1 for routing fallback only. Exact/subdomain/
+/// alias handled by `domain_matches` before this runs. Rules keep fuzzy
+/// safe: SLD labels compared, TLDs must share family (both ccTLD-len-2
+/// or equal) so mega.nz~mega.co.nz passes, mega.nz~mega.com does not,
+/// and lookalikes (notmega.nz) score low on label prefix.
+pub fn domain_similarity(want: &str, listed: &str) -> f64 {
+    let want = url_host(want);
+    let listed = url_host(listed);
+    if want.is_empty() || listed.is_empty() {
+        return 0.0;
+    }
+    let (wl, wt) = domain_parts(&want);
+    let (ll, lt) = domain_parts(&listed);
+    if wl.is_empty() || ll.is_empty() {
+        return 0.0;
+    }
+    let label_sim = jaro_winkler(&wl, &ll);
+    if wt == lt {
+        label_sim
+    } else if suffix_family(&wt, &lt) || (wl == ll && wl.len() >= 4) {
+        // Different suffix, same label: mega.nz vs mega.co.nz (ccTLD
+        // family), rapidgator.net vs rapidgator.asia (gTLD move).
+        // Full-label equality required for cross-suffix credit, so
+        // typos get none here — they need same-suffix path above.
+        // Short labels excluded (ul.to-style abbreviations).
+        label_sim * 0.95
+    } else {
+        label_sim * 0.5
+    }
+}
+
+/// Fuzzy routing threshold: user asked >85%.
+pub const SIMILARITY_THRESHOLD: f64 = 0.85;
+
+/// Best domain score for one hoster entry: 1.0 exact/alias via
+/// `domain_matches`, else best `domain_similarity` over its domains.
+fn host_score(h: &HostStatus, want: &str) -> f64 {
+    let mut best = 0.0f64;
+    for d in std::iter::once(h.domain.as_str()).chain(h.domains.iter().map(String::as_str)) {
+        if domain_matches(want, d) {
+            return 1.0;
+        }
+        best = best.max(domain_similarity(want, d));
+    }
+    best
 }
 
 #[derive(Clone, Debug)]
@@ -342,6 +562,7 @@ async fn hosts_uncached(
                 .into_iter()
                 .map(|h| {
                     let up = h.is_up();
+                    let domains = expand_domains([h.domain.clone()]);
                     HostStatus {
                         name: if h.name.is_empty() {
                             h.domain.clone()
@@ -349,7 +570,8 @@ async fn hosts_uncached(
                             h.name
                         },
                         up,
-                        domain: h.domain,
+                        domain: domains.first().cloned().unwrap_or_else(|| h.domain.clone()),
+                        domains,
                         supported: h.supported,
                     }
                 })
@@ -365,15 +587,20 @@ async fn hosts_uncached(
             };
             Ok(list
                 .into_iter()
-                .map(|h| HostStatus {
-                    name: h.name,
-                    domain: if h.host.is_empty() {
-                        h.domains.first().cloned().unwrap_or_default()
-                    } else {
-                        h.host
-                    },
-                    up: h.status.unwrap_or(false),
-                    supported: h.status.is_some(),
+                .map(|h| {
+                    let mut all: Vec<String> = Vec::new();
+                    if !h.host.is_empty() {
+                        all.push(h.host.clone());
+                    }
+                    all.extend(h.domains.iter().cloned());
+                    let domains = expand_domains(all);
+                    HostStatus {
+                        name: h.name,
+                        domain: domains.first().cloned().unwrap_or_default(),
+                        domains,
+                        up: h.status.unwrap_or(false),
+                        supported: h.status.is_some(),
+                    }
                 })
                 .collect())
         }
@@ -383,11 +610,22 @@ async fn hosts_uncached(
             Ok(c.hosters()
                 .await?
                 .into_iter()
-                .map(|h| HostStatus {
-                    name: h.name,
-                    domain: h.domains.first().cloned().unwrap_or_default(),
-                    up: h.status,
-                    supported: true,
+                .map(|h| {
+                    // TB `url` may hold sole domain when `domains` empty.
+                    let extra = if h.url.contains('.') {
+                        vec![h.url.clone()]
+                    } else {
+                        Vec::new()
+                    };
+                    let domains =
+                        expand_domains(h.domains.iter().cloned().chain(extra));
+                    HostStatus {
+                        name: h.name,
+                        domain: domains.first().cloned().unwrap_or_default(),
+                        domains,
+                        up: h.status,
+                        supported: true,
+                    }
                 })
                 .collect())
         }
@@ -402,10 +640,52 @@ pub fn host_up(hosts: &[HostStatus], url: &str) -> Option<bool> {
     hosts
         .iter()
         .find(|h| {
-            let d = url_host(&h.domain);
-            d == want || want.ends_with(&format!(".{d}"))
+            std::iter::once(h.domain.as_str())
+                .chain(h.domains.iter().map(String::as_str))
+                .any(|d| domain_matches(&want, d))
         })
         .map(|h| h.supported && h.up)
+}
+
+/// One provider's ranked match for a URL host: score 1.0 exact/alias,
+/// `SIMILARITY_THRESHOLD..1` fuzzy, plus whether listed host is up.
+/// Best-scoring entry wins; up entries beat down at equal score.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostMatch {
+    pub score: f64,
+    pub up: bool,
+    pub supported: bool,
+    pub name: String,
+    pub domain: String,
+}
+
+pub fn host_match(hosts: &[HostStatus], url: &str) -> Option<HostMatch> {
+    let want = url_host(url);
+    if want.is_empty() {
+        return None;
+    }
+    let mut best: Option<HostMatch> = None;
+    for h in hosts {
+        let score = host_score(h, &want);
+        if score < SIMILARITY_THRESHOLD {
+            continue;
+        }
+        let cand = HostMatch {
+            score,
+            up: h.up,
+            supported: h.supported,
+            name: h.name.clone(),
+            domain: h.domain.clone(),
+        };
+        let better = match &best {
+            None => true,
+            Some(b) => score > b.score || (score == b.score && cand.up && !b.up),
+        };
+        if better {
+            best = Some(cand);
+        }
+    }
+    best
 }
 
 /// Check-then-sleep poll: first check immediate; interval slept only
@@ -444,6 +724,9 @@ pub async fn unrestrict(
         Provider::Rd => {
             let c = crate::debrid_rd::RdClient::new(key, http);
             let r = c.unrestrict_link(url).await?;
+            if r.download.trim().is_empty() {
+                return Err("Real-Debrid: unrestrict returned no link".into());
+            }
             // ponytail: RD hoster unrestrict/link returns no cache-residency
             // field (only magnet instantAvailability, disabled upstream);
             // cached unknown, not fabricated. Add RD check-based signal
@@ -769,42 +1052,71 @@ pub async fn magnet_files(
     }
 }
 
-/// Try providers in preference order for hoster URL.
+/// Try providers for hoster URL, ranked: exact/alias domain (score 1.0)
+/// first, then fuzzy similarity above `SIMILARITY_THRESHOLD`, up before
+/// down, preference order breaks remaining ties. Preference no longer
+/// lets a fuzzy/down match jump ahead of another provider's exact match.
+/// Only ranked known hosters attempted; normal HTTP URLs must not be
+/// hijacked (or burn unrestrict quota). Hosts fetch fails -> skip
+/// provider rather than guessing. Failed unrestrict falls to next.
 pub async fn resolve_hoster(
     http: reqwest::Client,
     s: &Settings,
     url: &str,
 ) -> Result<(Provider, ResolvedFile), String> {
+    resolve_hoster_choice(http, s, url, "auto").await
+}
+
+/// `choice` = task `debrid_choice` via `providers_for`; `"auto"` =
+/// `resolve_hoster`.
+pub async fn resolve_hoster_choice(
+    http: reqwest::Client,
+    s: &Settings,
+    url: &str,
+    choice: &str,
+) -> Result<(Provider, ResolvedFile), String> {
+    struct Cand {
+        p: Provider,
+        m: HostMatch,
+        pref: usize,
+    }
+    let providers = providers_for(s, choice);
+    let mut cands: Vec<Cand> = Vec::new();
     let mut last = String::new();
     let mut tried = false;
-    for p in enabled_providers(s) {
+    for (pref, p) in providers.iter().enumerate() {
         let cfg = p.cfg(s);
         if !cfg.use_for_hosters {
             continue;
         }
         tried = true;
-        // Only route known-up hosters; normal HTTP URLs must not be
-        // hijacked (or burn unrestrict quota). Hosts fetch fails -> skip
-        // provider rather than guessing.
-        match hosts(http.clone(), p, &cfg.api_key).await {
-            Ok(list) => {
-                if host_up(&list, url) != Some(true) {
-                    last = format!("{}: hoster unsupported or down", p.label());
-                    continue;
-                }
-            }
-            Err(e) => {
-                last = format!("{}: hosts check failed: {e}", p.label());
-                continue;
-            }
-        }
-        match unrestrict(http.clone(), p, &cfg.api_key, url).await {
-            Ok(f) => return Ok((p, f)),
-            Err(e) => last = format!("{}: {e}", p.label()),
+        match hosts(http.clone(), *p, &cfg.api_key).await {
+            Ok(list) => match host_match(&list, url) {
+                Some(m) => cands.push(Cand { p: *p, m, pref }),
+                None => last = format!("{}: hoster unsupported", p.label()),
+            },
+            Err(e) => last = format!("{}: hosts check failed: {e}", p.label()),
         }
     }
     if !tried {
         return Err("no debrid provider enabled for hosters".into());
+    }
+    cands.sort_by(|a, b| {
+        b.m.score
+            .partial_cmp(&a.m.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.m.up.cmp(&a.m.up))
+            .then(a.pref.cmp(&b.pref))
+    });
+    for c in cands {
+        let cfg = c.p.cfg(s);
+        match unrestrict(http.clone(), c.p, &cfg.api_key, url).await {
+            Ok(f) => return Ok((c.p, f)),
+            Err(e) => last = format!("{}: {e}", c.p.label()),
+        }
+    }
+    if last.is_empty() {
+        last = "no enabled debrid provider supports this host".into();
     }
     Err(last)
 }
@@ -815,9 +1127,20 @@ pub async fn resolve_magnet(
     s: &Settings,
     magnet: &str,
 ) -> Result<(Provider, Vec<ResolvedFile>), String> {
+    resolve_magnet_choice(http, s, magnet, "auto").await
+}
+
+/// `choice` = task `debrid_choice` via `providers_for`; `"auto"` =
+/// `resolve_magnet`.
+pub async fn resolve_magnet_choice(
+    http: reqwest::Client,
+    s: &Settings,
+    magnet: &str,
+    choice: &str,
+) -> Result<(Provider, Vec<ResolvedFile>), String> {
     let mut last = String::new();
     let mut tried = false;
-    for p in enabled_providers(s) {
+    for p in providers_for(s, choice) {
         let cfg = p.cfg(s);
         if !cfg.use_for_magnets {
             continue;
@@ -847,13 +1170,29 @@ pub async fn download_via_debrid(
     settings: &Settings,
 ) -> Result<crate::model::DownloadTask, String> {
     let original_url = task.url.clone();
+    let choice = crate::model::debrid_choice_of(&task);
     let want_file = if !task.debrid_file_name.is_empty() {
         task.debrid_file_name.clone()
     } else {
         task.filename.clone()
     };
-    if is_magnet(&original_url) {
-        let (p, files) = resolve_magnet(http.clone(), settings, &original_url).await?;
+    // .torrent source: resolve via debrid as synthesized magnet. Infohash
+    // probe failure errors here; start-path caller falls back local.
+    let effective_magnet: Option<String> = if is_magnet(&original_url) {
+        Some(original_url.clone())
+    } else if crate::torrent::is_torrent_task(&task) {
+        Some(
+            crate::torrent::torrent_magnet(http.clone(), &task, settings)
+                .await
+                .map_err(|e| format!("torrent debrid probe: {e}"))?,
+        )
+    } else {
+        None
+    };
+    if let Some(magnet) = &effective_magnet {
+        let original_url = original_url.clone();
+        let (p, files) =
+            resolve_magnet_choice(http.clone(), settings, magnet, choice).await?;
         let chosen = if files.len() == 1 {
             files.into_iter().next().unwrap()
         } else {
@@ -894,7 +1233,7 @@ pub async fn download_via_debrid(
         return Ok(done);
     }
     // hoster URL
-    let (p, f) = resolve_hoster(http.clone(), settings, &original_url).await?;
+    let (p, f) = resolve_hoster_choice(http.clone(), settings, &original_url, choice).await?;
     let host = url_host(&original_url);
     task.url = f.url.clone();
     task.debrid_info = format_debrid_info(p.label(), &host, f.cached);
@@ -931,6 +1270,26 @@ mod tests {
         s.debrid_ad.api_key = "k".into();
         s.debrid_preferred = "ad".into();
         assert_eq!(enabled_providers(&s), vec![Provider::Ad, Provider::Rd]);
+    }
+
+    #[test]
+    fn providers_for_choice_override() {
+        let mut s = Settings::default();
+        assert!(providers_for(&s, "none").is_empty());
+        assert!(providers_for(&s, "rd").is_empty());
+        s.debrid_rd.enabled = true;
+        s.debrid_rd.api_key = "k".into();
+        s.debrid_ad.enabled = true;
+        s.debrid_ad.api_key = "k".into();
+        assert_eq!(providers_for(&s, "none"), Vec::new());
+        assert_eq!(providers_for(&s, "rd"), vec![Provider::Rd]);
+        // forced provider not configured -> empty (caller falls back)
+        assert!(providers_for(&s, "tb").is_empty());
+        assert_eq!(providers_for(&s, "auto"), vec![Provider::Rd, Provider::Ad]);
+        assert!(!any_for_magnets_choice(&s, "none"));
+        assert!(any_for_magnets_choice(&s, "rd"));
+        s.debrid_rd.use_for_magnets = false;
+        assert!(!any_for_magnets_choice(&s, "rd"));
     }
 
     #[test]
@@ -1013,12 +1372,14 @@ mod tests {
             HostStatus {
                 name: "Rapidgator".into(),
                 domain: "rapidgator.net".into(),
+                domains: vec!["rapidgator.net".into()],
                 up: true,
                 supported: true,
             },
             HostStatus {
                 name: "Down".into(),
                 domain: "down.example".into(),
+                domains: vec!["down.example".into()],
                 up: false,
                 supported: true,
             },
@@ -1030,6 +1391,127 @@ mod tests {
         );
         assert_eq!(host_up(&hosts, "https://down.example/x"), Some(false));
         assert_eq!(host_up(&hosts, "https://unknown.example/x"), None);
+    }
+
+    #[test]
+    fn host_up_alias_domains() {
+        // RD shape: hoster keyed only by mega.co.nz; user link on mega.nz.
+        let rd = vec![HostStatus {
+            name: "Mega".into(),
+            domain: "mega.co.nz".into(),
+            domains: expand_domains(["mega.co.nz".to_string()]),
+            up: true,
+            supported: true,
+        }];
+        assert_eq!(
+            host_up(&rd, "https://mega.nz/file/dXQTFSqT#ENgUuZqYxmxUWK5tB7ei"),
+            Some(true)
+        );
+        assert_eq!(host_up(&rd, "https://mega.co.nz/file/x#k"), Some(true));
+        assert_eq!(host_up(&rd, "https://www.mega.nz/file/x#k"), Some(true));
+        // Reverse: listed as mega.nz only, link on mega.co.nz.
+        let nz = vec![HostStatus {
+            name: "Mega".into(),
+            domain: "mega.nz".into(),
+            domains: vec!["mega.nz".into()],
+            up: true,
+            supported: true,
+        }];
+        assert_eq!(host_up(&nz, "https://mega.co.nz/file/x#k"), Some(true));
+        // Rapidgator alias rg.to both directions.
+        let rg = vec![HostStatus {
+            name: "Rapidgator".into(),
+            domain: "rapidgator.net".into(),
+            domains: expand_domains(["rapidgator.net".to_string()]),
+            up: true,
+            supported: true,
+        }];
+        assert_eq!(host_up(&rg, "https://rg.to/file/x"), Some(true));
+        // AD shape: domains list preserved, not just first.
+        let ad = vec![HostStatus {
+            name: "mega".into(),
+            domain: "mega.co.nz".into(),
+            domains: expand_domains(["mega.co.nz".to_string(), "mega.nz".to_string()]),
+            up: true,
+            supported: true,
+        }];
+        assert_eq!(host_up(&ad, "https://mega.nz/file/x#k"), Some(true));
+        // Lookalikes must not match.
+        assert_eq!(host_up(&rd, "https://mega.nz.evil.example/x"), None);
+        assert_eq!(host_up(&rd, "https://notmega.nz/x"), None);
+    }
+
+    #[test]
+    fn domain_similarity_routing() {
+        // TLD-family split (no alias group needed beyond mega itself).
+        assert!(
+            domain_similarity("mega.nz", "mega.co.nz") >= SIMILARITY_THRESHOLD,
+            "{}",
+            domain_similarity("mega.nz", "mega.co.nz")
+        );
+        assert!(
+            domain_similarity("rapidgator.net", "rapidgator.asia")
+                >= SIMILARITY_THRESHOLD
+        );
+        // Lookalikes / different hosters stay below threshold.
+        assert!(domain_similarity("notmega.nz", "mega.nz") < SIMILARITY_THRESHOLD);
+        assert!(
+            domain_similarity("mega.nz", "megaupload.com") < SIMILARITY_THRESHOLD
+        );
+        assert!(
+            domain_similarity("mega.nz", "mega.nz.evil.example")
+                < SIMILARITY_THRESHOLD
+        );
+        // Identical long label across suffix = canonical-domain move.
+        assert!(
+            domain_similarity("example.com", "example.org") >= SIMILARITY_THRESHOLD
+        );
+        // Abbreviations known gap: needs alias group, not fuzzy.
+        assert!(domain_similarity("uploaded.net", "ul.to") < SIMILARITY_THRESHOLD);
+    }
+
+    #[test]
+    fn host_match_scores_and_up_preference() {
+        let fuzzy = vec![HostStatus {
+            name: "Filefactory".into(),
+            domain: "filefactoryy.com".into(),
+            domains: vec!["filefactoryy.com".into()],
+            up: false,
+            supported: true,
+        }];
+        // Without alias expansion, similarity still ranks candidate;
+        // down status kept on match (resolver attempts anyway).
+        let m = host_match(&fuzzy, "https://filefactory.com/file/x").unwrap();
+        assert!(m.score >= SIMILARITY_THRESHOLD && m.score < 1.0);
+        assert!(!m.up);
+        // Exact beats fuzzy.
+        let exact = vec![HostStatus {
+            name: "Mega".into(),
+            domain: "mega.nz".into(),
+            domains: vec!["mega.nz".into()],
+            up: true,
+            supported: true,
+        }];
+        let m = host_match(&exact, "https://mega.nz/file/x#k").unwrap();
+        assert_eq!(m.score, 1.0);
+        assert!(m.up);
+        // User URL from report: RD mega.co.nz-only list matches.
+        let rd = vec![HostStatus {
+            name: "Mega".into(),
+            domain: "mega.co.nz".into(),
+            domains: expand_domains(["mega.co.nz".to_string()]),
+            up: true,
+            supported: true,
+        }];
+        let m = host_match(
+            &rd,
+            "https://mega.nz/file/dXQTFSqT#ENgUuZqYxmxUWK5tB7ei-mhSurDLjtVzxAEvNdI1GzM",
+        )
+        .unwrap();
+        assert_eq!(m.score, 1.0);
+        assert!(m.up);
+        // Unrelated host: no candidate.
+        assert!(host_match(&exact, "https://example.com/x").is_none());
     }
 
     #[test]

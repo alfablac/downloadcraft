@@ -135,15 +135,42 @@ impl RdHostStatus {
     }
 }
 
+/// SLD label: second-last dot label, collapsing known multi-label
+/// suffixes first (mega.co.nz -> mega, not co).
+fn rd_sld(host: &str) -> String {
+    let h = host.trim().to_ascii_lowercase();
+    for sfx in ["co.nz", "co.uk", "com.au", "co.in", "com.br", "co.za"] {
+        if let Some(p) = h.strip_suffix(&format!(".{sfx}")) {
+            return p.rsplit('.').next().unwrap_or("").to_string();
+        }
+    }
+    let parts: Vec<&str> = h.split('.').collect();
+    if parts.len() >= 2 {
+        parts[parts.len() - 2].to_string()
+    } else {
+        parts.first().copied().unwrap_or("").to_string()
+    }
+}
+
 /// Merge `/hosts` and `/hosts/status` bodies (either may be the empty-map
 /// `{}` shape). Domains present in only one side still appear, with the
 /// other side's fields defaulted.
 pub fn merge_hosts(hosts_json: &str, status_json: &str) -> Result<Vec<RdHostStatus>, String> {
     let hosts = parse_hosts(hosts_json)?;
     let states = parse_hosts_status(status_json)?;
+    // /hosts and /hosts/status may key same hoster under alias domains
+    // (mega.nz vs mega.co.nz): fall back to entry sharing SLD label.
+    // Exact match wins first.
+    let find_state = |domain: &str| -> Option<&RdHostState> {
+        states
+            .iter()
+            .find(|(d, _)| d == domain)
+            .or_else(|| states.iter().find(|(d, _)| rd_sld(d) == rd_sld(domain)))
+            .map(|(_, s)| s)
+    };
     let mut out: Vec<RdHostStatus> = Vec::new();
     for (domain, h) in &hosts {
-        let st = states.iter().find(|(d, _)| d == domain).map(|(_, s)| s);
+        let st = find_state(domain);
         out.push(RdHostStatus {
             domain: domain.clone(),
             id: h.id.clone(),
@@ -805,6 +832,27 @@ mod tests {
             .find(|h| h.domain == "rapidgator.net")
             .unwrap()
             .is_up());
+    }
+
+    #[test]
+    fn merge_hosts_alias_domain_status() {
+        // /hosts keys mega.nz, /hosts/status keys mega.co.nz (alias split):
+        // status must still join, else Mega reads down/unsupported and
+        // resolver skips RD for mega.nz links.
+        let hosts = r#"{"mega.nz":{"id":"mega","name":"Mega","icon":"i"}}"#;
+        let status = r#"{"mega.co.nz":{"supported":1,"status":"up","check_time":"2026-10-19T08:00:00.000Z"}}"#;
+        let m = merge_hosts(hosts, status).unwrap();
+        let mega = m.iter().find(|h| h.domain == "mega.nz").unwrap();
+        assert_eq!(mega.status, "up");
+        assert!(mega.supported);
+        assert!(mega.is_up());
+        // Different hoster sharing no SLD: no join.
+        let hosts2 = r#"{"rapidgator.net":{"id":"rg","name":"RG","icon":"i"}}"#;
+        let status2 = r#"{"mega.co.nz":{"supported":1,"status":"up"}}"#;
+        let m2 = merge_hosts(hosts2, status2).unwrap();
+        let rg = m2.iter().find(|h| h.domain == "rapidgator.net").unwrap();
+        assert_eq!(rg.status, "");
+        assert!(!rg.is_up());
     }
 
     #[test]
