@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.18.0-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.19.0-blue">
   <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">
   <img alt="Language" src="https://img.shields.io/badge/built%20with-Rust%20%2B%20egui-orange">
 </p>
@@ -19,7 +19,7 @@
 
 webcraft reimplements the observable behavior of Internet Download Manager from scratch: segmented downloads that resume, queues and schedules, DASH/HLS handling, a site grabber, and deep browser integration. No IDM code, binaries, icons, or activation logic — and no affiliation with Tonec.
 
-**Current version:** 0.18.0 · Changelog lives in GitHub Releases.
+**Current version:** 0.19.0 · Changelog lives in GitHub Releases.
 
 **Runs on:** Windows 10/11 x86_64 · macOS 13+ (Intel and Apple Silicon) · Linux x86_64 (Ubuntu 22.04+, X11 and Wayland).
 
@@ -37,6 +37,7 @@ webcraft reimplements the observable behavior of Internet Download Manager from 
 ### Download engine
 
 - Segmented HTTP/S downloads that resume from part files after a restart, with work-stealing across a fixed connection pool (configurable in Options) and correct byte accounting — downloaded never exceeds total
+- Options → **Part size MB (0 = auto)**: `0` auto-scales part size with file size; a set value is the exact part target (e.g. a 6 GiB file at 512 MB gives 12 parts). Applies to new downloads only — resumed downloads keep their saved segmentation
 - Pre-warm probing on add/capture: range probe, redirect resolution, and segment planning happen before you confirm; probe responses are reused instead of re-downloaded
 - Custom HTTP headers per download (User-Agent, Referer, Authorization Bearer, or any header) from the Add dialog's *Headers (advanced)* section — HTTP/S only
 - Per-download proxy override (Add URL/File *Transfer → Proxy*, browser Capture, or Progress dialog — Progress edits apply on restart); empty inherits the global Settings proxy. Applies to HTTP/HTTPS, HLS/DASH, Metalink, debrid, fetching NZB/.torrent files, and yt-dlp probe/download (`--proxy`); FTP/SFTP, NNTP articles, and torrent swarm stay direct. HTTP and SOCKS5 proxies work, with credentials in the URL
@@ -69,6 +70,9 @@ webcraft reimplements the observable behavior of Internet Download Manager from 
 ### Debrid
 
 - Real-Debrid, AllDebrid, and TorBox: hoster links and magnets are unrestricted through your account, in your preferred provider order
+- Alias domains route to a capable provider instead of direct HTTP: `mega.nz` / `mega.co.nz` / `mega.io` and `rapidgator.net` / `rg.to` / `rapidgator.asia` are treated as one hoster each
+- Provider refusals (e.g. `infringing_file`) surface as task errors — the hoster HTML page is never saved as a fake completed file
+- TorBox: non-cached hoster links create a server-side web download; the app polls until TorBox reports it ready, then downloads, and surfaces server errors
 - Magnet results fan out to one task per file; hoster checks are cached so repeat adds start fast
 - The downloads list shows a Debrid badge and the progress dialog names the provider, hoster, and cache status — no silent fallbacks
 
@@ -83,6 +87,8 @@ webcraft reimplements the observable behavior of Internet Download Manager from 
 - Queues with priority, retry counts, and per-queue concurrency; schedules with start/stop windows, weekday masks, quotas, missed-run catch-up, and completion actions (including shutdown with confirmation)
 - Site Grabber with depth, scope, size, and extension filters and a mirror mode that rewrites links to local relative paths — including SharePoint via browser cookies
 - Progress dialog with per-part status, speed graph, and live details; downloads table with saved sort/widths, protocol badges, and type filtering from the side rail
+- File size is highlighted (strong accent) in the progress and completed windows, with downloaded / total / percent; when total size is unknown (HLS/DASH), the completed window falls back to the final downloaded bytes
+- Chatbot app actions: ask the assistant to add a download (file, magnet, `.torrent`, NZB, or video page), pause / resume / delete / open-folder by name, start / stop all, delete completed, or change a whitelisted setting; `list_tasks` / `search_tasks` / `get_stats` run instantly, app state is supplied via an `[APPDATA]` context block, unsupported actions are reported instead of dropped, and mutating actions ask for Confirm first
 - Desktop notifications, system tray, autostart, single-instance lock, clipboard URL monitoring, drag-and-drop, HTTP/SOCKS5 proxy with authentication (global default, per-download override — see Download engine), and atomic state saving with a `.bak` fallback
 
 > [!NOTE]

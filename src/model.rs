@@ -258,7 +258,8 @@ pub struct Settings {
     pub max_connections: u32,
     #[serde(default = "def_global")]
     pub global_max_concurrent: usize,
-    /// HTTP max part size in MiB. 0 = auto (64 MiB, up to 256 MiB huge files).
+    /// HTTP part size in MiB. 0 = auto (64 MiB, up to 256 MiB huge
+    /// files); >0 = exact part size target for new downloads.
     #[serde(default)]
     pub max_part_mb: u64,
     #[serde(default)]

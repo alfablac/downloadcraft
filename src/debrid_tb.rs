@@ -249,7 +249,23 @@ pub struct TbWebDl {
     pub web_id: i64,
     pub name: String,
     pub files: Vec<TbFile>,
+    /// Docs `download_state` string (no closed enum); empty if absent.
+    pub download_state: String,
+    /// Docs: file ready on TorBox CDN.
+    pub download_present: bool,
+    /// Docs: server-side fetch finished.
+    pub download_finished: bool,
+    /// 0.0..=1.0 server-side fetch progress, if reported.
+    pub progress: Option<f64>,
+    /// Server-side error text (`error` field), empty if none.
+    pub error: String,
     pub raw: Value,
+}
+
+impl TbWebDl {
+    pub fn ready(&self) -> bool {
+        self.download_present || self.download_finished || !self.files.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -690,13 +706,20 @@ pub fn parse_web_list(data: &Value) -> Vec<TbWebDl> {
 
 pub fn parse_web_dl(v: &Value) -> TbWebDl {
     TbWebDl {
-        web_id: pick_i64(v, &["web_id", "id"]),
+        // Docs: create returns `data.webdownload_id` (string); mylist
+        // items use `id` (number). pick_i64 accepts both shapes.
+        web_id: pick_i64(v, &["webdownload_id", "web_id", "id"]),
         name: pick_str(v, &["name", "title"]),
         files: v
             .get("files")
             .and_then(Value::as_array)
             .map(|a| a.iter().map(parse_file).collect())
             .unwrap_or_default(),
+        download_state: pick_str(v, &["download_state"]),
+        download_present: pick_bool(v, &["download_present"]).unwrap_or(false),
+        download_finished: pick_bool(v, &["download_finished"]).unwrap_or(false),
+        progress: pick_f64(v, &["progress"]),
+        error: pick_str(v, &["error"]),
         raw: v.clone(),
     }
 }
@@ -1106,5 +1129,32 @@ mod tests {
         assert!(!s.contains("SECRET"));
         assert!(!s.contains("https://"));
         assert!(s.contains("done"));
+    }
+
+    #[test]
+    fn web_dl_docs_shapes_and_readiness() {
+        // Create response (docs): data.webdownload_id is a STRING.
+        let created = parse_web_dl(&json!({"webdownload_id": "123", "name": "f.mkv"}));
+        assert_eq!(created.web_id, 123);
+        assert!(!created.ready());
+        // Mylist item: numeric id + state fields.
+        let fetching = parse_web_dl(&json!({
+            "id": 7, "name": "f.mkv", "download_state": "downloading",
+            "download_present": false, "download_finished": false,
+            "progress": 0.42, "error": "", "files": []
+        }));
+        assert_eq!(fetching.web_id, 7);
+        assert_eq!(fetching.download_state, "downloading");
+        assert_eq!(fetching.progress, Some(0.42));
+        assert!(!fetching.ready());
+        // Ready: files present.
+        let ready = parse_web_dl(&json!({
+            "id": 7, "download_present": true, "download_finished": true,
+            "files": [{"id": 1, "name": "f.mkv", "size": 10}]
+        }));
+        assert!(ready.ready());
+        // Server-side error surfaces verbatim.
+        let failed = parse_web_dl(&json!({"id": 7, "error": "hoster unreachable"}));
+        assert_eq!(failed.error, "hoster unreachable");
     }
 }

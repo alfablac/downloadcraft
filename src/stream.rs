@@ -300,8 +300,9 @@ pub async fn download_url_with_settings(
     // Debrid before torrent/HTTP: magnets + hoster URLs. Resolved direct
     // URLs expire/IP-bound, so resolution runs fresh here on every start
     // (same client = same egress IP); persisted task keeps original URL
-    // (download_via_debrid restores it). Any debrid failure falls through
-    // to local torrent / plain HTTP below.
+    // (download_via_debrid restores it). Soft debrid failure falls through
+    // to local torrent / plain HTTP below; hard provider refusal returns
+    // Err (see below) so hoster page HTML never saves as fake file.
     let choice = crate::model::debrid_choice_of(&task);
     if choice != "none"
         && ((crate::debrid::is_magnet(&task.url)
@@ -330,8 +331,16 @@ pub async fn download_url_with_settings(
             .await
             {
                 Ok(t) => return Ok(t),
-                Err(_) => {
-                    // fall through: local torrent / HTTP. Never log URL/token.
+                Err((e, true)) => {
+                    // Hard provider refusal (e.g. RD infringing_file,
+                    // error 35): fail task with provider message.
+                    // Falling back to direct HTTP would download the
+                    // hoster HTML page as a fake completed file.
+                    return Err(e);
+                }
+                Err((_, false)) => {
+                    // Soft: unsupported/no provider — fall through to
+                    // local torrent / HTTP. Never log URL/token.
                 }
             }
         }

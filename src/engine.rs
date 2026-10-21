@@ -462,6 +462,9 @@ fn split_point_min(start: u64, end: u64, done: u64, min_half: u64) -> Option<u64
 
 /// Pool part sizing: parts are a percentage of file, never infinitesimal.
 /// target = total/(pool * PARTS_PER_CONN), clamped [MIN_SPLIT, cap].
+/// Explicit override (Settings Part size) replaces target outright, see
+/// `target_part_size_with` — a ceiling here made 512 MB setting invisible
+/// (6 GiB/32 conns-waves = 192 MiB < cap, and work-steal slack re-split).
 pub const PARTS_PER_CONN: u64 = 4;
 pub const MAX_PART: u64 = 64 * 1024 * 1024;
 /// Auto cap ceiling for huge files (Settings override 0 = auto).
@@ -498,10 +501,18 @@ pub fn target_part_size(total: u64, pool: u32) -> u64 {
 }
 
 pub fn target_part_size_with(total: u64, pool: u32, override_bytes: u64) -> u64 {
-    let waves = (pool.max(1) as u64) * PARTS_PER_CONN;
     // Small files: floor relaxes to per-connection share so pool still
     // parallelizes (parts never fewer than pool on fresh plan).
     let floor = MIN_SPLIT.min(total / (pool.max(1) as u64).max(1));
+    if override_bytes > 0 {
+        // Explicit user part size = target, not ceiling: 512 MiB on a 6 GiB
+        // file means ~512 MiB parts (~12), NOT total/(pool*4) under a cap.
+        // At least `pool` parts so every connection still gets work.
+        let cap = effective_max_part(total, override_bytes);
+        let per_conn = (total / (pool.max(1) as u64).max(1)).max(floor);
+        return cap.min(per_conn);
+    }
+    let waves = (pool.max(1) as u64) * PARTS_PER_CONN;
     (total / waves.max(1)).clamp(floor, effective_max_part(total, override_bytes))
 }
 /// Plan with pool-relative part size (fresh downloads only; resume keeps
@@ -527,6 +538,11 @@ pub fn parts_cap(total: u64, pool: u32) -> usize {
 pub fn parts_cap_with(total: u64, pool: u32, override_bytes: u64) -> usize {
     let cap = effective_max_part(total, override_bytes);
     let by_size = total.div_ceil(cap).max(1) as usize;
+    if override_bytes > 0 {
+        // Explicit size: no wave slack, else work-stealing splits the
+        // user's parts back down (512 MiB plan -> 32 live segments).
+        return by_size;
+    }
     let by_waves = (pool.max(1) as usize) * (PARTS_PER_CONN as usize);
     by_size.max(by_waves)
 }
@@ -3298,6 +3314,20 @@ mod tests {
             plan_parts_with(100 * gib, 8, 64 * 1024 * 1024).len(),
             1600
         );
+        // Explicit part size is a TARGET, not ceiling (user report:
+        // 512 MiB set on 6 GiB file still gave 49 x ~126 MiB auto parts).
+        // 6 GiB / 512 MiB = 12 parts; no wave-slack re-split.
+        let six = 6 * gib;
+        assert_eq!(target_part_size_with(six, 8, 512 * 1024 * 1024), 512 * 1024 * 1024);
+        assert_eq!(plan_parts_with(six, 8, 512 * 1024 * 1024).len(), 12);
+        assert_eq!(parts_cap_with(six, 8, 512 * 1024 * 1024), 12);
+        // 256 MiB manual on 6 GiB: 24 parts.
+        assert_eq!(plan_parts_with(six, 8, 256 * 1024 * 1024).len(), 24);
+        // Tiny file still parallelizes: at least pool parts.
+        assert_eq!(plan_parts_with(32 * 1024 * 1024, 8, 512 * 1024 * 1024).len(), 8);
+        // Auto fingerprint (old bug): 6 GiB auto = 128 MiB cap tier.
+        assert_eq!(target_part_size(six, 8), 128 * 1024 * 1024);
+        assert_eq!(plan_parts(six, 8).len(), 48);
         assert_eq!(target_part_size(100 * 1024 * 1024, 8), MIN_SPLIT);
         assert_eq!(plan_parts(100 * 1024 * 1024, 8).len(), 25);
         // 2GiB @8: 64MiB cap-bound, 32 parts (no 1MiB shredding).

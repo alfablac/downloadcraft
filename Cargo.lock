@@ -7423,7 +7423,7 @@ dependencies = [
 
 [[package]]
 name = "webcraft"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "aes 0.8.4",
  "arboard",

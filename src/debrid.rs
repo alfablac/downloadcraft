@@ -779,7 +779,42 @@ pub async fn unrestrict(
         Provider::Tb => {
             let _ = http;
             let c = crate::debrid_tb::TbClient::new(key);
-            let w = c.create_web_download(url).await?;
+            let mut web = c.create_web_download(url).await?;
+            // TorBox fetches non-cached hoster links server-side; docs say
+            // mylist updates live every 5s. Poll until files ready.
+            // ponytail: 24x5s=2min ceiling. Job keeps running server-side
+            // past timeout; retry re-polls mylist and picks it up. Raise
+            // if real files regularly exceed.
+            const TB_POLLS: usize = 24;
+            for _ in 0..TB_POLLS {
+                if !web.error.is_empty() {
+                    return Err(format!("TorBox: {}", web.error));
+                }
+                if web.ready() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                web = c
+                    .web_list(Some(web.web_id))
+                    .await?
+                    .into_iter()
+                    .next()
+                    .ok_or("TorBox: web download vanished")?;
+            }
+            if !web.error.is_empty() {
+                return Err(format!("TorBox: {}", web.error));
+            }
+            if !web.ready() {
+                let pct = web
+                    .progress
+                    .map(|p| format!(" ({:.0}%)", p * 100.0))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "TorBox still fetching {} server-side{} — retry shortly to continue",
+                    web.download_state, pct
+                ));
+            }
+            let w = web;
             let f = w
                 .files
                 .first()
@@ -1064,8 +1099,16 @@ pub async fn resolve_hoster(
     s: &Settings,
     url: &str,
 ) -> Result<(Provider, ResolvedFile), String> {
-    resolve_hoster_choice(http, s, url, "auto").await
+    let (r, _) = resolve_hoster_result(http, s, url, "auto").await;
+    r
 }
+
+/// Hoster resolution, structured failure: `(error, hard)`. `hard` = a
+/// provider actually attempted unrestrict and refused (e.g. RD
+/// `infringing_file`): caller must surface error, NOT fall back to
+/// direct HTTP (which downloads hoster HTML page as fake file).
+/// `hard=false`: unsupported / no candidate / hosts check failed.
+pub type ResolveHosterResult = (Result<(Provider, ResolvedFile), String>, bool);
 
 /// `choice` = task `debrid_choice` via `providers_for`; `"auto"` =
 /// `resolve_hoster`.
@@ -1075,6 +1118,16 @@ pub async fn resolve_hoster_choice(
     url: &str,
     choice: &str,
 ) -> Result<(Provider, ResolvedFile), String> {
+    let (r, _) = resolve_hoster_result(http, s, url, choice).await;
+    r
+}
+
+pub async fn resolve_hoster_result(
+    http: reqwest::Client,
+    s: &Settings,
+    url: &str,
+    choice: &str,
+) -> ResolveHosterResult {
     struct Cand {
         p: Provider,
         m: HostMatch,
@@ -1099,7 +1152,7 @@ pub async fn resolve_hoster_choice(
         }
     }
     if !tried {
-        return Err("no debrid provider enabled for hosters".into());
+        return (Err("no debrid provider enabled for hosters".into()), false);
     }
     cands.sort_by(|a, b| {
         b.m.score
@@ -1108,17 +1161,27 @@ pub async fn resolve_hoster_choice(
             .then(b.m.up.cmp(&a.m.up))
             .then(a.pref.cmp(&b.pref))
     });
+    let mut hard: Option<String> = None;
     for c in cands {
         let cfg = c.p.cfg(s);
         match unrestrict(http.clone(), c.p, &cfg.api_key, url).await {
-            Ok(f) => return Ok((c.p, f)),
-            Err(e) => last = format!("{}: {e}", c.p.label()),
+            Ok(f) => return (Ok((c.p, f)), false),
+            Err(e) => {
+                let msg = format!("{}: {e}", c.p.label());
+                if hard.is_none() {
+                    hard = Some(msg.clone());
+                }
+                last = msg;
+            }
         }
+    }
+    if let Some(h) = hard {
+        return (Err(h), true);
     }
     if last.is_empty() {
         last = "no enabled debrid provider supports this host".into();
     }
-    Err(last)
+    (Err(last), false)
 }
 
 /// Try providers in preference order for magnet.
@@ -1168,7 +1231,7 @@ pub async fn download_via_debrid(
     mut task: crate::model::DownloadTask,
     ctrl: std::sync::Arc<crate::engine::Controls>,
     settings: &Settings,
-) -> Result<crate::model::DownloadTask, String> {
+) -> Result<crate::model::DownloadTask, (String, bool)> {
     let original_url = task.url.clone();
     let choice = crate::model::debrid_choice_of(&task);
     let want_file = if !task.debrid_file_name.is_empty() {
@@ -1184,7 +1247,7 @@ pub async fn download_via_debrid(
         Some(
             crate::torrent::torrent_magnet(http.clone(), &task, settings)
                 .await
-                .map_err(|e| format!("torrent debrid probe: {e}"))?,
+                .map_err(|e| (format!("torrent debrid probe: {e}"), false))?,
         )
     } else {
         None
@@ -1192,18 +1255,20 @@ pub async fn download_via_debrid(
     if let Some(magnet) = &effective_magnet {
         let original_url = original_url.clone();
         let (p, files) =
-            resolve_magnet_choice(http.clone(), settings, magnet, choice).await?;
+            resolve_magnet_choice(http.clone(), settings, magnet, choice)
+                .await
+                .map_err(|e| (e, false))?;
         let chosen = if files.len() == 1 {
             files.into_iter().next().unwrap()
         } else {
             match files.iter().find(|f| f.name == want_file).cloned() {
                 Some(f) => f,
                 None => {
-                    return Err(format!(
+                    return Err((format!(
                         "debrid magnet resolved {} files; use Add dialog (debrid fan-out creates one task per file) or local torrent. Files: {}",
                         files.len(),
                         files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", ")
-                    ))
+                    ), false))
                 }
             }
         };
@@ -1225,7 +1290,15 @@ pub async fn download_via_debrid(
             task.filename = crate::model::sanitize_filename(&chosen.name);
         }
         let resolved = task.url.clone();
-        let mut done = crate::engine::download_http(http, task, ctrl).await?;
+        let mut done = crate::engine::download_http_with_prewarm(
+            http,
+            task,
+            ctrl,
+            None,
+            settings.max_part_mb * 1024 * 1024,
+        )
+        .await
+        .map_err(|e| (e, false))?;
         done.url = original_url;
         done.debrid_info = debrid_info;
         done.debrided_url = resolved;
@@ -1233,7 +1306,11 @@ pub async fn download_via_debrid(
         return Ok(done);
     }
     // hoster URL
-    let (p, f) = resolve_hoster_choice(http.clone(), settings, &original_url, choice).await?;
+    let (p, f) = match resolve_hoster_result(http.clone(), settings, &original_url, choice).await
+    {
+        (Ok(v), _) => v,
+        (Err(e), hard) => return Err((e, hard)),
+    };
     let host = url_host(&original_url);
     task.url = f.url.clone();
     task.debrid_info = format_debrid_info(p.label(), &host, f.cached);
@@ -1249,7 +1326,15 @@ pub async fn download_via_debrid(
         task.filename = crate::model::sanitize_filename(&f.name);
     }
     let resolved = f.url.clone();
-    let mut done = crate::engine::download_http(http, task, ctrl).await?;
+    let mut done = crate::engine::download_http_with_prewarm(
+        http,
+        task,
+        ctrl,
+        None,
+        settings.max_part_mb * 1024 * 1024,
+    )
+    .await
+    .map_err(|e| (e, false))?;
     done.url = original_url;
     done.debrid_info = debrid_info;
     done.debrided_url = resolved;

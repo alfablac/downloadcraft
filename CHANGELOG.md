@@ -2,6 +2,23 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.19.0] - 2026-10-21
+
+### Added
+
+- Chatbot app actions: `add_download` (file, magnet, `.torrent`, NZB, video page), `pause_task` / `resume_task` / `delete_task` / `open_folder` by name, `start_all` / `stop_all` / `delete_completed`, and `set_setting` (whitelisted keys only). `list_tasks` / `search_tasks` / `get_stats` run instantly without confirmation; mutating actions need Confirm. App state is injected as `[APPDATA]` context, and unsupported actions are reported instead of silently dropped.
+
+### Changed
+
+- Settings "Max part MB" renamed "Part size MB (0 = auto)" and now means an exact target: 0 = auto tiers that scale with file size; a set value sizes parts exactly (6 GiB at 512 MB = 12 parts). Resumed downloads keep their saved segmentation.
+- File size is highlighted (strong accent) in the progress and completed windows, with downloaded/total/percent. Completed downloads with unknown total (HLS/DASH) show final downloaded bytes instead.
+- TorBox: non-cached hoster links create a web download server-side; the app polls until ready, then downloads. Server errors are surfaced.
+
+### Fixed
+
+- Debrid alias domains (`mega.nz`/`mega.co.nz`/`mega.io`, `rapidgator.net`/`rg.to`/`rapidgator.asia`) route to a capable Real-Debrid/AllDebrid/TorBox provider instead of direct HTTP.
+- Provider errors during unrestrict (e.g. `infringing_file`) now surface as task errors; the hoster HTML page is no longer downloaded as a junk file.
+
 ## [0.18.0] - 2026-10-21
 
 ### Added
