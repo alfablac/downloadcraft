@@ -1427,43 +1427,52 @@ fn run_ytdlp_download(
     }
 }
 
+/// Direct media file URL: native pipeline downloads file itself; yt-dlp
+/// generic extractor would only wrap same URL, losing segmented/resume.
+/// Path only (query/fragment stripped), case-insensitive, suffix-exact
+/// (`file.mp4x` is a page, `watch?f=.mp4` is a page).
+pub fn is_direct_media_url(url: &str) -> bool {
+    const EXTS: &[&str] = &[
+        ".mp4", ".m4v", ".mkv", ".webm", ".mov", ".avi", ".mpg", ".mpeg", ".wmv", ".flv", ".3gp",
+        ".ogv", ".ts", ".m4s", ".mp3", ".m4a", ".opus", ".ogg", ".oga", ".flac", ".wav", ".aac",
+        ".wma",
+    ];
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    EXTS.iter().any(|e| path.ends_with(e))
+}
+
+/// Universal yt-dlp candidate: any http(s) page URL — no file extension
+/// or a page extension (.html/.php/.ghtml/...) — that is not a direct
+/// media/manifest/plain-file URL (.mp4/.m3u8/.zip/...: native pipeline
+/// owns files). yt-dlp itself decides support (1000+ extractors incl.
+/// generic) at probe/download; unsupported pages fail there instead of
+/// native pipeline saving page HTML as fake media file.
+/// ponytail: sync + pure, no subprocess/network — hot UI/dispatch callers.
+/// Per-site path allowlists belong in yt-dlp extractors, not here.
 pub fn is_video_page(url: &str) -> bool {
+    const PAGE_EXTS: &[&str] = &[
+        "html", "htm", "shtml", "xhtml", "ghtml", "php", "php3", "php4", "php5", "phtml", "asp",
+        "aspx", "jsp", "jspx", "cfm", "do", "action", "pl", "py", "rb", "erb",
+    ];
     let Ok(u) = url::Url::parse(url) else {
         return false;
     };
-    let host = u.host_str().unwrap_or("").to_ascii_lowercase();
-    let path = u.path().to_ascii_lowercase();
-    let h = host.strip_prefix("www.").unwrap_or(&host);
-    let h = h.strip_prefix("m.").unwrap_or(h);
-    match h {
-        "youtube.com" => {
-            path.starts_with("/watch") || path.starts_with("/shorts/") || path.starts_with("/live/")
-        }
-        "youtu.be" => path.len() > 1,
-        "music.youtube.com" => path.starts_with("/watch"),
-        "vimeo.com" => path.chars().nth(1).is_some_and(|c| c.is_ascii_digit()),
-        "dailymotion.com" => path.starts_with("/video/"),
-        "dai.ly" => path.len() > 1,
-        "twitch.tv" => path.starts_with("/videos/"),
-        "tiktok.com" => path.contains("/video/"),
-        "instagram.com" => {
-            ["/reel/", "/reels/", "/p/", "/tv/"]
-                .iter()
-                .any(|p| path.starts_with(p) && path.len() > p.len())
-                || (path.starts_with("/stories/")
-                    && path.trim_end_matches('/').matches('/').count() >= 3)
-        }
-        "twitter.com" | "x.com" => path.contains("/status/"),
-        "facebook.com" | "fb.watch" => {
-            h == "fb.watch"
-                || path.contains("/videos/")
-                || path.starts_with("/watch")
-                || path.starts_with("/reel/")
-        }
-        "reddit.com" => path.contains("/comments/"),
-        "soundcloud.com" => path.matches('/').count() >= 2,
-        "bilibili.com" => path.starts_with("/video/"),
-        _ => false,
+    if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() {
+        return false;
+    }
+    if is_manifest_url(url) || is_direct_media_url(url) {
+        return false;
+    }
+    // File-extension gate: last segment `name.<ext>` with non-page ext is
+    // a plain file download (zip/pdf/json/...), not a page.
+    let seg = u.path().rsplit('/').next().unwrap_or("");
+    match seg.rsplit_once('.') {
+        Some((_, ext)) if !ext.is_empty() => PAGE_EXTS.contains(&ext.to_ascii_lowercase().as_str()),
+        _ => true,
     }
 }
 
@@ -1688,11 +1697,11 @@ mod tests {
     }
     #[test]
     fn video_page_detection() {
+        // Old allowlist positives stay true.
         assert!(is_video_page("https://www.youtube.com/watch?v=aqz-KE-bpKQ"));
         assert!(is_video_page("https://youtu.be/aqz-KE-bpKQ"));
         assert!(is_video_page("https://vimeo.com/12345"));
         assert!(is_video_page("https://www.twitch.tv/videos/123"));
-        assert!(!is_video_page("https://example.com/file.mp4"));
         assert!(is_video_page("https://www.instagram.com/reel/ABC123/"));
         assert!(is_video_page("https://www.instagram.com/reels/ABC123/"));
         assert!(is_video_page("https://www.instagram.com/p/ABC123/"));
@@ -1700,12 +1709,73 @@ mod tests {
         assert!(is_video_page(
             "https://www.instagram.com/stories/someuser/1234567890/"
         ));
-        assert!(!is_video_page("https://www.instagram.com/someuser/"));
-        assert!(!is_video_page("https://www.instagram.com/explore/"));
-        assert!(!is_video_page("https://www.instagram.com/stories/someuser/"));
-        assert!(!is_video_page("https://www.youtube.com/feed/subscriptions"));
-        assert!(!is_video_page("https://vimeo.com/about"));
+        assert!(is_video_page(
+            "https://twitter.com/nytimes/status/1680000000000000000?s=20"
+        ));
+        assert!(is_video_page("https://x.com/nytimes/status/1680000000000000000"));
+        assert!(is_video_page(
+            "https://www.reddit.com/r/rust/comments/1abc/title_here/"
+        ));
+        assert!(is_video_page("https://g1.globo.com/jornal/article.ghtml"));
+        // New: unknown-site page — yt-dlp generic extractor decides.
+        assert!(is_video_page("https://unknown-site.example/watch/123"));
+        assert!(is_video_page("https://some-random-blog.example/posts/hello"));
+        assert!(is_video_page("http://example.com/"));
+        // Old negatives that are pages, not files: now yt-dlp candidates.
+        // Unsupported ones fail loudly at probe/download (stream.rs
+        // hard-errors) instead of saving page HTML as fake file.
+        assert!(is_video_page("https://www.instagram.com/someuser/"));
+        assert!(is_video_page("https://www.youtube.com/feed/subscriptions"));
+        assert!(is_video_page("https://vimeo.com/about"));
+        // Query/fragment naming media is still a page.
+        assert!(is_video_page("https://example.com/watch?f=.mp4"));
+        // Suffix-exact: .mp4x is unknown-ext file, stays native.
+        assert!(!is_video_page("https://example.com/file.mp4x"));
+    }
+
+    #[test]
+    fn video_page_rejects_direct_media_manifest_non_http() {
+        assert!(!is_video_page("https://example.com/file.mp4"));
+        assert!(!is_video_page("https://example.com/file.MP4?tok=1#t=3"));
+        assert!(!is_video_page("https://example.com/v/movie.webm"));
+        assert!(!is_video_page("https://example.com/v/clip.mkv"));
+        assert!(!is_video_page("https://example.com/song.mp3"));
+        assert!(!is_video_page("https://example.com/list.m3u8"));
+        assert!(!is_video_page("https://example.com/list.m3u8?sig=1#frag"));
+        assert!(!is_video_page("https://example.com/manifest.mpd?a=1"));
+        assert!(!is_video_page("https://example.com/pl.M3U8"));
+        assert!(!is_video_page("ftp://example.com/watch/1"));
+        assert!(!is_video_page("magnet:?xt=urn:btih:abc"));
+        assert!(!is_video_page("file:///C:/video/page.html"));
         assert!(!is_video_page("not a url"));
+        assert!(!is_video_page(""));
+        // Plain files stay native (segmented/resume/debrid), never yt-dlp.
+        assert!(!is_video_page("https://example.com/file.zip"));
+        assert!(!is_video_page("https://example.com/doc.pdf?dl=1"));
+        assert!(!is_video_page("https://example.com/data.json"));
+        assert!(!is_video_page("https://example.com/app.apk"));
+    }
+
+    #[test]
+    fn video_page_page_extensions() {
+        assert!(is_video_page("https://example.com/index.html"));
+        assert!(is_video_page("https://example.com/a/b.PHP?id=9"));
+        assert!(is_video_page("https://g1.globo.com/x/article.ghtml"));
+        assert!(is_video_page("https://example.com/watch.php?v=1"));
+        assert!(!is_video_page("https://example.com/pic.jpg"));
+        assert!(!is_video_page("https://example.com/pic.png?x=1"));
+    }
+
+    #[test]
+    fn direct_media_url_suffix_exact() {
+        assert!(is_direct_media_url("https://cdn.example.com/a/b.mp4"));
+        assert!(is_direct_media_url("https://cdn.example.com/A.WEBM?tok=1"));
+        assert!(is_direct_media_url("https://cdn.example.com/x.flac#t=1"));
+        assert!(!is_direct_media_url("https://example.com/watch?f=.mp4"));
+        assert!(!is_direct_media_url("https://example.com/file.mp4x"));
+        assert!(!is_direct_media_url("https://example.com/mp4/page"));
+        assert!(!is_direct_media_url("https://example.com/list.m3u8"));
+        assert!(!is_direct_media_url("https://example.com/about"));
     }
     fn vf(height: Option<u32>, vcodec: &str, ext: &str) -> YtFormat {
         YtFormat {

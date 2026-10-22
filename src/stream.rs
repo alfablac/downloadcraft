@@ -318,9 +318,10 @@ pub async fn download_url_with_settings(
         // cheap gate = debrid hosts check is provider-side on unrestrict;
         // avoid hijacking normal HTTP by requiring hoster match attempt
         // only for non-manifest URLs. Failure falls through anyway, but
-        // skip obvious manifests/video pages to save API calls.
-        let skip =
-            manifest_kind_from_url(&task.url).is_some() || crate::ytdlp::is_video_page(&task.url);
+        // Skip obvious manifests to save API calls. Video-page check dropped:
+        // is_video_page is universal now (any non-file page), which would
+        // skip debrid for every hoster page URL.
+        let skip = manifest_kind_from_url(&task.url).is_some();
         if !skip {
             match crate::debrid::download_via_debrid(
                 client.clone(),
@@ -1027,8 +1028,8 @@ mod tests {
     #[test]
     fn manifest_kind_path_not_query_token() {
         // Query token value `.mpd`/`.m3u8` alone must not route as manifest.
-        assert_eq!(kind_of("https://x.org/watch?f=.mpd"), ProtoKind::Http);
-        assert_eq!(kind_of("https://x.org/watch?f=.m3u8"), ProtoKind::Http);
+        assert_eq!(kind_of("https://x.org/watch?f=.mpd"), ProtoKind::YtDlp);
+        assert_eq!(kind_of("https://x.org/watch?f=.m3u8"), ProtoKind::YtDlp);
         assert_eq!(manifest_kind_from_url("https://x.org/watch?f=.mpd"), None);
         // Real manifest path (query noise ok) still routes.
         assert_eq!(

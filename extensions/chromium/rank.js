@@ -122,12 +122,16 @@
   }
   function matchRecordsForElement(records, el, now, extraPool) {
     var e = el || {};
-    // Host-scoped fallback (background-only, NOT reachable from content
-    // messages): IG/MSE pages can never src/id-match CDN URLs. Extra pool
-    // entries without tab/frame recorded (e.g. MV3 SW / webNavigation SPA
-    // ids) pass only when host-matched AND inside since window.
-    var hostScope = String(e.pageHost || "").toLowerCase();
-    var useExtra = !!(hostScope && e.since);
+    // Generic blob/MSE fallback (background-only, NOT reachable from content
+    // messages): element whose only src is blob: can never src/id-match the
+    // real request URLs. Extra pool = same-tab candidates inside since
+    // window, any host; playlists preferred (manifest is whole stream,
+    // segments/files are parts). bg sets blobOnly from element src state,
+    // never from page host; content calls pass no extraPool -> no widening.
+    var blobOnly = !!e.blobOnly;
+    var rawSrcs = e.srcs && e.srcs.length ? e.srcs : (e.srcKey ? [e.srcKey] : []);
+    var blobSrcOnly = blobOnly && rawSrcs.length > 0 && rawSrcs.every(function (s) { return /^(blob|data):/.test(String(s || "")); });
+    var useExtra = !!(blobSrcOnly && e.since);
     var srcs = {};
     (e.srcs || []).forEach(function (s) { if (s && !/^(blob|data):/.test(s)) srcs[s] = 1; });
     if (e.srcKey && !/^(blob|data):/.test(e.srcKey)) srcs[e.srcKey] = 1;
@@ -147,22 +151,18 @@
     if (useExtra) {
       (extraPool || []).forEach(function (r) {
         if (!r || !r.url || /^(blob|data):/.test(r.url)) return;
-        // Same-tab extras with different frame lose to tab-strict pool;
-        // tabId==null entries (host-scoped) still pass.
-        if (e.tabId != null && r.tabId != null && r.tabId !== e.tabId) return;
-        try {
-          var h = new URL(r.url).hostname.toLowerCase();
-          // IG page (instagram.com) serves media from cdninstagram/fbcdn:
-          // pageHost scope must accept CDN pair, not just subdomains.
-          var igPair = (hostScope === "instagram.com" || hostScope.endsWith(".instagram.com"))
-            && /(^|\.)(cdninstagram\.com|fbcdn\.net)$/.test(h);
-          if (!igPair && h !== hostScope && !h.endsWith("." + hostScope)) return;
-        } catch (err) { return; }
+        // Same-tab only; frame-agnostic: extra entries may lack frame ids
+        // (MV3 SW / webNavigation SPA), tab binding is the scope.
+        if (e.tabId != null && r.tabId !== e.tabId) return;
         if (!(r.time && r.time >= e.since - 2000 && r.time <= e.since + 45000)) return;
         extra.push(r);
       });
     }
-    function hostExtra() { return extra.length ? out(extra) : []; }
+    function genericExtra() {
+      // Playlist-preference: manifest alone when present, else all.
+      var pls = extra.filter(function (r) { return kindOf(r) === "playlist"; });
+      return out(pls.length ? pls : extra);
+    }
     function out(list) { return list.map(function (r) { return { url: r.url, type: r.type || "", size: r.size || 0, time: r.time || 0 }; }); }
     function hopsOf(r) { return Array.isArray(r.hops) ? r.hops : []; }
     if (srcKeys.length) {
@@ -191,9 +191,9 @@
       var timed = out(pool.filter(function (r) { return !!(r.time && r.time >= since - 2000 && r.time <= since + 45000); }));
       if (timed.length) return timed;
     }
-    // Host-wide fallback LAST resort (background-only, never reachable
-    // via content messages): IG/MSE pages never src/id-match.
-    return hostExtra();
+    // Generic blob/MSE fallback LAST resort (background-only, never
+    // reachable via content messages): blob-only element, same-tab pool.
+    return genericExtra();
   }
 
   g.rankCandidates = rankCandidates;

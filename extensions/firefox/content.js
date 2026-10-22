@@ -14,13 +14,13 @@
     // non-blob currentSrc at anchor time; survives later src swaps.
     if (!video._wcAnchor) {
       const srcs = directUrls(video);
-      video._wcAnchor = { since: video._wcFirstPlay || video._wcSeen || 0, postId: idFromUrl(permalinkFor(video)) || idFromUrl(location.href), srcKey: srcs[0] || "" };
+      video._wcAnchor = { since: video._wcFirstPlay || video._wcSeen || 0, postId: idFromUrl(permalinkFor(video)), srcKey: srcs[0] || "" };
     }
     return video._wcAnchor;
   }
   function elementFor(video) {
     const a = anchorFor(video);
-    return { id: elementId(video), srcs: directUrls(video), srcKey: a.srcKey, postId: a.postId, streamId: streamIdFor(video), since: a.since, now: Date.now() };
+    return { id: elementId(video), srcs: directUrls(video), srcKey: a.srcKey, postId: a.postId, since: a.since, now: Date.now() };
   }
   function filenameFromUrl(u) {
     try { const p = new URL(u).pathname; const last = p.split("/").pop(); return last ? decodeURIComponent(last) : u; } catch (e) { return u.split("/").pop() || u; }
@@ -119,18 +119,39 @@
     video.querySelectorAll("source").forEach((s) => { if (s.src) urls.push(s.src); });
     return [...new Set(urls)].filter((u) => u && !u.startsWith("blob:") && !u.startsWith("data:"));
   }
+  // Opaque correlation token, generic form: last path segment of permalink
+  // (query `v` fallback), digit-bearing so plain slugs/section names
+  // ("videos", "watch") never qualify. Bounded-match only (boundedIdHit,
+  // delimiter-wrapped) and rank tiers run src-first/exclusive, so false
+  // positive needs token to appear delimiter-wrapped in foreign stream URL.
   function idFromUrl(u) {
-    const m = String(u || "").match(/\/status\/(\d+)|\/comments\/([a-z0-9]+)|[?&]v=([A-Za-z0-9_-]{6,})|youtu\.be\/([A-Za-z0-9_-]{6,})|\/shorts\/([A-Za-z0-9_-]{6,})|\/(?:reel|reels|p|tv)\/([A-Za-z0-9_-]{5,})|\/stories\/[^/]+\/(\d+)/i);
-    return m ? (m[1] || m[2] || m[3] || m[4] || m[5] || m[6] || m[7]) : "";
+    try {
+      const x = new URL(u, location.href);
+      const ok = (t) => /^[A-Za-z0-9_-]{5,}$/.test(t) && /\d/.test(t);
+      const segs = x.pathname.split("/").filter(Boolean);
+      const last = segs.length ? decodeURIComponent(segs[segs.length - 1]) : "";
+      if (ok(last)) return last;
+      const v = x.searchParams.get("v") || "";
+      return ok(v) ? v : "";
+    } catch (e) { return ""; }
   }
-  function streamIdFromUrl(u) {
-    const m = String(u || "").match(/amplify_video\/(\d+)|ext_tw_video\/(\d+)|v\.redd\.it\/([a-z0-9]+)/i);
-    return m ? (m[1] || m[2] || m[3]) : "";
+  function videoObscured(video) {
+    // Generic overlay detection, no site list: page paints a layer over
+    // the video center, so <video> never wins the hit-test and hover is
+    // undiscoverable (feed-overlay player shape, any site like it).
+    // Cached per video until src swap (loadstart clears _wcObscured).
+    if (video._wcObscured != null) return video._wcObscured;
+    let obscured = false;
+    try {
+      const r = video.getBoundingClientRect();
+      if (r.width >= 40 && r.height >= 40) {
+        const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        obscured = !!hit && hit !== video && !video.contains(hit);
+      }
+    } catch (e) {}
+    return (video._wcObscured = obscured);
   }
-  function isInstagram(u) {
-    try { const h = u ? new URL(u, location.href).hostname : location.hostname; return /(^|\.)instagram\.com$/i.test(h); } catch (e) { return false; }
-  }
-  const CARD_SEL = "article,.thing,[data-permalink],[data-testid='tweet'],shreddit-post,ytd-rich-item-renderer,ytd-video-renderer,ytd-compact-video-renderer";
+  const CARD_SEL = "article,[data-permalink]";
   function cardScope(video) {
     let el = video;
     for (let i = 0; i < 4 && el; i++) {
@@ -141,47 +162,36 @@
     }
     return null;
   }
-  function streamIdFor(video) {
-    try {
-      const scope = video ? cardScope(video) : null;
-      if (!scope) return "";
-      const fromAttr = streamIdFromUrl((scope.getAttribute && scope.getAttribute("data-url")) || "");
-      if (fromAttr) return fromAttr;
-      const a = scope.querySelector && scope.querySelector('a[href*="v.redd.it"]');
-      return a ? streamIdFromUrl(a.href || "") : "";
-    } catch (e) { return ""; }
-  }
+  // Universal permalink cleaning: drop hash + tracking params
+  // (utm_*/fbclid/gclid/...), keep remaining query — yt-dlp needs e.g.
+  // ?v= id on player pages. Shared machinery, no host/path table.
+  const TRACKING_KEYS = /^(utm_.+|fbclid|gclid|gbraid|wbraid|dclid|msclkid|igsh(id)?|mc_cid|mc_eid|s|si|ref|ref_src|feature|embeds_referring_euri)$/i;
   function cleanPermalink(u) {
     try {
       const x = new URL(u, location.href);
       x.hash = "";
-      let m = x.pathname.match(/\/status\/(\d+)/);
-      if (m) return x.origin + x.pathname.slice(0, x.pathname.indexOf(m[0]) + m[0].length);
-      m = x.pathname.match(/\/comments\/([a-z0-9]+)/i);
-      if (m) return x.origin + x.pathname.slice(0, x.pathname.indexOf(m[0]) + m[0].length);
-      if (x.pathname === "/watch") return x.origin + "/watch?v=" + (x.searchParams.get("v") || "");
-      [...x.searchParams.keys()].forEach((k) => x.searchParams.delete(k));
+      [...x.searchParams.keys()].forEach((k) => { if (TRACKING_KEYS.test(k)) x.searchParams.delete(k); });
       return x.toString();
     } catch (e) { return String(u || location.href); }
   }
-  function isVideoPageUrl(u) {
-    // Instagram: host-scoped (path alone missed /p/, /reels/, /stories/, /tv/).
-    if (isInstagram(u)) return /\/(reel|reels|p|tv)\/[A-Za-z0-9_-]+|\/stories\//.test(new URL(u, location.href).pathname || "");
-    return /\/status\/\d+|\/comments\/[a-z0-9]+|\/watch\?v=|\/shorts\/|youtu\.be\/|\/videos\/|\/video\/|\.globo\.com\/.*\.ghtml|g1\.globo\.com/i.test(String(u || ""));
-  }
+  // Universal permalink, priority: (1) page canonical — page's own
+  // self-reference, (2) card data-permalink attr, (3) anchor wrapping/
+  // containing video, else anchor with <time> in same card, (4) location.
   function permalinkFor(video) {
     try {
+      const canonical = document.querySelector('link[rel="canonical"]');
+      const ch = canonical && canonical.getAttribute("href");
+      if (ch) return cleanPermalink(new URL(ch, location.href).href);
       const scope = video ? cardScope(video) : null;
       if (scope) {
         const dp = scope.getAttribute && scope.getAttribute("data-permalink");
         if (dp) return cleanPermalink(new URL(dp, location.origin).href);
-        // Instagram: card <a href="/p|/reel|/reels|/tv/SHORTCODE/"> is the post permalink.
-        if (isInstagram()) { const ia = scope.querySelector('a[href*="/p/"],a[href*="/reel/"],a[href*="/reels/"],a[href*="/tv/"]'); if (ia && cardScope(ia) === scope) return cleanPermalink(ia.href); }
-        const links = [...scope.querySelectorAll('a[href*="/status/"],a[href*="/comments/"],a[href*="/watch?v="],a[href*="/shorts/"],a[href*="youtu.be/"]')];
-        const own = links.filter((a) => cardScope(a) === scope);
-        const timed = own.find((a) => a.querySelector("time"));
+        const wrap = video.closest && video.closest("a[href]");
+        if (wrap && scope.contains(wrap)) return cleanPermalink(wrap.href);
+        const containing = [...scope.querySelectorAll("a[href]")].find((a) => a.contains(video) && cardScope(a) === scope);
+        if (containing) return cleanPermalink(containing.href);
+        const timed = [...scope.querySelectorAll("a[href]")].find((a) => a.querySelector("time") && cardScope(a) === scope);
         if (timed) return cleanPermalink(timed.href);
-        if (own.length) return cleanPermalink(own[0].href);
       }
     } catch (e) {}
     return cleanPermalink(location.href);
@@ -192,23 +202,13 @@
     return new RegExp("[/=?&._-]" + esc + "([/?&#._-]|$)").test(url);
   }
   function scopedCandidates(video, candidates) {
-    const pid = idFromUrl(permalinkFor(video)) || idFromUrl(location.href);
-    const streamId = streamIdFor(video);
+    const pid = idFromUrl(permalinkFor(video));
     const since = video._wcFirstPlay || video._wcSeen || 0;
-    const reddit = /(^|\.)reddit\.com$/.test(location.hostname);
-    // Instagram single-post: sniffed CDN mp4s carry no shortcode; timing tier
-    // (bg) already matched them. Accept video/* from IG CDNs for this video.
-    const igSingle = isInstagram() && isVideoPageUrl(permalinkFor(video) || location.href);
     return candidates.filter((c) => {
       if (!c || !c.url || c.url.startsWith("blob:")) return false;
-      const sid = streamIdFromUrl(c.url);
-      const xSid = sid && !/v\.redd\.it/.test(c.url) ? sid : "";
-      if (xSid && pid) return xSid === pid;
-      if (streamId && boundedIdHit(c.url, streamId)) return true;
       if (pid && boundedIdHit(c.url, pid)) return true;
-      if (xSid && !pid) return false;
-      if (reddit && (pid || streamId)) return false;
-      if (igSingle && /cdninstagram\.com|fbcdn\.net/i.test(c.url) && /video|mp4|mpegurl|dash/i.test(c.type || c.url)) return true;
+      // No-id videos: background tiers already src/id/timing-scoped; client
+      // unbounded timing re-admits feed neighbours. Keep timing only.
       if (since && c.time) return c.time >= since - 2000 && c.time <= since + 45000;
       return false;
     });
@@ -226,13 +226,14 @@
       return host;
     } catch (e) { return video; }
   }
-  // Effective rect: IG inserts blob/MSE <video> at 0x0 (layout pending) or
+  // Effective rect: MSE/blob players can insert <video> at 0x0 (layout pending) or
   // CSS-sizes only the wrapper. Fall back to nearest sized ancestor.
-  // IG-scoped: elsewhere ancestor fallback pinned button to whole card.
+  // Semi-visible-host-scoped: elsewhere ancestor fallback pinned button to
+  // whole card (v0.22.4 cross-site regression — do not de-scope).
   function videoRect(video) {
     const r = video.getBoundingClientRect();
     if (r.width >= 120 && r.height >= 68) return r;
-    if (!isInstagram()) return r;
+    if (!videoObscured(video)) return r;
     let el = video.parentElement;
     for (let i = 0; i < 4 && el; i++) {
       const pr = el.getBoundingClientRect();
@@ -245,9 +246,8 @@
     // Rescan at click time: manifests/page media declared after load.
     scanManifests();
     const pid = idFromUrl(permalinkFor(video));
-    // Instagram: src/MSE is blob:, shortcode cannot bound-hit cdninstagram/fbcdn
-    // URLs. On single-post page, page-declared CDN media belongs to that post.
-    const scopedGlobal = /(^|\.)reddit\.com$/.test(location.hostname) ? [] : [...manifestUrls, ...pageMediaUrls()].filter((u) => pid && (boundedIdHit(u, pid) || (isInstagram() && isVideoPageUrl(location.href) && /cdninstagram\.com|fbcdn\.net/i.test(u))));
+    // Blob/MSE src: ids cannot hit CDN URLs; bg timing tier covers.
+    const scopedGlobal = [...manifestUrls, ...pageMediaUrls()].filter((u) => pid && boundedIdHit(u, pid));
     const direct = [...new Set([...directUrls(video), ...scopedGlobal])];
     fetchCandidates(((candidates) => {
       // Bg element scoping primary; scopedCandidates second-pass safety.
@@ -262,7 +262,7 @@
       // then this video's own streams only — never tab-global list.
       const pu = permalinkFor(video);
       const items = [];
-      if (isVideoPageUrl(pu)) items.push({ url: pu, pageUrl: pu, intent: "page", label: "⬇ This video — webcraft (choose quality / audio / subs)", filename: filenameFromUrl(pu), type: "page" });
+      items.push({ url: pu, pageUrl: pu, intent: "page", label: "⬇ This video — webcraft (choose quality / audio / subs)", filename: filenameFromUrl(pu), type: "page" });
       streams.forEach((it) => { const isMan = /mpd|m3u8|dash|mpegurl|DASHPlaylist|HLSPlaylist/i.test(it.url || "") || /mpegurl|dash/i.test(it.type || ""); items.push({ ...it, intent: isMan ? "manifest" : "stream", pageUrl: pu, label: (isMan ? "Playlist (yt-dlp/native) · " : "") + (it.label || it.url) }); });
       showPanel(video, items);
     }), video);
@@ -349,19 +349,19 @@
     });
     // Discreet elsewhere: invisible until pointer over video or button itself;
     // hidden state must not swallow clicks meant for video controls.
-    // Instagram: always semi-visible — hover-only proved undiscoverable there
+    // Obscured players: always semi-visible — hover-only undiscoverable there
     // (overlays + touch); still clickable at rest on IG.
     const showBtn = () => { btn.style.opacity = ".9"; btn.style.pointerEvents = "auto"; };
-    const hideBtn = () => { if (isInstagram(location.href)) { btn.style.opacity = ".55"; btn.style.pointerEvents = "auto"; } else { btn.style.opacity = "0"; btn.style.pointerEvents = "none"; } };
-    // Hover on player wrapper: overlays cover <video> (X/YouTube/Instagram).
-    // Delegated mouseover: overlay siblings (IG action rail/gradient) never
+    const hideBtn = () => { if (videoObscured(video)) { btn.style.opacity = ".55"; btn.style.pointerEvents = "auto"; } else { btn.style.opacity = "0"; btn.style.pointerEvents = "none"; } };
+    // Hover on player wrapper: overlays cover <video> on many players.
+    // Delegated mouseover: overlay siblings (action rail/gradient) never
     // fire mouseenter on wrapper/video, so check containment per event.
-    // Coordinate hover only on Instagram (overlay-proof): IG gradient/
+    // Coordinate hover only for obscured players (overlay-proof): gradient/
     // action-rail layers are siblings covering video, containment checks
     // never fire for them. Elsewhere containment hover (pre-0.22.1 shape).
     // ponytail: per-video mousemove listener, rAF-throttled; ceiling —
     // one shared pointer router, add when many-video feeds still jank.
-    if (isInstagram()) {
+    if (videoObscured(video)) {
       let hoverRaf = 0;
       const onHover = (e) => {
         if (hoverRaf) return;
@@ -405,7 +405,7 @@
     const isBig = () => { const r = videoRect(video); return r.width >= 120 && r.height >= 68; };
     const show = () => { if (isBig()) attachBtn(video); };
     if (isBig() || video.poster || video.readyState >= 1 || video.currentSrc || !video.paused) attachBtn(video);
-    video.addEventListener("loadstart", () => { video._wcFirstPlay = 0; video._wcSeen = Date.now(); video._wcAnchor = null; });
+    video.addEventListener("loadstart", () => { video._wcFirstPlay = 0; video._wcSeen = Date.now(); video._wcAnchor = null; video._wcObscured = null; });
     video.addEventListener("playing", () => { if (!video._wcFirstPlay) { video._wcFirstPlay = Date.now(); anchorFor(video); } show(); });
     video.addEventListener("loadedmetadata", show);
     video.addEventListener("loadeddata", show);
@@ -437,7 +437,7 @@
   let pending = null;
   const mo = new MutationObserver(() => { if (pending) return; pending = setTimeout(() => { pending = null; scan(); for (let i = btnForEntries.length - 1; i >= 0; i--) { const [v, b] = btnForEntries[i]; if (!v.isConnected) { b.remove(); btnForEntries.splice(i, 1); } } document.querySelectorAll("video, audio").forEach(positionBtn); }, 400); });
   window.addEventListener("resize", () => document.querySelectorAll("video, audio").forEach(positionBtn), { passive: true });
-  // Capture: IG reels scroll inner snap containers, no window scroll fires.
+  // Capture: reels-style players scroll inner snap containers, no window scroll fires.
   window.addEventListener("scroll", () => document.querySelectorAll("video, audio").forEach(positionBtn), { passive: true, capture: true });
   // Fullscreen: re-host buttons (body <-> fullscreen subtree), stale
   // pre-FS drag coords invalid after viewport resize.
@@ -460,15 +460,10 @@
         if (r.width >= 120 && r.height >= 68 && a > best) { best = a; anchor = v; }
       });
       if (anchor) { attachBtn(anchor); showForVideo(anchor); }
-      else if (isInstagram() && isVideoPageUrl(location.href)) {
-        // Instagram video page with blob/MSE <video> not yet attached (or no
-        // <video> in DOM): still offer the page itself; yt-dlp resolves it app-side.
-        const pu = location.href;
-        api.runtime.sendMessage({ type: "downloadcraft-video-panel", url: pu, intent: "page", pageUrl: pu, pageTitle: document.title, filename: filenameFromUrl(pu), mime: "" });
-      }
       else {
-        // No video element: send page itself (yt-dlp probes it app-side).
-        const pu = location.href;
+        // No attachable <video> (blob/MSE pending / none in DOM): offer page
+        // itself; yt-dlp resolves it app-side. Universal, any site.
+        const pu = cleanPermalink(location.href);
         api.runtime.sendMessage({ type: "downloadcraft-video-panel", url: pu, intent: "page", pageUrl: pu, pageTitle: document.title, filename: filenameFromUrl(pu), mime: "" });
       }
       return;

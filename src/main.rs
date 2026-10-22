@@ -194,7 +194,8 @@ pub fn save_state(state: &AppState) {
 }
 
 /// Promote extension pageUrl to task URL? stream intent never; page intent
-/// always (off-allowlist yt-dlp sites included); no intent = allowlist only.
+/// always (any yt-dlp-supported site); no intent = page-shaped URL only
+/// (is_video_page, universal: non-file http(s) page).
 pub fn should_promote(task_url: &str, page_url: &str, intent: &str) -> bool {
     if intent == "stream" {
         return false;
@@ -236,8 +237,8 @@ fn parse_kv_file(path: &std::path::Path) -> Option<DownloadTask> {
                         t.headers.insert("x-page-title".into(), v.to_string());
                     }
                 }
-                // intent=page: user picked "this video" row — promote even off
-                // host allowlist. intent=stream: never promote (manifest pick).
+                // intent=page: user picked "this video" row — promote for
+                // any page. intent=stream: never promote (manifest pick).
                 "intent" => {
                     t.headers
                         .insert("x-page-intent".into(), v.trim().to_string());
@@ -658,8 +659,8 @@ pub fn take_inbox_tasks(rt: &Arc<Mutex<Runtime>>) -> Vec<DownloadTask> {
                 }
                 // Video page: promote page URL to task URL so yt-dlp extractor
                 // runs; sniffed stream kept as fallback. intent=page promotes
-                // even off allowlist (any yt-dlp site); intent=stream never.
-                // Absent intent = legacy heuristic (allowlist only).
+                // for any page; intent=stream never. Absent intent = legacy
+                // heuristic (page-shaped URL only).
                 if let Some(pu) = t.headers.get("x-page-url").cloned() {
                     let intent = t.headers.get("x-page-intent").cloned().unwrap_or_default();
                     let promote = should_promote(&t.url, &pu, &intent);
