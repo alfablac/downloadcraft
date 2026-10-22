@@ -1446,7 +1446,13 @@ pub fn is_video_page(url: &str) -> bool {
         "dai.ly" => path.len() > 1,
         "twitch.tv" => path.starts_with("/videos/"),
         "tiktok.com" => path.contains("/video/"),
-        "instagram.com" => path.starts_with("/reel/") || path.starts_with("/p/"),
+        "instagram.com" => {
+            ["/reel/", "/reels/", "/p/", "/tv/"]
+                .iter()
+                .any(|p| path.starts_with(p) && path.len() > p.len())
+                || (path.starts_with("/stories/")
+                    && path.trim_end_matches('/').matches('/').count() >= 3)
+        }
         "twitter.com" | "x.com" => path.contains("/status/"),
         "facebook.com" | "fb.watch" => {
             h == "fb.watch"
@@ -1687,6 +1693,16 @@ mod tests {
         assert!(is_video_page("https://vimeo.com/12345"));
         assert!(is_video_page("https://www.twitch.tv/videos/123"));
         assert!(!is_video_page("https://example.com/file.mp4"));
+        assert!(is_video_page("https://www.instagram.com/reel/ABC123/"));
+        assert!(is_video_page("https://www.instagram.com/reels/ABC123/"));
+        assert!(is_video_page("https://www.instagram.com/p/ABC123/"));
+        assert!(is_video_page("https://www.instagram.com/tv/ABC123/"));
+        assert!(is_video_page(
+            "https://www.instagram.com/stories/someuser/1234567890/"
+        ));
+        assert!(!is_video_page("https://www.instagram.com/someuser/"));
+        assert!(!is_video_page("https://www.instagram.com/explore/"));
+        assert!(!is_video_page("https://www.instagram.com/stories/someuser/"));
         assert!(!is_video_page("https://www.youtube.com/feed/subscriptions"));
         assert!(!is_video_page("https://vimeo.com/about"));
         assert!(!is_video_page("not a url"));

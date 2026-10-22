@@ -9,7 +9,8 @@ mod icons;
 mod theme;
 mod ui;
 use downloadcraft_lib::{
-    debrid, engine, grabber, model, nntp, platform, queue, scheduler, stream, torrent, ytdlp,
+    applog, debrid, dl_history, engine, grabber, model, nntp, platform, queue, scheduler, stream,
+    torrent, ytdlp,
 };
 use model::*;
 use std::collections::HashMap;
@@ -41,6 +42,10 @@ impl Runtime {
     pub fn load() -> Self {
         platform::migrate_legacy();
         let _ = platform::ensure_dirs();
+        // Retention + shared 50 MiB budget for logs/ and dl-history/ (cheap:
+        // two dir scans). History prune first so budget sees post-retention set.
+        dl_history::prune_history(&dl_history::history_dir());
+        applog::prune_default(applog::now_ms());
         let mut state = load_state();
         if state.queues.is_empty() {
             state.queues.push(Queue::default());
@@ -65,7 +70,19 @@ impl Runtime {
         save_state(&self.state);
     }
     pub fn log(&mut self, m: impl Into<String>) {
-        self.messages.push(m.into());
+        let m = m.into();
+        // Persistent copy (redacted, daily JSONL) before in-memory push:
+        // log lines often carry URLs with tokens — applog redacts them.
+        let lower = m.to_ascii_lowercase();
+        let level = if lower.starts_with("error") || lower.contains("failed") {
+            applog::LV_ERROR
+        } else if lower.contains("warn") {
+            applog::LV_WARN
+        } else {
+            applog::LV_INFO
+        };
+        applog::append_default(level, "app", &m);
+        self.messages.push(m);
         if self.messages.len() > 200 {
             self.messages.drain(..50);
         }
@@ -117,7 +134,12 @@ impl Runtime {
             ..Default::default()
         };
         let id = task.id.clone();
+        let ev = dl_history::DlEvent::new(&task.id, dl_history::KIND_ADDED)
+            .with_filename(&task.filename)
+            .with_url(&task.url)
+            .with_bytes(task.downloaded, task.total.unwrap_or(0));
         self.state.tasks.push(task);
+        dl_history::append_event_default(&ev);
         self.save();
         id
     }

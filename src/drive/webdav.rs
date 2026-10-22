@@ -235,7 +235,10 @@ impl DriveBackend for WebDav {
                 ),
             )]
         };
-        Ok(super::StreamSource { url: self.url_for(&entry.path), headers })
+        Ok(super::StreamSource {
+            url: self.url_for(&entry.path),
+            headers,
+        })
     }
     async fn download(
         &self,

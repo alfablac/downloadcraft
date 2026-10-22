@@ -114,12 +114,15 @@
     return [...new Set(urls)].filter((u) => u && !u.startsWith("blob:") && !u.startsWith("data:"));
   }
   function idFromUrl(u) {
-    const m = String(u || "").match(/\/status\/(\d+)|\/comments\/([a-z0-9]+)|[?&]v=([A-Za-z0-9_-]{6,})|youtu\.be\/([A-Za-z0-9_-]{6,})|\/shorts\/([A-Za-z0-9_-]{6,})/i);
-    return m ? (m[1] || m[2] || m[3] || m[4] || m[5]) : "";
+    const m = String(u || "").match(/\/status\/(\d+)|\/comments\/([a-z0-9]+)|[?&]v=([A-Za-z0-9_-]{6,})|youtu\.be\/([A-Za-z0-9_-]{6,})|\/shorts\/([A-Za-z0-9_-]{6,})|\/(?:reel|reels|p|tv)\/([A-Za-z0-9_-]{5,})|\/stories\/[^/]+\/(\d+)/i);
+    return m ? (m[1] || m[2] || m[3] || m[4] || m[5] || m[6] || m[7]) : "";
   }
   function streamIdFromUrl(u) {
     const m = String(u || "").match(/amplify_video\/(\d+)|ext_tw_video\/(\d+)|v\.redd\.it\/([a-z0-9]+)/i);
     return m ? (m[1] || m[2] || m[3]) : "";
+  }
+  function isInstagram(u) {
+    try { const h = u ? new URL(u, location.href).hostname : location.hostname; return /(^|\.)instagram\.com$/i.test(h); } catch (e) { return false; }
   }
   const CARD_SEL = "article,.thing,[data-permalink],[data-testid='tweet'],shreddit-post,ytd-rich-item-renderer,ytd-video-renderer,ytd-compact-video-renderer";
   function cardScope(video) {
@@ -156,7 +159,9 @@
     } catch (e) { return String(u || location.href); }
   }
   function isVideoPageUrl(u) {
-    return /\/status\/\d+|\/comments\/[a-z0-9]+|\/watch\?v=|\/shorts\/|youtu\.be\/|\/videos\/|\/reel\/|\/video\/|\.globo\.com\/.*\.ghtml|g1\.globo\.com/i.test(String(u || ""));
+    // Instagram: host-scoped (path alone missed /p/, /reels/, /stories/, /tv/).
+    if (isInstagram(u)) return /\/(reel|reels|p|tv)\/[A-Za-z0-9_-]+|\/stories\//.test(new URL(u, location.href).pathname || "");
+    return /\/status\/\d+|\/comments\/[a-z0-9]+|\/watch\?v=|\/shorts\/|youtu\.be\/|\/videos\/|\/video\/|\.globo\.com\/.*\.ghtml|g1\.globo\.com/i.test(String(u || ""));
   }
   function permalinkFor(video) {
     try {
@@ -164,6 +169,8 @@
       if (scope) {
         const dp = scope.getAttribute && scope.getAttribute("data-permalink");
         if (dp) return cleanPermalink(new URL(dp, location.origin).href);
+        // Instagram: card <a href="/p|/reel|/reels|/tv/SHORTCODE/"> is the post permalink.
+        if (isInstagram()) { const ia = scope.querySelector('a[href*="/p/"],a[href*="/reel/"],a[href*="/reels/"],a[href*="/tv/"]'); if (ia && cardScope(ia) === scope) return cleanPermalink(ia.href); }
         const links = [...scope.querySelectorAll('a[href*="/status/"],a[href*="/comments/"],a[href*="/watch?v="],a[href*="/shorts/"],a[href*="youtu.be/"]')];
         const own = links.filter((a) => cardScope(a) === scope);
         const timed = own.find((a) => a.querySelector("time"));
@@ -183,6 +190,9 @@
     const streamId = streamIdFor(video);
     const since = video._wcFirstPlay || video._wcSeen || 0;
     const reddit = /(^|\.)reddit\.com$/.test(location.hostname);
+    // Instagram single-post: sniffed CDN mp4s carry no shortcode; timing tier
+    // (bg) already matched them. Accept video/* from IG CDNs for this video.
+    const igSingle = isInstagram() && isVideoPageUrl(permalinkFor(video) || location.href);
     return candidates.filter((c) => {
       if (!c || !c.url || c.url.startsWith("blob:")) return false;
       const sid = streamIdFromUrl(c.url);
@@ -192,6 +202,7 @@
       if (pid && boundedIdHit(c.url, pid)) return true;
       if (xSid && !pid) return false;
       if (reddit && (pid || streamId)) return false;
+      if (igSingle && /cdninstagram\.com|fbcdn\.net/i.test(c.url) && /video|mp4|mpegurl|dash/i.test(c.type || c.url)) return true;
       if (since && c.time) return c.time >= since - 2000 && c.time <= since + 45000;
       return false;
     });
@@ -212,7 +223,9 @@
     // Rescan at click time: manifests/page media declared after load.
     scanManifests();
     const pid = idFromUrl(permalinkFor(video));
-    const scopedGlobal = /(^|\.)reddit\.com$/.test(location.hostname) ? [] : [...manifestUrls, ...pageMediaUrls()].filter((u) => pid && boundedIdHit(u, pid));
+    // Instagram: src/MSE is blob:, shortcode cannot bound-hit cdninstagram/fbcdn
+    // URLs. On single-post page, page-declared CDN media belongs to that post.
+    const scopedGlobal = /(^|\.)reddit\.com$/.test(location.hostname) ? [] : [...manifestUrls, ...pageMediaUrls()].filter((u) => pid && (boundedIdHit(u, pid) || (isInstagram() && isVideoPageUrl(location.href) && /cdninstagram\.com|fbcdn\.net/i.test(u))));
     const direct = [...new Set([...directUrls(video), ...scopedGlobal])];
     fetchCandidates(((candidates) => {
       // Bg element scoping primary; scopedCandidates second-pass safety.
@@ -283,10 +296,11 @@
     // hidden state must not swallow clicks meant for video controls.
     const showBtn = () => { btn.style.opacity = ".9"; btn.style.pointerEvents = "auto"; };
     const hideBtn = () => { btn.style.opacity = "0"; btn.style.pointerEvents = "none"; };
-    // Hover on player wrapper: overlays cover <video> (X/YouTube).
+    // Hover on player wrapper: overlays cover <video> (X/YouTube/Instagram).
+    // Delegated mouseover: overlay siblings (IG action rail/gradient) never
+    // fire mouseenter on wrapper/video, so check containment per event.
     const hoverHost = playerRoot(video);
-    hoverHost.addEventListener("mouseenter", showBtn);
-    hoverHost.addEventListener("mouseleave", hideBtn);
+    document.addEventListener("mouseover", (e) => { if (e.target === btn || hoverHost.contains(e.target)) showBtn(); else hideBtn(); });
     btn.addEventListener("mouseenter", showBtn);
     btn.addEventListener("mouseleave", hideBtn);
     btn.addEventListener("focus", showBtn);
@@ -352,6 +366,12 @@
         if (r.width >= 120 && r.height >= 68 && a > best) { best = a; anchor = v; }
       });
       if (anchor) { attachBtn(anchor); showForVideo(anchor); }
+      else if (isInstagram() && isVideoPageUrl(location.href)) {
+        // Instagram video page with blob/MSE <video> not yet attached (or no
+        // <video> in DOM): still offer the page itself; yt-dlp resolves it app-side.
+        const pu = location.href;
+        api.runtime.sendMessage({ type: "downloadcraft-video-panel", url: pu, intent: "page", pageUrl: pu, pageTitle: document.title, filename: filenameFromUrl(pu), mime: "" });
+      }
       else {
         // No video element: send page itself (yt-dlp probes it app-side).
         const pu = location.href;

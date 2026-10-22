@@ -480,7 +480,7 @@ pub const MAX_PART_LIMIT: u64 = 1024 * 1024 * 1024;
 pub fn auto_max_part(total: u64) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     match total {
-        0..=4294967296 => MAX_PART,               // <= 4 GiB
+        0..=4294967296 => MAX_PART,                    // <= 4 GiB
         4294967297..=17179869184 => 128 * 1024 * 1024, // <= 16 GiB
         _ if total <= 64 * GIB => 192 * 1024 * 1024,   // <= 64 GiB
         _ => MAX_PART_AUTO,
@@ -559,10 +559,7 @@ fn seg_keep(end: u64, range_start: u64, written: u64) -> u64 {
 /// removed slots). Callers must re-pin active indexes and rename part files.
 /// Active/started segments untouched: their part files hold bytes.
 /// ponytail: done==0 only; done>0 pending kept separate (part bytes exist).
-fn coalesce_pending(
-    segs: &mut [SegmentState],
-    active: &std::collections::HashSet<usize>,
-) -> bool {
+fn coalesce_pending(segs: &mut [SegmentState], active: &std::collections::HashSet<usize>) -> bool {
     let mut changed = false;
     let mut survivor: Option<usize> = None;
     for i in 0..segs.len() {
@@ -1370,7 +1367,7 @@ pub async fn download_http_with_prewarm(
                                 start,
                                 end,
                                 done: done.min(actual),
-        merged: false,
+                                merged: false,
                             });
                         }
                         // Split tails appended out of order: intervals must tile [0,total) exactly, else discard corrupt state.
@@ -1407,7 +1404,7 @@ pub async fn download_http_with_prewarm(
                 start,
                 end,
                 done: 0,
-        merged: false,
+                merged: false,
             })
             .collect();
     }
@@ -1428,7 +1425,16 @@ pub async fn download_http_with_prewarm(
         let mut pg = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner());
         *pg = segs
             .iter()
-            .map(|x| if x.merged { (x.end.saturating_add(1).saturating_sub(x.start), x.end.saturating_add(1).saturating_sub(x.start)) } else { (x.done, x.end.saturating_add(1).saturating_sub(x.start)) })
+            .map(|x| {
+                if x.merged {
+                    (
+                        x.end.saturating_add(1).saturating_sub(x.start),
+                        x.end.saturating_add(1).saturating_sub(x.start),
+                    )
+                } else {
+                    (x.done, x.end.saturating_add(1).saturating_sub(x.start))
+                }
+            })
             .collect();
     }
     // Work-stealing pool: fixed worker count (= initial segment count) is
@@ -1478,8 +1484,7 @@ pub async fn download_http_with_prewarm(
                 // Concurrency enforced per-GET inside run_segment via
                 // gate permits; claim cap only bounds split growth.
                 let r = run_segment(
-                    i, &segs, &client, &task_c, &part_dir, &etag, total, &ctrl, &gate,
-                    &active,
+                    i, &segs, &client, &task_c, &part_dir, &etag, total, &ctrl, &gate, &active,
                 )
                 .await;
                 active.lock().await.remove(&i);
@@ -1618,15 +1623,21 @@ async fn claim_or_split(
         Claim::Split(i) => i,
         Claim::None => return None,
     };
-    let snapshot: Vec<SegmentState> = s
-        .iter()
-        .map(seg_clone)
-        .collect();
+    let snapshot: Vec<SegmentState> = s.iter().map(seg_clone).collect();
     {
         let mut pg = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner());
         *pg = snapshot
             .iter()
-            .map(|x| if x.merged { (x.end.saturating_add(1).saturating_sub(x.start), x.end.saturating_add(1).saturating_sub(x.start)) } else { (x.done, x.end.saturating_add(1).saturating_sub(x.start)) })
+            .map(|x| {
+                if x.merged {
+                    (
+                        x.end.saturating_add(1).saturating_sub(x.start),
+                        x.end.saturating_add(1).saturating_sub(x.start),
+                    )
+                } else {
+                    (x.done, x.end.saturating_add(1).saturating_sub(x.start))
+                }
+            })
             .collect();
     }
     drop(act);
@@ -1702,15 +1713,21 @@ async fn run_segment(
             if let Ok(mut s) = ck_segs.try_lock() {
                 let new_len = s[i].end + 1 - s[i].start;
                 s[i].done = abs_done.min(new_len);
-                let snap: Vec<SegmentState> = s
-                    .iter()
-                    .map(seg_clone)
-                    .collect();
+                let snap: Vec<SegmentState> = s.iter().map(seg_clone).collect();
                 drop(s);
                 if let Ok(mut pg) = ck_ctrl.parts.lock() {
                     *pg = snap
                         .iter()
-                        .map(|x| if x.merged { (x.end.saturating_add(1).saturating_sub(x.start), x.end.saturating_add(1).saturating_sub(x.start)) } else { (x.done, x.end.saturating_add(1).saturating_sub(x.start)) })
+                        .map(|x| {
+                            if x.merged {
+                                (
+                                    x.end.saturating_add(1).saturating_sub(x.start),
+                                    x.end.saturating_add(1).saturating_sub(x.start),
+                                )
+                            } else {
+                                (x.done, x.end.saturating_add(1).saturating_sub(x.start))
+                            }
+                        })
                         .collect();
                 }
                 save_state(&ck_part_dir, &ck_url, &ck_etag, total, &snap);
@@ -1763,13 +1780,26 @@ async fn run_segment(
                         let mut pg = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner());
                         *pg = snap
                             .iter()
-                            .map(|x| if x.merged { (x.end.saturating_add(1).saturating_sub(x.start), x.end.saturating_add(1).saturating_sub(x.start)) } else { (x.done, x.end.saturating_add(1).saturating_sub(x.start)) })
+                            .map(|x| {
+                                if x.merged {
+                                    (
+                                        x.end.saturating_add(1).saturating_sub(x.start),
+                                        x.end.saturating_add(1).saturating_sub(x.start),
+                                    )
+                                } else {
+                                    (x.done, x.end.saturating_add(1).saturating_sub(x.start))
+                                }
+                            })
                             .collect();
                         drop(pg);
                         save_state(
                             part_dir,
                             &task.url,
-                            &if etag.is_empty() { None } else { Some(etag.to_string()) },
+                            &if etag.is_empty() {
+                                None
+                            } else {
+                                Some(etag.to_string())
+                            },
                             total,
                             &snap,
                         );
@@ -1799,15 +1829,22 @@ async fn run_segment(
                 apply_shrink_correction(ctrl, written, keep);
                 let snapshot = {
                     let s = segs.lock().await;
-                    s.iter()
-                        .map(seg_clone)
-                        .collect::<Vec<_>>()
+                    s.iter().map(seg_clone).collect::<Vec<_>>()
                 };
                 {
                     let mut pg = ctrl.parts.lock().unwrap_or_else(|e| e.into_inner());
                     *pg = snapshot
                         .iter()
-                        .map(|x| if x.merged { (x.end.saturating_add(1).saturating_sub(x.start), x.end.saturating_add(1).saturating_sub(x.start)) } else { (x.done, x.end.saturating_add(1).saturating_sub(x.start)) })
+                        .map(|x| {
+                            if x.merged {
+                                (
+                                    x.end.saturating_add(1).saturating_sub(x.start),
+                                    x.end.saturating_add(1).saturating_sub(x.start),
+                                )
+                            } else {
+                                (x.done, x.end.saturating_add(1).saturating_sub(x.start))
+                            }
+                        })
                         .collect();
                 }
                 let et_opt = if etag.is_empty() {
@@ -1874,7 +1911,10 @@ pub const CHECKPOINT_BYTES: u64 = 1024 * 1024;
 pub enum RangeOutcome {
     Done(u64),
     /// 429: bytes checkpointed this call; caller waits, re-ranges.
-    Throttled { written: u64, retry_after: u64 },
+    Throttled {
+        written: u64,
+        retry_after: u64,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3245,7 +3285,7 @@ mod tests {
                 start,
                 end,
                 done: 0,
-        merged: false,
+                merged: false,
             })
             .collect()
     }
@@ -3303,28 +3343,34 @@ mod tests {
         assert_eq!(auto_max_part(32 * gib), 192 * 1024 * 1024);
         assert_eq!(auto_max_part(100 * gib), 256 * 1024 * 1024);
         // Override wins and clamps; 0 = auto.
-        assert_eq!(effective_max_part(100 * gib, 64 * 1024 * 1024), 64 * 1024 * 1024);
+        assert_eq!(
+            effective_max_part(100 * gib, 64 * 1024 * 1024),
+            64 * 1024 * 1024
+        );
         assert_eq!(effective_max_part(100 * gib, 0), 256 * 1024 * 1024);
         assert_eq!(effective_max_part(gib, 9999 * 1024 * 1024), MAX_PART_LIMIT);
         // Huge file auto: far fewer parts than 64 MiB cap would give.
         assert_eq!(target_part_size(100 * gib, 8), 256 * 1024 * 1024);
         assert_eq!(plan_parts(100 * gib, 8).len(), 400);
         // Manual 64 MiB on huge file restores old count.
-        assert_eq!(
-            plan_parts_with(100 * gib, 8, 64 * 1024 * 1024).len(),
-            1600
-        );
+        assert_eq!(plan_parts_with(100 * gib, 8, 64 * 1024 * 1024).len(), 1600);
         // Explicit part size is a TARGET, not ceiling (user report:
         // 512 MiB set on 6 GiB file still gave 49 x ~126 MiB auto parts).
         // 6 GiB / 512 MiB = 12 parts; no wave-slack re-split.
         let six = 6 * gib;
-        assert_eq!(target_part_size_with(six, 8, 512 * 1024 * 1024), 512 * 1024 * 1024);
+        assert_eq!(
+            target_part_size_with(six, 8, 512 * 1024 * 1024),
+            512 * 1024 * 1024
+        );
         assert_eq!(plan_parts_with(six, 8, 512 * 1024 * 1024).len(), 12);
         assert_eq!(parts_cap_with(six, 8, 512 * 1024 * 1024), 12);
         // 256 MiB manual on 6 GiB: 24 parts.
         assert_eq!(plan_parts_with(six, 8, 256 * 1024 * 1024).len(), 24);
         // Tiny file still parallelizes: at least pool parts.
-        assert_eq!(plan_parts_with(32 * 1024 * 1024, 8, 512 * 1024 * 1024).len(), 8);
+        assert_eq!(
+            plan_parts_with(32 * 1024 * 1024, 8, 512 * 1024 * 1024).len(),
+            8
+        );
         // Auto fingerprint (old bug): 6 GiB auto = 128 MiB cap tier.
         assert_eq!(target_part_size(six, 8), 128 * 1024 * 1024);
         assert_eq!(plan_parts(six, 8).len(), 48);
@@ -3526,13 +3572,13 @@ mod tests {
                 start: 0,
                 end: 999,
                 done: 400,
-        merged: false,
+                merged: false,
             },
             SegmentState {
                 start: 1000,
                 end: 1999,
                 done: 500,
-        merged: false,
+                merged: false,
             },
         ];
         assert_eq!(committed_total(&segs), 900);

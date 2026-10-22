@@ -158,6 +158,46 @@ pub fn parse_tracks(data: &serde_json::Value) -> Vec<TrackInfo> {
         .collect()
 }
 
+/// One chapter from mpv `chapter-list` property (index = list position).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChapterInfo {
+    pub index: usize,
+    pub title: String, // "" when container gives none
+    pub time: f64,     // seconds
+}
+
+impl ChapterInfo {
+    /// Combo label: title, fallback "Chapter <n>".
+    pub fn label(&self) -> String {
+        if self.title.is_empty() {
+            format!("Chapter {}", self.index + 1)
+        } else {
+            self.title.clone()
+        }
+    }
+}
+
+/// Parse mpv `chapter-list` JSON value into chapters (pure, tested).
+pub fn parse_chapters(data: &serde_json::Value) -> Vec<ChapterInfo> {
+    let Some(arr) = data.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            Some(ChapterInfo {
+                index: i,
+                title: t
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                time: t.get("time")?.as_f64()?,
+            })
+        })
+        .collect()
+}
+
 /// mpv argv for `url` (URL or local path) from Settings. Flags in Settings
 /// field order; `--` before URL/path so it never parses as option.
 pub fn build_args(s: &Settings, url: &str) -> Result<Vec<String>, String> {
@@ -313,6 +353,9 @@ pub struct PlayerState {
     pub sid: i64,      // -1 = no subtitle track selected / unknown
     /// All tracks (audio/sub/video) from `track-list`.
     pub tracks: Vec<TrackInfo>,
+    /// Chapters from `chapter-list` (empty = file has none).
+    pub chapters: Vec<ChapterInfo>,
+    pub chapter: i64, // current chapter index, -1 = none
     pub mute: bool,
     pub paused_for_cache: bool,
     pub connected: bool, // IPC pipe connected / property events flowing
@@ -334,6 +377,8 @@ impl Default for PlayerState {
             aid: -1,
             sid: -1,
             tracks: Vec::new(),
+            chapters: Vec::new(),
+            chapter: -1,
             mute: false,
             paused_for_cache: false,
             connected: false,
@@ -390,8 +435,7 @@ pub fn embedded_args_h(
     pipe: &str,
     headers: &[(String, String)],
 ) -> Result<Vec<String>, String> {
-    let header_arg = header_fields(headers)?
-        .map(|h| format!("--http-header-fields={h}"));
+    let header_arg = header_fields(headers)?.map(|h| format!("--http-header-fields={h}"));
     let mut args = build_args(s, url)?;
     if let Some(h) = header_arg {
         args.insert(1, h);
@@ -409,9 +453,25 @@ pub fn embedded_args_h(
                 | "--log-file"
                 | "--volume"
                 | "--mute"
+                // User-config vectors: embedded must ignore user mpv.conf /
+                // input.conf / scripts (--no-config below). Strip so
+                // mpv_extra_args cannot re-enable them in embedded spawn.
+                | "--config"
+                | "--no-config"
+                | "--config-dir"
+                | "--include"
+                | "--input-conf"
+                | "--load-scripts"
+                | "--script"
+                | "--scripts"
+                | "--use-filedir-conf"
         )
     });
     let emb = [
+        // Ignore %APPDATA%/portable user config + scripts: user pause/OSD
+        // scripts (uosc etc.) draw non-interactive overlays into --wid
+        // child (egui owns input). Detached launch() keeps user config.
+        "--no-config".into(),
         format!("--wid={wid}"),
         format!("--input-ipc-server={pipe}"),
         format!(
@@ -537,6 +597,8 @@ fn ipc_io(pipe: String, rx: mpsc::Receiver<String>, state: Arc<Mutex<PlayerState
         (12, "path"),
         (13, "sid"),
         (14, "track-list"),
+        (15, "chapter-list"),
+        (16, "chapter"),
     ] {
         let _ = writeln!(wf, "{{\"command\":[\"observe_property\",{id},\"{name}\"]}}");
     }
@@ -587,6 +649,8 @@ fn ipc_io(pipe: String, rx: mpsc::Receiver<String>, state: Arc<Mutex<PlayerState
                         "path" => g.path = data.as_str().unwrap_or("").to_string(),
                         "sid" => g.sid = data.as_i64().unwrap_or(-1),
                         "track-list" => g.tracks = parse_tracks(&data),
+                        "chapter-list" => g.chapters = parse_chapters(&data),
+                        "chapter" => g.chapter = data.as_i64().unwrap_or(-1),
                         _ => {}
                     }
                 }
@@ -637,6 +701,10 @@ impl MpvHandle {
     pub fn loadfile_h(&self, url: &str, headers: &[(String, String)]) -> Result<(), String> {
         self.set_http_headers(headers);
         self.loadfile(url)
+    }
+    /// Jump to chapter by zero-based index (`chapter` property write).
+    pub fn set_chapter(&self, idx: i64) {
+        self.cmd(serde_json::json!({"command":["set_property","chapter",idx]}));
     }
     /// Load external subtitle file live (`sub-add ... select`).
     pub fn sub_add(&self, path: &str) {
@@ -915,9 +983,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_chapters_filters_and_labels() {
+        let v = serde_json::json!([
+            {"title":"Intro","time":0.0},
+            {"time":95.5},
+            {"title":"Bad no time"},
+            {"title":"Credits","time":1200}
+        ]);
+        let c = parse_chapters(&v);
+        assert_eq!(c.len(), 3);
+        assert_eq!(c[0].label(), "Intro");
+        assert_eq!(c[1].label(), "Chapter 2");
+        assert_eq!(c[1].index, 1);
+        assert_eq!(c[2].time, 1200.0);
+        assert_eq!(parse_chapters(&serde_json::json!(null)).len(), 0);
+        assert_eq!(parse_chapters(&serde_json::json!("x")).len(), 0);
+    }
+
+    #[test]
     fn player_state_defaults() {
         let st = PlayerState::default();
         assert_eq!(st.aid, -1);
+        assert_eq!(st.chapter, -1);
+        assert!(st.chapters.is_empty());
         assert!(!st.mute && !st.paused_for_cache && !st.connected);
         assert!(st.path.is_empty());
     }
@@ -963,5 +1051,41 @@ mod tests {
             .iter()
             .any(|x| x.starts_with("--log-file=") && x.ends_with("mpv-embedded.log")));
         assert_eq!(a.iter().filter(|x| x.starts_with("--log-file")).count(), 1);
+        // Embedded spawn isolated from user mpv config/scripts (pause OSD).
+        assert!(a.contains(&"--input-default-bindings=no".to_string()));
+        assert_eq!(a.iter().filter(|x| x.as_str() == "--no-config").count(), 1);
+        let nc = a.iter().position(|x| x == "--no-config").unwrap();
+        assert!(nc < dash, "no-config must be mpv flag, not file");
+    }
+
+    #[test]
+    fn embedded_args_strip_user_config_vectors() {
+        let s = Settings {
+            mpv_extra_args: "--config=yes --config-dir=C:/x --load-scripts=yes \
+            --script=C:/x.lua --scripts=C:/y.lua --include=C:/x.conf \
+            --input-conf=C:/i.conf --use-filedir-conf=yes"
+                .into(),
+            ..Default::default()
+        };
+        let a = embedded_args(&s, "https://x/v.mp4", 3, "pipe").unwrap();
+        for bad in [
+            "--config",
+            "--config-dir",
+            "--load-scripts",
+            "--script",
+            "--scripts",
+            "--include",
+            "--input-conf",
+            "--use-filedir-conf",
+        ] {
+            assert!(
+                !a.iter().any(|x| x.split('=').next() == Some(bad)),
+                "leaked {bad}"
+            );
+        }
+        assert_eq!(a.iter().filter(|x| x.as_str() == "--no-config").count(), 1);
+        // Detached launch args keep user config (no --no-config added).
+        let plain = build_args(&Settings::default(), "https://x/v.mp4").unwrap();
+        assert!(!plain.iter().any(|x| x == "--no-config"));
     }
 }

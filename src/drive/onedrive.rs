@@ -188,7 +188,10 @@ impl DriveBackend for OneDrive {
             .as_str()
             .filter(|s| !s.is_empty())
             .ok_or("OneDrive: no downloadUrl for file")?;
-        Ok(super::StreamSource { url: dl.to_string(), headers: Vec::new() })
+        Ok(super::StreamSource {
+            url: dl.to_string(),
+            headers: Vec::new(),
+        })
     }
     async fn download(
         &self,

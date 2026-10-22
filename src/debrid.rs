@@ -160,7 +160,10 @@ const ALIAS_GROUPS: &[&[&str]] = &[
 
 fn alias_group(domain: &str) -> Option<&'static [&'static str]> {
     let d = domain.trim().to_ascii_lowercase();
-    ALIAS_GROUPS.iter().find(|g| g.contains(&d.as_str())).copied()
+    ALIAS_GROUPS
+        .iter()
+        .find(|g| g.contains(&d.as_str()))
+        .copied()
 }
 
 /// Lowercase/dedupe domains and expand any known alias group members.
@@ -193,7 +196,9 @@ fn domain_matches(want: &str, listed: &str) -> bool {
     }
     // Alias equivalence: want is (subdomain of) an alias of listed.
     if let Some(g) = alias_group(&listed) {
-        return g.iter().any(|a| want == *a || want.ends_with(&format!(".{a}")));
+        return g
+            .iter()
+            .any(|a| want == *a || want.ends_with(&format!(".{a}")));
     }
     false
 }
@@ -202,7 +207,11 @@ fn domain_matches(want: &str, listed: &str) -> bool {
 fn jaro(a: &str, b: &str) -> f64 {
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
     if a.is_empty() || b.is_empty() {
-        return if a.is_empty() && b.is_empty() { 1.0 } else { 0.0 };
+        return if a.is_empty() && b.is_empty() {
+            1.0
+        } else {
+            0.0
+        };
     }
     if a == b {
         return 1.0;
@@ -260,8 +269,8 @@ fn jaro_winkler(a: &str, b: &str) -> f64 {
 /// mega.co.nz -> (mega, co.nz). ponytail: short suffix table, not full
 /// public-suffix list; unknown multi-label suffixes just miss fuzzy.
 const MULTI_SUFFIXES: &[&str] = &[
-    "co.nz", "co.uk", "com.au", "co.in", "com.br", "co.za", "co.kr",
-    "com.cn", "com.tw", "com.mx", "co.jp", "com.sg", "com.hk",
+    "co.nz", "co.uk", "com.au", "co.in", "com.br", "co.za", "co.kr", "com.cn", "com.tw", "com.mx",
+    "co.jp", "com.sg", "com.hk",
 ];
 
 fn domain_parts(host: &str) -> (String, String) {
@@ -617,8 +626,7 @@ async fn hosts_uncached(
                     } else {
                         Vec::new()
                     };
-                    let domains =
-                        expand_domains(h.domains.iter().cloned().chain(extra));
+                    let domains = expand_domains(h.domains.iter().cloned().chain(extra));
                     HostStatus {
                         name: h.name,
                         domain: domains.first().cloned().unwrap_or_default(),
@@ -1254,10 +1262,9 @@ pub async fn download_via_debrid(
     };
     if let Some(magnet) = &effective_magnet {
         let original_url = original_url.clone();
-        let (p, files) =
-            resolve_magnet_choice(http.clone(), settings, magnet, choice)
-                .await
-                .map_err(|e| (e, false))?;
+        let (p, files) = resolve_magnet_choice(http.clone(), settings, magnet, choice)
+            .await
+            .map_err(|e| (e, false))?;
         let chosen = if files.len() == 1 {
             files.into_iter().next().unwrap()
         } else {
@@ -1306,8 +1313,7 @@ pub async fn download_via_debrid(
         return Ok(done);
     }
     // hoster URL
-    let (p, f) = match resolve_hoster_result(http.clone(), settings, &original_url, choice).await
-    {
+    let (p, f) = match resolve_hoster_result(http.clone(), settings, &original_url, choice).await {
         (Ok(v), _) => v,
         (Err(e), hard) => return Err((e, hard)),
     };
@@ -1534,23 +1540,13 @@ mod tests {
             "{}",
             domain_similarity("mega.nz", "mega.co.nz")
         );
-        assert!(
-            domain_similarity("rapidgator.net", "rapidgator.asia")
-                >= SIMILARITY_THRESHOLD
-        );
+        assert!(domain_similarity("rapidgator.net", "rapidgator.asia") >= SIMILARITY_THRESHOLD);
         // Lookalikes / different hosters stay below threshold.
         assert!(domain_similarity("notmega.nz", "mega.nz") < SIMILARITY_THRESHOLD);
-        assert!(
-            domain_similarity("mega.nz", "megaupload.com") < SIMILARITY_THRESHOLD
-        );
-        assert!(
-            domain_similarity("mega.nz", "mega.nz.evil.example")
-                < SIMILARITY_THRESHOLD
-        );
+        assert!(domain_similarity("mega.nz", "megaupload.com") < SIMILARITY_THRESHOLD);
+        assert!(domain_similarity("mega.nz", "mega.nz.evil.example") < SIMILARITY_THRESHOLD);
         // Identical long label across suffix = canonical-domain move.
-        assert!(
-            domain_similarity("example.com", "example.org") >= SIMILARITY_THRESHOLD
-        );
+        assert!(domain_similarity("example.com", "example.org") >= SIMILARITY_THRESHOLD);
         // Abbreviations known gap: needs alias group, not fuzzy.
         assert!(domain_similarity("uploaded.net", "ul.to") < SIMILARITY_THRESHOLD);
     }

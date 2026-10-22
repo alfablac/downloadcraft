@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.21.0-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.22.0-blue">
   <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">
   <img alt="Language" src="https://img.shields.io/badge/built%20with-Rust%20%2B%20egui-orange">
 </p>
@@ -19,7 +19,7 @@
 
 webcraft reimplements the observable behavior of Internet Download Manager from scratch: segmented downloads that resume, queues and schedules, DASH/HLS handling, a site grabber, and deep browser integration. No IDM code, binaries, icons, or activation logic — and no affiliation with Tonec.
 
-**Current version:** 0.21.0 · Changelog lives in GitHub Releases.
+**Current version:** 0.22.0 · Changelog lives in GitHub Releases.
 
 **Runs on:** Windows 10/11 x86_64 · macOS 13+ (Intel and Apple Silicon) · Linux x86_64 (Ubuntu 22.04+, X11 and Wayland).
 
@@ -82,7 +82,7 @@ webcraft reimplements the observable behavior of Internet Download Manager from 
 - Video pages on YouTube, Vimeo, TikTok, Twitch, Dailymotion, Instagram, X, Facebook, Reddit, SoundCloud, Bilibili, and short-link hosts, resolved by a yt-dlp sidecar (native DASH/HLS fallback)
 - Format, audio, and subtitle picker before downloading; browser cookies passed from the extension for login-gated pages; yt-dlp runs silently with no console windows
 - Direct playback with mpv: Streams page, embedded player controls (pause, seek, volume, speed), and external mpv with your own options
-- Drives: double-click a video file to open it in the built-in player popup — local files play direct, remote drive files stream in place (provider URL + auth headers into mpv; Google Drive, OneDrive, Dropbox, S3 presigned, WebDAV, Teldrive; SFTP/FTP/crypt accounts cannot stream and ask you to download first). No rclone mount needed. The player popup now has **Audio** and **Subtitle** track selectors (subtitle Off included), **Load sub…** for an external subtitle file, and a **Sub style** row — size, position, text/shadow color, bold, and force-on-ASS — applied live and remembered in *Options → mpv → Subtitle style*
+- Drives: double-click a video file to open it in the built-in player popup — local files play direct, remote drive files stream in place (provider URL + auth headers into mpv; Google Drive, OneDrive, Dropbox, S3 presigned, WebDAV, Teldrive; SFTP/FTP/crypt accounts cannot stream and ask you to download first). No rclone mount needed. The player popup now has **Audio** and **Subtitle** track selectors (subtitle Off included), **Load sub…** for an external subtitle file, and a **Sub style** row — size, position, text/shadow color, bold, and force-on-ASS — applied live and remembered in *Options → mpv → Subtitle style*. Chapter dropdown with Prev/Next buttons appears when file has chapters. Dropdowns hide video frame while open (native video cannot layer under egui menus); Esc exits fullscreen, Full/Window toggles, Close quits player. Embedded player ignores your mpv config/scripts (`--no-config`) so external OSC/OSD overlays never leak in; detached mpv keeps them
 
 ### Automation and interface
 
@@ -90,7 +90,8 @@ webcraft reimplements the observable behavior of Internet Download Manager from 
 - Site Grabber with depth, scope, size, and extension filters and a mirror mode that rewrites links to local relative paths — including SharePoint via browser cookies
 - Progress dialog with per-part status, speed graph, and live details; downloads table with saved sort/widths, protocol badges, and type filtering from the side rail
 - File size is highlighted (strong accent) in the progress and completed windows, with downloaded / total / percent; when total size is unknown (HLS/DASH), the completed window falls back to the final downloaded bytes
-- Chatbot app actions: ask the assistant to add a download (file, magnet, `.torrent`, NZB, or video page), pause / resume / delete / open-folder by name, start / stop all, delete completed, or change a whitelisted setting; `list_tasks` / `search_tasks` / `get_stats` run instantly, app state is supplied via an `[APPDATA]` context block, unsupported actions are reported instead of dropped, and mutating actions ask for Confirm first
+- Chatbot app actions: ask the assistant to add a download (file, magnet, `.torrent`, NZB, or video page), pause / resume / delete / open-folder by name, start / stop all, delete completed, or change a whitelisted setting; `list_tasks` / `search_tasks` / `get_stats` run instantly, app state is supplied via an `[APPDATA]` context block, unsupported actions are reported instead of dropped, and mutating actions ask for Confirm first. Chat history persists across restarts (`chat-history.json`; New/History/Export .md/Search/Clear in the Chatbot header) with an append-only audit log (`chat-audit.jsonl`). Live answers: ask about local weather/news (IP geolocation, or name a place — `Clima em Xique-Xique, Bahia`), say `pesquise/search/buscar …` for web search, or paste a URL to have the page fetched — results arrive as `[CONTEXT]` with source URLs cited. The model never touches your PC directly: actions are proposed, you confirm
+- History tab + app-wide logs: every download event (added/started/paused/resumed/completed/failed/removed, host only — never full URLs) and ~5 s speed samples persist in daily JSONL under `dl-history/`, app events under `logs/`; both share a 50 MiB budget with 90-day retention and daily rotation. The History tab shows 7/30/90-day totals, bytes-per-day, a 24 h speed chart with axes, top hosts, and recent items — graphs survive restart, and the chatbot answers usage questions ("how much did I download this week?") from the same history
 - Desktop notifications, system tray, autostart, single-instance lock, clipboard URL monitoring, drag-and-drop, HTTP/SOCKS5 proxy with authentication (global default, per-download override — see Download engine), and atomic state saving with a `.bak` fallback
 
 > [!NOTE]

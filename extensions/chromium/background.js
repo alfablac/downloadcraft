@@ -125,7 +125,10 @@ function isSniff(details, type) {
   try { path = new URL(url).pathname.toLowerCase(); } catch (e) {}
   // Extension fallback: DASH/HLS/full mp4 served without usable Content-Type.
   if (!type || type === "application/octet-stream") {
-    return path.endsWith(".mpd") || path.endsWith(".m3u8") || path.endsWith(".mp4");
+    if (path.endsWith(".mpd") || path.endsWith(".m3u8") || path.endsWith(".mp4")) return true;
+    // Extension-less full media (IG CDN serves blob-MSE mp4s at opaque paths):
+    // browser <video src> fetches are type=media; keep API/XHR octet-stream out.
+    return type === "application/octet-stream" && details.type === "media";
   }
   if (SNIFF_TYPES.has(type)) return true;
   if (type.startsWith("video/") || type.startsWith("audio/")) {

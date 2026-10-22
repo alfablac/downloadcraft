@@ -419,7 +419,9 @@ pub async fn download_url_with_settings(
             .map_err(|e| format!("yt-dlp failed: {e}"));
     }
     match probe_manifest(&client, &task).await {
-        Manifest::Metalink => download_metalink(client, task, ctrl, settings.max_part_mb * 1024 * 1024).await,
+        Manifest::Metalink => {
+            download_metalink(client, task, ctrl, settings.max_part_mb * 1024 * 1024).await
+        }
         Manifest::Dash => download_dash(client, task, ctrl, false).await,
         Manifest::Hls => download_hls(client, task, ctrl).await,
         // Prewarm hit (Add/capture dialog probe, runtime-only registry):
@@ -496,7 +498,7 @@ async fn download_metalink(
         engine::prewarm_take(&task.url),
         max_part,
     )
-        .await
+    .await
 }
 
 async fn fetch_text(

@@ -2,6 +2,47 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.22.0] - 2026-10-22
+
+### Added
+
+- Built-in player chapter navigation: Prev/Next buttons + chapter dropdown
+  (mpv `chapter-list`/`chapter` observed via IPC). Hidden when file has no
+  chapters.
+- Chatbot: persistent chat history (`chat-history.json`, restored on startup,
+  New/History/Export .md/Search/Clear in Chatbot header), append-only audit
+  log (`chat-audit.jsonl`), live context: local weather/news by IP geolocation
+  or named place (Open-Meteo), explicit web search (`pesquise/search/buscar …`,
+  EN/PT/ES, DuckDuckGo HTML, no API key) and user-supplied page capture
+  (http(s) only, private hosts refused, size-capped) fed to the model as
+  `[CONTEXT]` with source URLs; model stays fenced — actions proposed only,
+  user confirms before execution.
+- App-wide audit logging + persistent download history: daily JSONL in
+  `logs/app-YYYY-MM-DD.jsonl` and `dl-history/dl-YYYY-MM-DD.jsonl` (host only,
+  never full URL), shared 50 MiB budget, 90-day retention, daily rotation.
+  History tab shows 7/30/90-day totals, bytes-per-day bars, 24 h speed chart
+  with axes, top hosts, recent completed/failed — survives restart; chatbot
+  `[APPDATA]` answers downloads/streaming usage questions from it.
+
+### Fixed
+
+- Browser capture on Instagram: extension now detects videos on `/reel/`,
+  `/reels/`, `/p/`, `/tv/` and stories (shortcode extraction, host-scoped
+  video-page check, IG-CDN `cdninstagram.com`/`fbcdn.net` media accepted on
+  single-post pages, extension-less `application/octet-stream` media sniffed);
+  download button reveals on delegated hover (IG overlay layers blocked
+  `mouseenter`); app-side `is_video_page` accepts `/reels/`, `/tv/` and
+  `/stories/<user>/<id>` so the page reaches yt-dlp instead of plain-link path.
+
+- Player dropdown menus (Audio/Subtitle/Speed/Chapter) rendered behind video:
+  native mpv child HWND composites above egui, so video frame hides while any
+  popup open (playback continues) and returns on close.
+- Player fullscreen had no exit: Esc now leaves fullscreen (popup owns Esc
+  when menu open), Full button toggles to Window, Close button added.
+- Foreign mpv OSD/OSC appearing on pause: embedded spawn now `--no-config`
+  (ignores user mpv.conf/scripts, eg `--script`/`--include` vectors stripped).
+  Detached mpv launch keeps user config.
+
 ## [0.21.0] - 2026-10-22
 
 ### Added

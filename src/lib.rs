@@ -1,5 +1,10 @@
+pub mod applog;
+pub mod chat_audit;
+pub mod chat_context;
 pub mod chat_core;
+pub mod chat_history;
 pub mod debrid;
+pub mod dl_history;
 pub mod debrid_ad;
 pub mod debrid_rd;
 pub mod debrid_tb;

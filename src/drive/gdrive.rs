@@ -472,7 +472,10 @@ impl DriveBackend for GDrive {
                 "https://www.googleapis.com/drive/v3/files/{}?alt=media&supportsAllDrives=true",
                 super::pct(&entry.id)
             ),
-            headers: vec![("Authorization".into(), format!("Bearer {}", self.token().await?))],
+            headers: vec![(
+                "Authorization".into(),
+                format!("Bearer {}", self.token().await?),
+            )],
         })
     }
     /// Server-side copy body: keep name, land in destination folder id.
@@ -506,7 +509,11 @@ impl DriveBackend for GDrive {
             Ok(())
         } else {
             let status = resp.status().as_u16();
-            Err(copy_error_hint(status, &src_entry.id, &http_util::err_text(resp).await))
+            Err(copy_error_hint(
+                status,
+                &src_entry.id,
+                &http_util::err_text(resp).await,
+            ))
         }
     }
 }
