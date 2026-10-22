@@ -2,23 +2,6 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
-## [0.23.0] - 2026-10-22
-
-### Changed
-
-- Universal capture, no per-site code: the extension and app no longer
-  contain site-specific host/path tables, CDN rules or permalink
-  regexes. Video pages on any host route to the real yt-dlp binary
-  (its own extractor set decides support); sniffing matches media by
-  MIME/extension only; stream-to-video binding uses generic tiers
-  (direct src, opaque URL token, first-play timing window). Obscured
-  players (page paints a layer over the video center, overlay-style
-  feeds) are detected geometrically via `elementFromPoint` instead of
-  a host list, and get the semi-visible button + coordinate hover;
-  all other players keep containment hover. `is_video_page` accepts
-  any non-file http(s) page URL; direct media/manifest URLs stay
-  native downloads.
-
 ## [0.22.4] - 2026-10-22
 
 ### Fixed

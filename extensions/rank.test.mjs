@@ -95,79 +95,47 @@ const ceil = [
 ];
 assert.deepEqual(matchRecordsForElement(ceil, { tabId: 7, frameId: 3, srcs: [], since: T, now: T }, T).map((r) => r.url), ["https://cdn/v1.mp4", "https://cdn/v2.mp4"], "F10e ceiling: both timing videos included");
 
-// Generic opaque-id tier: any delimiter-bounded token matches stream URLs on
-// any host (no per-site id extraction). Comments id != stream id case:
-// stream URL carries its own id only.
+// streamId tier: reddit comments id != v.redd.it stream id; DASH url carries stream id only.
 const streamRecs = [
-  { url: "https://cdn.example/zx9stream42/DASHPlaylist.mpd", tabId: 7, frameId: 3, time: T, type: "application/dash+xml" },
-  { url: "https://cdn.example/otherstream9/DASHPlaylist.mpd", tabId: 7, frameId: 3, time: T, type: "application/dash+xml" },
+  { url: "https://v.redd.it/cz2wlzfaeiwh1/DASHPlaylist.mpd", tabId: 7, frameId: 3, time: T, type: "application/dash+xml" },
+  { url: "https://v.redd.it/otherstream9/DASHPlaylist.mpd", tabId: 7, frameId: 3, time: T, type: "application/dash+xml" },
 ];
-assert.deepEqual(matchRecordsForElement(streamRecs, { tabId: 7, frameId: 3, srcs: [], postId: "", streamId: "zx9stream42", since: 0, now: T }, T).map((r) => r.url), ["https://cdn.example/zx9stream42/DASHPlaylist.mpd"], "streamId tier hits opaque stream id");
-assert.deepEqual(also.matchRecordsForElement(streamRecs, { tabId: 7, frameId: 3, srcs: [], postId: "", streamId: "zx9stream42", since: 0, now: T }, T).map((r) => r.url), ["https://cdn.example/zx9stream42/DASHPlaylist.mpd"], "streamId firefox parity");
+assert.deepEqual(matchRecordsForElement(streamRecs, { tabId: 7, frameId: 3, srcs: [], postId: "", streamId: "cz2wlzfaeiwh1", since: 0, now: T }, T).map((r) => r.url), ["https://v.redd.it/cz2wlzfaeiwh1/DASHPlaylist.mpd"], "streamId tier hits v.redd.it playlist");
+assert.deepEqual(also.matchRecordsForElement(streamRecs, { tabId: 7, frameId: 3, srcs: [], postId: "", streamId: "cz2wlzfaeiwh1", since: 0, now: T }, T).map((r) => r.url), ["https://v.redd.it/cz2wlzfaeiwh1/DASHPlaylist.mpd"], "streamId firefox parity");
 // postId tier precedence over streamId (exclusive tiers, postId before streamId)
-assert.deepEqual(matchRecordsForElement([...streamRecs, { url: "https://cdn/post_abc123_x.mp4", tabId: 7, frameId: 3, time: T, type: "video/mp4" }], { tabId: 7, frameId: 3, srcs: [], postId: "abc123", streamId: "zx9stream42", since: 0, now: T }, T).map((r) => r.url), ["https://cdn/post_abc123_x.mp4"], "postId tier before streamId");
-// postId alone on generic CDN host (no streamId field needed)
-assert.deepEqual(matchRecordsForElement([{ url: "https://media.example/embed/abc123/player.m3u8", tabId: 7, frameId: 3, time: T, type: "application/x-mpegurl" }], { tabId: 7, frameId: 3, srcs: [], postId: "abc123", since: 0, now: T }, T).map((r) => r.url), ["https://media.example/embed/abc123/player.m3u8"], "postId tier generic host");
+assert.deepEqual(matchRecordsForElement([...streamRecs, { url: "https://cdn/post_abc123_x.mp4", tabId: 7, frameId: 3, time: T, type: "video/mp4" }], { tabId: 7, frameId: 3, srcs: [], postId: "abc123", streamId: "cz2wlzfaeiwh1", since: 0, now: T }, T).map((r) => r.url), ["https://cdn/post_abc123_x.mp4"], "postId tier before streamId");
 
-// Generic blob/MSE fallback (background-only extraPool): element src blob:
-// only, so src/postId tiers all miss; any-host same-tab candidates inside
-// since window win (background sets blobOnly from el srcs, never page host).
-const mseRecs = [
-  { url: "https://media.example/v/abc123/movie.mp4?sig=xyz", tabId: 7, frameId: 3, time: T + 5000, type: "video/mp4" },
-  { url: "https://static.other-cdn.net/v/xyz.mp4", tabId: 7, frameId: 3, time: T + 6000, type: "video/mp4" },
-  { url: "https://media.example/v/old.mp4", tabId: 7, frameId: 3, time: T - 99999, type: "video/mp4" }, // outside since window
-  { url: "https://media.example/v/wrongtab.mp4", tabId: 8, frameId: 3, time: T + 5000, type: "video/mp4" }, // wrong tab
+// IG host-scoped fallback (background-only extraPool): CDN URLs carry no
+// shortcode, MSE src is blob:, so src/postId/timing tiers all miss.
+const igRecs = [
+  { url: "https://scontent.cdninstagram.com/v/t50.2886-16/abc.mp4?efg=xyz", tabId: 7, frameId: 3, time: T + 5000, type: "video/mp4" },
+  { url: "https://scontent.xx.fbcdn.net/v/t39.30808-6/xyz.mp4", tabId: 7, frameId: 3, time: T + 6000, type: "video/mp4" },
+  { url: "https://scontent.cdninstagram.com/v/t50.2886-16/old.mp4", tabId: 7, frameId: 3, time: T - 99999, type: "video/mp4" }, // outside since window
+  { url: "https://other.cdn.example/v.mp4", tabId: 7, frameId: 3, time: T + 5000, type: "video/mp4" }, // wrong host
 ];
-const mseEl = { tabId: 7, frameId: 3, srcs: ["blob:https://player.example/1"], postId: "DAbc123XyZ", since: T, now: T, blobOnly: true };
-// main pool empty (records evicted/killed), extraPool = candidates: window hit, any host
+const igEl = { tabId: 7, frameId: 3, srcs: ["blob:https://www.instagram.com/1"], postId: "DAbc123XyZ", since: T, now: T, pageHost: "instagram.com" };
+// main pool empty (records evicted/killed), extraPool = candidates: host+window hit
 assert.deepEqual(
-  matchRecordsForElement([], mseEl, T, mseRecs).map((r) => r.url),
-  ["https://media.example/v/abc123/movie.mp4?sig=xyz", "https://static.other-cdn.net/v/xyz.mp4"],
-  "blob fallback: any-host in-window, old + wrong-tab excluded");
-// playlist-preference: playlist under same blob element drops segments/files
-const msePl = [
-  { url: "https://media.example/v/clip/seg-1.ts", tabId: 7, frameId: 3, time: T + 1000, type: "video/mp2t" },
-  { url: "https://media.example/v/clip/movie.mp4", tabId: 7, frameId: 3, time: T + 2000, type: "video/mp4" },
-  { url: "https://media.example/v/clip/list.m3u8", tabId: 7, frameId: 3, time: T + 3000, type: "application/x-mpegurl" },
-];
+  matchRecordsForElement([], igEl, T, igRecs).map((r) => r.url),
+  ["https://scontent.cdninstagram.com/v/t50.2886-16/abc.mp4?efg=xyz", "https://scontent.xx.fbcdn.net/v/t39.30808-6/xyz.mp4"],
+  "IG host fallback: cdninstagram+fbcdn in-window, old + wrong-host excluded");
+// fbcdn passes when scope is fbcdn.net
 assert.deepEqual(
-  matchRecordsForElement([], mseEl, T, msePl).map((r) => r.url),
-  ["https://media.example/v/clip/list.m3u8"],
-  "blob fallback: playlist alone, segment + file dropped");
-// segment-under-playlist already in rank pool: rank keeps playlist+file only
-assert.deepEqual(
-  rankCandidates(msePl).map((e) => e.url),
-  ["https://media.example/v/clip/list.m3u8", "https://media.example/v/clip/movie.mp4"],
-  "rank: playlist preferred, segment dropped, file kept");
-// no blobOnly -> no fallback (content-reachable calls never widen)
-assert.deepEqual(matchRecordsForElement([], { tabId: 7, frameId: 3, srcs: [], postId: "DAbc123XyZ", since: T, now: T }, T, mseRecs), [], "no blobOnly: extraPool ignored");
-assert.deepEqual(matchRecordsForElement([], { ...mseEl, blobOnly: false }, T, mseRecs), [], "blobOnly=false: extraPool ignored");
-// real (non-blob) src present -> blobOnly signal does not arm fallback
-assert.deepEqual(matchRecordsForElement([], { ...mseEl, srcs: ["https://media.example/direct.mp4"] }, T, mseRecs), [], "non-blob src: no blob fallback");
+  matchRecordsForElement([], { ...igEl, pageHost: "fbcdn.net" }, T, igRecs).map((r) => r.url),
+  ["https://scontent.xx.fbcdn.net/v/t39.30808-6/xyz.mp4"],
+  "IG host fallback: fbcdn.net scope");
+// no pageHost -> no fallback (content-reachable calls never widen)
+assert.deepEqual(matchRecordsForElement([], { tabId: 7, frameId: 3, srcs: [], postId: "DAbc123XyZ", since: T, now: T }, T, igRecs), [], "no pageHost: extraPool ignored");
 // no since -> no fallback
-assert.deepEqual(matchRecordsForElement([], { ...mseEl, since: 0 }, T, mseRecs), [], "since=0: no blob fallback");
-// src tier still wins over blob fallback
-const mseSrc = [{ url: "https://media.example/v/mine.mp4", tabId: 7, frameId: 3, time: T, type: "video/mp4" }];
+assert.deepEqual(matchRecordsForElement([], { ...igEl, since: 0 }, T, igRecs), [], "since=0: no host fallback");
+// src tier still wins over host fallback
+const igSrc = [{ url: "https://scontent.cdninstagram.com/v/mine.mp4", tabId: 7, frameId: 3, time: T, type: "video/mp4" }];
 assert.deepEqual(
-  matchRecordsForElement(mseSrc, { tabId: 7, frameId: 3, srcs: ["https://media.example/v/mine.mp4"], postId: "DAbc123XyZ", since: T, now: T, blobOnly: true }, T, mseRecs).map((r) => r.url),
-  ["https://media.example/v/mine.mp4"], "src tier exclusive over blob fallback");
-// cross-feed isolation: two blob videos, disjoint timing windows -> own window only
-const feedRecs = [
-  { url: "https://media.example/feed/v1.mp4", tabId: 7, frameId: 3, time: T + 5000, type: "video/mp4" },
-  { url: "https://media.example/feed/v2.mp4", tabId: 7, frameId: 3, time: T + 120000, type: "video/mp4" },
-];
-assert.deepEqual(
-  matchRecordsForElement([], { tabId: 7, frameId: 3, srcs: ["blob:https://player.example/a"], since: T, now: T, blobOnly: true }, T, feedRecs).map((r) => r.url),
-  ["https://media.example/feed/v1.mp4"], "cross-feed: video A window excludes video B");
-assert.deepEqual(
-  matchRecordsForElement([], { tabId: 7, frameId: 3, srcs: ["blob:https://player.example/b"], since: T + 115000, now: T + 115000, blobOnly: true }, T + 115000, feedRecs).map((r) => r.url),
-  ["https://media.example/feed/v2.mp4"], "cross-feed: video B window excludes video A");
+  matchRecordsForElement(igSrc, { tabId: 7, frameId: 3, srcs: ["https://scontent.cdninstagram.com/v/mine.mp4"], postId: "DAbc123XyZ", since: T, now: T, pageHost: "instagram.com" }, T, igRecs).map((r) => r.url),
+  ["https://scontent.cdninstagram.com/v/mine.mp4"], "src tier exclusive over host fallback");
 // firefox parity
 assert.deepEqual(
-  also.matchRecordsForElement([], mseEl, T, mseRecs).map((r) => r.url),
-  ["https://media.example/v/abc123/movie.mp4?sig=xyz", "https://static.other-cdn.net/v/xyz.mp4"], "blob fallback firefox parity");
-assert.deepEqual(
-  also.matchRecordsForElement([], mseEl, T, msePl).map((r) => r.url),
-  ["https://media.example/v/clip/list.m3u8"], "blob playlist-preference firefox parity");
+  also.matchRecordsForElement([], igEl, T, igRecs).map((r) => r.url),
+  ["https://scontent.cdninstagram.com/v/t50.2886-16/abc.mp4?efg=xyz", "https://scontent.xx.fbcdn.net/v/t39.30808-6/xyz.mp4"], "IG host fallback firefox parity");
 
 console.log("rank.test.mjs OK", urls);

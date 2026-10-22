@@ -118,26 +118,37 @@ async function loadCandidates() {
   } catch (e) {}
 }
 const SNIFF_TYPES = new Set(["application/dash+xml", "application/x-mpegurl", "application/vnd.apple.mpegurl", "application/x-mpegurl", "video/vnd.mpeg.dash.mpd", "video/mpegurl", "video/x-mpegurl", "application/mpegurl"]);
+const IG_CDN_RE = /(^|\.)(cdninstagram\.com|fbcdn\.net)$/i;
+const IG_PAGE_RE = /(^|\.)instagram\.com$/i;
+function isIgCdnUrl(u) { try { return IG_CDN_RE.test(new URL(u).hostname); } catch (e) { return /cdninstagram\.com|fbcdn\.net/i.test(String(u || "")); } }
+function isIgDoc(details) { try { const d = details && (details.documentUrl || details.initiator || details.originUrl || ""); if (!d) return false; return IG_PAGE_RE.test(new URL(d).hostname); } catch (e) { return false; } }
 function isSniff(details, type) {
   const url = details.url || "";
   let path = "";
   try { path = new URL(url).pathname.toLowerCase(); } catch (e) { path = String(url).split(/[?#]/)[0].toLowerCase(); }
-  // pathname only: query-string ext false-rejects signed URLs
+  // pathname only: query-string ext false-rejects signed IG URLs
   // (?x=.js / ?token=xx.css). Page assets rejected by real path suffix.
   if (/\.(json|js|mjs|css|html?|map)$/i.test(path)) return false; // page assets
-  // Universal, host-agnostic: playlist ext/MIME, media MIME, or media-typed
-  // octet-stream, on any host. Extension-less octet-stream via xhr/fetch is
-  // indistinguishable from site API traffic; page-level yt-dlp owns that case.
+  const ft = String(details.type || "");
+  const igCdn = isIgCdnUrl(url);
+  const igDoc = isIgDoc(details);
+  // IG progressive (extension-less, video/mp4, type=fetch/xhr/other) and
+  // IG DASH (extension-less .mpd via fetch, application/dash+xml or
+  // octet-stream): accept IG-CDN regardless of request type. Request-type
+  // allowlist was root cause: MSE fetch arrives as xmlhttprequest/fetch, not media.
+  if (igCdn && (type.startsWith("video/") || type.startsWith("audio/") || SNIFF_TYPES.has(type))) return true;
+  if (igCdn && (type === "application/octet-stream" || !type) && (igDoc || ft === "media" || ft === "xmlhttprequest" || ft === "fetch" || ft === "other" || ft === "object" || ft === "")) return true;
+  if (igCdn && igDoc && (path.endsWith(".mpd") || path.endsWith(".m3u8"))) return true;
   if (path.endsWith(".mpd") || path.endsWith(".m3u8")) return true;
-  if (SNIFF_TYPES.has(type)) return true;
   // Extension fallback: DASH/HLS/full mp4 served without usable Content-Type.
   if (!type || type === "application/octet-stream") {
     if (path.endsWith(".mp4")) return true;
     return type === "application/octet-stream" && details.type === "media";
   }
+  if (SNIFF_TYPES.has(type)) return true;
   if (type.startsWith("video/") || type.startsWith("audio/")) {
-    // Segments pollute panel (DASH segment floods cap); only
-    // manifests/full media belong, on every host.
+    // Segments pollute panel (X twimg / Reddit DASH floods cap); only
+    // manifests/full media belong. IG-CDN exempted by branches above.
     try { const seg = new URL(url).pathname.split("/").pop() || ""; if (/^(seg|segment|chunk|frag)[-_]?\d|\.m4s$|[-_]\d+\.(ts|m4s)$/i.test(seg)) return false; } catch (e) {}
     return true;
   }
@@ -406,13 +417,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // Element-frame match empty: retry frame-agnostic (frameId=null passes
         // tolerant filter) before returning empty.
         if (!pool.length && senderFrame != null && typeof matchRecordsForElement === "function") pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null }, Date.now());
-          // Generic blob/MSE fallback (background-only): element has blob:
-          // src and no id tier can bind (page may be plain pushState SPA),
-          // so extraPool=same-tab candidates in since window, playlists
-          // preferred. Signal blobOnly derived bg-side from el srcs, never
-          // a host check; content-reachable calls pass no extraPool.
+          // IG host-scoped fallback (background-only): CDN URLs never carry
+          // shortcode, MSE src is blob:, timing anchored at firstPlay misses
+          // preloads. pageHost from sender.tab.url (trusted bg, not msg).
           if (!pool.length && typeof matchRecordsForElement === "function") {
-            pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null, blobOnly: true }, Date.now(), [...candidates.values()]);
+            let ph = "";
+            try { ph = new URL((sender.tab && sender.tab.url) || "").hostname.toLowerCase(); } catch (e) {}
+            if (/(^|\.)instagram\.com$/.test(ph)) pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null, pageHost: "instagram.com" }, Date.now(), [...candidates.values()]);
           }
       } else {
         pool = [...candidates.values()].filter((c) => tabId == null || c.tabId === tabId);
@@ -428,11 +439,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // to yt-dlp page (else manifest choice lost). Only cookies scope passes.
   if (msg && msg.type === "downloadcraft-video-panel") { sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer || msg.pageUrl, pageTitle: msg.pageTitle, pageUrl: msg.intent === "page" ? msg.pageUrl : undefined, cookieUrl: msg.pageUrl, intent: msg.intent }).then(sendResponse, (e) => sendResponse({ type: "error", error: String((e && e.message) || e) })); return true; }
 });
-// Toolbar click -> content scan (unchanged); generic blob/MSE fallback
-// lives in getCandidates above.
+// Toolbar click -> content scan (unchanged); IG fallback lives in getCandidates above.
 chrome.action.onClicked.addListener((tab) => { if (tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "downloadcraft-scan" }).catch(() => {}); });
-// SPA pushState nav (url-only change) must NOT wipe candidates: players
-// preload media before user opens it; only real loading nav to a new URL purges.
+// SPA pushState nav (url-only change) must NOT wipe candidates: IG preloads
+// media before user opens reel; only real loading nav to a new URL purges.
 const tabLastUrl = new Map();
 if (chrome.tabs && chrome.tabs.onUpdated) chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (info.status !== "loading" || !info.url) return;
