@@ -103,12 +103,28 @@ pub trait DriveBackend: Send + Sync {
         name: &str,
         prog: &Progress,
     ) -> Result<RemoteEntry, String>;
-    /// Server-side copy if backend supports, else Err (jobs runner falls
-    /// back to download+upload streaming through memory/disk).
-    async fn copy_to(
+    /// S3 bucket for CopyObject source header ("" = not S3-compatible
+    /// copy source). Lets same-kind server-side copy name source bucket
+    /// without downcasting the source backend object.
+    fn s3_bucket(&self) -> String {
+        String::new()
+    }
+    /// True when backend wraps another (crypt): ids/paths exposed are
+    /// logical, inner stored bytes differ, server-side copy invalid.
+    fn crypt_wrapped(&self) -> bool {
+        false
+    }
+    /// Server-side copy INTO this backend from `src_entry` on `src`:
+    /// provider copies bytes server-to-server under this (destination)
+    /// identity; no data passes through this machine. Default Err; jobs
+    /// runner then falls back to download+upload through local disk.
+    /// `src` is the same backend object that produced `src_entry`, so
+    /// providers needing source credentials (S3 bucket/key) read them
+    /// from it. Implementations must reject crypt-wrapped peers.
+    async fn copy_from(
         &self,
-        _entry: &RemoteEntry,
-        _dst: &dyn DriveBackend,
+        _src: &Arc<dyn DriveBackend>,
+        _src_entry: &RemoteEntry,
         _dst_dir: &str,
         _prog: &Progress,
     ) -> Result<(), String> {

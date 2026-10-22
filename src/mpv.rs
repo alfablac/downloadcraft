@@ -81,6 +81,83 @@ fn charset_ok(v: &str, ok: impl Fn(char) -> bool) -> bool {
     !v.is_empty() && v.chars().all(ok)
 }
 
+/// "#RRGGBB" hex color (subtitle style fields).
+pub fn is_hex_color(v: &str) -> bool {
+    v.len() == 7 && v.starts_with('#') && v[1..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// One audio/subtitle/video track from mpv `track-list` property.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackInfo {
+    pub id: i64,
+    pub kind: String, // "audio" | "sub" | "video"
+    pub title: String,
+    pub lang: String,
+    pub codec: String,
+    pub selected: bool,
+    pub external_filename: String,
+}
+
+impl TrackInfo {
+    /// Combo label: lang/title/codec, fallback "Track <id>".
+    pub fn label(&self) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        if !self.lang.is_empty() {
+            parts.push(&self.lang);
+        }
+        if !self.title.is_empty() && self.title != self.lang {
+            parts.push(&self.title);
+        }
+        if parts.is_empty() && !self.codec.is_empty() {
+            parts.push(&self.codec);
+        }
+        if !self.external_filename.is_empty() {
+            parts.push(&self.external_filename);
+        }
+        if parts.is_empty() {
+            format!("Track {}", self.id)
+        } else {
+            parts.join(" · ")
+        }
+    }
+}
+
+/// Parse mpv `track-list` JSON value into tracks (pure, tested).
+pub fn parse_tracks(data: &serde_json::Value) -> Vec<TrackInfo> {
+    let Some(arr) = data.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|t| {
+            Some(TrackInfo {
+                id: t.get("id")?.as_i64()?,
+                kind: t.get("type")?.as_str()?.to_string(),
+                title: t
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                lang: t
+                    .get("lang")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                codec: t
+                    .get("codec")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                selected: t.get("selected").and_then(|v| v.as_bool()).unwrap_or(false),
+                external_filename: t
+                    .get("external-filename")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
 /// mpv argv for `url` (URL or local path) from Settings. Flags in Settings
 /// field order; `--` before URL/path so it never parses as option.
 pub fn build_args(s: &Settings, url: &str) -> Result<Vec<String>, String> {
@@ -145,6 +222,40 @@ pub fn build_args(s: &Settings, url: &str) -> Result<Vec<String>, String> {
         }
         a.push(format!("--sub-auto={sub_auto}"));
     }
+    // Subtitle style: only non-default values emitted (mpv defaults kept).
+    if s.mpv_sub_size != 55 {
+        if !(1..=200).contains(&s.mpv_sub_size) {
+            return Err(format!(
+                "mpv subtitle size out of range (1..=200): {}",
+                s.mpv_sub_size
+            ));
+        }
+        a.push(format!("--sub-font-size={}", s.mpv_sub_size));
+    }
+    if s.mpv_sub_pos != 100 {
+        if s.mpv_sub_pos > 100 {
+            return Err(format!(
+                "mpv subtitle position out of range (0..=100): {}",
+                s.mpv_sub_pos
+            ));
+        }
+        a.push(format!("--sub-pos={}", s.mpv_sub_pos));
+    }
+    for (val, flag, def) in [
+        (&s.mpv_sub_color, "--sub-color", "#FFFFFF"),
+        (&s.mpv_sub_shadow_color, "--sub-back-color", "#000000"),
+    ] {
+        let v = val.trim();
+        if is_hex_color(v) && !v.eq_ignore_ascii_case(def) {
+            a.push(format!("{flag}={v}"));
+        }
+    }
+    if s.mpv_sub_bold {
+        a.push("--sub-bold=yes".into());
+    }
+    if s.mpv_sub_ass_override {
+        a.push("--sub-ass-override=yes".into());
+    }
     // ponytail: whitespace split only; quoted extra args with spaces unsupported.
     for tok in s.mpv_extra_args.split_whitespace() {
         a.push(tok.to_string());
@@ -196,6 +307,9 @@ pub struct PlayerState {
     pub title: String,
     pub error: String, // pipe/launch failure; mpv IPC has no stable error prop
     pub aid: i64,      // -1 = no audio track selected
+    pub sid: i64,      // -1 = no subtitle track selected / unknown
+    /// All tracks (audio/sub/video) from `track-list`.
+    pub tracks: Vec<TrackInfo>,
     pub mute: bool,
     pub paused_for_cache: bool,
     pub connected: bool, // IPC pipe connected / property events flowing
@@ -215,6 +329,8 @@ impl Default for PlayerState {
             title: String::new(),
             error: String::new(),
             aid: -1,
+            sid: -1,
+            tracks: Vec::new(),
             mute: false,
             paused_for_cache: false,
             connected: false,
@@ -363,6 +479,8 @@ fn ipc_io(pipe: String, rx: mpsc::Receiver<String>, state: Arc<Mutex<PlayerState
         (10, "mute"),
         (11, "paused-for-cache"),
         (12, "path"),
+        (13, "sid"),
+        (14, "track-list"),
     ] {
         let _ = writeln!(wf, "{{\"command\":[\"observe_property\",{id},\"{name}\"]}}");
     }
@@ -411,6 +529,8 @@ fn ipc_io(pipe: String, rx: mpsc::Receiver<String>, state: Arc<Mutex<PlayerState
                         "mute" => g.mute = data.as_bool().unwrap_or(false),
                         "paused-for-cache" => g.paused_for_cache = data.as_bool().unwrap_or(false),
                         "path" => g.path = data.as_str().unwrap_or("").to_string(),
+                        "sid" => g.sid = data.as_i64().unwrap_or(-1),
+                        "track-list" => g.tracks = parse_tracks(&data),
                         _ => {}
                     }
                 }
@@ -436,6 +556,25 @@ impl Drop for MpvHandle {
 impl MpvHandle {
     pub fn cmd(&self, v: serde_json::Value) {
         let _ = self.cmd_tx.send(v.to_string());
+    }
+    /// Switch audio track (`aid` property).
+    pub fn set_aid(&self, id: i64) {
+        self.cmd(serde_json::json!({"command":["set_property","aid",id]}));
+    }
+    /// Switch subtitle track; None = off.
+    pub fn set_sid(&self, id: Option<i64>) {
+        match id {
+            Some(id) => self.cmd(serde_json::json!({"command":["set_property","sid",id]})),
+            None => self.cmd(serde_json::json!({"command":["set_property","sid","no"]})),
+        }
+    }
+    /// Load external subtitle file live (`sub-add ... select`).
+    pub fn sub_add(&self, path: &str) {
+        self.cmd(serde_json::json!({"command":["sub-add",path,"select"]}));
+    }
+    /// Live subtitle style property (`sub-font-size`, `sub-color`, ...).
+    pub fn set_sub_prop(&self, name: &str, value: serde_json::Value) {
+        self.cmd(serde_json::json!({"command":["set_property",name,value]}));
     }
     pub fn toggle_pause(&self) {
         self.cmd(serde_json::json!({"command":["cycle","pause"]}));
@@ -503,6 +642,85 @@ mod tests {
                 "https://x.org/v.mp4"
             ]
         );
+    }
+
+    #[test]
+    fn parse_tracks_filters_and_labels() {
+        let v = serde_json::json!([
+            {"id":1,"type":"video","codec":"h264","selected":true},
+            {"id":2,"type":"audio","lang":"eng","title":"Stereo","codec":"aac","selected":true},
+            {"id":3,"type":"audio","lang":"jpn","codec":"flac"},
+            {"id":4,"type":"sub","lang":"eng","title":"Full","codec":"ass"},
+            {"id":5,"type":"sub","external-filename":"movie.en.srt"},
+            {"type":"audio","lang":"bad-no-id"}
+        ]);
+        let t = parse_tracks(&v);
+        assert_eq!(t.len(), 5);
+        assert_eq!(t[1].kind, "audio");
+        assert_eq!(t[1].label(), "eng · Stereo");
+        assert_eq!(t[3].label(), "eng · Full");
+        assert_eq!(t[4].label(), "movie.en.srt");
+        assert_eq!(t[0].label(), "h264");
+        assert_eq!(parse_tracks(&serde_json::json!(null)).len(), 0);
+        assert_eq!(parse_tracks(&serde_json::json!("x")).len(), 0);
+    }
+
+    #[test]
+    fn build_args_sub_style_only_when_non_default() {
+        let s = Settings::default();
+        let a = build_args(&s, "http://x/v.mkv").unwrap();
+        for f in [
+            "--sub-font-size",
+            "--sub-pos",
+            "--sub-color",
+            "--sub-back-color",
+            "--sub-bold",
+            "--sub-ass-override",
+        ] {
+            assert!(
+                !a.iter().any(|x| x.starts_with(f)),
+                "unexpected {f} in {a:?}"
+            );
+        }
+        let s = Settings {
+            mpv_sub_size: 70,
+            mpv_sub_pos: 90,
+            mpv_sub_color: "#FFCC00".into(),
+            mpv_sub_shadow_color: "#112233".into(),
+            mpv_sub_bold: true,
+            mpv_sub_ass_override: true,
+            ..Default::default()
+        };
+        let a = build_args(&s, "http://x/v.mkv").unwrap();
+        for f in [
+            "--sub-font-size=70",
+            "--sub-pos=90",
+            "--sub-color=#FFCC00",
+            "--sub-back-color=#112233",
+            "--sub-bold=yes",
+            "--sub-ass-override=yes",
+        ] {
+            assert!(a.contains(&f.to_string()), "missing {f} in {a:?}");
+        }
+        // Default text color suppressed, changed shadow emitted.
+        let s2 = Settings {
+            mpv_sub_shadow_color: "#445566".into(),
+            ..Default::default()
+        };
+        let a2 = build_args(&s2, "http://x/v.mkv").unwrap();
+        assert!(!a2.iter().any(|x| x.starts_with("--sub-color")));
+        assert!(a2.contains(&"--sub-back-color=#445566".to_string()));
+        // Bad ranges rejected.
+        let s3 = Settings {
+            mpv_sub_size: 999,
+            ..Default::default()
+        };
+        assert!(build_args(&s3, "http://x/v.mkv").is_err());
+        let s3 = Settings {
+            mpv_sub_pos: 101,
+            ..Default::default()
+        };
+        assert!(build_args(&s3, "http://x/v.mkv").is_err());
     }
 
     #[test]

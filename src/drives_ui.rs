@@ -278,6 +278,8 @@ pub struct DrivesUi {
     pub sync_preview: Option<SyncPlan>,
     pub sync_slot: Option<SyncSlot>,
     pub pending_download_tasks: Vec<(String, String, String)>, // url,user,pass
+    /// Local video paths awaiting built-in player (drained by app).
+    pub pending_play: Vec<String>,
     /// Pending destructive confirmation (remote delete / account removal).
     pub confirm: Option<DriveConfirm>,
 }
@@ -326,6 +328,7 @@ impl Default for DrivesUi {
             sync_preview: None,
             sync_slot: None,
             pending_download_tasks: Vec::new(),
+            pending_play: Vec::new(),
             confirm: None,
         }
     }
@@ -800,6 +803,10 @@ impl DrivesUi {
                             },
                         );
                     }
+                }
+                PaneAction::Play(_pane, path) => {
+                    self.status = format!("Playing {path} in built-in player");
+                    self.pending_play.push(path);
                 }
                 PaneAction::DownloadTask(i) => {
                     // WebDAV only: direct URL into segmented engine.
@@ -1364,6 +1371,20 @@ impl DrivesUi {
                                     e.path.clone()
                                 };
                                 actions.push(PaneAction::Navigate(idx, p));
+                            } else if resp.double_clicked()
+                                && downloadcraft_lib::model::category_for(&e.name) == "Video"
+                            {
+                                // Double-click video: local pane plays in
+                                // built-in player; remote needs streaming
+                                // (not supported) -> status note.
+                                if self.panes[idx].account_id == LOCAL_ID {
+                                    actions.push(PaneAction::Play(idx, e.id.clone()));
+                                } else {
+                                    self.status = format!(
+                                        "Playback needs local file: download {} first (remote streaming not supported).",
+                                        e.name
+                                    );
+                                }
                             }
                         }
                         if entries.is_empty() && !self.panes[idx].loading {
@@ -2445,6 +2466,7 @@ enum PaneAction {
     Mkdir(usize),
     Rename(usize),
     DownloadTask(usize),
+    Play(usize, String),
 }
 
 async fn collect_at(be: &Arc<dyn DriveBackend>, root: &str) -> Result<Vec<RemoteEntry>, String> {

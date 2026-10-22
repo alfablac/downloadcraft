@@ -418,6 +418,9 @@ impl DriveBackend for CryptBackend {
     fn kind(&self) -> DriveKind {
         self.inner.kind()
     }
+    fn crypt_wrapped(&self) -> bool {
+        true
+    }
     async fn about(&self) -> Result<String, String> {
         self.inner.about().await
     }

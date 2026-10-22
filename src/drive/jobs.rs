@@ -94,6 +94,15 @@ pub async fn copy_file(
     prog: &Progress,
 ) -> Result<(), String> {
     prog.check()?;
+    // Server-side: destination provider copies from source directly.
+    // Crypt peers excluded (ids are logical, bytes encrypted).
+    if !src_be.crypt_wrapped()
+        && !dst_be.crypt_wrapped()
+        && dst_be.copy_from(src_be, entry, dst_dir, prog).await.is_ok()
+    {
+        prog.add(entry.size);
+        return Ok(());
+    }
     let tmp = staging_path(&format!(
         "{}-{}",
         crate::model::new_id(),

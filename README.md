@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.19.0-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.20.0-blue">
   <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">
   <img alt="Language" src="https://img.shields.io/badge/built%20with-Rust%20%2B%20egui-orange">
 </p>
@@ -19,7 +19,7 @@
 
 webcraft reimplements the observable behavior of Internet Download Manager from scratch: segmented downloads that resume, queues and schedules, DASH/HLS handling, a site grabber, and deep browser integration. No IDM code, binaries, icons, or activation logic — and no affiliation with Tonec.
 
-**Current version:** 0.19.0 · Changelog lives in GitHub Releases.
+**Current version:** 0.20.0 · Changelog lives in GitHub Releases.
 
 **Runs on:** Windows 10/11 x86_64 · macOS 13+ (Intel and Apple Silicon) · Linux x86_64 (Ubuntu 22.04+, X11 and Wayland).
 
@@ -60,6 +60,7 @@ webcraft reimplements the observable behavior of Internet Download Manager from 
 ### Drives (cloud storage)
 
 - Drives tab (next to Streams / Site Grabber): dual-pane browser — This PC (download folder) or any account per pane, breadcrumb navigation, copy/move/delete/mkdir/rename, transfer panel with pause/resume/cancel and speed. Copy skips existing names unless *Overwrite* on. WebDAV files can also go *To Downloads* into segmented engine.
+- **Server-side copy:** Google Drive → Google Drive and S3 → S3 transfers copy on the provider's servers (Drive `files.copy`, S3 `CopyObject`) with no data passing through your machine — large files land in seconds. Any failure (cross-account read denied, object over 5 GiB on S3, crypt-wrapped account, other providers) silently falls back to the download+upload path through a local temp file. Move only deletes the source after a copy that verifiably succeeded.
 - Accounts (unlimited, no tier limits): Google Drive, OneDrive, Dropbox (OAuth in browser — paste your own OAuth client_id/secret from Google/Azure/Dropbox app; tokens plain in `state.json` like Debrid tokens, auto-refreshed), WebDAV (Nextcloud/ownCloud/etc app passwords), S3-compatible (AWS/R2/B2/MinIO, SigV4, multipart), SFTP, FTP/FTPS, Telegram via your self-hosted teldrive server (server URL + API key), local folders.
 - Getting tokens — Wizard (rclone config order): from empty Drives tab or Accounts > Add account. 1 Provider 2 Details+Setup steps (console URL, clicks, Client ID/secret fields) 3 Connect (OAuth browser opens at redirect `http://127.0.0.1:53682/` registered in console — Google Desktop app needs none — or paste-code fallback; key/password providers Test here) 4 Root: Google separate Team Drive pick (list with new token, My Drive default) + optional start folder (paste drive folder link/id), S3 bucket, other root paths 5 Review with final test > Finish. Only Finish saves account (no save-first trips), then auto-opens it in a pane. Cancel saves nothing.
 - Multithreaded: per-account Parallel streams (Edit account) = concurrent files per job plus segments per file; parallel ranged downloads, SFTP parallel sessions, S3 multipart parallel parts, Drive/Dropbox/OneDrive session chunk uploads. FTP single-stream per file.
@@ -81,6 +82,7 @@ webcraft reimplements the observable behavior of Internet Download Manager from 
 - Video pages on YouTube, Vimeo, TikTok, Twitch, Dailymotion, Instagram, X, Facebook, Reddit, SoundCloud, Bilibili, and short-link hosts, resolved by a yt-dlp sidecar (native DASH/HLS fallback)
 - Format, audio, and subtitle picker before downloading; browser cookies passed from the extension for login-gated pages; yt-dlp runs silently with no console windows
 - Direct playback with mpv: Streams page, embedded player controls (pause, seek, volume, speed), and external mpv with your own options
+- Drives: double-click a local video file in This PC to open it in the built-in player popup (remote-drive files show a hint to download first — no remote streaming yet). The player popup now has **Audio** and **Subtitle** track selectors (subtitle Off included), **Load sub…** for an external subtitle file, and a **Sub style** row — size, position, text/shadow color, bold, and force-on-ASS — applied live and remembered in *Options → mpv → Subtitle style*
 
 ### Automation and interface
 

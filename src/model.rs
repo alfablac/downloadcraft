@@ -387,6 +387,22 @@ pub struct Settings {
     /// mpv --sub-auto value ("" = mpv default, e.g. "fuzzy"/"all").
     #[serde(default)]
     pub mpv_sub_auto: String,
+    /// Subtitle style (player popup + Options > mpv). Defaults = mpv
+    /// defaults, emitted only when changed. Color = hex "#RRGGBB" plus
+    /// shadow hex; size 1..=200; pos 0..=100 (100 = bottom).
+    #[serde(default = "def_mpv_sub_size")]
+    pub mpv_sub_size: u32,
+    #[serde(default = "def_mpv_sub_color")]
+    pub mpv_sub_color: String,
+    #[serde(default = "def_mpv_sub_shadow")]
+    pub mpv_sub_shadow_color: String,
+    #[serde(default = "def_mpv_sub_pos")]
+    pub mpv_sub_pos: u32,
+    #[serde(default)]
+    pub mpv_sub_bold: bool,
+    /// Force style onto ASS/SSA subtitles (mpv --sub-ass-override=yes).
+    #[serde(default)]
+    pub mpv_sub_ass_override: bool,
     /// Extra mpv args, whitespace-split (Streams Options common flags).
     #[serde(default)]
     pub mpv_extra_args: String,
@@ -445,6 +461,18 @@ fn def_mpv_speed() -> f32 {
 }
 fn def_mpv_cache_secs() -> u32 {
     30
+}
+fn def_mpv_sub_size() -> u32 {
+    55
+}
+fn def_mpv_sub_color() -> String {
+    "#FFFFFF".into()
+}
+fn def_mpv_sub_shadow() -> String {
+    "#000000".into()
+}
+fn def_mpv_sub_pos() -> u32 {
+    100
 }
 fn def_nntp_port() -> u16 {
     563
@@ -679,6 +707,12 @@ impl Default for Settings {
             mpv_cache: true,
             mpv_cache_secs: 30,
             mpv_sub_auto: String::new(),
+            mpv_sub_size: 55,
+            mpv_sub_color: "#FFFFFF".into(),
+            mpv_sub_shadow_color: "#000000".into(),
+            mpv_sub_pos: 100,
+            mpv_sub_bold: false,
+            mpv_sub_ass_override: false,
             mpv_extra_args: String::new(),
             drive_accounts: Vec::new(),
             drive_syncs: Vec::new(),
@@ -1405,7 +1439,10 @@ mod tests {
         task.debrid_choice = "junk".into();
         assert_eq!(debrid_choice_of(&task), "auto");
         // old state without field still parses
-        let old: DownloadTask = serde_json::from_str(r#"{"id":"x","url":"https://e/f.bin","filename":"f.bin","dest_dir":"."}"#).unwrap();
+        let old: DownloadTask = serde_json::from_str(
+            r#"{"id":"x","url":"https://e/f.bin","filename":"f.bin","dest_dir":"."}"#,
+        )
+        .unwrap();
         assert_eq!(debrid_choice_of(&old), "auto");
     }
 

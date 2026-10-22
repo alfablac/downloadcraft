@@ -132,7 +132,12 @@ fn spawn_prewarm(
 /// Prewarm UI result slot: (url, display text). Same stale-drop as yt probe.
 // (url, Ok((label, total, content_type)) | Err)
 type PrewarmSlot = std::sync::Arc<
-    std::sync::Mutex<Option<(String, Result<(String, Option<u64>, String, Option<bool>), String>)>>,
+    std::sync::Mutex<
+        Option<(
+            String,
+            Result<(String, Option<u64>, String, Option<bool>), String>,
+        )>,
+    >,
 >;
 static PREWARM_UI: std::sync::OnceLock<PrewarmSlot> = std::sync::OnceLock::new();
 
@@ -184,7 +189,10 @@ fn browser_resume_eligible(t: &DownloadTask) -> bool {
         return false;
     }
     !t.headers.contains_key("x-ytdlp")
-        && !t.headers.get("x-page-intent").is_some_and(|s| s.trim() == "page")
+        && !t
+            .headers
+            .get("x-page-intent")
+            .is_some_and(|s| s.trim() == "page")
 }
 
 fn write_browser_resume(t: &DownloadTask, filename: &str) {
@@ -199,8 +207,9 @@ fn write_browser_resume(t: &DownloadTask, filename: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let body = serde_json::json!({"url": t.url, "filename": filename, "referrer": t.referrer, "ts": ts})
-        .to_string();
+    let body =
+        serde_json::json!({"url": t.url, "filename": filename, "referrer": t.referrer, "ts": ts})
+            .to_string();
     let path = dir.join(format!("resume-{}.json", t.id));
     let tmp = dir.join(format!("resume-{}.tmp", t.id));
     if std::fs::write(&tmp, body).is_ok() {
@@ -2740,6 +2749,21 @@ fn capped_wake_ms(
     wake
 }
 
+/// Parse "#RRGGBB" hex color; bad value -> white.
+fn hex_to_rgb(v: &str) -> [u8; 3] {
+    let h = v.trim().trim_start_matches('#');
+    if h.len() == 6 {
+        if let (Ok(r), Ok(g), Ok(b)) = (
+            u8::from_str_radix(&h[0..2], 16),
+            u8::from_str_radix(&h[2..4], 16),
+            u8::from_str_radix(&h[4..6], 16),
+        ) {
+            return [r, g, b];
+        }
+    }
+    [255, 255, 255]
+}
+
 fn today_parts() -> (i64, u32) {
     // Local time approx via system time UTC (scheduler tests use injected clock; UI display uses UTC offset not critical)
     // ponytail: use UTC day/secs; local tz conversion needs chrono/tz dep, skipped.
@@ -2911,6 +2935,11 @@ impl DownloadApp {
         let mut vol_req: Option<f64> = None;
         let mut mute_req: Option<bool> = None;
         let mut video_rect: Option<egui::Rect> = None;
+        let mut aid_req: Option<i64> = None;
+        let mut sid_req: Option<Option<i64>> = None;
+        let mut sub_add_req: Option<String> = None;
+        let mut sub_style_req: Vec<(String, serde_json::Value)> = Vec::new();
+        let mut sub_settings_dirty = false;
         ctx.show_viewport_immediate(vp_id("webcraft-player"), builder, |ctx, _class| {
             if ctx.input(|i| i.viewport().close_requested()) {
                 close = true;
@@ -2981,14 +3010,16 @@ impl DownloadApp {
                     s.connected,
                     s.paused_for_cache,
                     s.path.clone(),
+                    s.sid,
+                    s.tracks.clone(),
                 )
             });
-            if let Some((p, _, d, _, _, _, _, _, _, _, _, _, _)) = &snap {
+            if let Some((p, _, d, _, _, _, _, _, _, _, _, _, _, _, _)) = &snap {
                 self.player_title_state = (*p, *d);
             }
             let paused = snap.as_ref().map(|s| s.0).unwrap_or(false);
             egui::TopBottomPanel::bottom("player-controls")
-                .exact_height(108.0)
+                .exact_height(152.0)
                 .frame(
                     egui::Frame::none()
                         .fill(theme::SURFACE)
@@ -3009,6 +3040,8 @@ impl DownloadApp {
                         connected,
                         pfc,
                         path,
+                        _sid,
+                        _tracks,
                     )) = &snap
                     {
                         let disp = if media.is_empty() {
@@ -3167,6 +3200,69 @@ impl DownloadApp {
                                 .small(),
                         );
                     }
+                    if let Some((_, _, _, _, _, _, _, _, aid, _, _, _, _, sid, tracks)) = &snap {
+                        // Tracks + subtitle style row.
+                        ui.horizontal(|ui| {
+                            let audio_tracks: Vec<&downloadcraft_lib::mpv::TrackInfo> =
+                                tracks.iter().filter(|t| t.kind == "audio").collect();
+                            let sub_tracks: Vec<&downloadcraft_lib::mpv::TrackInfo> =
+                                tracks.iter().filter(|t| t.kind == "sub").collect();
+                            ui.label(egui::RichText::new("Audio").color(theme::TEXT_FAINT));
+                            let cur_audio = audio_tracks
+                                .iter()
+                                .find(|t| t.id == *aid)
+                                .map(|t| t.label())
+                                .unwrap_or_else(|| "Default".to_string());
+                            egui::ComboBox::from_id_salt("player-audio")
+                                .selected_text(cur_audio)
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    for t in &audio_tracks {
+                                        if ui.selectable_label(t.id == *aid, t.label()).clicked() {
+                                            aid_req = Some(t.id);
+                                        }
+                                    }
+                                });
+                            ui.label(egui::RichText::new("Subtitle").color(theme::TEXT_FAINT));
+                            let cur_sub = if *sid < 0 {
+                                "Off".to_string()
+                            } else {
+                                sub_tracks
+                                    .iter()
+                                    .find(|t| t.id == *sid)
+                                    .map(|t| t.label())
+                                    .unwrap_or_else(|| format!("Track {sid}"))
+                            };
+                            egui::ComboBox::from_id_salt("player-sub")
+                                .selected_text(cur_sub)
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    if ui.selectable_label(*sid < 0, "Off").clicked() {
+                                        sid_req = Some(None);
+                                    }
+                                    for t in &sub_tracks {
+                                        if ui.selectable_label(t.id == *sid, t.label()).clicked() {
+                                            sid_req = Some(Some(t.id));
+                                        }
+                                    }
+                                });
+                            if ui::secondary_button(ui, "Load sub\u{2026}").clicked() {
+                                let start = std::env::current_dir()
+                                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                                if let Some(p) = rfd::FileDialog::new()
+                                    .set_directory(start)
+                                    .add_filter(
+                                        "Subtitles",
+                                        &["srt", "ass", "ssa", "vtt", "sub", "idx"],
+                                    )
+                                    .pick_file()
+                                {
+                                    sub_add_req = Some(p.to_string_lossy().into_owned());
+                                }
+                            }
+                        });
+                        self.player_sub_style_ui(ui, &mut sub_style_req, &mut sub_settings_dirty);
+                    }
                 });
             let frame = if self.player.is_some() {
                 egui::Frame::none()
@@ -3214,7 +3310,95 @@ impl DownloadApp {
             if let Some(m) = mute_req {
                 h.cmd(serde_json::json!({"command":["set_property","mute",m]}));
             }
+            if let Some(id) = aid_req {
+                h.set_aid(id);
+            }
+            if let Some(id) = sid_req {
+                h.set_sid(id);
+            }
+            if let Some(p) = &sub_add_req {
+                h.sub_add(p);
+            }
+            for (name, v) in &sub_style_req {
+                h.set_sub_prop(name, v.clone());
+            }
         }
+        if sub_settings_dirty {
+            crate::lock_unpoison(&self.rt).save();
+        }
+    }
+
+    /// Subtitle style row (player popup): edits Settings live + persists.
+    fn player_sub_style_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        reqs: &mut Vec<(String, serde_json::Value)>,
+        dirty: &mut bool,
+    ) {
+        let mut g = crate::lock_unpoison(&self.rt);
+        let s = &mut g.state.settings;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Sub style").color(theme::TEXT_FAINT));
+            ui.label(egui::RichText::new("Size").color(theme::TEXT_FAINT).small());
+            let mut size = s.mpv_sub_size as f32;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut size)
+                        .range(1.0..=200.0)
+                        .speed(1.0),
+                )
+                .changed()
+            {
+                s.mpv_sub_size = size.round().clamp(1.0, 200.0) as u32;
+                reqs.push(("sub-font-size".into(), serde_json::json!(s.mpv_sub_size)));
+                *dirty = true;
+            }
+            ui.label(egui::RichText::new("Pos").color(theme::TEXT_FAINT).small());
+            let mut pos = s.mpv_sub_pos as f32;
+            if ui
+                .add(egui::DragValue::new(&mut pos).range(0.0..=100.0).speed(1.0))
+                .changed()
+            {
+                s.mpv_sub_pos = pos.round().clamp(0.0, 100.0) as u32;
+                reqs.push(("sub-pos".into(), serde_json::json!(s.mpv_sub_pos)));
+                *dirty = true;
+            }
+            for (field_is_text, label, flag) in [
+                (true, "Text", "sub-color"),
+                (false, "Shadow", "sub-back-color"),
+            ] {
+                ui.label(egui::RichText::new(label).color(theme::TEXT_FAINT).small());
+                let cur = if field_is_text {
+                    s.mpv_sub_color.clone()
+                } else {
+                    s.mpv_sub_shadow_color.clone()
+                };
+                let mut rgb = hex_to_rgb(&cur);
+                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                    let hex = format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
+                    if field_is_text {
+                        s.mpv_sub_color = hex.clone();
+                    } else {
+                        s.mpv_sub_shadow_color = hex.clone();
+                    }
+                    reqs.push((flag.into(), serde_json::json!(hex)));
+                    *dirty = true;
+                }
+            }
+            if ui.checkbox(&mut s.mpv_sub_bold, "Bold").changed() {
+                let v = s.mpv_sub_bold;
+                reqs.push(("sub-bold".into(), serde_json::json!(v)));
+                *dirty = true;
+            }
+            if ui
+                .checkbox(&mut s.mpv_sub_ass_override, "Force on ASS")
+                .changed()
+            {
+                let v = if s.mpv_sub_ass_override { "yes" } else { "no" };
+                reqs.push(("sub-ass-override".into(), serde_json::json!(v)));
+                *dirty = true;
+            }
+        });
     }
 
     fn quit_player(&mut self) {
@@ -5232,7 +5416,11 @@ fn md_render_runs(ui: &mut egui::Ui, runs: &[MdRun], size: f32) {
                     }
                 }
                 None => {
-                    ui.add(egui::Label::new(md_job(std::slice::from_ref(r), size, theme::TEXT)));
+                    ui.add(egui::Label::new(md_job(
+                        std::slice::from_ref(r),
+                        size,
+                        theme::TEXT,
+                    )));
                 }
             }
         }
@@ -5297,9 +5485,7 @@ fn ui_chat_markdown(ui: &mut egui::Ui, text: &str) {
                 r.italic = true;
                 r
             }));
-            ui.add(
-                egui::Label::new(md_job(&runs, 11.0, theme::TEXT_MUTED)).wrap(),
-            );
+            ui.add(egui::Label::new(md_job(&runs, 11.0, theme::TEXT_MUTED)).wrap());
             continue;
         }
         let indent = (line.len() - line.trim_start().len()) / 2;
@@ -5324,9 +5510,7 @@ fn ui_chat_markdown(ui: &mut egui::Ui, text: &str) {
             {
                 ui.horizontal_top(|ui| {
                     ui.add_space((indent.min(3) as f32) * theme::SP_MD);
-                    ui.label(
-                        egui::RichText::new(format!("{digits}.")).color(theme::TEXT_MUTED),
-                    );
+                    ui.label(egui::RichText::new(format!("{digits}.")).color(theme::TEXT_MUTED));
                     md_render_runs(ui, &md_inline(rest), 11.0);
                 });
                 continue;
@@ -6694,14 +6878,9 @@ impl DownloadApp {
                 if debrid_kind {
                     let s = crate::lock_unpoison(&app.rt).state.settings.clone();
                     ui.add_space(theme::SP_SM);
-                    let magnet_kind = crate::debrid::is_magnet(&t.url)
-                        || crate::torrent::is_torrent_task(&t);
-                    ui_debrid_section(
-                        ui,
-                        &s,
-                        &mut t.debrid_choice,
-                        magnet_kind,
-                    );
+                    let magnet_kind =
+                        crate::debrid::is_magnet(&t.url) || crate::torrent::is_torrent_task(&t);
+                    ui_debrid_section(ui, &s, &mut t.debrid_choice, magnet_kind);
                 }
             }
             // Write back every edit (Browse/Category/Queue were dropped unless stream kind).
@@ -7752,7 +7931,7 @@ impl DownloadApp {
                 }
                 // Clear draft incl. password: no stale secrets next open.
                 self.add_url.clear();
-                        self.add_debrid_choice.clear();
+                self.add_debrid_choice.clear();
                 self.add_torrent_url.clear();
                 self.add_torrent_files.clear();
                 self.add_torrent_error.clear();
@@ -7905,7 +8084,9 @@ impl DownloadApp {
                 };
                 if !chip_info.is_empty() {
                     ui.label(
-                        egui::RichText::new(&chip_info).color(theme::TEAL_500).small(),
+                        egui::RichText::new(&chip_info)
+                            .color(theme::TEAL_500)
+                            .small(),
                     )
                     .on_hover_text(&chip_info);
                 }
@@ -8708,12 +8889,7 @@ impl DownloadApp {
                 let g = crate::lock_unpoison(&self.rt);
                 g.controls
                     .get(id)
-                    .and_then(|c| {
-                        c.live
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .clone()
-                    })
+                    .and_then(|c| c.live.lock().unwrap_or_else(|e| e.into_inner()).clone())
                     .map(|l| l.resolved_url)
                     .filter(|s| !s.is_empty())
                     .or_else(|| {
@@ -9421,6 +9597,10 @@ impl DownloadApp {
             self.start_task(&id);
             self.tab = Tab::Downloads;
         }
+        // Drives double-click video -> built-in player.
+        for path in std::mem::take(&mut self.drives.pending_play) {
+            self.play_embedded(&path);
+        }
     }
 
     // --- Chatbot ---
@@ -9448,11 +9628,7 @@ impl DownloadApp {
     }
 
     /// Resolve query to exactly one task; on 0/>1 push disambiguation note.
-    fn chat_resolve_one(
-        &mut self,
-        query: &str,
-        verb: &str,
-    ) -> Option<crate::model::DownloadTask> {
+    fn chat_resolve_one(&mut self, query: &str, verb: &str) -> Option<crate::model::DownloadTask> {
         let hits = self.chat_match_tasks(query);
         match hits.len() {
             1 => hits.into_iter().next(),
@@ -9498,7 +9674,10 @@ impl DownloadApp {
                     ));
                 }
                 if lines.is_empty() {
-                    format!("No downloads (status filter: '{}').", if want.is_empty() { "all" } else { &want })
+                    format!(
+                        "No downloads (status filter: '{}').",
+                        if want.is_empty() { "all" } else { &want }
+                    )
                 } else {
                     format!("Downloads:\n{}", lines.join("\n"))
                 }
@@ -9522,7 +9701,11 @@ impl DownloadApp {
                             )
                         })
                         .collect();
-                    format!("{} match(es) for '{query}':\n{}", hits.len(), lines.join("\n"))
+                    format!(
+                        "{} match(es) for '{query}':\n{}",
+                        hits.len(),
+                        lines.join("\n")
+                    )
                 }
             }
             ChatAction::GetStats => {
@@ -9604,9 +9787,7 @@ impl DownloadApp {
                     Ok(text) => {
                         let mut handled_readonly = false;
                         let mut invalid_note: Option<String> = None;
-                        if let Some(a) =
-                            downloadcraft_lib::chat_core::extract_action(&text)
-                        {
+                        if let Some(a) = downloadcraft_lib::chat_core::extract_action(&text) {
                             if a.read_only() {
                                 handled_readonly = true;
                                 let stripped =
@@ -9626,25 +9807,22 @@ impl DownloadApp {
                             ));
                         }
                         if !handled_readonly {
-                            self.chat_messages.push(
-                                downloadcraft_lib::chat_core::ChatMsg {
+                            self.chat_messages
+                                .push(downloadcraft_lib::chat_core::ChatMsg {
                                     user: false,
-                                    text: downloadcraft_lib::chat_core::strip_action_block(
-                                        &text,
-                                    ),
-                                },
-                            );
+                                    text: downloadcraft_lib::chat_core::strip_action_block(&text),
+                                });
                             if let Some(n) = invalid_note {
                                 self.chat_push(n);
                             }
                         }
                     }
-                    Err(e) => self.chat_messages.push(
-                        downloadcraft_lib::chat_core::ChatMsg {
+                    Err(e) => self
+                        .chat_messages
+                        .push(downloadcraft_lib::chat_core::ChatMsg {
                             user: false,
                             text: format!("Error: {e}"),
-                        },
-                    ),
+                        }),
                 }
             }
         }
@@ -9653,8 +9831,7 @@ impl DownloadApp {
                 self.chat_links_busy = false;
                 match res {
                     Ok(files) => {
-                        self.chat_links_status =
-                            format!("{} links found.", files.len());
+                        self.chat_links_status = format!("{} links found.", files.len());
                         self.chat_links = files;
                     }
                     Err(e) => self.chat_links_status = format!("Find links failed: {e}"),
@@ -9670,7 +9847,28 @@ impl DownloadApp {
         }
         self.chat_input.clear();
         self.chat_messages
-            .push(downloadcraft_lib::chat_core::ChatMsg { user: true, text: text.clone() });
+            .push(downloadcraft_lib::chat_core::ChatMsg {
+                user: true,
+                text: text.clone(),
+            });
+        // Deterministic bypass: URL + add intent skips LLM (models refuse
+        // hoster links like MEGA). Never auto-executes: sets chat_pending
+        // for existing Confirm UI. validate_action still gates.
+        if let Some(action) = downloadcraft_lib::chat_core::detect_add_download(&text) {
+            match downloadcraft_lib::chat_core::validate_action(&action) {
+                Ok(()) => {
+                    self.chat_pending = Some(action);
+                    self.chat_push(
+                        "Add download detected — confirm below to add it as a paused download."
+                            .to_string(),
+                    );
+                }
+                Err(e) => {
+                    self.chat_push(format!("Download link rejected: {e}"));
+                }
+            }
+            return;
+        }
         let (base, key, model, proxy) = {
             let g = crate::lock_unpoison(&self.rt);
             let s = &g.state.settings;
@@ -9682,12 +9880,10 @@ impl DownloadApp {
             )
         };
         // Follow-up ("and tomorrow?") reuses previous turn's need kind.
-        let prev_local = self
-            .chat_messages
-            .iter()
-            .rev()
-            .nth(1)
-            .is_some_and(|m| m.user && downloadcraft_lib::chat_core::wants_local_context(&m.text));
+        let prev_local =
+            self.chat_messages.iter().rev().nth(1).is_some_and(|m| {
+                m.user && downloadcraft_lib::chat_core::wants_local_context(&m.text)
+            });
         let need = downloadcraft_lib::chat_core::local_need(&text).or_else(|| {
             if prev_local && downloadcraft_lib::chat_core::is_local_followup(&text) {
                 self.chat_messages
@@ -9846,8 +10042,7 @@ impl DownloadApp {
             ChatAction::DeleteCompleted => {
                 delete_completed(self);
                 self.chat_push(
-                    "Delete-completed confirmation opened — confirm there to clear."
-                        .to_string(),
+                    "Delete-completed confirmation opened — confirm there to clear.".to_string(),
                 );
             }
             ChatAction::SetSetting { key, value } => {
@@ -9906,15 +10101,16 @@ impl DownloadApp {
                 std::thread::spawn(move || {
                     let res = rt.block_on(async move {
                         let client = engine::build_client("");
-                        let crawler = Crawler { project: proj, progress: None };
+                        let crawler = Crawler {
+                            project: proj,
+                            progress: None,
+                        };
                         let (_pages, mut files) = crawler.crawl(&client).await?;
                         if !filter.is_empty() {
                             files.retain(|f| f.url.to_ascii_lowercase().contains(&filter));
                         }
                         for f in &mut files {
-                            if let Ok(u) =
-                                crate::grabber::normalize_start_url(&f.url)
-                            {
+                            if let Ok(u) = crate::grabber::normalize_start_url(&f.url) {
                                 downloadcraft_lib::chat_core::reject_private_host(&u)?;
                             }
                         }
@@ -10009,7 +10205,10 @@ impl DownloadApp {
             ui.add_space(theme::SP_XS);
             theme::panel().show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new("Proposed action — nothing runs until you confirm:").strong());
+                ui.label(
+                    egui::RichText::new("Proposed action — nothing runs until you confirm:")
+                        .strong(),
+                );
                 let desc = match &action {
                     downloadcraft_lib::chat_core::ChatAction::AddDownload { url }
                     | downloadcraft_lib::chat_core::ChatAction::AddUrl { url } => {
@@ -10023,12 +10222,21 @@ impl DownloadApp {
                         }
                     }
                     downloadcraft_lib::chat_core::ChatAction::ListTasks { status } => {
-                        format!("List downloads (status: {})", if status.trim().is_empty() { "all" } else { status })
+                        format!(
+                            "List downloads (status: {})",
+                            if status.trim().is_empty() {
+                                "all"
+                            } else {
+                                status
+                            }
+                        )
                     }
                     downloadcraft_lib::chat_core::ChatAction::SearchTasks { query } => {
                         format!("Search downloads: {query}")
                     }
-                    downloadcraft_lib::chat_core::ChatAction::GetStats => "Show download statistics".to_string(),
+                    downloadcraft_lib::chat_core::ChatAction::GetStats => {
+                        "Show download statistics".to_string()
+                    }
                     downloadcraft_lib::chat_core::ChatAction::PauseTask { query } => {
                         format!("Pause download matching: {query}")
                     }
@@ -10041,19 +10249,32 @@ impl DownloadApp {
                     downloadcraft_lib::chat_core::ChatAction::OpenFolder { query } => {
                         format!("Open folder for download matching: {query}")
                     }
-                    downloadcraft_lib::chat_core::ChatAction::StartAll => "Start all paused/queued/error downloads".to_string(),
-                    downloadcraft_lib::chat_core::ChatAction::StopAll => "Pause all active downloads".to_string(),
-                    downloadcraft_lib::chat_core::ChatAction::DeleteCompleted => "Clear completed downloads from list (files kept)".to_string(),
+                    downloadcraft_lib::chat_core::ChatAction::StartAll => {
+                        "Start all paused/queued/error downloads".to_string()
+                    }
+                    downloadcraft_lib::chat_core::ChatAction::StopAll => {
+                        "Pause all active downloads".to_string()
+                    }
+                    downloadcraft_lib::chat_core::ChatAction::DeleteCompleted => {
+                        "Clear completed downloads from list (files kept)".to_string()
+                    }
                     downloadcraft_lib::chat_core::ChatAction::SetSetting { key, value } => {
                         format!("Set setting {key} = {value}")
                     }
-                    downloadcraft_lib::chat_core::ChatAction::DraftBugReport { title, description } => {
+                    downloadcraft_lib::chat_core::ChatAction::DraftBugReport {
+                        title,
+                        description,
+                    } => {
                         format!("Draft GitHub bug report: {title}\n{description}")
                     }
                 };
                 ui.label(egui::RichText::new(desc).color(theme::TEXT));
                 ui.horizontal(|ui| {
-                    if ui::Btn::primary("Confirm").enabled(!self.chat_links_busy).show(ui).clicked() {
+                    if ui::Btn::primary("Confirm")
+                        .enabled(!self.chat_links_busy)
+                        .show(ui)
+                        .clicked()
+                    {
                         self.chat_confirm_pending(ui.ctx());
                     }
                     if ui::Btn::secondary("Dismiss").show(ui).clicked() {
@@ -10069,7 +10290,11 @@ impl DownloadApp {
                 ui.label(&self.chat_links_status);
             });
         } else if !self.chat_links_status.is_empty() {
-            ui.label(egui::RichText::new(&self.chat_links_status).color(theme::TEXT_MUTED).small());
+            ui.label(
+                egui::RichText::new(&self.chat_links_status)
+                    .color(theme::TEXT_MUTED)
+                    .small(),
+            );
         }
         if !self.chat_links.is_empty() {
             ui.add_space(theme::SP_XS);
@@ -10084,16 +10309,13 @@ impl DownloadApp {
                             if ui::Btn::secondary("Add paused").show(ui).clicked() {
                                 add = Some(f.clone());
                             }
-                            ui.label(
-                                egui::RichText::new(&f.url)
-                                    .color(theme::TEXT)
-                                    .small(),
-                            );
+                            ui.label(egui::RichText::new(&f.url).color(theme::TEXT).small());
                         });
                     }
                 });
             if let Some(f) = add {
-                let action = downloadcraft_lib::chat_core::ChatAction::AddUrl { url: f.url.clone() };
+                let action =
+                    downloadcraft_lib::chat_core::ChatAction::AddUrl { url: f.url.clone() };
                 match downloadcraft_lib::chat_core::validate_action(&action) {
                     Ok(()) => {
                         let id = {
@@ -10133,7 +10355,11 @@ impl DownloadApp {
             {
                 self.chat_send(&ctx);
             }
-            if ui::Btn::secondary("Clear").enabled(!self.chat_busy).show(ui).clicked() {
+            if ui::Btn::secondary("Clear")
+                .enabled(!self.chat_busy)
+                .show(ui)
+                .clicked()
+            {
                 self.chat_messages.clear();
                 self.chat_pending = None;
                 self.chat_links.clear();
@@ -11299,6 +11525,50 @@ impl DownloadApp {
                             ui.checkbox(&mut settings.mpv_cache, "Cache");
                         });
                     });
+                    ui.add_space(theme::SP_SM);
+                    section(ui, "Subtitle style");
+                    ui::form_grid("opts-mpv-sub-grid").show(ui, |ui| {
+                        ui::form_label(ui, "Size");
+                        ui.add_sized(
+                            [DRAG_W, theme::BTN_H],
+                            drag(&mut settings.mpv_sub_size).range(1..=200).speed(1),
+                        );
+                        ui.end_row();
+                        ui::form_label(ui, "Position");
+                        ui.add_sized(
+                            [DRAG_W, theme::BTN_H],
+                            drag(&mut settings.mpv_sub_pos).range(0..=100).speed(1),
+                        );
+                        ui.end_row();
+                        ui::form_label(ui, "Text color");
+                        {
+                            let mut rgb = hex_to_rgb(&settings.mpv_sub_color);
+                            if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                settings.mpv_sub_color =
+                                    format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
+                            }
+                        }
+                        ui.end_row();
+                        ui::form_label(ui, "Shadow color");
+                        {
+                            let mut rgb = hex_to_rgb(&settings.mpv_sub_shadow_color);
+                            if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                settings.mpv_sub_shadow_color =
+                                    format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
+                            }
+                        }
+                        ui.end_row();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(ui::LABEL_W + 12.0);
+                        ui.vertical(|ui| {
+                            ui.checkbox(&mut settings.mpv_sub_bold, "Bold subtitles");
+                            ui.checkbox(
+                                &mut settings.mpv_sub_ass_override,
+                                "Force style on ASS/SSA (override embedded styling)",
+                            );
+                        });
+                    });
                     ui.label(egui::RichText::new("Flags apply to Play in mpv on the Streams page. Changes save automatically like other options.").color(theme::TEXT_FAINT).small());
                 }
                 10 => {
@@ -11590,7 +11860,9 @@ mod browser_resume_tests {
         page.headers.insert("x-page-intent".into(), "page".into());
         assert!(!browser_resume_eligible(&page));
         let mut stream = task("https://ex.com/v.mp4");
-        stream.headers.insert("x-page-intent".into(), "stream".into());
+        stream
+            .headers
+            .insert("x-page-intent".into(), "stream".into());
         assert!(browser_resume_eligible(&stream));
     }
 }

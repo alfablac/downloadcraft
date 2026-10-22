@@ -126,6 +126,22 @@ fn civil(secs: u64) -> (i64, i64, i64, i64, i64, i64) {
     )
 }
 
+/// CopyObject answers HTTP 200 even when body carries <Error>; extract
+/// its code. Empty/error-free body -> None.
+pub fn copy_xml_error(body: &str) -> Option<String> {
+    for ev in roxmltree::Document::parse(body).ok()?.descendants() {
+        if ev.has_tag_name("Code") {
+            return ev.text().map(str::to_string);
+        }
+    }
+    None
+}
+
+/// `x-amz-copy-source` header value: /bucket/percent-encoded-key.
+pub fn copy_source_header(bucket: &str, key: &str) -> String {
+    format!("/{}/{}", bucket, super::pct_path(key))
+}
+
 pub struct S3 {
     acc: DriveAccount,
     client: reqwest::Client,
@@ -216,6 +232,38 @@ impl S3 {
         }
         r.send().await.map_err(|e| e.to_string())
     }
+    /// `signed_send` with per-request timeout (CopyObject on big objects
+    /// can run minutes server-side; client default may cut it short).
+    async fn signed_send_with_timeout(
+        &self,
+        method: reqwest::Method,
+        url: url::Url,
+        extra: Vec<(String, String)>,
+        body: Vec<u8>,
+        timeout: std::time::Duration,
+    ) -> Result<reqwest::Response, String> {
+        let body_sha = if body.is_empty() {
+            sha256_hex(b"")
+        } else {
+            sha256_hex(&body)
+        };
+        let headers = sign(
+            &self.signer(),
+            method.as_str(),
+            &url,
+            &extra,
+            &body_sha,
+            now_amz(),
+        );
+        let mut r = self.client.request(method, url.as_str()).timeout(timeout);
+        for (k, v) in headers.iter().chain(extra.iter()) {
+            r = r.header(k.as_str(), v.as_str());
+        }
+        if !body.is_empty() {
+            r = r.body(body);
+        }
+        r.send().await.map_err(|e| e.to_string())
+    }
     fn prefix(path: &str) -> String {
         let p = path.trim_matches('/');
         if p.is_empty() {
@@ -228,6 +276,9 @@ impl S3 {
 
 #[async_trait::async_trait]
 impl DriveBackend for S3 {
+    fn s3_bucket(&self) -> String {
+        self.bucket()
+    }
     fn kind(&self) -> DriveKind {
         DriveKind::S3
     }
@@ -545,17 +596,46 @@ impl DriveBackend for S3 {
             mime: String::new(),
         })
     }
-    async fn copy_to(
+    /// Server-side copy: CopyObject under destination identity. Source
+    /// bucket/key read from source S3 backend (same-kind any-cast).
+    async fn copy_from(
         &self,
-        _entry: &RemoteEntry,
-        dst: &dyn DriveBackend,
-        _dst_dir: &str,
+        src: &std::sync::Arc<dyn DriveBackend>,
+        src_entry: &RemoteEntry,
+        dst_dir: &str,
         _prog: &Progress,
     ) -> Result<(), String> {
-        if dst.kind() != DriveKind::S3 {
-            return Err("cross-provider via jobs".into());
+        if src.kind() != DriveKind::S3 {
+            return Err("cross-provider copy: staging".into());
         }
-        Err("jobs fallback".into())
+        if src_entry.size > 5 * 1024 * 1024 * 1024 {
+            return Err("object >5GiB: staging".into());
+        }
+        let src_bucket = src.s3_bucket();
+        if src_bucket.is_empty() {
+            return Err("source backend is not S3".into());
+        }
+        let copy_src = copy_source_header(&src_bucket, &src_entry.id);
+        let dst_key = super::join_path(dst_dir, &src_entry.name);
+        let url = self.url(&dst_key, "");
+        let resp = self
+            .signed_send_with_timeout(
+                reqwest::Method::PUT,
+                url,
+                vec![("x-amz-copy-source".to_string(), copy_src)],
+                Vec::new(),
+                std::time::Duration::from_secs(900),
+            )
+            .await?;
+        if !resp.status().is_success() {
+            return Err(http_util::err_text(resp).await);
+        }
+        // ponytail: 200 OK can still hide <Error> in body (CopyObject quirk).
+        let body = resp.text().await.map_err(|e| e.to_string())?;
+        if let Some(code) = copy_xml_error(&body) {
+            return Err(format!("S3 CopyObject error: {code}"));
+        }
+        Ok(())
     }
 }
 
@@ -610,5 +690,25 @@ mod tests {
     fn civil_check() {
         assert_eq!(civil(0), (1970, 1, 1, 0, 0, 0));
         assert_eq!(civil(1704067200), (2024, 1, 1, 0, 0, 0));
+    }
+    #[test]
+    fn copy_xml_error_extracts_code_and_ignores_ok_bodies() {
+        assert_eq!(
+            copy_xml_error("<?xml version=\"1.0\"?><Error><Code>AccessDenied</Code><Message>no</Message></Error>"),
+            Some("AccessDenied".to_string())
+        );
+        assert_eq!(
+            copy_xml_error("<CopyObjectResult><ETag>\"x\"</ETag><LastModified>2024-01-01T00:00:00Z</LastModified></CopyObjectResult>"),
+            None
+        );
+        assert_eq!(copy_xml_error(""), None);
+        assert_eq!(copy_xml_error("not xml"), None);
+    }
+    #[test]
+    fn copy_source_header_encodes_key() {
+        assert_eq!(
+            copy_source_header("mybucket", "dir/my file #1.mkv"),
+            "/mybucket/dir/my%20file%20%231.mkv"
+        );
     }
 }

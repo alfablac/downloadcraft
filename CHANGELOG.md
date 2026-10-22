@@ -2,6 +2,18 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.20.0] - 2026-10-21
+
+### Added
+
+- Drives server-side copy: Google Drive -> Google Drive uses `files.copy`, S3 -> S3 uses `CopyObject` (including cross-account when destination credentials can read the source) — no data through the local machine. Falls back to staged download+upload on any failure; S3 objects over 5 GiB and crypt-wrapped accounts always stage. S3 CopyObject 200-with-embedded-error bodies detected and treated as failure, so Move never deletes a source after a false success.
+- Drives: double-click a local video (This PC pane) opens the built-in player popup; remote panes show a download-first hint.
+- Player popup: Audio and Subtitle track selectors (with Off), Load sub file, and Sub style row (size, position, text/shadow color, bold, force-on-ASS) applied live via mpv IPC. Style persists in Settings and is editable in Options > mpv > Subtitle style; launch flags emitted only when non-default.
+
+### Changed
+
+- Chatbot `add_download` on URL+add-intent is detected deterministically and routed to the Confirm UI instead of relying on the model.
+
 ## [0.19.0] - 2026-10-21
 
 ### Added

@@ -197,6 +197,11 @@ impl GDrive {
     }
 }
 
+/// files.copy body: keep display name, land in resolved destination folder.
+fn copy_body(name: &str, parent_id: &str) -> serde_json::Value {
+    serde_json::json!({"name": name, "parents": [parent_id]})
+}
+
 #[async_trait::async_trait]
 impl DriveBackend for GDrive {
     fn kind(&self) -> DriveKind {
@@ -435,17 +440,38 @@ impl DriveBackend for GDrive {
             .find(|e| e.name == name)
             .ok_or_else(|| "Drive upload done but file not listed".to_string())
     }
-    async fn copy_to(
+    /// Server-side copy body: keep name, land in destination folder id.
+    async fn copy_from(
         &self,
-        _entry: &RemoteEntry,
-        dst: &dyn DriveBackend,
-        _dst_dir: &str,
+        src: &std::sync::Arc<dyn DriveBackend>,
+        src_entry: &RemoteEntry,
+        dst_dir: &str,
         _prog: &Progress,
     ) -> Result<(), String> {
-        if dst.kind() != DriveKind::GoogleDrive {
-            return Err("cross-provider copy: use transfer job".into());
+        if src.kind() != DriveKind::GoogleDrive {
+            return Err("cross-provider copy: staging".into());
         }
-        Err("same-account Drive copy via jobs fallback".into())
+        if src_entry.id.is_empty() {
+            return Err("source file has no Drive id".into());
+        }
+        let parent = self.folder_id(dst_dir).await?;
+        let body = copy_body(&src_entry.name, &parent);
+        let url = format!(
+            "https://www.googleapis.com/drive/v3/files/{}/copy?supportsAllDrives=true",
+            super::pct(&src_entry.id)
+        );
+        let resp = self
+            .req(reqwest::Method::POST, &url)
+            .await?
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(http_util::err_text(resp).await)
+        }
     }
 }
 
@@ -473,5 +499,11 @@ mod tests {
             parse_drives(&v),
             vec![("0A1".to_string(), "Team".to_string())]
         );
+    }
+    #[test]
+    fn copy_body_keeps_name_and_sets_parent() {
+        let b = copy_body("movie.mkv", "0AFolder");
+        assert_eq!(b["name"], "movie.mkv");
+        assert_eq!(b["parents"], serde_json::json!(["0AFolder"]));
     }
 }
