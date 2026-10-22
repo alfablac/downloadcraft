@@ -1427,6 +1427,19 @@ fn run_ytdlp_download(
     }
 }
 
+/// Obvious non-item page: site root or bare feed/home root (host-agnostic).
+/// Bare roots only (optional trailing slash); deep paths stay promotable.
+pub fn is_feed_or_home_url(url: &str) -> bool {
+    let Ok(u) = url::Url::parse(url) else {
+        return false;
+    };
+    let path = u.path().trim_end_matches('/').to_ascii_lowercase();
+    matches!(
+        path.as_str(),
+        "" | "/home" | "/feed" | "/explore" | "/notifications" | "/messages" | "/search"
+    )
+}
+
 pub fn is_video_page(url: &str) -> bool {
     let Ok(u) = url::Url::parse(url) else {
         return false;
@@ -1702,10 +1715,36 @@ mod tests {
         ));
         assert!(!is_video_page("https://www.instagram.com/someuser/"));
         assert!(!is_video_page("https://www.instagram.com/explore/"));
-        assert!(!is_video_page("https://www.instagram.com/stories/someuser/"));
+        assert!(!is_video_page(
+            "https://www.instagram.com/stories/someuser/"
+        ));
         assert!(!is_video_page("https://www.youtube.com/feed/subscriptions"));
         assert!(!is_video_page("https://vimeo.com/about"));
         assert!(!is_video_page("not a url"));
+        for feed in [
+            "https://x.com/home",
+            "https://x.com/",
+            "https://x.com",
+            "https://www.instagram.com/",
+            "https://www.instagram.com/explore/",
+            "https://example.com/feed",
+            "https://example.com/FEED/?q=1",
+            "https://example.com/notifications/",
+            "https://example.com/messages",
+            "https://example.com/search?q=x",
+        ] {
+            assert!(is_feed_or_home_url(feed), "feed missed: {feed}");
+        }
+        for item in [
+            "https://x.com/u/status/123",
+            "https://www.instagram.com/reel/ABC/",
+            "https://unknown-site.example/watch/1",
+            "https://example.com/home/video-1",
+            "https://example.com/feedback",
+            "not a url",
+        ] {
+            assert!(!is_feed_or_home_url(item), "item flagged: {item}");
+        }
     }
     fn vf(height: Option<u32>, vcodec: &str, ext: &str) -> YtFormat {
         YtFormat {

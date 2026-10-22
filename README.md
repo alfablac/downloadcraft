@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.22.4-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.23.1-blue">
   <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">
   <img alt="Language" src="https://img.shields.io/badge/built%20with-Rust%20%2B%20egui-orange">
 </p>
@@ -19,7 +19,7 @@
 
 webcraft reimplements the observable behavior of Internet Download Manager from scratch: segmented downloads that resume, queues and schedules, DASH/HLS handling, a site grabber, and deep browser integration. No IDM code, binaries, icons, or activation logic — and no affiliation with Tonec.
 
-**Current version:** 0.22.4 · Changelog lives in GitHub Releases.
+**Current version:** 0.23.1 · Changelog lives in GitHub Releases.
 
 **Runs on:** Windows 10/11 x86_64 · macOS 13+ (Intel and Apple Silicon) · Linux x86_64 (Ubuntu 22.04+, X11 and Wayland).
 
@@ -128,7 +128,7 @@ The desktop app registers the native messaging host and the `webcraft://` protoc
 - **Chromium:** load `extensions/chromium` as an unpacked extension.
 - **Firefox:** install `extensions/webcraft-firefox.xpi` from about:addons → gear → Install Add-on From File (start webcraft once first so the host is registered). Release Firefox refuses unsigned add-ons permanently — use Developer Edition/Nightly, set `xpinstall.signatures.required` to false where allowed, or load `extensions/firefox` temporarily from about:debugging. Rebuild the XPI with `scripts/package-firefox.ps1`.
 
-The extension watches downloads passively and ranks what it finds, so a page with many small segments offers the playlist or file first. Playlist candidates (.m3u8/.mpd) are kept for 30 minutes (other candidates 5), evicted last when the candidate cap is hit, and partial (206) responses count as candidates too — so a stream detected early is still offered when you click later. It hands video-page links to the app with the page's cookies, where yt-dlp resolves formats. Capture can be limited by an extension allowlist and minimum size in Options (`capture-filter.json`). Video buttons appear when playback starts and reveal fully on hover; on Instagram the button is always semi-visible (Instagram overlays block hover detection). The button lives at page level and moves into the fullscreen subtree while fullscreen is active, so it shows in fullscreen viewers without being affected by site player wrappers.
+The extension watches downloads passively and ranks what it finds, so a page with many small segments offers the playlist or file first. Playlist candidates (.m3u8/.mpd) are kept for 30 minutes (other candidates 5), evicted last when the candidate cap is hit, and partial (206) responses count as candidates too — so a stream detected early is still offered when you click later. It hands video-page links to the app with the page's cookies, where yt-dlp resolves formats. Capture can be limited by an extension allowlist and minimum size in Options (`capture-filter.json`). Video buttons appear when playback starts and reveal fully on hover; on Instagram the button is always semi-visible (Instagram overlays block hover detection). The button lives at page level and moves into the fullscreen subtree while fullscreen is active, so it shows in fullscreen viewers without being affected by site player wrappers. The per-video link is found generically from the clicked video (wrapping anchor, timestamp/permalink link in its container), so feed videos download their own item page — never the feed home URL.
 
 Extensions installed unpacked or from a release file never auto-update: after upgrading, reload the extension (Chromium: `chrome://extensions` → Reload; Firefox: reinstall the XPI) and close/reopen already-open tabs — a tab keeps the content script from when it was loaded. The repo-tracked `extensions/webcraft-firefox.xpi` is rebuilt each release; prefer the XPI attached to the GitHub release.
 

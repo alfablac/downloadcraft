@@ -415,20 +415,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const el = { tabId: sender.tab ? sender.tab.id : tabId, frameId: senderFrame, srcs: msg.element.srcs || [], srcKey: msg.element.srcKey || "", postId: msg.element.postId || "", streamId: msg.element.streamId || "", since: msg.element.since || 0, now: Date.now() };
         pool = typeof matchRecordsForElement === "function" ? matchRecordsForElement([...byUrl.values()], el, Date.now()) : [];
         // Element-frame match empty: retry frame-agnostic (frameId=null passes
-        // tolerant filter) before returning empty.
-        if (!pool.length && senderFrame != null && typeof matchRecordsForElement === "function") pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null }, Date.now());
+        // tolerant filter) before returning empty. noTiming: retry widens
+        // frame only, never tier — else cross-frame timing hands this video
+        // another video's streams when srcs/postId/streamId matched nothing.
+        if (!pool.length && senderFrame != null && typeof matchRecordsForElement === "function") pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null, noTiming: true }, Date.now());
           // IG host-scoped fallback (background-only): CDN URLs never carry
           // shortcode, MSE src is blob:, timing anchored at firstPlay misses
           // preloads. pageHost from sender.tab.url (trusted bg, not msg).
+          // noTiming likewise: hostExtra is window-bound itself; plain timing
+          // must not widen into other frames on IG feeds.
           if (!pool.length && typeof matchRecordsForElement === "function") {
             let ph = "";
             try { ph = new URL((sender.tab && sender.tab.url) || "").hostname.toLowerCase(); } catch (e) {}
-            if (/(^|\.)instagram\.com$/.test(ph)) pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null, pageHost: "instagram.com" }, Date.now(), [...candidates.values()]);
+            if (/(^|\.)instagram\.com$/.test(ph)) pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null, noTiming: true, pageHost: "instagram.com" }, Date.now(), [...candidates.values()]);
           }
       } else {
         pool = [...candidates.values()].filter((c) => tabId == null || c.tabId === tabId);
       }
-      const list = (typeof rankCandidates === "function" ? rankCandidates : (x) => x)(pool);
+      const list = (typeof rankCandidates === "function" ? rankCandidates : (x) => x)(pool, msg.element ? el : null);
       sendResponse({ type: "candidates", candidates: list });
     });
     return true;

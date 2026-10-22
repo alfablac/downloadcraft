@@ -203,7 +203,9 @@ pub fn should_promote(task_url: &str, page_url: &str, intent: &str) -> bool {
         return false; // already page target
     }
     if intent == "page" {
-        return page_url.starts_with("http://") || page_url.starts_with("https://");
+        // Feed/home URL never "this video" (multi-video feed regression guard).
+        return (page_url.starts_with("http://") || page_url.starts_with("https://"))
+            && !ytdlp::is_feed_or_home_url(page_url);
     }
     ytdlp::is_video_page(page_url)
 }
@@ -725,6 +727,32 @@ mod state_tests {
             "page intent off-allowlist"
         );
         assert!(!should_promote(page, page, "page"), "already page target");
+        // intent=page must never promote feed/home page as "this video".
+        for feed in [
+            "https://x.com/home",
+            "https://x.com/",
+            "https://www.instagram.com/",
+            "https://www.instagram.com/explore/",
+            "https://example.com/feed",
+            "https://x.com/HOME?ref=1",
+            "https://example.com/search/",
+            "https://example.com/notifications",
+            "https://example.com/messages",
+        ] {
+            assert!(
+                !should_promote(stream, feed, "page"),
+                "feed promoted: {feed}"
+            );
+        }
+        // Item pages still promote under intent=page (incl. unknown sites).
+        for item in [
+            "https://x.com/u/status/123",
+            "https://www.instagram.com/reel/ABC/",
+            "https://unknown-site.example/watch/1",
+            "https://example.com/home/video-1",
+        ] {
+            assert!(should_promote(stream, item, "page"), "item blocked: {item}");
+        }
         assert!(!should_promote(stream, "https://example.com/file.mp4", ""));
     }
 

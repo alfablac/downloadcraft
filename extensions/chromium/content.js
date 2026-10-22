@@ -14,7 +14,7 @@
     // non-blob currentSrc at anchor time; survives later src swaps.
     if (!video._wcAnchor) {
       const srcs = directUrls(video);
-      video._wcAnchor = { since: video._wcFirstPlay || video._wcSeen || 0, postId: idFromUrl(permalinkFor(video)) || idFromUrl(location.href), srcKey: srcs[0] || "" };
+      video._wcAnchor = { since: video._wcFirstPlay || video._wcSeen || 0, postId: idFromUrl(permalinkFor(video)), srcKey: srcs[0] || "" };
     }
     return video._wcAnchor;
   }
@@ -64,6 +64,7 @@
   function ensureConfirm(msg) { /* legacy no-op */ }
   function pageItem(video) {
     const pu = permalinkFor(video || null);
+    if (!pu || !isVideoPageUrl(pu)) return null;
     return { url: pu, pageUrl: pu, intent: "page", label: "▶ This video — webcraft (choose quality / audio / subs)", filename: filenameFromUrl(pu), type: "page" };
   }
   function showPanelFixed(items, note) { showPanel(document.body, items, note); }
@@ -154,8 +155,12 @@
       return a ? streamIdFromUrl(a.href || "") : "";
     } catch (e) { return ""; }
   }
+  // Tracking params stripped everywhere (query may carry video id,
+  // e.g. /watch?v= survives only via site-shaped branch below).
+  const TRACK_PARAMS = ["fbclid", "gclid", "igshid", "s", "t", "ref", "ref_src", "ref_url", "mc_cid", "mc_eid", "spm", "si", "_hsenc", "_hsmi", "vero_id"];
   function cleanPermalink(u) {
     try {
+      if (!u) return "";
       const x = new URL(u, location.href);
       x.hash = "";
       let m = x.pathname.match(/\/status\/(\d+)/);
@@ -163,22 +168,125 @@
       m = x.pathname.match(/\/comments\/([a-z0-9]+)/i);
       if (m) return x.origin + x.pathname.slice(0, x.pathname.indexOf(m[0]) + m[0].length);
       if (x.pathname === "/watch") return x.origin + "/watch?v=" + (x.searchParams.get("v") || "");
-      [...x.searchParams.keys()].forEach((k) => x.searchParams.delete(k));
+      [...x.searchParams.keys()].forEach((k) => { if (/^utm_/i.test(k) || TRACK_PARAMS.includes(k.toLowerCase())) x.searchParams.delete(k); });
       return x.toString();
-    } catch (e) { return String(u || location.href); }
+    } catch (e) { return ""; }
+  }
+  function sameUrl(a, b) {
+    try { return !!a && cleanPermalink(a) === cleanPermalink(b); } catch (e) { return false; }
   }
   function isVideoPageUrl(u) {
     // Instagram: host-scoped (path alone missed /p/, /reels/, /stories/, /tv/).
     if (isInstagram(u)) return /\/(reel|reels|p|tv)\/[A-Za-z0-9_-]+|\/stories\//.test(new URL(u, location.href).pathname || "");
     return /\/status\/\d+|\/comments\/[a-z0-9]+|\/watch\?v=|\/shorts\/|youtu\.be\/|\/videos\/|\/video\/|\.globo\.com\/.*\.ghtml|g1\.globo\.com/i.test(String(u || ""));
   }
+  // Generic per-video scope: walk up from <video> (shadow-host hops like
+  // cardScope) collecting ancestors owning exactly this one video. A
+  // container owning >1 video is feed-level, never bounds search. Depth-
+  // bounded for big feeds. Ancestors only -- no global coordinate /
+  // ancestor-rect fallback (v0.22.2 regression).
+  function scopeChain(video, limit) {
+    const chain = [];
+    const max = limit || 6;
+    let el = video;
+    for (let i = 0; i < 10 && el && chain.length < max; i++) {
+      if (el.closest) { const s = el.closest(CARD_SEL); if (s && !chain.includes(s)) { chain.push(s); if (chain.length >= max) break; } }
+      const root = el.getRootNode && el.getRootNode();
+      el = root && root.host ? root.host : (el.parentElement || null);
+      if (el) {
+        let n = 0;
+        try { n = el.querySelectorAll ? el.querySelectorAll("video").length : 0; } catch (e) {}
+        if (n === 1 && !chain.includes(el)) chain.push(el);
+        else if (n > 1) break;
+      }
+    }
+    return chain;
+  }
+  // "2 hours ago" / "Jan 3, 2024" / "2024-01-03 10:20" / "3h" time-ish text.
+  function isTimeText(t) {
+    t = String(t || "").trim();
+    if (!t) return false;
+    if (/\d/.test(t) && /(ago|am\b|pm\b|:|\/|\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b|\d{4})/i.test(t)) return true;
+    return /^\d+\s?(s|m|h|d|w)$/i.test(t);
+  }
+  // Timestamp/permalink-flavored link inside scope: wraps <time>, has
+  // rel~=bookmark, or class/aria-label/title mentions permalink/timestamp;
+  // visible text (or time[datetime]) must parse as time/date anyway.
+  function timestampLink(scope) {
+    try {
+      for (const a of [...scope.querySelectorAll("a[href]")]) {
+        const time = a.querySelector("time");
+        const cls = ((a.className && a.className.baseVal !== undefined) ? a.className.baseVal : a.className) || "";
+        const flavored = !!time || /(^|\s)bookmark(\s|$)/i.test(a.getAttribute("rel") || "") || /permalink|timestamp|time/i.test(cls + " " + (a.getAttribute("aria-label") || "") + " " + (a.getAttribute("title") || ""));
+        if (!flavored) continue;
+        const text = time ? (time.getAttribute("datetime") || time.textContent || "") : (a.textContent || "");
+        if (text && (isTimeText(text) || (time && time.getAttribute("datetime")))) return a.href || "";
+      }
+    } catch (e) {}
+    return "";
+  }
+  // Useable item link: absolute http(s), same origin, not current page,
+  // not bare fragment/javascript link. Returns cleaned URL or "".
+  function itemHref(raw) {
+    try {
+      if (!raw) return "";
+      const s = String(raw).trim();
+      if (!s || s.startsWith("#") || /^javascript:/i.test(s)) return "";
+      const u = new URL(s, location.href);
+      if (!/^https?:$/.test(u.protocol) || u.origin !== location.origin) return "";
+      if (sameUrl(u.href, location.href)) return "";
+      return cleanPermalink(u.href);
+    } catch (e) { return ""; }
+  }
+  function isFeedHome(u) {
+    try { const p = new URL(u, location.href).pathname.replace(/\/+$/, "").toLowerCase(); return p === "" || p === "/home" || p === "/feed"; } catch (e) { return false; }
+  }
+  // Generic-first per-video item URL. Chain: 1a wrapping <a>; 1b timestamp/
+  // permalink link in nearest single-video scope; 1c scope data-* attrs,
+  // then nearest differing same-origin <a> (last path segment with digit,
+  // != current page segment preferred); 1d og:url/canonical pointing
+  // elsewhere non-root; 1e v0.22.4 site signals (CARD_SEL data-permalink,
+  // IG post link, /status/ /comments/ /watch?v= /shorts/ youtu.be, timed
+  // links); 1f cleaned location ONLY on single-video pages. Multi-video
+  // page, no per-video link: "" (unknown) -- NEVER feed/home URL.
   function permalinkFor(video) {
     try {
-      const scope = video ? cardScope(video) : null;
+      if (!video) {
+        // No element context (toolbar scan): location is item only when it
+        // is not a root/home page; callers gate with isVideoPageUrl.
+        const loc = cleanPermalink(location.href);
+        return isFeedHome(loc) ? "" : loc;
+      }
+      const multi = allVideos().length > 1;
+      // 1a. <a> wrapping video itself (closest crosses shadow hosts too).
+      try { const a = video.closest && video.closest("a[href]"); if (a) { const h = itemHref(a.getAttribute("href")); if (h) return h; } } catch (e) {}
+      const chain = scopeChain(video);
+      // 1b. Timestamp/permalink link, nearest scope first.
+      for (const scope of chain) { const h = itemHref(timestampLink(scope)); if (h) return h; }
+      // 1c. Scope data attrs, then nearest differing link.
+      const curSeg = location.pathname.split("/").filter(Boolean).pop() || "";
+      for (const scope of chain) {
+        if (scope.getAttribute) for (const attr of ["data-permalink", "data-url", "data-href"]) { const h = itemHref(scope.getAttribute(attr)); if (h) return h; }
+        try {
+          const links = [...scope.querySelectorAll("a[href]")];
+          const pick = links.find((a) => { const h = itemHref(a.getAttribute("href")); if (!h) return false; const seg = new URL(h).pathname.split("/").filter(Boolean).pop() || ""; return /\d/.test(seg) && seg !== curSeg; }) || links.find((a) => itemHref(a.getAttribute("href")));
+          if (pick) return itemHref(pick.getAttribute("href"));
+        } catch (e) {}
+      }
+      // 1d. og:url / canonical pointing at different non-root item.
+      try {
+        const meta = document.querySelector('meta[property="og:url"]');
+        const canon = document.querySelector('link[rel="canonical"]');
+        const cand = (meta && meta.getAttribute("content")) || (canon && canon.getAttribute("href")) || "";
+        const h = itemHref(cand);
+        if (h && !isFeedHome(h)) return h;
+      } catch (e) {}
+      // 1e. Site-shaped fallback (v0.22.4 behavior).
+      const scope = cardScope(video);
       if (scope) {
         const dp = scope.getAttribute && scope.getAttribute("data-permalink");
         if (dp) return cleanPermalink(new URL(dp, location.origin).href);
-        // Instagram: card <a href="/p|/reel|/reels|/tv/SHORTCODE/"> is the post permalink.
+        // Instagram: card <a href="/p|/reel|/reels|/tv/SHORTCODE/"> is post permalink.
         if (isInstagram()) { const ia = scope.querySelector('a[href*="/p/"],a[href*="/reel/"],a[href*="/reels/"],a[href*="/tv/"]'); if (ia && cardScope(ia) === scope) return cleanPermalink(ia.href); }
         const links = [...scope.querySelectorAll('a[href*="/status/"],a[href*="/comments/"],a[href*="/watch?v="],a[href*="/shorts/"],a[href*="youtu.be/"]')];
         const own = links.filter((a) => cardScope(a) === scope);
@@ -186,8 +294,10 @@
         if (timed) return cleanPermalink(timed.href);
         if (own.length) return cleanPermalink(own[0].href);
       }
+      // 1f. Single-video page: page itself is item.
+      if (!multi) { const loc = cleanPermalink(location.href); return isFeedHome(loc) ? "" : loc; }
     } catch (e) {}
-    return cleanPermalink(location.href);
+    return "";
   }
   function boundedIdHit(url, pid) {
     if (!pid) return false;
@@ -195,7 +305,7 @@
     return new RegExp("[/=?&._-]" + esc + "([/?&#._-]|$)").test(url);
   }
   function scopedCandidates(video, candidates) {
-    const pid = idFromUrl(permalinkFor(video)) || idFromUrl(location.href);
+    const pid = idFromUrl(permalinkFor(video)) || (allVideos().length <= 1 ? idFromUrl(location.href) : "");
     const streamId = streamIdFor(video);
     const since = video._wcFirstPlay || video._wcSeen || 0;
     const reddit = /(^|\.)reddit\.com$/.test(location.hostname);
@@ -265,9 +375,9 @@
       const note = items0.length ? "Streams for this video:" : "";
       const mapped = items0.map((c) => {
         const isMan = /mpd|m3u8|dash|mpegurl|DASHPlaylist|HLSPlaylist/i.test(c.url) || /mpegurl|dash/i.test(c.type || "");
-        return { url: c.url, intent: isMan ? "manifest" : "stream", pageUrl: permalinkFor(video), label: (isMan ? "Playlist (yt-dlp/native) · " : "") + (c.label || candidateLabel(c)), filename: filenameFromUrl(c.url), type: c.type };
+        return { url: c.url, intent: isMan ? "manifest" : "stream", pageUrl: permalinkFor(video) || location.href, label: (isMan ? "Playlist (yt-dlp/native) · " : "") + (c.label || candidateLabel(c)), filename: filenameFromUrl(c.url), type: c.type };
       });
-      if (isVideoPageUrl(permalinkFor(video))) mapped.unshift(pageItem(video));
+      const pi = pageItem(video); if (pi) mapped.unshift(pi);
       showPanel(video, mapped, note);
     }), video);
   }
@@ -322,8 +432,8 @@
     btn.title = "Download video";
     btn.setAttribute("aria-label", "Download video");
     btn.setAttribute("data-downloadcraft-btn", "1");
-    btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:7px auto;pointer-events:none"><path d="M12 3v11"/><path d="m7 10 5 5 5-5"/><path d="M4 20h16"/></svg>';
-    btn.style.cssText = "position:fixed;z-index:2147483646;width:32px;height:32px;border-radius:50%;background:#4E7A74;color:#fff;border:1px solid #7FB3AA;padding:0;cursor:grab;text-align:center;opacity:0;pointer-events:none;display:none;touch-action:none;user-select:none;-webkit-user-select:none;font-family:\"Inter\",system-ui,sans-serif;";
+    btn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:6.5px auto;pointer-events:none"><path d="M12 3v11"/><path d="m7 10 5 5 5-5"/><path d="M4 20h16"/></svg>';
+    btn.style.cssText = "position:fixed;z-index:2147483647;width:27px;height:27px;border-radius:50%;background:rgba(20,26,25,.72);color:rgba(255,255,255,.92);border:1px solid rgba(255,255,255,.28);box-shadow:0 1px 5px rgba(0,0,0,.35);padding:0;cursor:grab;text-align:center;opacity:0;pointer-events:none;display:none;touch-action:none;user-select:none;-webkit-user-select:none;transform:translateZ(0);font-family:\"Inter\",system-ui,sans-serif;";
     btn.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); if (btn.dataset.suppressClick) { delete btn.dataset.suppressClick; return; } pickStream(video); });
 
     // Draggable: press-move >4px drags (persisted offset per video via dataset),
@@ -355,8 +465,8 @@
     // hidden state must not swallow clicks meant for video controls.
     // Instagram: always semi-visible — hover-only proved undiscoverable there
     // (overlays + touch); still clickable at rest on IG.
-    const showBtn = () => { btn.style.opacity = ".9"; btn.style.pointerEvents = "auto"; };
-    const hideBtn = () => { if (isInstagram(location.href)) { btn.style.opacity = ".55"; btn.style.pointerEvents = "auto"; } else { btn.style.opacity = "0"; btn.style.pointerEvents = "none"; } };
+    const showBtn = () => { btn.style.opacity = ".96"; btn.style.pointerEvents = "auto"; btn.style.background = "rgba(46,74,69,.94)"; btn.style.borderColor = "rgba(127,179,170,.9)"; };
+    const hideBtn = () => { btn.style.background = "rgba(20,26,25,.72)"; btn.style.borderColor = "rgba(255,255,255,.28)"; if (isInstagram(location.href)) { btn.style.opacity = ".42"; btn.style.pointerEvents = "auto"; } else { btn.style.opacity = "0"; btn.style.pointerEvents = "none"; } };
     // Hover on player wrapper: overlays cover <video> (X/YouTube/Instagram).
     // Delegated mouseover: overlay siblings (IG action rail/gradient) never
     // fire mouseenter on wrapper/video, so check containment per event.
@@ -473,7 +583,7 @@
           candidates.forEach((c) => { if (c && c.url && !c.url.startsWith("blob:")) byUrl.set(c.url, { url: c.url, label: candidateLabel(c), filename: filenameFromUrl(c.url), type: c.type }); });
           const items = (typeof rankCandidates === "function" ? rankCandidates : (x) => x)([...byUrl.values()]);
           const mapped = items.map((c) => { const isMan = /mpd|m3u8|dash|mpegurl|DASHPlaylist|HLSPlaylist/i.test(c.url) || /mpegurl|dash/i.test(c.type || ""); return { url: c.url, intent: isMan ? "manifest" : "stream", pageUrl: pageUrl(), label: (isMan ? "Playlist (yt-dlp/native) · " : "") + (c.label || candidateLabel(c)), filename: filenameFromUrl(c.url), type: c.type }; });
-          if (isVideoPageUrl(location.href)) mapped.unshift(pageItem(null));
+          if (isVideoPageUrl(location.href)) { const pi = pageItem(null); if (pi) mapped.unshift(pi); }
           showPanelFixed(mapped, items.length ? "" : "No video found on page.");
         });
       }

@@ -2,6 +2,29 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.23.1] - 2026-10-22
+
+### Fixed
+
+- Universal per-video finder: the "This video" URL is now resolved
+  generically from the clicked `<video>` (wrapping anchor, timestamp/
+  permalink link in the video's own container, scope data attributes,
+  nearest differing link), with the previous site-shaped link patterns
+  as fallback. A feed video with no per-video link yields no page row
+  instead of the feed/home URL (`x.com/home` was downloaded before).
+  Streams still bind via src/id/timing tiers. The app additionally
+  refuses to promote feed/home URLs (`/`, `/home`, `/feed`, `/explore`,
+  `/search`, ...) to yt-dlp targets.
+- Reverted v0.23.0 (universal capture rewrite): it sent feed/home
+  pages as "this video" and broke Instagram. Instagram X/Twitter,
+  Reddit and Globo behavior from 0.22.4 is restored; timing matches
+  now order closest-to-play first, frame-agnostic retries never widen
+  to timing, and Firefox sniffing rejects `.ts`/`.m4s` segments like
+  Chromium.
+- Download button more discreet (27px, translucent dark, lower rest
+  opacity) and z-index raised to `2147483647` so page players no
+  longer paint over it.
+
 ## [0.22.4] - 2026-10-22
 
 ### Fixed

@@ -159,6 +159,7 @@ function captureDecision(details) {
   if (isBypassed(details.url)) return null;
   if (![200, 206].includes(details.statusCode)) return null;
   if (/^(seg|segment|chunk|frag)[-_]?\d|\.m4s$|[-_]\d+\.(ts|m4s)$/i.test(filenameFromUrl(details.url))) return null; // stream segments: panel lists manifest, not fragments
+  if (["ts", "m4s"].includes(extOfUrl(details.url))) return null; // parity Chromium isSniff ext gate: unnumbered segment files
   const type = headerOf(details.responseHeaders, "content-type").split(";")[0].trim().toLowerCase();
   const disp = headerOf(details.responseHeaders, "content-disposition").toLowerCase();
   const ext = extOfUrl(details.url);
@@ -353,19 +354,22 @@ browser.runtime.onMessage.addListener((msg, sender) => {
       const el = { tabId: sender.tab ? sender.tab.id : tabId, frameId: senderFrame, srcs: msg.element.srcs || [], srcKey: msg.element.srcKey || "", postId: msg.element.postId || "", streamId: msg.element.streamId || "", since: msg.element.since || 0, now: Date.now() };
       pool = typeof matchRecordsForElement === "function" ? matchRecordsForElement([...byUrl.values()], el, Date.now()) : [];
       // Element-frame match empty: retry frame-agnostic (frameId=null passes
-      // tolerant filter) before returning empty.
-      if (!pool.length && senderFrame != null && typeof matchRecordsForElement === "function") pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null }, Date.now());
-      // IG host-scoped fallback (background-only): see Chromium.
+      // tolerant filter) before returning empty. noTiming: retry widens
+      // frame only, never tier — else cross-frame timing hands this video
+      // another video's streams when srcs/postId/streamId matched nothing.
+      if (!pool.length && senderFrame != null && typeof matchRecordsForElement === "function") pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null, noTiming: true }, Date.now());
+      // IG host-scoped fallback (background-only): see Chromium. noTiming
+      // likewise: hostExtra is window-bound itself.
       if (!pool.length && typeof matchRecordsForElement === "function") {
         let ph = "";
         try { ph = new URL((sender.tab && sender.tab.url) || "").hostname.toLowerCase(); } catch (e) {}
-        if (/(^|\.)instagram\.com$/.test(ph)) pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null, pageHost: "instagram.com" }, Date.now(), [...candidates.values()]);
+        if (/(^|\.)instagram\.com$/.test(ph)) pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null, noTiming: true, pageHost: "instagram.com" }, Date.now(), [...candidates.values()]);
       }
     } else {
       // No frame filter: player frame != sniffer frame on embeds drops all.
       pool = [...candidates.values()].filter((c) => tabId == null || c.tabId === tabId);
     }
-    const list = (typeof rankCandidates === "function" ? rankCandidates : (x) => x)(pool);
+    const list = (typeof rankCandidates === "function" ? rankCandidates : (x) => x)(pool, msg.element ? el : null);
     return Promise.resolve({ type: "candidates", candidates: list });
   }
   if (msg && msg.type === "downloadcraft-grab-site" && sender.tab && sender.tab.url) return safeSend("webcraft://grab?url=" + encodeURIComponent(sender.tab.url), sender.tab, { referrer: sender.tab.url, cookieUrl: sender.tab.url });

@@ -1,5 +1,6 @@
 // rune: node extensions/rank.test.mjs
 import assert from "node:assert";
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const { rankCandidates, matchRecordsForElement } = require("./chromium/rank.js");
@@ -88,12 +89,51 @@ const noFrame = [{ url: "https://cdn/nf.mp4", tabId: 7, time: T, type: "video/mp
 assert.equal(matchRecordsForElement(noFrame, { tabId: 7, frameId: 3, srcs: [], since: T, now: T }, T).length, 2, "F10d undefined/null frameId passes");
 assert.equal(also.matchRecordsForElement(noFrame, { tabId: 7, frameId: 3, srcs: [], since: T, now: T }, T).length, 2, "F10d firefox parity");
 // F10(e) ceiling (documented limit): two concurrent no-id/no-src videos in
-// same tab+frame both timing-match; matcher cannot disambiguate. Both included.
+// same tab+frame both timing-match; matcher cannot disambiguate. Both
+// included, closest-to-since first.
 const ceil = [
   { url: "https://cdn/v1.mp4", tabId: 7, frameId: 3, time: T + 1000, type: "video/mp4" },
   { url: "https://cdn/v2.mp4", tabId: 7, frameId: 3, time: T + 2000, type: "video/mp4" },
 ];
 assert.deepEqual(matchRecordsForElement(ceil, { tabId: 7, frameId: 3, srcs: [], since: T, now: T }, T).map((r) => r.url), ["https://cdn/v1.mp4", "https://cdn/v2.mp4"], "F10e ceiling: both timing videos included");
+// Two blob videos, same tab+frame, DISJOINT since windows: each element
+// gets only own-window records (windows: [s-2s, s+45s]).
+const twoBlob = [
+  { url: "https://cdn/first.mp4", tabId: 7, frameId: 3, time: T + 1000, type: "video/mp4" },
+  { url: "https://cdn/second.mp4", tabId: 7, frameId: 3, time: T + 120000, type: "video/mp4" },
+];
+assert.deepEqual(matchRecordsForElement(twoBlob, { tabId: 7, frameId: 3, srcs: ["blob:https://x/1"], since: T, now: T }, T).map((r) => r.url), ["https://cdn/first.mp4"], "two blob videos: video1 own window only");
+assert.deepEqual(matchRecordsForElement(twoBlob, { tabId: 7, frameId: 3, srcs: ["blob:https://x/2"], since: T + 119000, now: T + 119000 }, T + 119000).map((r) => r.url), ["https://cdn/second.mp4"], "two blob videos: video2 own window only");
+assert.deepEqual(also.matchRecordsForElement(twoBlob, { tabId: 7, frameId: 3, srcs: ["blob:https://x/1"], since: T, now: T }, T).map((r) => r.url), ["https://cdn/first.mp4"], "two blob videos firefox parity");
+// Overlapping windows: both records returned, closest to own since first,
+// and rankCandidates(el) keeps closest ahead despite smaller size.
+const overlap = [
+  { url: "https://cdn/foreign-big.mp4", tabId: 7, frameId: 3, time: T + 40000, type: "video/mp4", size: 99999 },
+  { url: "https://cdn/own-small.mp4", tabId: 7, frameId: 3, time: T + 1000, type: "video/mp4", size: 10 },
+];
+const om = matchRecordsForElement(overlap, { tabId: 7, frameId: 3, srcs: [], since: T, now: T }, T);
+assert.deepEqual(om.map((r) => r.url), ["https://cdn/own-small.mp4", "https://cdn/foreign-big.mp4"], "overlap: timing sorted closest-first");
+assert.equal(rankCandidates(om, { since: T })[0].url, "https://cdn/own-small.mp4", "rankCandidates el.since: closest beats bigger foreign");
+assert.equal(rankCandidates(om)[0].url, "https://cdn/foreign-big.mp4", "rankCandidates no el: size order unchanged");
+assert.equal(also.rankCandidates(om, { since: T })[0].url, "https://cdn/own-small.mp4", "rankCandidates closeness firefox parity");
+// noTiming (background frame-agnostic retry): retry widens frame, never
+// tier. Element HAD srcs/postId but matched nothing in own frame ->
+// cross-frame timing records must NOT attach; cross-frame postId hits may.
+const retryRecs = [
+  { url: "https://cdn/other-frame-timing.mp4", tabId: 7, frameId: 9, time: T + 1000, type: "video/mp4" },
+  { url: "https://cdn/post_abc123_otherframe.mp4", tabId: 7, frameId: 9, time: T - 99999, type: "video/mp4" },
+];
+assert.deepEqual(matchRecordsForElement(retryRecs, { tabId: 7, frameId: null, noTiming: true, srcs: ["https://cdn/gone.mp4"], postId: "abc123", since: T, now: T }, T).map((r) => r.url), ["https://cdn/post_abc123_otherframe.mp4"], "noTiming retry: cross-frame postId hits, timing does not leak");
+assert.deepEqual(matchRecordsForElement(retryRecs, { tabId: 7, frameId: null, noTiming: true, srcs: [], since: T, now: T }, T), [], "noTiming: pure timing element gets nothing cross-frame");
+assert.deepEqual(matchRecordsForElement(retryRecs, { tabId: 7, frameId: 3, srcs: [], since: T, now: T }, T), [], "own frame: other-frame records excluded");
+// bounded postId: hit does not pull ALL same-tab records (bounded tier only,
+// foreign timing-window record excluded).
+const postAll = [
+  { url: "https://cdn/post_abc123_mine.mp4", tabId: 7, frameId: 3, time: T - 99999, type: "video/mp4" },
+  { url: "https://cdn/foreign.mp4", tabId: 7, frameId: 3, time: T + 1000, type: "video/mp4" },
+  { url: "https://cdn/abc1234.mp4", tabId: 7, frameId: 3, time: T + 1000, type: "video/mp4" }, // unbounded prefix
+];
+assert.deepEqual(matchRecordsForElement(postAll, { tabId: 7, frameId: 3, srcs: [], postId: "abc123", since: T, now: T }, T).map((r) => r.url), ["https://cdn/post_abc123_mine.mp4"], "postId bounded hit does not match ALL");
 
 // streamId tier: reddit comments id != v.redd.it stream id; DASH url carries stream id only.
 const streamRecs = [
@@ -138,4 +178,18 @@ assert.deepEqual(
   also.matchRecordsForElement([], igEl, T, igRecs).map((r) => r.url),
   ["https://scontent.cdninstagram.com/v/t50.2886-16/abc.mp4?efg=xyz", "https://scontent.xx.fbcdn.net/v/t39.30808-6/xyz.mp4"], "IG host fallback firefox parity");
 
+// Background static invariants: IG gate (empty pool + trusted instagram
+// host), noTiming retry/IG, rankCandidates(el), segment flood parity.
+for (const bg of ["./chromium/background.js", "./firefox/background.js"]) {
+  const s = readFileSync(new URL(bg, import.meta.url), "utf8");
+  assert.match(s, /!pool\.length[\s\S]{0,400}instagram\\\.com/, bg + ": IG fallback gated on empty pool + instagram host");
+  assert.match(s, /frameId: null, noTiming: true/, bg + ": frame-agnostic retry carries noTiming");
+  assert.match(s, /noTiming: true, pageHost: "instagram\.com"/, bg + ": IG call carries noTiming");
+  assert.match(s, /rankCandidates[^;]*msg\.element \? el : null/, bg + ": rankCandidates(el) closeness");
+  // Segment flood: both reject HLS/DASH segment URLs pre-capture via same
+  // filename regex; Firefox captureDecision also ext-rejects ts/m4s
+  // (parity Chromium isSniff ext gate).
+  assert.ok(s.includes("/^(seg|segment|chunk|frag)[-_]?\\d|\\.m4s$|[-_]\\d+\\.(ts|m4s)$/i"), bg + ": segment URL reject present (identical regex)");
+  if (bg.includes("firefox")) assert.ok(s.includes('["ts", "m4s"].includes(extOfUrl(details.url))'), bg + ": segment ext reject parity");
+}
 console.log("rank.test.mjs OK", urls);

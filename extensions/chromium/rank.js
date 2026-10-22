@@ -78,7 +78,12 @@
     return 50;
   }
 
-  function rankCandidates(list) {
+  function rankCandidates(list, el) {
+    // Optional el.since: closeness-to-firstPlay tie-break (after kind score,
+    // before size) so own video's timing hits beat overlapping foreign ones.
+    // No el -> dt all-equal, ordering unchanged.
+    var since = el && el.since ? el.since : 0;
+    function dtOf(e) { return since ? (e.time ? Math.abs(e.time - since) : Infinity) : 0; }
     var byCanon = new Map();
     (list || []).forEach(function (raw, idx) {
       var item = typeof raw === "string" ? { url: raw } : raw;
@@ -97,10 +102,10 @@
     if (hasPlaylist) rows = rows.filter(function (r) { return kindOf(r.item) !== "segment"; });
     return rows
       .map(function (r) {
-        return { item: r.item, index: r.index, size: r.size, dur: durationOf(r.item), score: scoreOf(kindOf(r.item), hasPlaylist) };
+        return { item: r.item, index: r.index, size: r.size, dur: durationOf(r.item), dt: dtOf(r.item), score: scoreOf(kindOf(r.item), hasPlaylist) };
       })
       .sort(function (a, b) {
-        return (b.score - a.score) || (b.size - a.size) || (b.dur - a.dur) || (a.index - b.index);
+        return (b.score - a.score) || (a.dt - b.dt) || (b.size - a.size) || (b.dur - a.dur) || (a.index - b.index);
       })
       .map(function (r) { return r.item; });
   }
@@ -112,9 +117,13 @@
   // Tiers EXCLUSIVE: src/hops hit wins; else bounded postId hit; else bounded
   // streamId hit; else timing
   // (only when element has no real srcs, else timing leaks other videos).
-  // ponytail: timing cannot disambiguate two concurrent no-id/no-src videos;
-  // both are returned (see rank.test.mjs ceiling case). Upgrade:
-  // performance-timeline resource naming if that proves too loose.
+  // Timing hits sorted closest-to-since first (out() preserves it; callers
+  // ranking by closeness keep own video ahead of overlapping foreign one).
+  // ponytail: timing still cannot disambiguate two concurrent no-id/no-src
+  // videos; both returned, closest first (rank.test.mjs ceiling case).
+  // Upgrade: performance-timeline resource naming if that proves too loose.
+  // el.noTiming (background retry/IG only): retry widens frame, never tier,
+  // so timing tier skipped; src/postId/streamId/hostExtra still apply.
   function boundedHit(u, pid) {
     if (!pid || !u) return false;
     var esc = String(pid).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -187,8 +196,10 @@
     }
     // Timing anchored at firstPlay (since), never at click time (now):
     // late click must not widen window. No since -> no timing hits.
-    if (!srcKeys.length && since) {
-      var timed = out(pool.filter(function (r) { return !!(r.time && r.time >= since - 2000 && r.time <= since + 45000); }));
+    if (!srcKeys.length && !e.noTiming && since) {
+      var timed = out(pool
+        .filter(function (r) { return !!(r.time && r.time >= since - 2000 && r.time <= since + 45000); })
+        .sort(function (a, b) { return Math.abs(a.time - since) - Math.abs(b.time - since); }));
       if (timed.length) return timed;
     }
     // Host-wide fallback LAST resort (background-only, never reachable
