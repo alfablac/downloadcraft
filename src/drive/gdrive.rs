@@ -197,6 +197,25 @@ impl GDrive {
     }
 }
 
+/// Map Drive files.copy failure to user-actionable text. Pure (tested).
+/// 404 here almost always means destination identity cannot see source
+/// file (different account, file not shared with it): Drive hides
+/// inaccessible files as not-found. Shared Drive membership also fits.
+fn copy_error_hint(status: u16, file_id: &str, raw: &str) -> String {
+    if status == 404 {
+        format!(
+            "Google Drive 404: file {file_id} not visible to destination account. \
+             Server-side copy runs as destination account, so it can only copy files that \
+             account can already see. Fix: in Google Drive, Share '{file_id}' (file or its \
+             parent Shared Drive) with destination account, then retry. For many files, \
+             share parent folder/Shared Drive once, or use normal Copy (download+upload, \
+             works across accounts). Raw: {raw}"
+        )
+    } else {
+        raw.to_string()
+    }
+}
+
 /// files.copy body: keep display name, land in resolved destination folder.
 fn copy_body(name: &str, parent_id: &str) -> serde_json::Value {
     serde_json::json!({"name": name, "parents": [parent_id]})
@@ -470,7 +489,8 @@ impl DriveBackend for GDrive {
         if resp.status().is_success() {
             Ok(())
         } else {
-            Err(http_util::err_text(resp).await)
+            let status = resp.status().as_u16();
+            Err(copy_error_hint(status, &src_entry.id, &http_util::err_text(resp).await))
         }
     }
 }
@@ -505,5 +525,15 @@ mod tests {
         let b = copy_body("movie.mkv", "0AFolder");
         assert_eq!(b["name"], "movie.mkv");
         assert_eq!(b["parents"], serde_json::json!(["0AFolder"]));
+    }
+    #[test]
+    fn copy_error_hint_404_guides_sharing() {
+        let h = copy_error_hint(404, "1LKYYrExample", "HTTP 404: File not found");
+        assert!(h.contains("not visible to destination account"));
+        assert!(h.contains("Share"));
+        assert!(h.contains("normal Copy"));
+        assert!(h.contains("1LKYYrExample"));
+        let raw = copy_error_hint(403, "id", "HTTP 403: forbidden");
+        assert_eq!(raw, "HTTP 403: forbidden");
     }
 }

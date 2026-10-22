@@ -2,6 +2,12 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.20.2] - 2026-10-22
+
+### Fixed
+
+- Drives Server-side copy cross-account `404 File not found`: Drive runs `files.copy` as the destination account, so files that account cannot already see (different account, not shared) return 404, not 403. Error now explains this and names the fix: share the file, parent folder, or Shared Drive with the destination account, then retry; normal Copy (download+upload) remains the cross-account path without sharing. Same-account copies unaffected.
+
 ## [0.20.1] - 2026-10-22
 
 ### Changed
