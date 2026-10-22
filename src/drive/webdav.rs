@@ -222,6 +222,21 @@ impl DriveBackend for WebDav {
             Err(http_util::err_text(resp).await)
         }
     }
+    /// Stream source: GET URL + Basic auth header (mpv sends it).
+    async fn stream_url(&self, entry: &RemoteEntry) -> Result<super::StreamSource, String> {
+        let headers = if self.acc.username.is_empty() {
+            Vec::new()
+        } else {
+            vec![(
+                "Authorization".into(),
+                format!(
+                    "Basic {}",
+                    super::b64(format!("{}:{}", self.acc.username, self.acc.secret).as_bytes())
+                ),
+            )]
+        };
+        Ok(super::StreamSource { url: self.url_for(&entry.path), headers })
+    }
     async fn download(
         &self,
         entry: &RemoteEntry,

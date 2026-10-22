@@ -21,6 +21,7 @@ fn lock<T>(m: &Arc<Mutex<T>>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+type StreamSlot = Arc<Mutex<Option<Result<(String, Vec<(String, String)>), String>>>>;
 type ListSlot = Arc<Mutex<Option<(u64, Result<Vec<RemoteEntry>, String>)>>>;
 type ActSlot = Arc<Mutex<Option<Result<String, String>>>>;
 type SyncSlot = Arc<Mutex<Option<Result<(Vec<RemoteEntry>, Vec<RemoteEntry>), String>>>>;
@@ -278,8 +279,11 @@ pub struct DrivesUi {
     pub sync_preview: Option<SyncPlan>,
     pub sync_slot: Option<SyncSlot>,
     pub pending_download_tasks: Vec<(String, String, String)>, // url,user,pass
-    /// Local video paths awaiting built-in player (drained by app).
-    pub pending_play: Vec<String>,
+    /// Play requests awaiting built-in player (drained by app):
+    /// (url-or-local-path, http headers for remote streams).
+    pub pending_play: Vec<(String, Vec<(String, String)>)>,
+    /// In-flight stream URL resolution (double-click remote video).
+    pub stream_slot: Option<StreamSlot>,
     /// Pending destructive confirmation (remote delete / account removal).
     pub confirm: Option<DriveConfirm>,
 }
@@ -329,6 +333,7 @@ impl Default for DrivesUi {
             sync_slot: None,
             pending_download_tasks: Vec::new(),
             pending_play: Vec::new(),
+            stream_slot: None,
             confirm: None,
         }
     }
@@ -766,6 +771,21 @@ impl DrivesUi {
         for i in 0..2 {
             self.poll_pane(i, &settings);
         }
+        // Stream URL resolved -> queue play; failure -> status (SFTP/
+        // FTP/crypt say download first via backend Err text).
+        if let Some(slot) = &self.stream_slot {
+            let done = crate::lock_unpoison(slot).take();
+            if let Some(r) = done {
+                self.stream_slot = None;
+                match r {
+                    Ok((url, headers)) => {
+                        self.status = "Streaming in built-in player".into();
+                        self.pending_play.push((url, headers));
+                    }
+                    Err(e) => self.status = format!("Stream failed: {e}"),
+                }
+            }
+        }
         self.poll_oauth(app_rt);
         ui.add_space(theme::SP_SM);
         ui.horizontal(|ui| {
@@ -912,9 +932,30 @@ impl DrivesUi {
                         );
                     }
                 }
-                PaneAction::Play(_pane, path) => {
+                PaneAction::Play(_pane, path, headers) => {
                     self.status = format!("Playing {path} in built-in player");
-                    self.pending_play.push(path);
+                    self.pending_play.push((path, headers));
+                }
+                PaneAction::StreamPlay(i, entry) => {
+                    // Resolve provider stream URL async; result polled
+                    // in ui(). Crypt/SFTP/FTP backends Err -> status.
+                    if let Ok((_acc, be)) = Self::backend(&settings, &self.panes[i].account_id) {
+                        {
+                            let slot: StreamSlot =
+                                Arc::new(Mutex::new(None));
+                            let slot2 = slot.clone();
+                            let name = entry.name.clone();
+                            self.status = format!("Resolving stream for {name}...");
+                            self.stream_slot = Some(slot);
+                            tokio_rt.spawn(async move {
+                                let r = be
+                                    .stream_url(&entry)
+                                    .await
+                                    .map(|s| (s.url, s.headers));
+                                *crate::lock_unpoison(&slot2) = Some(r);
+                            });
+                        }
+                    }
                 }
                 PaneAction::DownloadTask(i) => {
                     // WebDAV only: direct URL into segmented engine.
@@ -1505,16 +1546,13 @@ impl DrivesUi {
                             } else if resp.double_clicked()
                                 && downloadcraft_lib::model::category_for(&e.name) == "Video"
                             {
-                                // Double-click video: local pane plays in
-                                // built-in player; remote needs streaming
-                                // (not supported) -> status note.
+                                // Double-click video: local plays direct;
+                                // remote resolves stream URL async (mpv
+                                // streams provider URL, no download).
                                 if self.panes[idx].account_id == LOCAL_ID {
-                                    actions.push(PaneAction::Play(idx, e.id.clone()));
+                                    actions.push(PaneAction::Play(idx, e.id.clone(), Vec::new()));
                                 } else {
-                                    self.status = format!(
-                                        "Playback needs local file: download {} first (remote streaming not supported).",
-                                        e.name
-                                    );
+                                    actions.push(PaneAction::StreamPlay(idx, e.clone()));
                                 }
                             }
                         }
@@ -2598,7 +2636,8 @@ enum PaneAction {
     Mkdir(usize),
     Rename(usize),
     DownloadTask(usize),
-    Play(usize, String),
+    Play(usize, String, Vec<(String, String)>),
+    StreamPlay(usize, RemoteEntry),
 }
 
 async fn collect_at(be: &Arc<dyn DriveBackend>, root: &str) -> Result<Vec<RemoteEntry>, String> {

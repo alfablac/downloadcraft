@@ -827,8 +827,9 @@ pub struct DownloadApp {
     cap_vp_sent: Option<egui::Vec2>,
     prog_vp_sent: Option<egui::Vec2>,
     player: Option<downloadcraft_lib::mpv::embedded::MpvHandle>,
-    /// URL awaiting player viewport HWND (spawn on first ui_player frame).
-    player_pending: Option<String>,
+    /// (URL, http headers) awaiting player viewport HWND (spawn on first
+    /// ui_player frame). Headers empty for local files/presigned URLs.
+    player_pending: Option<(String, Vec<(String, String)>)>,
     player_seek: f64,
     player_seek_dragging: bool,
     player_speed: f64,
@@ -2948,7 +2949,7 @@ impl DownloadApp {
             // FIRST: --wid INTO HWND. No HWND yet -> do not spawn; next frame
             // retries (show_viewport_immediate creates window first frame).
             if self.player.is_none() {
-                if let Some(url) = self.player_pending.clone() {
+                if let Some((url, headers)) = self.player_pending.clone() {
                     let parent = self.player_hwnd.or_else(|| {
                         let h = find_player_hwnd();
                         self.player_hwnd = h;
@@ -2973,8 +2974,8 @@ impl DownloadApp {
                                 let g = crate::lock_unpoison(&self.rt);
                                 g.state.settings.clone()
                             };
-                            match downloadcraft_lib::mpv::embedded::spawn_embedded(
-                                &settings, &url, h,
+                            match downloadcraft_lib::mpv::embedded::spawn_embedded_h(
+                                &settings, &url, h, &headers,
                             ) {
                                 Ok(handle) => {
                                     self.stream_status = format!("Playing in player: {url}");
@@ -3416,8 +3417,14 @@ impl DownloadApp {
     /// Play `url` in embedded player: reuse live handle (loadfile) else
     /// queue viewport spawn (HWND known next frame).
     fn play_embedded(&mut self, url: &str) {
+        self.play_embedded_h(url, &[]);
+    }
+
+    /// Play with per-file HTTP headers (remote drive streams). Headers
+    /// set on live handle before loadfile so first request has auth.
+    fn play_embedded_h(&mut self, url: &str, headers: &[(String, String)]) {
         if let Some(h) = &self.player {
-            match h.loadfile(url) {
+            match h.loadfile_h(url, headers) {
                 Ok(()) => {
                     self.player_seek = 0.0;
                     self.player_seek_dragging = false;
@@ -3425,11 +3432,11 @@ impl DownloadApp {
                 }
                 Err(e) => {
                     self.stream_status = format!("ERR {e}");
-                    self.player_pending = Some(url.to_string());
+                    self.player_pending = Some((url.to_string(), headers.to_vec()));
                 }
             }
         } else {
-            self.player_pending = Some(url.to_string());
+            self.player_pending = Some((url.to_string(), headers.to_vec()));
             self.stream_status = format!("Opening player: {url}");
         }
     }
@@ -9597,9 +9604,10 @@ impl DownloadApp {
             self.start_task(&id);
             self.tab = Tab::Downloads;
         }
-        // Drives double-click video -> built-in player.
-        for path in std::mem::take(&mut self.drives.pending_play) {
-            self.play_embedded(&path);
+        // Drives double-click video -> built-in player (local path or
+        // remote stream URL + headers).
+        for (path, headers) in std::mem::take(&mut self.drives.pending_play) {
+            self.play_embedded_h(&path, &headers);
         }
     }
 

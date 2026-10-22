@@ -163,6 +163,33 @@ impl DriveBackend for OneDrive {
             Err(http_util::err_text(resp).await)
         }
     }
+    /// Stream source: pre-authenticated `@microsoft.graph.downloadUrl`
+    /// from item metadata. `/content` 302 strips Authorization in mpv,
+    /// so never hand mpv that URL + Bearer header.
+    async fn stream_url(&self, entry: &RemoteEntry) -> Result<super::StreamSource, String> {
+        if entry.id.is_empty() {
+            return Err("source file has no OneDrive id".into());
+        }
+        let url = format!(
+            "https://graph.microsoft.com/v1.0/me/drive/items/{}?$select=@microsoft.graph.downloadUrl",
+            super::pct(&entry.id)
+        );
+        let resp = self
+            .req(reqwest::Method::GET, &url)
+            .await?
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(http_util::err_text(resp).await);
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let dl = v["@microsoft.graph.downloadUrl"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or("OneDrive: no downloadUrl for file")?;
+        Ok(super::StreamSource { url: dl.to_string(), headers: Vec::new() })
+    }
     async fn download(
         &self,
         entry: &RemoteEntry,

@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.20.2-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.21.0-blue">
   <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">
   <img alt="Language" src="https://img.shields.io/badge/built%20with-Rust%20%2B%20egui-orange">
 </p>
@@ -19,7 +19,7 @@
 
 webcraft reimplements the observable behavior of Internet Download Manager from scratch: segmented downloads that resume, queues and schedules, DASH/HLS handling, a site grabber, and deep browser integration. No IDM code, binaries, icons, or activation logic — and no affiliation with Tonec.
 
-**Current version:** 0.20.2 · Changelog lives in GitHub Releases.
+**Current version:** 0.21.0 · Changelog lives in GitHub Releases.
 
 **Runs on:** Windows 10/11 x86_64 · macOS 13+ (Intel and Apple Silicon) · Linux x86_64 (Ubuntu 22.04+, X11 and Wayland).
 
@@ -82,7 +82,7 @@ webcraft reimplements the observable behavior of Internet Download Manager from 
 - Video pages on YouTube, Vimeo, TikTok, Twitch, Dailymotion, Instagram, X, Facebook, Reddit, SoundCloud, Bilibili, and short-link hosts, resolved by a yt-dlp sidecar (native DASH/HLS fallback)
 - Format, audio, and subtitle picker before downloading; browser cookies passed from the extension for login-gated pages; yt-dlp runs silently with no console windows
 - Direct playback with mpv: Streams page, embedded player controls (pause, seek, volume, speed), and external mpv with your own options
-- Drives: double-click a local video file in This PC to open it in the built-in player popup (remote-drive files show a hint to download first — no remote streaming yet). The player popup now has **Audio** and **Subtitle** track selectors (subtitle Off included), **Load sub…** for an external subtitle file, and a **Sub style** row — size, position, text/shadow color, bold, and force-on-ASS — applied live and remembered in *Options → mpv → Subtitle style*
+- Drives: double-click a video file to open it in the built-in player popup — local files play direct, remote drive files stream in place (provider URL + auth headers into mpv; Google Drive, OneDrive, Dropbox, S3 presigned, WebDAV, Teldrive; SFTP/FTP/crypt accounts cannot stream and ask you to download first). No rclone mount needed. The player popup now has **Audio** and **Subtitle** track selectors (subtitle Off included), **Load sub…** for an external subtitle file, and a **Sub style** row — size, position, text/shadow color, bold, and force-on-ASS — applied live and remembered in *Options → mpv → Subtitle style*
 
 ### Automation and interface
 

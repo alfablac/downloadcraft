@@ -152,6 +152,29 @@ impl DriveBackend for Teldrive {
             Err(http_util::err_text(resp).await)
         }
     }
+    /// Stream source: content URL without `download=1` (inline) + auth.
+    async fn stream_url(&self, entry: &RemoteEntry) -> Result<super::StreamSource, String> {
+        if entry.id.is_empty() {
+            return Err("source file has no teldrive id".into());
+        }
+        let s = self.acc.secret.trim();
+        let headers = if let Some(k) = s.strip_prefix("api_key:") {
+            vec![("X-Api-Key".into(), k.trim().to_string())]
+        } else if !s.is_empty() {
+            vec![("Authorization".into(), format!("Bearer {s}"))]
+        } else {
+            Vec::new()
+        };
+        Ok(super::StreamSource {
+            url: format!(
+                "{}/v1/files/{}/content/{}",
+                self.base(),
+                super::pct(&entry.id),
+                super::pct(&entry.name)
+            ),
+            headers,
+        })
+    }
     async fn download(
         &self,
         entry: &RemoteEntry,

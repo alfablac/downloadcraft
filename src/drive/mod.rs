@@ -72,6 +72,14 @@ impl Progress {
     }
 }
 
+/// Direct playable source for embedded mpv: URL + extra HTTP headers
+/// (auth). Empty headers = URL self-authenticates (presigned/temp link).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct StreamSource {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+}
+
 /// Backend seam: all operations take display `path` ("" or "/" = root).
 /// Implementations map path <-> provider ids internally.
 #[async_trait::async_trait]
@@ -129,6 +137,14 @@ pub trait DriveBackend: Send + Sync {
         _prog: &Progress,
     ) -> Result<(), String> {
         Err("server-side copy unsupported".into())
+    }
+    /// Direct stream source for player: provider URL mpv can GET with
+    /// returned headers, bytes never touch local disk. Default Err =
+    /// not streamable (SFTP/FTP/crypt/local): caller says download first.
+    /// Implementations must reject crypt-wrapped peers (default covers
+    /// crypt wrapper itself; inner backends only reached unwrapped).
+    async fn stream_url(&self, _entry: &RemoteEntry) -> Result<StreamSource, String> {
+        Err("streaming not supported for this account: download file first".into())
     }
 }
 
@@ -349,6 +365,21 @@ pub fn fmt_bytes(n: u64) -> String {
 }
 
 /// Percent-encode one path segment / query value (RFC3986 unreserved kept).
+/// Minimal RFC 4648 base64 (Basic auth header; no dep for one header).
+pub fn b64(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in data.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
 pub fn pct(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -430,6 +461,12 @@ mod tests {
         assert_eq!(base_name("a/b.txt"), "b.txt");
         assert_eq!(pct("a b&c"), "a%20b%26c");
         assert_eq!(pct_path("a b/c"), "a%20b/c");
+    }
+    #[test]
+    fn b64_basic() {
+        assert_eq!(b64(b""), "");
+        assert_eq!(b64(b"u:p"), "dTpw");
+        assert_eq!(b64(b"user:pass"), "dXNlcjpwYXNz");
     }
     #[test]
     fn time_parse() {

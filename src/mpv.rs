@@ -267,7 +267,10 @@ pub fn build_args(s: &Settings, url: &str) -> Result<Vec<String>, String> {
 
 /// Re-export shim: UI codes against `mpv::embedded::*`.
 pub mod embedded {
-    pub use super::{embedded_args, ipc_pipe_path, spawn_embedded, MpvHandle, PlayerState};
+    pub use super::{
+        embedded_args, embedded_args_h, header_fields, ipc_pipe_path, spawn_embedded,
+        spawn_embedded_h, MpvHandle, PlayerState,
+    };
 }
 
 /// Spawn mpv detached (null stdio, no window). Returns child pid.
@@ -351,13 +354,48 @@ pub fn ipc_pipe_path(pid: u32) -> String {
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// mpv `http-header-fields` value from (name, value) pairs. mpv format:
+/// comma-separated "Name: value". Reject CR/LF/comma breaking format
+/// (values with those chars cannot nest); empty = no arg.
+pub fn header_fields(headers: &[(String, String)]) -> Result<Option<String>, String> {
+    if headers.is_empty() {
+        return Ok(None);
+    }
+    let mut parts = Vec::new();
+    for (n, v) in headers {
+        if n.is_empty() || n.chars().any(|c| c.is_control() || c == ':' || c == ',') {
+            return Err(format!("invalid stream header name: {n}"));
+        }
+        if v.chars().any(|c| c.is_control() || c == ',') {
+            return Err(format!("invalid stream header value for {n}"));
+        }
+        parts.push(format!("{n}: {v}"));
+    }
+    Ok(Some(parts.join(",")))
+}
+
 pub fn embedded_args(
     s: &Settings,
     url: &str,
     wid: isize,
     pipe: &str,
 ) -> Result<Vec<String>, String> {
+    embedded_args_h(s, url, wid, pipe, &[])
+}
+
+pub fn embedded_args_h(
+    s: &Settings,
+    url: &str,
+    wid: isize,
+    pipe: &str,
+    headers: &[(String, String)],
+) -> Result<Vec<String>, String> {
+    let header_arg = header_fields(headers)?
+        .map(|h| format!("--http-header-fields={h}"));
     let mut args = build_args(s, url)?;
+    if let Some(h) = header_arg {
+        args.insert(1, h);
+    }
     args.retain(|a| {
         let base = a.split('=').next().unwrap_or(a);
         !matches!(
@@ -404,14 +442,32 @@ pub fn embedded_args(
     Ok(args)
 }
 
+pub fn spawn_embedded_h(
+    s: &Settings,
+    url: &str,
+    wid: isize,
+    headers: &[(String, String)],
+) -> Result<MpvHandle, String> {
+    spawn_embedded_impl(s, url, wid, headers)
+}
+
 pub fn spawn_embedded(s: &Settings, url: &str, wid: isize) -> Result<MpvHandle, String> {
+    spawn_embedded_impl(s, url, wid, &[])
+}
+
+fn spawn_embedded_impl(
+    s: &Settings,
+    url: &str,
+    wid: isize,
+    headers: &[(String, String)],
+) -> Result<MpvHandle, String> {
     let exe = find_mpv(&s.mpv_path).ok_or_else(|| "mpv not found: set Options > mpv Path, place mpv.exe beside webcraft.exe, install mpv, or add it to PATH".to_string())?;
     let pipe = format!(
         "{}-{}",
         ipc_pipe_path(std::process::id()),
         SEQ.fetch_add(1, Ordering::Relaxed)
     );
-    let args = embedded_args(s, url, wid, &pipe)?;
+    let args = embedded_args_h(s, url, wid, &pipe, headers)?;
     let mut cmd = Command::new(&exe);
     cmd.args(&args)
         .stdin(Stdio::null())
@@ -568,6 +624,20 @@ impl MpvHandle {
             None => self.cmd(serde_json::json!({"command":["set_property","sid","no"]})),
         }
     }
+    /// Set extra HTTP headers for next/current stream loads.
+    pub fn set_http_headers(&self, headers: &[(String, String)]) {
+        if let Ok(Some(v)) = header_fields(headers) {
+            self.cmd(serde_json::json!({"command":["set_property","http-header-fields",v]}));
+        } else if headers.is_empty() {
+            self.cmd(serde_json::json!({"command":["set_property","http-header-fields",""]}));
+        }
+    }
+    /// Load file with per-file HTTP headers (headers set before load so
+    /// first request carries auth; headerless file clears old auth).
+    pub fn loadfile_h(&self, url: &str, headers: &[(String, String)]) -> Result<(), String> {
+        self.set_http_headers(headers);
+        self.loadfile(url)
+    }
     /// Load external subtitle file live (`sub-add ... select`).
     pub fn sub_add(&self, path: &str) {
         self.cmd(serde_json::json!({"command":["sub-add",path,"select"]}));
@@ -663,6 +733,32 @@ mod tests {
         assert_eq!(t[0].label(), "h264");
         assert_eq!(parse_tracks(&serde_json::json!(null)).len(), 0);
         assert_eq!(parse_tracks(&serde_json::json!("x")).len(), 0);
+    }
+
+    #[test]
+    fn header_fields_joins_and_rejects_breakers() {
+        assert_eq!(header_fields(&[]), Ok(None));
+        let h = vec![
+            ("Authorization".to_string(), "Bearer tok".to_string()),
+            ("X-Api-Key".to_string(), "k1".to_string()),
+        ];
+        assert_eq!(
+            header_fields(&h),
+            Ok(Some("Authorization: Bearer tok,X-Api-Key: k1".into()))
+        );
+        assert!(header_fields(&[("Bad,Name".into(), "v".into())]).is_err());
+        assert!(header_fields(&[("X".into(), "a\nb".into())]).is_err());
+        assert!(header_fields(&[("X".into(), "a,b".into())]).is_err());
+    }
+
+    #[test]
+    fn embedded_args_carry_stream_headers() {
+        let s = Settings::default();
+        let h = vec![("Authorization".to_string(), "Bearer tok".to_string())];
+        let a = embedded_args_h(&s, "https://x/v.mkv", 7, "pipe", &h).unwrap();
+        assert!(a.contains(&"--http-header-fields=Authorization: Bearer tok".to_string()));
+        let a0 = embedded_args(&s, "https://x/v.mkv", 7, "pipe").unwrap();
+        assert!(!a0.iter().any(|x| x.starts_with("--http-header-fields")));
     }
 
     #[test]

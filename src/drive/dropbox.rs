@@ -137,6 +137,15 @@ impl DriveBackend for Dropbox {
         self.rpc("files/move_v2", serde_json::json!({"from_path": self.full(&entry.path), "to_path": self.full(&to), "autorename": false})).await?;
         Ok(())
     }
+    /// Stream source: 4h temporary link (self-authenticating).
+    /// `/files/download` is POST-only, mpv cannot use it.
+    async fn stream_url(&self, entry: &RemoteEntry) -> Result<super::StreamSource, String> {
+        let v = self
+            .rpc("files/get_temporary_link", serde_json::json!({"path": self.full(&entry.path)}))
+            .await?;
+        let link = v["link"].as_str().filter(|s| !s.is_empty()).ok_or("Dropbox: no temporary link")?;
+        Ok(super::StreamSource { url: link.to_string(), headers: Vec::new() })
+    }
     async fn download(
         &self,
         entry: &RemoteEntry,

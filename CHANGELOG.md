@@ -2,6 +2,12 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.21.0] - 2026-10-22
+
+### Added
+
+- Drives remote video streaming: double-click a video on a remote pane plays it in the built-in player without downloading or mounting anything. mpv streams the provider URL directly (`DriveBackend::stream_url` + `http-header-fields`, set at spawn and live on file switch): Google Drive `alt=media` + Bearer, OneDrive `@microsoft.graph.downloadUrl` (pre-authenticated; `/content` redirect would strip auth), Dropbox temporary link, S3 SigV4 presigned URL (1h), WebDAV Basic auth, Teldrive API key/Bearer. No rclone mount or local proxy needed. SFTP/FTP and crypt-wrapped accounts cannot stream (no HTTP URL / ciphertext bytes) and show download-first status. Track/subtitle controls from 0.20.0 apply to streams as well.
+
 ## [0.20.2] - 2026-10-22
 
 ### Fixed

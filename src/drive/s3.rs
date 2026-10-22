@@ -142,6 +142,44 @@ pub fn copy_source_header(bucket: &str, key: &str) -> String {
     format!("/{}/{}", bucket, super::pct_path(key))
 }
 
+/// SigV4 presigned GET URL (query-signed, UNSIGNED-PAYLOAD; pure, tested).
+pub fn presign_get(s: &SigV4, url: &url::Url, expires_secs: u64, now: (String, String)) -> String {
+    let (amzdate, datestamp) = now;
+    let scope = format!("{datestamp}/{}/{}/aws4_request", s.region, s.service);
+    let cred = format!("{}/{}", s.access, scope);
+    let mut pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    pairs.push(("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into()));
+    pairs.push(("X-Amz-Credential".into(), cred));
+    pairs.push(("X-Amz-Date".into(), amzdate.clone()));
+    pairs.push(("X-Amz-Expires".into(), expires_secs.to_string()));
+    pairs.push(("X-Amz-SignedHeaders".into(), "host".into()));
+    let enc = |s: &str| {
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+                _ => format!("%{b:02X}"),
+            })
+            .collect::<String>()
+    };
+    let mut enc_pairs: Vec<(String, String)> =
+        pairs.iter().map(|(k, v)| (enc(k), enc(v))).collect();
+    enc_pairs.sort();
+    let canon_q = enc_pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
+    let host = url.host_str().unwrap_or("");
+    let canon = format!("GET\n{}\n{}\nhost:{}\n\nhost\nUNSIGNED-PAYLOAD", url.path(), canon_q, host);
+    let to_sign = format!("AWS4-HMAC-SHA256\n{amzdate}\n{scope}\n{}", sha256_hex(canon.as_bytes()));
+    let k_date = hmac(format!("AWS4{}", s.secret).as_bytes(), datestamp.as_bytes());
+    let k_region = hmac(&k_date, s.region.as_bytes());
+    let k_service = hmac(&k_region, s.service.as_bytes());
+    let k_sign = hmac(&k_service, b"aws4_request");
+    let sig = hex_bytes(&hmac(&k_sign, to_sign.as_bytes()));
+    let base = format!("{}://{}{}", url.scheme(), host, url.path());
+    format!("{base}?{canon_q}&X-Amz-Signature={sig}")
+}
+
 pub struct S3 {
     acc: DriveAccount,
     client: reqwest::Client,
@@ -438,6 +476,14 @@ impl DriveBackend for S3 {
         let _ = &mut e;
         Ok(())
     }
+    /// Stream source: SigV4 presigned GET (1h, self-authenticating).
+    async fn stream_url(&self, entry: &RemoteEntry) -> Result<super::StreamSource, String> {
+        let url = self.url(&entry.path, "");
+        Ok(super::StreamSource {
+            url: presign_get(&self.signer(), &url, 3600, now_amz()),
+            headers: Vec::new(),
+        })
+    }
     async fn download(
         &self,
         entry: &RemoteEntry,
@@ -685,6 +731,28 @@ mod tests {
             ("20150830T123600Z".into(), "20150830".into()),
         );
         assert_eq!(hdrs, hdrs2, "signing must be deterministic");
+    }
+    #[test]
+    fn presign_get_shape() {
+        let s = SigV4 {
+            access: "AKIDEXAMPLE".into(),
+            secret: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
+            region: "us-east-1".into(),
+            service: "s3".into(),
+        };
+        let url = url::Url::parse("https://bkt.s3.us-east-1.amazonaws.com/dir/a b.mkv").unwrap();
+        let u = presign_get(&s, &url, 3600, ("20150830T123600Z".into(), "20150830".into()));
+        assert!(u.starts_with("https://bkt.s3.us-east-1.amazonaws.com/dir/a%20b.mkv?"), "{u}");
+        assert!(u.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"), "{u}");
+        assert!(u.contains("X-Amz-Credential=AKIDEXAMPLE%2F20150830%2Fus-east-1%2Fs3%2Faws4_request"), "{u}");
+        assert!(u.contains("X-Amz-Expires=3600"), "{u}");
+        assert!(u.contains("X-Amz-SignedHeaders=host"), "{u}");
+        assert!(u.contains("&X-Amz-Signature="), "{u}");
+        let sig = u.rsplit("X-Amz-Signature=").next().unwrap();
+        assert_eq!(sig.len(), 64);
+        assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
+        // deterministic
+        assert_eq!(u, presign_get(&s, &url, 3600, ("20150830T123600Z".into(), "20150830".into())));
     }
     #[test]
     fn civil_check() {

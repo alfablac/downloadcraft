@@ -459,6 +459,22 @@ impl DriveBackend for GDrive {
             .find(|e| e.name == name)
             .ok_or_else(|| "Drive upload done but file not listed".to_string())
     }
+    /// Stream source: same alt=media URL as download + fresh Bearer.
+    async fn stream_url(&self, entry: &RemoteEntry) -> Result<super::StreamSource, String> {
+        if entry.id.is_empty() {
+            return Err("source file has no Drive id".into());
+        }
+        if entry.mime.starts_with("application/vnd.google-apps.") {
+            return Err("Google Docs/Sheets files cannot stream; export first".into());
+        }
+        Ok(super::StreamSource {
+            url: format!(
+                "https://www.googleapis.com/drive/v3/files/{}?alt=media&supportsAllDrives=true",
+                super::pct(&entry.id)
+            ),
+            headers: vec![("Authorization".into(), format!("Bearer {}", self.token().await?))],
+        })
+    }
     /// Server-side copy body: keep name, land in destination folder id.
     async fn copy_from(
         &self,
