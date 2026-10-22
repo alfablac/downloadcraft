@@ -55,8 +55,8 @@ function pumpNative() {
   }
 }
 // --- Media sniffing (observing webRequest only; no webRequestBlocking) ---
-const CANDIDATE_TTL_MS = 5 * 60 * 1000;
-const CANDIDATE_MAX = 50;
+const CANDIDATE_TTL_MS = 30 * 60 * 1000;
+const CANDIDATE_MAX = 200;
 const candidates = new Map(); // url -> {url, type, tabId, frameId, redirectFrom, time, size}
 // IDM model: every in-flight request keyed by requestId. Transient (not
 // persisted); on completion/error record dies, candidate (URL index) stays.
@@ -118,26 +118,36 @@ async function loadCandidates() {
   } catch (e) {}
 }
 const SNIFF_TYPES = new Set(["application/dash+xml", "application/x-mpegurl", "application/vnd.apple.mpegurl", "application/x-mpegurl", "video/vnd.mpeg.dash.mpd", "video/mpegurl", "video/x-mpegurl", "application/mpegurl"]);
+const IG_CDN_RE = /(^|\.)(cdninstagram\.com|fbcdn\.net)$/i;
+const IG_PAGE_RE = /(^|\.)instagram\.com$/i;
+function isIgCdnUrl(u) { try { return IG_CDN_RE.test(new URL(u).hostname); } catch (e) { return /cdninstagram\.com|fbcdn\.net/i.test(String(u || "")); } }
+function isIgDoc(details) { try { const d = details && (details.documentUrl || details.initiator || details.originUrl || ""); if (!d) return false; return IG_PAGE_RE.test(new URL(d).hostname); } catch (e) { return false; } }
 function isSniff(details, type) {
   const url = details.url || "";
-  if (/\.(json|js|mjs|css|html?|map)($|[?#])/i.test(url)) return false; // page assets, whatever MIME claims
   let path = "";
-  try { path = new URL(url).pathname.toLowerCase(); } catch (e) {}
+  try { path = new URL(url).pathname.toLowerCase(); } catch (e) { path = String(url).split(/[?#]/)[0].toLowerCase(); }
+  // pathname only: query-string ext false-rejects signed IG URLs
+  // (?x=.js / ?token=xx.css). Page assets rejected by real path suffix.
+  if (/\.(json|js|mjs|css|html?|map)$/i.test(path)) return false; // page assets
+  const ft = String(details.type || "");
+  const igCdn = isIgCdnUrl(url);
+  const igDoc = isIgDoc(details);
+  // IG progressive (extension-less, video/mp4, type=fetch/xhr/other) and
+  // IG DASH (extension-less .mpd via fetch, application/dash+xml or
+  // octet-stream): accept IG-CDN regardless of request type. Request-type
+  // allowlist was root cause: MSE fetch arrives as xmlhttprequest/fetch, not media.
+  if (igCdn && (type.startsWith("video/") || type.startsWith("audio/") || SNIFF_TYPES.has(type))) return true;
+  if (igCdn && (type === "application/octet-stream" || !type) && (igDoc || ft === "media" || ft === "xmlhttprequest" || ft === "fetch" || ft === "other" || ft === "object" || ft === "")) return true;
+  if (igCdn && igDoc && (path.endsWith(".mpd") || path.endsWith(".m3u8"))) return true;
+  if (path.endsWith(".mpd") || path.endsWith(".m3u8")) return true;
   // Extension fallback: DASH/HLS/full mp4 served without usable Content-Type.
   if (!type || type === "application/octet-stream") {
-    if (path.endsWith(".mpd") || path.endsWith(".m3u8") || path.endsWith(".mp4")) return true;
-    // Extension-less full media (IG CDN serves blob-MSE mp4s at opaque paths):
-    // browser <video src> fetches are type=media; keep API/XHR octet-stream out.
+    if (path.endsWith(".mp4")) return true;
     return type === "application/octet-stream" && details.type === "media";
   }
   if (SNIFF_TYPES.has(type)) return true;
-  if (type.startsWith("video/") || type.startsWith("audio/")) {
-    // Segments (seg-1.ts, chunk_00001.m4s, -0002.ts) pollute panel; only
-    // manifests/full media belong there.
-    try { const seg = new URL(url).pathname.split("/").pop() || ""; if (/^(seg|segment|chunk|frag)[-_]?\d|\.m4s$|[-_]\d+\.(ts|m4s)$/i.test(seg)) return false; } catch (e) {}
-    return true;
-  }
-  return path.endsWith(".mpd") || path.endsWith(".m3u8");
+  if (type.startsWith("video/") || type.startsWith("audio/")) return true;
+  return false;
 }
 function isPlaylistUrl(u) { try { const p = new URL(u).pathname.toLowerCase(); return p.endsWith(".mpd") || p.endsWith(".m3u8"); } catch (e) { return /\.(mpd|m3u8)($|[?#])/i.test(String(u || "")); } }
 function pruneCandidates(now = Date.now()) {
@@ -402,6 +412,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // Element-frame match empty: retry frame-agnostic (frameId=null passes
         // tolerant filter) before returning empty.
         if (!pool.length && senderFrame != null && typeof matchRecordsForElement === "function") pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null }, Date.now());
+          // IG host-scoped fallback (background-only): CDN URLs never carry
+          // shortcode, MSE src is blob:, timing anchored at firstPlay misses
+          // preloads. pageHost from sender.tab.url (trusted bg, not msg).
+          if (!pool.length && typeof matchRecordsForElement === "function") {
+            let ph = "";
+            try { ph = new URL((sender.tab && sender.tab.url) || "").hostname.toLowerCase(); } catch (e) {}
+            if (/(^|\.)instagram\.com$/.test(ph)) pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null, pageHost: "instagram.com" }, Date.now(), [...candidates.values()]);
+          }
       } else {
         pool = [...candidates.values()].filter((c) => tabId == null || c.tabId === tabId);
       }
@@ -416,7 +434,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // to yt-dlp page (else manifest choice lost). Only cookies scope passes.
   if (msg && msg.type === "downloadcraft-video-panel") { sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer || msg.pageUrl, pageTitle: msg.pageTitle, pageUrl: msg.intent === "page" ? msg.pageUrl : undefined, cookieUrl: msg.pageUrl, intent: msg.intent }).then(sendResponse, (e) => sendResponse({ type: "error", error: String((e && e.message) || e) })); return true; }
 });
+// Toolbar click -> content scan (unchanged); IG fallback lives in getCandidates above.
 chrome.action.onClicked.addListener((tab) => { if (tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "downloadcraft-scan" }).catch(() => {}); });
-// SPA pushState nav fires url change without status=loading: drop stale streams then too.
-if (chrome.tabs && chrome.tabs.onUpdated) chrome.tabs.onUpdated.addListener((tabId, info) => { if ((info.status === "loading" || info.url) && info.url) { let n = false; for (const [u, c] of [...candidates]) if (c.tabId === tabId) { candidates.delete(u); n = true; } for (const [k, r] of [...requestRecords]) if (r.tabId === tabId) requestRecords.delete(k); if (n) persistCandidates(); } });
+// SPA pushState nav (url-only change) must NOT wipe candidates: IG preloads
+// media before user opens reel; only real loading nav to a new URL purges.
+const tabLastUrl = new Map();
+if (chrome.tabs && chrome.tabs.onUpdated) chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.status !== "loading" || !info.url) return;
+  if (tabLastUrl.get(tabId) === info.url) return;
+  tabLastUrl.set(tabId, info.url);
+  let n = false;
+  for (const [u, c] of [...candidates]) if (c.tabId === tabId) { candidates.delete(u); n = true; }
+  for (const [k, r] of [...requestRecords]) if (r.tabId === tabId) requestRecords.delete(k);
+  if (n) persistCandidates();
+});
 if (chrome.tabs && chrome.tabs.onRemoved) chrome.tabs.onRemoved.addListener((tabId) => { for (const [k, r] of [...requestRecords]) if (r.tabId === tabId) requestRecords.delete(k); for (const [u, c] of [...candidates]) if (c.tabId === tabId) candidates.delete(u); persistCandidates(); });

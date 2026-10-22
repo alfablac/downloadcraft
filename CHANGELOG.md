@@ -2,6 +2,22 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.22.1] - 2026-10-22
+
+### Fixed
+
+- Instagram capture button invisible after 0.22.0: button now uses
+  `position:fixed`, repositions on inner-container scroll (capture-phase
+  listener), effective video rect falls back to sized wrapper ancestor
+  (IG inserts `blob:`/MSE `<video>` at 0×0), hover hit-tests pointer
+  coordinates against video rect (IG overlay/action-rail siblings never
+  satisfied containment hover), and button flashes 2.5 s on playback start
+  so it can be found without moving the mouse. Sniffing accepts IG-CDN
+  (`cdninstagram.com`/`fbcdn.net`) media on any request type, SPA
+  navigations no longer purge tab candidates, candidate TTL/cap raised
+  (30 min / 200), ranking gains host-scoped IG fallback when src/postId
+  tiers cannot match blob playback.
+
 ## [0.22.0] - 2026-10-22
 
 ### Added

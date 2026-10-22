@@ -120,8 +120,14 @@
     var esc = String(pid).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     return new RegExp("[/=?&._-]" + esc + "([/?&#._-]|$)").test(String(u));
   }
-  function matchRecordsForElement(records, el, now) {
+  function matchRecordsForElement(records, el, now, extraPool) {
     var e = el || {};
+    // Host-scoped fallback (background-only, NOT reachable from content
+    // messages): IG/MSE pages can never src/id-match CDN URLs. Extra pool
+    // entries without tab/frame recorded (e.g. MV3 SW / webNavigation SPA
+    // ids) pass only when host-matched AND inside since window.
+    var hostScope = String(e.pageHost || "").toLowerCase();
+    var useExtra = !!(hostScope && e.since);
     var srcs = {};
     (e.srcs || []).forEach(function (s) { if (s && !/^(blob|data):/.test(s)) srcs[s] = 1; });
     if (e.srcKey && !/^(blob|data):/.test(e.srcKey)) srcs[e.srcKey] = 1;
@@ -137,6 +143,26 @@
       if (typeof e.frameId === "number" && typeof r.frameId === "number" && r.frameId !== e.frameId) return;
       pool.push(r);
     });
+    var extra = [];
+    if (useExtra) {
+      (extraPool || []).forEach(function (r) {
+        if (!r || !r.url || /^(blob|data):/.test(r.url)) return;
+        // Same-tab extras with different frame lose to tab-strict pool;
+        // tabId==null entries (host-scoped) still pass.
+        if (e.tabId != null && r.tabId != null && r.tabId !== e.tabId) return;
+        try {
+          var h = new URL(r.url).hostname.toLowerCase();
+          // IG page (instagram.com) serves media from cdninstagram/fbcdn:
+          // pageHost scope must accept CDN pair, not just subdomains.
+          var igPair = (hostScope === "instagram.com" || hostScope.endsWith(".instagram.com"))
+            && /(^|\.)(cdninstagram\.com|fbcdn\.net)$/.test(h);
+          if (!igPair && h !== hostScope && !h.endsWith("." + hostScope)) return;
+        } catch (err) { return; }
+        if (!(r.time && r.time >= e.since - 2000 && r.time <= e.since + 45000)) return;
+        extra.push(r);
+      });
+    }
+    function hostExtra() { return extra.length ? out(extra) : []; }
     function out(list) { return list.map(function (r) { return { url: r.url, type: r.type || "", size: r.size || 0, time: r.time || 0 }; }); }
     function hopsOf(r) { return Array.isArray(r.hops) ? r.hops : []; }
     if (srcKeys.length) {
@@ -162,9 +188,12 @@
     // Timing anchored at firstPlay (since), never at click time (now):
     // late click must not widen window. No since -> no timing hits.
     if (!srcKeys.length && since) {
-      return out(pool.filter(function (r) { return !!(r.time && r.time >= since - 2000 && r.time <= since + 45000); }));
+      var timed = out(pool.filter(function (r) { return !!(r.time && r.time >= since - 2000 && r.time <= since + 45000); }));
+      if (timed.length) return timed;
     }
-    return [];
+    // Host-wide fallback LAST resort (background-only, never reachable
+    // via content messages): IG/MSE pages never src/id-match.
+    return hostExtra();
   }
 
   g.rankCandidates = rankCandidates;

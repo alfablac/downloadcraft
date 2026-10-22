@@ -207,17 +207,18 @@
       return false;
     });
   }
-  function playerRoot(video) {
-    try {
-      const vr = video.getBoundingClientRect();
-      let host = video;
-      let el = video.parentElement;
-      for (let i = 0; i < 4 && el; i++) {
-        const r = el.getBoundingClientRect();
-        if (Math.abs(r.width - vr.width) <= 12 && Math.abs(r.height - vr.height) <= 12 && r.width >= 40) { host = el; el = el.parentElement; } else break;
-      }
-      return host;
-    } catch (e) { return video; }
+  // Effective rect: IG inserts blob/MSE <video> at 0x0 (layout pending) or
+  // CSS-sizes only the wrapper. Fall back to nearest sized ancestor.
+  function videoRect(video) {
+    const r = video.getBoundingClientRect();
+    if (r.width >= 120 && r.height >= 68) return r;
+    let el = video.parentElement;
+    for (let i = 0; i < 4 && el; i++) {
+      const pr = el.getBoundingClientRect();
+      if (pr.width >= 120 && pr.height >= 68) return pr;
+      el = el.parentElement;
+    }
+    return r;
   }
   function showForVideo(video) {
     // Rescan at click time: manifests/page media declared after load.
@@ -249,12 +250,12 @@
   function positionBtn(video) {
     const btn = btnFor.get(video);
     if (!btn) return;
-    const r = video.getBoundingClientRect();
+    const r = videoRect(video);
     if (r.width < 120 || r.height < 68) { btn.style.display = "none"; return; }
     btn.style.display = "";
     if (btn.dataset.dragged) return;
-    btn.style.left = (window.scrollX + r.left - 10) + "px";
-    btn.style.top = (window.scrollY + r.top - 10) + "px";
+    btn.style.left = (r.left - 10) + "px";
+    btn.style.top = (r.top - 10) + "px";
   }
   function attachBtn(video) {
     let btn = btnFor.get(video);
@@ -264,7 +265,7 @@
     btn.setAttribute("aria-label", "Download video");
     btn.setAttribute("data-downloadcraft-btn", "1");
     btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:7px auto;pointer-events:none"><path d="M12 3v11"/><path d="m7 10 5 5 5-5"/><path d="M4 20h16"/></svg>';
-    btn.style.cssText = "position:absolute;z-index:2147483646;width:32px;height:32px;border-radius:50%;background:#4E7A74;color:#fff;border:1px solid #7FB3AA;padding:0;cursor:grab;text-align:center;opacity:0;pointer-events:none;display:none;touch-action:none;user-select:none;-webkit-user-select:none;font-family:\"Inter\",system-ui,sans-serif;";
+    btn.style.cssText = "position:fixed;z-index:2147483646;width:32px;height:32px;border-radius:50%;background:#4E7A74;color:#fff;border:1px solid #7FB3AA;padding:0;cursor:grab;text-align:center;opacity:0;pointer-events:none;display:none;touch-action:none;user-select:none;-webkit-user-select:none;font-family:\"Inter\",system-ui,sans-serif;";
     btn.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); if (btn.dataset.suppressClick) { delete btn.dataset.suppressClick; return; } showForVideo(video); });
 
     // Draggable: press-move >4px drags (persisted offset per video via dataset),
@@ -299,8 +300,18 @@
     // Hover on player wrapper: overlays cover <video> (X/YouTube/Instagram).
     // Delegated mouseover: overlay siblings (IG action rail/gradient) never
     // fire mouseenter on wrapper/video, so check containment per event.
-    const hoverHost = playerRoot(video);
-    document.addEventListener("mouseover", (e) => { if (e.target === btn || hoverHost.contains(e.target)) showBtn(); else hideBtn(); });
+    // Coordinate hover (overlay-proof): IG gradient/action-rail layers are
+    // siblings covering video, containment checks never fire for them.
+    // Hit-test pointer coords vs effective rect, ignore event target.
+    const onHover = (e) => { const r = videoRect(video); const inside = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom; if (e.target === btn || inside) { positionBtn(video); showBtn(); } else hideBtn(); };
+    document.addEventListener("mouseover", onHover, true);
+    document.addEventListener("mousemove", onHover, true);
+    // Discoverability: brief reveal on playback start (pointer may sit still
+    // over video, no mousemove fires). Touch/no-hover: also flash on attach.
+    let flashTimer = null;
+    const flashBtn = () => { positionBtn(video); showBtn(); if (flashTimer) clearTimeout(flashTimer); flashTimer = setTimeout(hideBtn, 2500); };
+    video.addEventListener("playing", flashBtn);
+    if (window.matchMedia && matchMedia("(hover: none)").matches) { flashBtn(); video.addEventListener("loadedmetadata", flashBtn); video.addEventListener("play", flashBtn); }
     btn.addEventListener("mouseenter", showBtn);
     btn.addEventListener("mouseleave", hideBtn);
     btn.addEventListener("focus", showBtn);
@@ -318,12 +329,13 @@
     wired.add(video);
     // Button on poster/metadata too: paused X/Reddit videos never fire
     // `playing`, and loop+muted+autoplay IS the X feed video shape.
-    const isBig = () => { const r = video.getBoundingClientRect(); return r.width >= 120 && r.height >= 68; };
+    const isBig = () => { const r = videoRect(video); return r.width >= 120 && r.height >= 68; };
     const show = () => { if (isBig()) attachBtn(video); };
     if (isBig() || video.poster || video.readyState >= 1 || video.currentSrc || !video.paused) attachBtn(video);
     video.addEventListener("loadstart", () => { video._wcFirstPlay = 0; video._wcSeen = Date.now(); video._wcAnchor = null; });
     video.addEventListener("playing", () => { if (!video._wcFirstPlay) { video._wcFirstPlay = Date.now(); anchorFor(video); } show(); });
     video.addEventListener("loadedmetadata", show);
+    video.addEventListener("loadeddata", show);
     video.addEventListener("canplay", show);
   }
   let manifestUrls = [];
@@ -352,7 +364,8 @@
   let pending = null;
   const mo = new MutationObserver(() => { if (pending) return; pending = setTimeout(() => { pending = null; scan(); for (let i = btnForEntries.length - 1; i >= 0; i--) { const [v, b] = btnForEntries[i]; if (!v.isConnected) { b.remove(); btnForEntries.splice(i, 1); } } document.querySelectorAll("video, audio").forEach(positionBtn); }, 400); });
   window.addEventListener("resize", () => document.querySelectorAll("video, audio").forEach(positionBtn), { passive: true });
-  window.addEventListener("scroll", () => document.querySelectorAll("video, audio").forEach(positionBtn), { passive: true });
+  // Capture: IG reels scroll inner snap containers, no window scroll fires.
+  window.addEventListener("scroll", () => document.querySelectorAll("video, audio").forEach(positionBtn), { passive: true, capture: true });
   mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "poster"] });
   scan();
   api.runtime.onMessage.addListener((msg) => {

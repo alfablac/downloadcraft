@@ -105,4 +105,37 @@ assert.deepEqual(also.matchRecordsForElement(streamRecs, { tabId: 7, frameId: 3,
 // postId tier precedence over streamId (exclusive tiers, postId before streamId)
 assert.deepEqual(matchRecordsForElement([...streamRecs, { url: "https://cdn/post_abc123_x.mp4", tabId: 7, frameId: 3, time: T, type: "video/mp4" }], { tabId: 7, frameId: 3, srcs: [], postId: "abc123", streamId: "cz2wlzfaeiwh1", since: 0, now: T }, T).map((r) => r.url), ["https://cdn/post_abc123_x.mp4"], "postId tier before streamId");
 
+// IG host-scoped fallback (background-only extraPool): CDN URLs carry no
+// shortcode, MSE src is blob:, so src/postId/timing tiers all miss.
+const igRecs = [
+  { url: "https://scontent.cdninstagram.com/v/t50.2886-16/abc.mp4?efg=xyz", tabId: 7, frameId: 3, time: T + 5000, type: "video/mp4" },
+  { url: "https://scontent.xx.fbcdn.net/v/t39.30808-6/xyz.mp4", tabId: 7, frameId: 3, time: T + 6000, type: "video/mp4" },
+  { url: "https://scontent.cdninstagram.com/v/t50.2886-16/old.mp4", tabId: 7, frameId: 3, time: T - 99999, type: "video/mp4" }, // outside since window
+  { url: "https://other.cdn.example/v.mp4", tabId: 7, frameId: 3, time: T + 5000, type: "video/mp4" }, // wrong host
+];
+const igEl = { tabId: 7, frameId: 3, srcs: ["blob:https://www.instagram.com/1"], postId: "DAbc123XyZ", since: T, now: T, pageHost: "instagram.com" };
+// main pool empty (records evicted/killed), extraPool = candidates: host+window hit
+assert.deepEqual(
+  matchRecordsForElement([], igEl, T, igRecs).map((r) => r.url),
+  ["https://scontent.cdninstagram.com/v/t50.2886-16/abc.mp4?efg=xyz", "https://scontent.xx.fbcdn.net/v/t39.30808-6/xyz.mp4"],
+  "IG host fallback: cdninstagram+fbcdn in-window, old + wrong-host excluded");
+// fbcdn passes when scope is fbcdn.net
+assert.deepEqual(
+  matchRecordsForElement([], { ...igEl, pageHost: "fbcdn.net" }, T, igRecs).map((r) => r.url),
+  ["https://scontent.xx.fbcdn.net/v/t39.30808-6/xyz.mp4"],
+  "IG host fallback: fbcdn.net scope");
+// no pageHost -> no fallback (content-reachable calls never widen)
+assert.deepEqual(matchRecordsForElement([], { tabId: 7, frameId: 3, srcs: [], postId: "DAbc123XyZ", since: T, now: T }, T, igRecs), [], "no pageHost: extraPool ignored");
+// no since -> no fallback
+assert.deepEqual(matchRecordsForElement([], { ...igEl, since: 0 }, T, igRecs), [], "since=0: no host fallback");
+// src tier still wins over host fallback
+const igSrc = [{ url: "https://scontent.cdninstagram.com/v/mine.mp4", tabId: 7, frameId: 3, time: T, type: "video/mp4" }];
+assert.deepEqual(
+  matchRecordsForElement(igSrc, { tabId: 7, frameId: 3, srcs: ["https://scontent.cdninstagram.com/v/mine.mp4"], postId: "DAbc123XyZ", since: T, now: T, pageHost: "instagram.com" }, T, igRecs).map((r) => r.url),
+  ["https://scontent.cdninstagram.com/v/mine.mp4"], "src tier exclusive over host fallback");
+// firefox parity
+assert.deepEqual(
+  also.matchRecordsForElement([], igEl, T, igRecs).map((r) => r.url),
+  ["https://scontent.cdninstagram.com/v/t50.2886-16/abc.mp4?efg=xyz", "https://scontent.xx.fbcdn.net/v/t39.30808-6/xyz.mp4"], "IG host fallback firefox parity");
+
 console.log("rank.test.mjs OK", urls);

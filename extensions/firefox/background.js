@@ -85,8 +85,8 @@ async function browserDownload(p) {
 
 const PANEL_EXTS = new Set("aac avi f4v flv m4a m4v mkv mov mp3 mp4 mpeg mpg ogg ogv rm ts wav webm wma wmv 3gp".split(" "));
 const STREAM_TYPES = new Set(["application/dash+xml", "application/x-mpegurl", "application/vnd.apple.mpegurl", "application/x-mpegurl", "video/vnd.mpeg.dash.mpd", "video/mpegurl", "video/x-mpegurl", "application/mpegurl"]);
-const CANDIDATE_TTL_MS = 5 * 60 * 1000;
-const CANDIDATE_MAX = 80;
+const CANDIDATE_TTL_MS = 30 * 60 * 1000;
+const CANDIDATE_MAX = 200;
 const candidates = new Map(); // url -> {url, type, tabId, frameId, redirectFrom, time, size}
 // IDM model: every in-flight request keyed by requestId (transient);
 // on completion/error record dies, candidate (URL index) stays.
@@ -94,10 +94,15 @@ const requestRecords = new Map(); // requestId -> {url, redirectFrom, hops, tabI
 const RECORD_TTL_MS = 10 * 60 * 1000;
 const RECORD_MAX = 500;
 const MEDIA_PATH = /\.(mpd|m3u8|mp4|webm|ts|m4s)($|[?#])/i;
-const MEDIA_TYPES = new Set(["media", "xmlhttprequest", "other", "object"]);
+const MEDIA_TYPES = new Set(["media", "xmlhttprequest", "fetch", "other", "object"]);
+const IG_CDN_RE = /(^|\.)(cdninstagram\.com|fbcdn\.net)$/i;
+const IG_PAGE_RE = /(^|\.)instagram\.com$/i;
+function isIgCdnUrl(u) { try { return IG_CDN_RE.test(new URL(u).hostname); } catch (e) { return /cdninstagram\.com|fbcdn\.net/i.test(String(u || "")); } }
+function isIgDoc(details) { try { const d = details && (details.documentUrl || details.initiator || details.originUrl || ""); if (!d) return false; return IG_PAGE_RE.test(new URL(d).hostname); } catch (e) { return false; } }
 function isMediaIsh(details) {
   // Record only media-ish requests; full <all_urls> recording bloats TTL map
   // with page/API traffic element matcher never needs.
+  if (isIgCdnUrl(details.url)) return true;
   if (details.type && MEDIA_TYPES.has(details.type)) return true;
   try { return MEDIA_PATH.test(new URL(details.url || "").pathname); } catch (e) { return MEDIA_PATH.test(String(details.url || "")); }
 }
@@ -157,10 +162,14 @@ function captureDecision(details) {
   const type = headerOf(details.responseHeaders, "content-type").split(";")[0].trim().toLowerCase();
   const disp = headerOf(details.responseHeaders, "content-disposition").toLowerCase();
   const ext = extOfUrl(details.url);
+  let urlPath = "";
+  try { urlPath = new URL(details.url || "").pathname.toLowerCase(); } catch (e) { urlPath = String(details.url || "").split(/[?#]/)[0].toLowerCase(); }
+  if (/\.(json|js|mjs|css|html?|map)$/i.test(urlPath)) return null; // pathname only: query ext false-rejects signed IG URLs
   const fname = filenameFromDisp(disp, details.url);
   const isStream = STREAM_TYPES.has(type) || ext === "m3u8" || ext === "mpd";
   const isMedia = type.startsWith("video/") || type.startsWith("audio/") || PANEL_EXTS.has(ext);
-  if (isStream || isMedia) return { url: details.url, type: type || (ext === "mpd" ? "application/dash+xml" : "application/x-mpegurl"), tabId: details.tabId, kind: "panel" };
+  const igSniff = isIgCdnUrl(details.url) && (type.startsWith("video/") || type.startsWith("audio/") || STREAM_TYPES.has(type) || type === "application/octet-stream" || !type || urlPath.endsWith(".mpd") || urlPath.endsWith(".m3u8"));
+  if (isStream || isMedia || igSniff) return { url: details.url, type: type || (ext === "mpd" ? "application/dash+xml" : "application/x-mpegurl"), tabId: details.tabId, kind: "panel" };
   const isAttach = disp.startsWith("attachment");
   // NB: nearly all application/* is JSON/JS API traffic. Requiring real file
   // ext (no fname fallback) stops drive-by capture of site XHR.
@@ -346,6 +355,12 @@ browser.runtime.onMessage.addListener((msg, sender) => {
       // Element-frame match empty: retry frame-agnostic (frameId=null passes
       // tolerant filter) before returning empty.
       if (!pool.length && senderFrame != null && typeof matchRecordsForElement === "function") pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null }, Date.now());
+      // IG host-scoped fallback (background-only): see Chromium.
+      if (!pool.length && typeof matchRecordsForElement === "function") {
+        let ph = "";
+        try { ph = new URL((sender.tab && sender.tab.url) || "").hostname.toLowerCase(); } catch (e) {}
+        if (/(^|\.)instagram\.com$/.test(ph)) pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null, pageHost: "instagram.com" }, Date.now(), [...candidates.values()]);
+      }
     } else {
       // No frame filter: player frame != sniffer frame on embeds drops all.
       pool = [...candidates.values()].filter((c) => tabId == null || c.tabId === tabId);
@@ -358,7 +373,15 @@ browser.runtime.onMessage.addListener((msg, sender) => {
 });
 
 // Toolbar click: scan tab for video / page download (was no-op).
+// Toolbar click -> content scan (unchanged); IG fallback lives in getCandidates above.
 if (browser.browserAction && browser.browserAction.onClicked) browser.browserAction.onClicked.addListener((tab) => { if (tab && tab.id) browser.tabs.sendMessage(tab.id, { type: "downloadcraft-scan" }).catch(() => {}); });
 // SPA pushState nav: url change without status=loading also drops stale streams.
-if (browser.tabs && browser.tabs.onUpdated) browser.tabs.onUpdated.addListener((tabId, info) => { if ((info.status === "loading" || info.url) && info.url) { for (const [u, c] of [...candidates]) if (c.tabId === tabId) candidates.delete(u); for (const [k, r] of [...requestRecords]) if (r.tabId === tabId) requestRecords.delete(k); } });
+const tabLastUrl = new Map();
+if (browser.tabs && browser.tabs.onUpdated) browser.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.status !== "loading" || !info.url) return;
+  if (tabLastUrl.get(tabId) === info.url) return;
+  tabLastUrl.set(tabId, info.url);
+  for (const [u, c] of [...candidates]) if (c.tabId === tabId) candidates.delete(u);
+  for (const [k, r] of [...requestRecords]) if (r.tabId === tabId) requestRecords.delete(k);
+});
 if (browser.tabs && browser.tabs.onRemoved) browser.tabs.onRemoved.addListener((tabId) => { for (const [k, r] of [...requestRecords]) if (r.tabId === tabId) requestRecords.delete(k); for (const [u, c] of [...candidates]) if (c.tabId === tabId) candidates.delete(u); });
