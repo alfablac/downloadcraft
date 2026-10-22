@@ -94,9 +94,13 @@ pub async fn copy_file(
     prog: &Progress,
 ) -> Result<(), String> {
     prog.check()?;
-    // Server-side: destination provider copies from source directly.
-    // Crypt peers excluded (ids are logical, bytes encrypted).
-    if !src_be.crypt_wrapped()
+    // S3 only: destination CopyObject via source backend, silent fallback
+    // on any failure. Google Drive server copy NOT attempted here;
+    // explicit Drives button routes through `copy_file_server_side` instead.
+    let is_s3_pair = src_be.kind() == crate::model::DriveKind::S3
+        && dst_be.kind() == crate::model::DriveKind::S3;
+    if is_s3_pair
+        && !src_be.crypt_wrapped()
         && !dst_be.crypt_wrapped()
         && dst_be.copy_from(src_be, entry, dst_dir, prog).await.is_ok()
     {
@@ -153,6 +157,97 @@ pub async fn copy_file(
     let _ = tokio::fs::remove_file(&tmp).await;
     up?;
     Ok(())
+}
+
+/// Strict server-side copy (explicit Drives button, Google Drive pairs):
+/// provider copy only, no staging fallback. Error = caller surfaces it;
+/// no local bytes downloaded, nothing written on failure.
+pub async fn copy_file_server_side(
+    src_be: &Arc<dyn DriveBackend>,
+    entry: &RemoteEntry,
+    dst_be: &Arc<dyn DriveBackend>,
+    dst_dir: &str,
+    prog: &Progress,
+) -> Result<(), String> {
+    prog.check()?;
+    if src_be.crypt_wrapped() || dst_be.crypt_wrapped() {
+        return Err("server-side copy unavailable on crypt-wrapped accounts".into());
+    }
+    dst_be.copy_from(src_be, entry, dst_dir, prog).await?;
+    prog.add(entry.size);
+    Ok(())
+}
+
+/// Run explicit server-side copy over entries (Google Drive pairs only,
+/// files.copy per file, folders recurse). No staging fallback: first
+/// error aborts job. Reuses run_job's collection so dir handling and
+/// progress totals match Copy.
+pub async fn run_server_side_copy(
+    src_be: &Arc<dyn DriveBackend>,
+    entries: &[RemoteEntry],
+    dst_be: &Arc<dyn DriveBackend>,
+    dst_dir: &str,
+    prog: &Progress,
+) -> Result<String, String> {
+    if src_be.kind() != crate::model::DriveKind::GoogleDrive
+        || dst_be.kind() != crate::model::DriveKind::GoogleDrive
+    {
+        return Err("server-side copy requires Google Drive on both sides".into());
+    }
+    // Collect flat file list with destination dirs, mirroring run_job.
+    let mut files: Vec<(RemoteEntry, String)> = Vec::new();
+    let mut total: u64 = 0;
+    for e in entries {
+        if e.is_dir {
+            let sub = collect_files(src_be, e).await?;
+            for f in &sub {
+                let rel = norm(&f.path)
+                    .strip_prefix(&norm(&e.path))
+                    .unwrap_or("")
+                    .trim_matches('/')
+                    .to_string();
+                let parent_rel = super::parent_path(&rel);
+                let base = super::join_path(dst_dir, &norm(&e.name));
+                let d = if parent_rel.is_empty() {
+                    base
+                } else {
+                    super::join_path(&base, &parent_rel)
+                };
+                files.push((f.clone(), d));
+                total += f.size;
+            }
+            if sub.is_empty() {
+                let _ = dst_be.mkdir(&super::join_path(dst_dir, &e.name)).await;
+            }
+        } else {
+            files.push((e.clone(), dst_dir.to_string()));
+            total += e.size;
+        }
+    }
+    prog.set_total(total);
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    let mut first_err: Option<String> = None;
+    for (f, d) in &files {
+        prog.check()?;
+        match copy_file_server_side(src_be, f, dst_be, d, prog).await {
+            Ok(()) => done += 1,
+            Err(e) => {
+                failed += 1;
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    if failed > 0 {
+        Err(format!(
+            "server-side copy: {failed} failed, {done} done: {}",
+            first_err.unwrap_or_default()
+        ))
+    } else {
+        Ok(format!("server-side copied {done} file(s)"))
+    }
 }
 
 /// Delete partial destination file after error/cancel so half files

@@ -477,6 +477,113 @@ impl DrivesUi {
         self.status = "Job queued in Downloads > Drives panel (bottom).".into();
     }
 
+    /// Explicit server-side copy pane `from` -> other pane current dir.
+    /// Google Drive pairs only (button gated); strict files.copy, no
+    /// staging fallback: failures surface as job errors.
+    fn server_side_copy_selected(
+        &mut self,
+        rt: &Arc<tokio::runtime::Runtime>,
+        settings: &Settings,
+        from: usize,
+    ) {
+        let to = 1 - from;
+        let src_id = self.panes[from].account_id.clone();
+        let dst_id = self.panes[to].account_id.clone();
+        // Defense in depth: same gate as button visibility.
+        let pair_ok = [&src_id, &dst_id].iter().all(|id| {
+            account_by_id(settings, id)
+                .map(|a| {
+                    a.kind == downloadcraft_lib::model::DriveKind::GoogleDrive
+                        && a.crypt_password.is_empty()
+                })
+                .unwrap_or(false)
+        });
+        let same_place = src_id == dst_id
+            && self.panes[from].path.trim_matches('/') == self.panes[to].path.trim_matches('/');
+        if !pair_ok {
+            self.status = "Server-side copy needs Google Drive on both panes (crypt off).".into();
+            return;
+        }
+        if same_place {
+            self.status = "Server-side copy: destination is the source folder.".into();
+            return;
+        }
+        let dst_dir = self.panes[to].path.clone();
+        let entries: Vec<RemoteEntry> = self.panes[from]
+            .entries
+            .iter()
+            .filter(|e| self.panes[from].selected.contains(&e.id))
+            .cloned()
+            .collect();
+        if entries.is_empty() {
+            self.status = "Select file(s) first (click rows).".into();
+            return;
+        }
+        let settings2 = settings.clone();
+        let prog = Progress::new();
+        let prog2 = prog.clone();
+        let overwrite = self.overwrite;
+        let dst_label = account_by_id(settings, &dst_id)
+            .map(|a| a.display())
+            .unwrap_or(dst_id.clone());
+        let first = entries.first().map(|e| e.name.clone()).unwrap_or_default();
+        let label = if entries.len() == 1 {
+            format!(
+                "Server copy {first} → {dst_label}:{}",
+                if dst_dir.is_empty() { "/" } else { &dst_dir }
+            )
+        } else {
+            format!(
+                "Server copy {} items (first {first}) → {dst_label}:{}",
+                entries.len(),
+                if dst_dir.is_empty() { "/" } else { &dst_dir }
+            )
+        };
+        let dst_names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+        let dst_id2 = dst_id.clone();
+        let dst_dir2 = dst_dir.clone();
+        self.spawn_job(
+            rt,
+            label,
+            async move {
+                let (_, src_be) = Self::backend(&settings2, &src_id)?;
+                let (_, dst_be) = Self::backend(&settings2, &dst_id)?;
+                if !overwrite {
+                    let existing: HashSet<String> = dst_be
+                        .list(&dst_dir)
+                        .await
+                        .map_err(|e| format!("list destination before copy: {e}"))?
+                        .into_iter()
+                        .map(|e| e.name)
+                        .collect();
+                    let mut kept = Vec::new();
+                    let mut skipped = 0usize;
+                    for e in &entries {
+                        if existing.contains(&e.name) {
+                            skipped += 1;
+                        } else {
+                            kept.push(e.clone());
+                        }
+                    }
+                    if kept.is_empty() {
+                        return Ok("all skipped (exist, Overwrite off)".to_string());
+                    }
+                    let r =
+                        jobs::run_server_side_copy(&src_be, &kept, &dst_be, &dst_dir, &prog2).await;
+                    return r.map(|m| format!("{m}; {skipped} skipped (exist)"));
+                }
+                jobs::run_server_side_copy(&src_be, &entries, &dst_be, &dst_dir, &prog2).await
+            },
+            prog,
+        );
+        if let Some(j) = self.jobs.last_mut() {
+            j.dst_account = dst_id2;
+            j.dst_dir = dst_dir2;
+            j.dest_names = dst_names;
+            j.is_transfer = true;
+        }
+    }
+
     /// Copy/move selected entries pane `from` -> other pane current dir.
     fn transfer_selected(
         &mut self,
@@ -758,6 +865,7 @@ impl DrivesUi {
                 PaneAction::Move(i) => {
                     self.transfer_selected(tokio_rt, &settings, i, JobKind::Move)
                 }
+                PaneAction::ServerCopy(i) => self.server_side_copy_selected(tokio_rt, &settings, i),
                 PaneAction::Delete(i) => self.confirm = Some(DriveConfirm::Files(i)),
                 PaneAction::Mkdir(i) => {
                     let name = self.panes[i].new_name.trim().to_string();
@@ -1225,6 +1333,29 @@ impl DrivesUi {
                         actions.push(PaneAction::DownloadTask(idx));
                     }
                 });
+                // Server-side copy: only Google Drive -> Google Drive
+                // panes (either account, incl. same account navigated
+                // twice). Crypt accounts excluded (ids encrypted).
+                let gdrive_pair = [idx, 1 - idx].iter().all(|&i| {
+                    account_by_id(settings, &self.panes[i].account_id)
+                        .map(|a| {
+                            a.kind == DriveKind::GoogleDrive && a.crypt_password.is_empty()
+                        })
+                        .unwrap_or(false)
+                });
+                if gdrive_pair {
+                    ui.add_enabled_ui(has_sel, |ui| {
+                        if ui::secondary_button(ui, "Server-side copy")
+                            .on_hover_text(
+                                "Google Drive copies bytes server-to-server (files.copy); \
+                                 no download to this PC. No staging fallback: failures are errors.",
+                            )
+                            .clicked()
+                        {
+                            actions.push(PaneAction::ServerCopy(idx));
+                        }
+                    });
+                }
                 ui.add(
                     ui::text_field(&mut self.panes[idx].new_name)
                         .hint_text("New folder")
@@ -2462,6 +2593,7 @@ enum PaneAction {
     AccountChanged(usize, String),
     Copy(usize),
     Move(usize),
+    ServerCopy(usize),
     Delete(usize),
     Mkdir(usize),
     Rename(usize),
