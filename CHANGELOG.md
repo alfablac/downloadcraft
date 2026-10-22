@@ -2,6 +2,18 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.22.3] - 2026-10-22
+
+### Fixed
+
+- Repo-tracked Firefox XPI (`extensions/webcraft-firefox.xpi`) rebuilt at
+  0.22.3 so installing from the repository no longer yields the stale
+  0.18.0 extension without the Instagram capture fixes; same for the
+  0.22.2 fixes below. README now states the button visibility model
+  (hover-revealed generally, always semi-visible on Instagram) and that
+  unpacked/release extension installs never auto-update — reload the
+  extension and reopen the tab after upgrading.
+
 ## [0.22.2] - 2026-10-22
 
 ### Fixed
