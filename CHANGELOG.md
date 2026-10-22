@@ -2,6 +2,25 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.22.4] - 2026-10-22
+
+### Fixed
+
+- Cross-site capture regression from the Instagram fixes (x.com,
+  reddit.com, globo.com and others): the download button is anchored in
+  `document.body` again instead of the video's parent element, so site
+  player wrappers (React/Lit re-renders, `transform`/`filter` containing
+  blocks, `overflow:hidden` clipping, shadow-DOM customs like Globo's
+  `bs-player`) can no longer hide, misplace or delete it. During
+  fullscreen the button moves into the fullscreen element's subtree and
+  back on exit, so the Instagram viewer keeps working; when the `<video>`
+  itself is the fullscreen element the button hides until exit (children
+  of `<video>` never render).
+- Non-Instagram hover restored to containment checks (coordinate
+  hit-testing and the wrapper-rect fallback are Instagram-scoped again);
+  Chromium request sniffing rejects stream segments again so X/Reddit
+  segments no longer flood the candidate pool.
+
 ## [0.22.3] - 2026-10-22
 
 ### Fixed

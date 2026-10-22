@@ -146,7 +146,12 @@ function isSniff(details, type) {
     return type === "application/octet-stream" && details.type === "media";
   }
   if (SNIFF_TYPES.has(type)) return true;
-  if (type.startsWith("video/") || type.startsWith("audio/")) return true;
+  if (type.startsWith("video/") || type.startsWith("audio/")) {
+    // Segments pollute panel (X twimg / Reddit DASH floods cap); only
+    // manifests/full media belong. IG-CDN exempted by branches above.
+    try { const seg = new URL(url).pathname.split("/").pop() || ""; if (/^(seg|segment|chunk|frag)[-_]?\d|\.m4s$|[-_]\d+\.(ts|m4s)$/i.test(seg)) return false; } catch (e) {}
+    return true;
+  }
   return false;
 }
 function isPlaylistUrl(u) { try { const p = new URL(u).pathname.toLowerCase(); return p.endsWith(".mpd") || p.endsWith(".m3u8"); } catch (e) { return /\.(mpd|m3u8)($|[?#])/i.test(String(u || "")); } }

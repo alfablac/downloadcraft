@@ -44,7 +44,13 @@
   }
   function ensurePanel() {
     let panel = document.getElementById("downloadcraft-panel");
-    if (panel) return panel;
+    if (panel) {
+      // Fullscreen renders only its subtree: re-home open panel on FS change.
+      const fs = document.fullscreenElement;
+      if (fs && !fs.contains(panel)) fs.appendChild(panel);
+      else if (!fs && panel.parentElement !== document.documentElement) document.documentElement.appendChild(panel);
+      return panel;
+    }
     panel = document.createElement("div");
     panel.id = "downloadcraft-panel";
     panel.style.cssText = "position:absolute;z-index:2147483647;background:#222222;color:#E8E8E8;font-family:\"Inter\",system-ui,-apple-system,\"Segoe UI\",sans-serif;font-size:11px;border:1px solid #3D3D3D;border-radius:6px;padding:8px;max-width:480px;min-width:260px;box-sizing:border-box;";
@@ -210,11 +216,26 @@
       return false;
     });
   }
+  // Hover host: nearest sized wrapper (site overlays cover <video> itself).
+  function playerRoot(video) {
+    try {
+      const vr = video.getBoundingClientRect();
+      let host = video;
+      let el = video.parentElement;
+      for (let i = 0; i < 4 && el; i++) {
+        const r = el.getBoundingClientRect();
+        if (Math.abs(r.width - vr.width) <= 12 && Math.abs(r.height - vr.height) <= 12 && r.width >= 40) { host = el; el = el.parentElement; } else break;
+      }
+      return host;
+    } catch (e) { return video; }
+  }
   // Effective rect: IG inserts blob/MSE <video> at 0x0 (layout pending) or
   // CSS-sizes only the wrapper. Fall back to nearest sized ancestor.
+  // IG-scoped: elsewhere ancestor fallback pinned button to whole card.
   function videoRect(video) {
     const r = video.getBoundingClientRect();
     if (r.width >= 120 && r.height >= 68) return r;
+    if (!isInstagram()) return r;
     let el = video.parentElement;
     for (let i = 0; i < 4 && el; i++) {
       const pr = el.getBoundingClientRect();
@@ -251,22 +272,52 @@
     }), video);
   }
   const btnFor = new WeakMap();
+  function fsEl() { return document.fullscreenElement || document.webkitFullscreenElement || null; }
+  function inFs(video, fs) {
+    let el = video;
+    while (el) {
+      if (fs.contains(el)) return true;
+      const root = el.getRootNode && el.getRootNode();
+      const next = root && root.host ? root.host : el.parentElement;
+      if (!next || next === el) return false;
+      el = next;
+    }
+    return false;
+  }
+  // Host: body normally (escapes player transform/overflow/stacking and
+  // React/Lit re-renders, v0.22.2 regression); fullscreen subtree only
+  // while fullscreen contains video. <video> as fullscreen element itself:
+  // null (children of <video> never render; button hidden till exit).
+  function hostFor(video) {
+    const fs = fsEl();
+    if (!fs) return document.body || document.documentElement;
+    return fs !== video && inFs(video, fs) ? fs : null;
+  }
+  function syncBtnHost(video) {
+    const btn = btnFor.get(video);
+    if (!btn) return;
+    const host = hostFor(video);
+    if (!host) { btn.style.display = "none"; return; }
+    if (btn.parentNode !== host) host.appendChild(btn);
+    positionBtn(video);
+  }
   function positionBtn(video) {
     const btn = btnFor.get(video);
     if (!btn) return;
+    if (fsEl() && !hostFor(video)) { btn.style.display = "none"; return; }
     const r = videoRect(video);
     if (r.width < 120 || r.height < 68) { btn.style.display = "none"; return; }
     btn.style.display = "";
     if (btn.dataset.dragged) return;
-    btn.style.left = (r.left - 10) + "px";
-    btn.style.top = (r.top - 10) + "px";
+    const fs = !!fsEl();
+    btn.style.left = (fs ? Math.max(2, r.left - 10) : r.left - 10) + "px";
+    btn.style.top = (fs ? Math.max(2, r.top - 10) : r.top - 10) + "px";
   }
   function attachBtn(video) {
     let btn = btnFor.get(video);
-    // React re-renders can drop our button while video stays connected:
-    // re-anchor instead of trusting registry.
-    if (btn && !btn.isConnected) { (video.parentElement || document.body || document.documentElement).appendChild(btn); positionBtn(video); return btn; }
-    if (btn) { positionBtn(video); return btn; }
+    // Host migration (body<->fullscreen) + re-anchor if page re-render
+    // dropped button while video stayed connected.
+    if (btn) { syncBtnHost(video); return btn; }
     btn = document.createElement("button");
     btn.title = "Download video";
     btn.setAttribute("aria-label", "Download video");
@@ -309,12 +360,28 @@
     // Hover on player wrapper: overlays cover <video> (X/YouTube/Instagram).
     // Delegated mouseover: overlay siblings (IG action rail/gradient) never
     // fire mouseenter on wrapper/video, so check containment per event.
-    // Coordinate hover (overlay-proof): IG gradient/action-rail layers are
-    // siblings covering video, containment checks never fire for them.
-    // Hit-test pointer coords vs effective rect, ignore event target.
-    const onHover = (e) => { const r = videoRect(video); const inside = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom; if (e.target === btn || inside) { positionBtn(video); showBtn(); } else hideBtn(); };
-    document.addEventListener("mouseover", onHover, true);
-    document.addEventListener("mousemove", onHover, true);
+    // Coordinate hover only on Instagram (overlay-proof): IG gradient/
+    // action-rail layers are siblings covering video, containment checks
+    // never fire for them. Elsewhere containment hover (pre-0.22.1 shape).
+    // ponytail: per-video mousemove listener, rAF-throttled; ceiling —
+    // one shared pointer router, add when many-video feeds still jank.
+    if (isInstagram()) {
+      let hoverRaf = 0;
+      const onHover = (e) => {
+        if (hoverRaf) return;
+        hoverRaf = requestAnimationFrame(() => {
+          hoverRaf = 0;
+          const r = videoRect(video);
+          const inside = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+          if (e.target === btn || inside) { positionBtn(video); showBtn(); } else hideBtn();
+        });
+      };
+      document.addEventListener("mouseover", onHover, true);
+      document.addEventListener("mousemove", onHover, true);
+    } else {
+      const hoverHost = playerRoot(video);
+      document.addEventListener("mouseover", (e) => { if (e.target === btn || hoverHost.contains(e.target)) showBtn(); else hideBtn(); });
+    }
     // Discoverability: brief reveal on playback start (pointer may sit still
     // over video, no mousemove fires). Touch/no-hover: also flash on attach.
     let flashTimer = null;
@@ -329,11 +396,8 @@
     btnFor.set(video, btn);
     btnForEntries.push([video, btn]);
     if (!video._wcSeen) video._wcSeen = Date.now();
-    // Fullscreen renders only the fullscreen element subtree: a body-level
-    // button vanishes there (IG viewer). Anchor inside video parent when
-    // possible (fixed positioning unaffected by ancestor), body fallback.
-    (video.parentElement || document.body || document.documentElement).appendChild(btn);
-    positionBtn(video);
+    (document.body || document.documentElement).appendChild(btn);
+    syncBtnHost(video); // moves into fullscreen subtree when already FS
     hideBtn();
     return btn;
   }
@@ -379,7 +443,14 @@
   window.addEventListener("resize", () => document.querySelectorAll("video, audio").forEach(positionBtn), { passive: true });
   // Capture: IG reels scroll inner snap containers, no window scroll fires.
   window.addEventListener("scroll", () => document.querySelectorAll("video, audio").forEach(positionBtn), { passive: true, capture: true });
-  document.addEventListener("fullscreenchange", () => document.querySelectorAll("video, audio").forEach(positionBtn));
+  // Fullscreen: re-host buttons (body <-> fullscreen subtree), stale
+  // pre-FS drag coords invalid after viewport resize.
+  const onFsChange = () => {
+    btnForEntries.forEach(([v, b]) => { delete b.dataset.dragged; syncBtnHost(v); });
+    requestAnimationFrame(() => btnForEntries.forEach(([v]) => positionBtn(v)));
+  };
+  document.addEventListener("fullscreenchange", onFsChange);
+  document.addEventListener("webkitfullscreenchange", onFsChange);
   mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "poster"] });
   scan();
   api.runtime.onMessage.addListener((msg) => {
