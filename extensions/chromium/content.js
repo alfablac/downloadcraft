@@ -263,6 +263,9 @@
   }
   function attachBtn(video) {
     let btn = btnFor.get(video);
+    // React re-renders can drop our button while video stays connected:
+    // re-anchor instead of trusting registry.
+    if (btn && !btn.isConnected) { (video.parentElement || document.body || document.documentElement).appendChild(btn); positionBtn(video); return btn; }
     if (btn) { positionBtn(video); return btn; }
     btn = document.createElement("button");
     btn.title = "Download video";
@@ -297,10 +300,12 @@
       btn.style.cursor = "grab"; if (wasDrag) { btn.dataset.suppressClick = "1"; setTimeout(() => delete btn.dataset.suppressClick, 50); }
       if (wasDrag) { e.preventDefault(); e.stopPropagation(); }
     });
-    // Discreet: invisible until pointer over video or button itself;
+    // Discreet elsewhere: invisible until pointer over video or button itself;
     // hidden state must not swallow clicks meant for video controls.
+    // Instagram: always semi-visible — hover-only proved undiscoverable there
+    // (overlays + touch); still clickable at rest on IG.
     const showBtn = () => { btn.style.opacity = ".9"; btn.style.pointerEvents = "auto"; };
-    const hideBtn = () => { btn.style.opacity = "0"; btn.style.pointerEvents = "none"; };
+    const hideBtn = () => { if (isInstagram(location.href)) { btn.style.opacity = ".55"; btn.style.pointerEvents = "auto"; } else { btn.style.opacity = "0"; btn.style.pointerEvents = "none"; } };
     // Hover on player wrapper: overlays cover <video> (X/YouTube/Instagram).
     // Delegated mouseover: overlay siblings (IG action rail/gradient) never
     // fire mouseenter on wrapper/video, so check containment per event.
@@ -324,8 +329,12 @@
     btnFor.set(video, btn);
     btnForEntries.push([video, btn]);
     if (!video._wcSeen) video._wcSeen = Date.now();
-    (document.body || document.documentElement).appendChild(btn);
+    // Fullscreen renders only the fullscreen element subtree: a body-level
+    // button vanishes there (IG viewer). Anchor inside video parent when
+    // possible (fixed positioning unaffected by ancestor), body fallback.
+    (video.parentElement || document.body || document.documentElement).appendChild(btn);
     positionBtn(video);
+    hideBtn();
     return btn;
   }
   function scanVideo(video) {
@@ -370,6 +379,7 @@
   window.addEventListener("resize", () => document.querySelectorAll("video, audio").forEach(positionBtn), { passive: true });
   // Capture: IG reels scroll inner snap containers, no window scroll fires.
   window.addEventListener("scroll", () => document.querySelectorAll("video, audio").forEach(positionBtn), { passive: true, capture: true });
+  document.addEventListener("fullscreenchange", () => document.querySelectorAll("video, audio").forEach(positionBtn));
   mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "poster"] });
   scan();
   api.runtime.onMessage.addListener((msg) => {

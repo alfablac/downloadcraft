@@ -2,6 +2,17 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.22.2] - 2026-10-22
+
+### Fixed
+
+- Instagram overlay still invisible in feed and fullscreen viewer: on
+  Instagram the download button is now always semi-visible (opacity .55,
+  clickable) instead of hover-only, is anchored inside the video's parent
+  element so it survives the fullscreen subtree rule (body-level buttons
+  are not rendered in fullscreen), re-anchors if a React re-render drops
+  it, and repositions on `fullscreenchange`.
+
 ## [0.22.1] - 2026-10-22
 
 ### Fixed
