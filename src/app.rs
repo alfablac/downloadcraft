@@ -11532,7 +11532,11 @@ impl DownloadApp {
                 ui.end_row();
                 ui::form_label(ui, "Scope");
                 ui.horizontal_wrapped(|ui| {
-                    egui::ComboBox::from_id_salt("grab-scope").width(ui.available_width()).selected_text(["Same host", "Same domain", "Any host"][self.grab_scope.min(2) as usize]).show_ui(ui, |ui| { for (i, l) in ["Same host", "Same domain", "Any host"].iter().enumerate() { ui.selectable_value(&mut self.grab_scope, i as u8, *l); } });
+                    // Fixed combo width: .width(available_width()) here starved
+                    // the trailing checkbox (no padding, label truncated/wrapped
+                    // against the combo edge). 160 fits "Same domain" + arrow.
+                    egui::ComboBox::from_id_salt("grab-scope").width(160.0).selected_text(["Same host", "Same domain", "Any host"][self.grab_scope.min(2) as usize]).show_ui(ui, |ui| { for (i, l) in ["Same host", "Same domain", "Any host"].iter().enumerate() { ui.selectable_value(&mut self.grab_scope, i as u8, *l); } });
+                    ui.add_space(theme::SP_SM);
                     ui.checkbox(&mut self.grab_parent_dirs, "Don't explore parent dirs");
                 });
                 ui.end_row();
