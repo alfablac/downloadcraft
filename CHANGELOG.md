@@ -2,6 +2,50 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.24.0] - 2026-10-23
+
+### Added
+
+- Always-on download button on every sized `<video>` on any page
+  (IDM-style): visible at rest (opacity .42) with no play or hover
+  needed, so paused videos (e.g. Reddit) and generic players get a
+  button immediately. Feed-card buttons are retained.
+- Options > Browser integration: 10 video-button icon/size presets,
+  served to the extensions via the native host (`button-style.json`)
+  and applied live with no browser restart. The "Button style" picker
+  shows a live preview of the selected button (icon, size and corner
+  radius as drawn in the browser), and each dropdown entry carries
+  its own icon preview, so presets are identifiable by their icon.
+
+### Fixed
+
+- Globo GE / YouTube embeds "No streams detected": on a registry
+  "page" (e.g. `ge.globo.com/.../*.ghtml` with a Clappr blob `<video>`,
+  or a Shorts page), `permalinkFor` could walk scope links and offer
+  a related article instead of the current page. Both extensions now
+  return the cleaned current URL first when it classifies as a
+  registry "page", and `showPanel` falls back to the page/embed item
+  so the dead-end note is unreachable on video pages.
+- YouTube embeds: `youtube-nocookie.com/embed/...` (and
+  `/embed|v|live|shorts/<id>`, `youtu.be/<id>`) now canonicalize to
+  `https://www.youtube.com/watch?v=<id>`; pages that embed a
+  registry-"page" video in an `iframe`/`embed`/`object` get that
+  embed as an `intent=page` offer plus a corner page button even
+  with no local `<video>`. Rust `is_video_page` parity added for
+  nocookie/embed/shorts (incl. `/shorts/DyvaWC4kIYw?feature=share`).
+- Feed cards (YouTube home and shelves): cards carrying only a
+  thumbnail link previously had no download button until a
+  hover-preview `<video>` became active (IDM-style gap). Every card
+  whose item link is a registry "page" now gets a definite button
+  at rest opacity .42 (clickable, .96 on hover/focus) sending that
+  card's watch/shorts URL directly with `intent=page`; the button
+  yields to the per-video button once a `<video>` owns the card.
+- Sandbox: fixtures for the GE `.ghtml` blob player, the nocookie
+  iframe embed, YouTube Shorts (playing / 3-reel shell / paused
+  `preload=none`), and thumbnail-only home-feed cards
+  (`cardbtn` activation asserts rest opacity, direct payload, no
+  panel); harness main-frame routing fix (`req.frame`).
+
 ## [0.23.3] - 2026-10-22
 
 ### Fixed

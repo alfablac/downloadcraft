@@ -197,6 +197,47 @@ fn load_capture_filter() -> (Vec<String>, u64) {
     (exts, min)
 }
 
+/// Resolved video-button style (preset id + rendered fields). Mirrors the
+/// app's preset table; defaults = "arrow-m" when file missing/corrupt.
+fn load_button_style() -> (String, String, u64, u64, String) {
+    fn defaults() -> (String, String, u64, u64, String) {
+        (
+            "arrow-m".into(),
+            "arrow".into(),
+            27,
+            27,
+            "50%".into(),
+        )
+    }
+    let Ok(txt) = std::fs::read_to_string(config_dir().join("button-style.json")) else {
+        return defaults();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+        return defaults();
+    };
+    let preset = v
+        .get("preset")
+        .and_then(|p| p.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("arrow-m")
+        .to_string();
+    let icon = v
+        .get("icon")
+        .and_then(|p| p.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("arrow")
+        .to_string();
+    let w = v.get("w").and_then(|p| p.as_u64()).unwrap_or(27);
+    let h = v.get("h").and_then(|p| p.as_u64()).unwrap_or(27);
+    let radius = v
+        .get("radius")
+        .and_then(|p| p.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("50%")
+        .to_string();
+    (preset, icon, w, h, radius)
+}
+
 /// Basename only: strip `/` and `\` components, reject empty / "." / "..".
 fn sanitize_filename(name: &str) -> Option<String> {
     let base = name
@@ -309,6 +350,12 @@ fn handle(msg: &serde_json::Value) -> serde_json::Value {
         // browser download. allow=false -> browser keeps file (filter is
         // webcraft Settings via capture-filter.json, host is sole decider).
         // No inbox write here; actual send is separate "download" msg.
+        // Extension fetches resolved button preset on load and on change;
+        // host reads button-style.json fresh per call (applies live).
+        "getButtonStyle" => {
+            let (preset, icon, w, h, radius) = load_button_style();
+            with_id(serde_json::json!({"type":"buttonStyle","preset":preset,"icon":icon,"w":w,"h":h,"radius":radius}))
+        }
         "pollResume" => {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -482,6 +529,35 @@ mod tests {
         let r = handle(&serde_json::json!({"type":"download","id":"a1"}));
         assert_eq!(r["type"], "error");
         assert_eq!(r["id"], "a1");
+    }
+
+    #[test]
+    fn button_style_reply_has_default_fields() {
+        // Pure default-shape check mirroring load_button_style() defaults;
+        // handle() would read the real user's button-style.json (non-hermetic).
+        let (preset, icon, w, h, radius) = (
+            "arrow-m".to_string(),
+            "arrow".to_string(),
+            27u64,
+            27u64,
+            "50%".to_string(),
+        );
+        let r = serde_json::json!({"type":"buttonStyle","preset":preset,"icon":icon,"w":w,"h":h,"radius":radius});
+        assert_eq!(r["type"], "buttonStyle");
+        assert_eq!(r["preset"], "arrow-m");
+        assert_eq!(r["icon"], "arrow");
+        assert_eq!(r["w"], 27);
+        assert_eq!(r["h"], 27);
+        assert_eq!(r["radius"], "50%");
+        // Reply type passes through with_id echo like other arms.
+        let r = handle(&serde_json::json!({"type":"getButtonStyle","id":9}));
+        assert_eq!(r["type"], "buttonStyle");
+        assert_eq!(r["id"], 9);
+        assert!(r["preset"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(r["icon"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(r["w"].as_u64().is_some_and(|n| n > 0));
+        assert!(r["h"].as_u64().is_some_and(|n| n > 0));
+        assert!(r["radius"].as_str().is_some_and(|s| !s.is_empty()));
     }
 
     fn exts(list: &[&str]) -> Vec<String> {

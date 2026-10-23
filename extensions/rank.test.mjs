@@ -189,6 +189,8 @@ const kindCases = [
   ["youtube watch=page", "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "page"],
   ["youtube shorts=page", "https://www.youtube.com/shorts/dQw4w9WgXcQ", "page"],
   ["youtube feed=feed", "https://www.youtube.com/feed/subscriptions", "feed"],
+  ["youtube-nocookie embed=page", "https://www.youtube-nocookie.com/embed/Eo38zL1kLko", "page"],
+  ["youtube-nocookie root=other", "https://www.youtube-nocookie.com/", "other"],
   ["instagram reel=page", "https://www.instagram.com/reel/DAbc123XyZ/", "page"],
   ["instagram explore=feed", "https://www.instagram.com/explore/", "feed"],
   ["facebook /share/v/=page", "https://www.facebook.com/share/v/AbC123XyZ/", "page"],
@@ -215,6 +217,10 @@ for (const [name, u, want] of kindCases) {
 }
 const idCases = [
   ["youtube watch?v=", "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"],
+  ["youtube-nocookie embed id (?wmode)", "https://www.youtube-nocookie.com/embed/Eo38zL1kLko?wmode=opaque", "Eo38zL1kLko"],
+  ["youtube /embed/ id", "https://www.youtube.com/embed/dQw4w9WgXcQ", "dQw4w9WgXcQ"],
+  ["youtube /v/ id", "https://www.youtube.com/v/dQw4w9WgXcQ", "dQw4w9WgXcQ"],
+  ["youtube /live/ id", "https://www.youtube.com/live/dQw4w9WgXcQ", "dQw4w9WgXcQ"],
   ["instagram reel code", "https://www.instagram.com/reel/DAbc123XyZ/", "DAbc123XyZ"],
   ["twitch clip slug", "https://www.twitch.tv/somechannel/clip/SomeSlug-ABC_123", "SomeSlug-ABC_123"],
   ["tiktok photo id", "https://www.tiktok.com/@someuser/photo/1234567890123456789", "1234567890123456789"],

@@ -246,7 +246,7 @@
   function isVideoPageUrl2(u) { return videoPageKind(u) === "page"; }
   function videoIdOf(u) {
     var s = String(u || "");
-    var m = s.match(/\/status\/(\d+)|\/comments\/([a-z0-9]{5,})|[?&]v=([A-Za-z0-9_-]{6,})|youtu\.be\/([A-Za-z0-9_-]{6,})|\/shorts\/([A-Za-z0-9_-]{6,})|\/(?:reel|reels|p|tv)\/([A-Za-z0-9_-]{5,})|\/stories\/[^/]+\/(\d+)|\/post\/([A-Za-z0-9_-]{5,})|\/video\/(BV[0-9A-Za-z]{8,}|\d{5,}|[a-z0-9]{3,})|\/videos\/(\d{5,})|\/videos?\/(\d{5,})|\/clip\/([A-Za-z0-9_-]{5,})|clips\.twitch\.tv\/([A-Za-z0-9_-]{5,})|v\.redd\.it\/([a-z0-9]{5,})|dai\.ly\/([a-z0-9]{3,})|\/watch\/((?:sm|nm|so|lv)?\d{5,})/i);
+    var m = s.match(/\/status\/(\d+)|\/comments\/([a-z0-9]{5,})|[?&]v=([A-Za-z0-9_-]{6,})|youtu\.be\/([A-Za-z0-9_-]{6,})|\/shorts\/([A-Za-z0-9_-]{6,})|\/(?:embed|v|live)\/([A-Za-z0-9_-]{6,})|\/(?:reel|reels|p|tv)\/([A-Za-z0-9_-]{5,})|\/stories\/[^/]+\/(\d+)|\/post\/([A-Za-z0-9_-]{5,})|\/video\/(BV[0-9A-Za-z]{8,}|\d{5,}|[a-z0-9]{3,})|\/videos\/(\d{5,})|\/videos?\/(\d{5,})|\/clip\/([A-Za-z0-9_-]{5,})|clips\.twitch\.tv\/([A-Za-z0-9_-]{5,})|v\.redd\.it\/([a-z0-9]{5,})|dai\.ly\/([a-z0-9]{3,})|\/watch\/((?:sm|nm|so|lv)?\d{5,})/i);
     if (m) { for (var i = 1; i < m.length; i++) if (m[i]) return m[i]; }
     // Host-scoped bare-id shapes: vimeo.com/123, fb.watch/CODE, vm.tiktok.
     try {

@@ -5402,6 +5402,72 @@ fn badge_color_row(
     ui.end_row();
 }
 
+/// Faithful miniature of the browser-extension video button for one
+/// preset: same size, corner radius, background/border and glyph
+/// geometry as `btnIconHtml`/`attachBtn` in the extensions
+/// (`extensions/chromium/content.js`), shown in its hover colours so
+/// the icon stays legible on the dark Options surface (at rest in the
+/// browser the whole button sits at opacity .42).
+fn button_preset_preview(ui: &mut egui::Ui, p: &crate::model::ButtonPreset) {
+    let (w, h) = (p.w as f32, p.h as f32);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+    resp.on_hover_text(format!("{} · {}x{} px", p.label, p.w, p.h));
+    let painter = ui.painter_at(rect);
+    let radius = if p.radius == "50%" {
+        w.min(h) / 2.0
+    } else {
+        p.radius.trim_end_matches("px").parse::<f32>().unwrap_or(0.0)
+    };
+    painter.rect_filled(rect, radius, egui::Color32::from_rgb(46, 74, 69));
+    painter.rect_stroke(
+        rect,
+        radius,
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(127, 179, 170)),
+    );
+    let fg = egui::Color32::from_rgb(235, 235, 235);
+    if p.icon == "dl" {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "DL",
+            egui::FontId::proportional((h * 0.36).max(8.0)),
+            fg,
+        );
+        return;
+    }
+    // SVG glyph: viewBox 0 0 24 24, drawn at min(w,h)*0.48, centred.
+    let size = w.min(h) * 0.48;
+    let glyph = egui::Rect::from_center_size(rect.center(), egui::vec2(size, size));
+    let pt = |x: f32, y: f32| {
+        egui::Pos2::new(
+            glyph.left() + x / 24.0 * glyph.width(),
+            glyph.top() + y / 24.0 * glyph.height(),
+        )
+    };
+    let sw = if p.icon == "arrow-bold" { 3.6 } else { 2.4 };
+    let stroke = egui::Stroke::new((size / 24.0 * sw).max(1.0), fg);
+    let seg = |a: egui::Pos2, b: egui::Pos2| painter.line_segment([a, b], stroke);
+    match p.icon {
+        "chevron" => {
+            seg(pt(5.0, 8.0), pt(12.0, 15.0));
+            seg(pt(12.0, 15.0), pt(19.0, 8.0));
+            seg(pt(5.0, 13.0), pt(12.0, 20.0));
+            seg(pt(12.0, 20.0), pt(19.0, 13.0));
+        }
+        "plus" => {
+            seg(pt(12.0, 5.0), pt(12.0, 19.0));
+            seg(pt(5.0, 12.0), pt(19.0, 12.0));
+        }
+        _ => {
+            // "arrow" / "arrow-bold": shaft, head, tray.
+            seg(pt(12.0, 3.0), pt(12.0, 14.0));
+            seg(pt(7.0, 10.0), pt(12.0, 15.0));
+            seg(pt(12.0, 15.0), pt(17.0, 10.0));
+            seg(pt(4.0, 20.0), pt(20.0, 20.0));
+        }
+    }
+}
+
 /// Section header: label + 6px + separator (Options / editor groups).
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.label(egui::RichText::new(title).color(theme::TEXT).strong());
@@ -12208,6 +12274,43 @@ impl DownloadApp {
                     });
                     ui.label(egui::RichText::new("Empty extensions = all types. Size filter skips files below limit and files with unknown size (no size to prove large enough) when minimum set. Explicit browser sends (context menu, video panel) bypass filter.").color(theme::TEXT_FAINT).small());
                     ui.add_space(theme::SP_MD);
+                    section(ui, "Video button (browser pages)");
+                    ui::form_grid("opts_button_preset").show(ui, |ui| {
+                        ui::form_label(ui, "Button style");
+                        let current = crate::model::resolve(&settings.button_preset);
+                        ui.horizontal(|ui| {
+                            button_preset_preview(ui, current);
+                            egui::ComboBox::from_id_salt("button-preset")
+                                .selected_text(current.label)
+                                .show_ui(ui, |ui| {
+                                    ui.set_min_width(230.0);
+                                    for p in crate::model::button_presets() {
+                                        // One row per preset: label, then the
+                                        // icon preview pushed to the right
+                                        // edge so every icon is identifiable.
+                                        let selected = settings.button_preset == p.id;
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .selectable_label(selected, p.label)
+                                                .clicked()
+                                            {
+                                                settings.button_preset =
+                                                    p.id.to_string();
+                                            }
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(
+                                                    egui::Align::Center,
+                                                ),
+                                                |ui| button_preset_preview(ui, p),
+                                            );
+                                        });
+                                    }
+                                });
+                        });
+                        ui.end_row();
+                    });
+                    ui.label(egui::RichText::new("Always-on button shown on every video in the browser. Icon/size apply live via the extension (native host), no browser restart needed.").color(theme::TEXT_FAINT).small());
+                    ui.add_space(theme::SP_MD);
                     section(ui, "yt-dlp (video pages)");
                     ui.horizontal(|ui| {
                         ui.add_space(ui::LABEL_W + 12.0);
@@ -12647,6 +12750,7 @@ impl DownloadApp {
             // Native host reads capture-filter.json on each captured download;
             // desktop owns settings, browser storage never synced.
             crate::platform::write_capture_filter(&settings);
+            crate::platform::write_button_style(&settings);
             let limits: Vec<_> = {
                 let mut g = crate::lock_unpoison(&self.rt);
                 g.state.settings = settings;

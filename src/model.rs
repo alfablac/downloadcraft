@@ -249,6 +249,45 @@ pub struct Schedule {
     pub quota_used_bytes: u64,
 }
 
+/// One video-button appearance preset (browser extension always-on button).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ButtonPreset {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub icon: &'static str,
+    pub w: u32,
+    pub h: u32,
+    pub radius: &'static str,
+}
+
+/// The 10 video-button presets; "arrow-m" is the default (see `def_button_preset`).
+pub fn button_presets() -> &'static [ButtonPreset] {
+    &[
+        ButtonPreset { id: "arrow-s", label: "Arrow · Small", icon: "arrow", w: 22, h: 22, radius: "50%" },
+        ButtonPreset { id: "arrow-m", label: "Arrow · Medium", icon: "arrow", w: 27, h: 27, radius: "50%" },
+        ButtonPreset { id: "arrow-l", label: "Arrow · Large", icon: "arrow", w: 36, h: 36, radius: "50%" },
+        ButtonPreset { id: "arrow-xl", label: "Arrow · Extra large", icon: "arrow", w: 44, h: 44, radius: "50%" },
+        ButtonPreset { id: "bold-m", label: "Bold arrow · Medium", icon: "arrow-bold", w: 27, h: 27, radius: "50%" },
+        ButtonPreset { id: "bold-l", label: "Bold arrow · Large", icon: "arrow-bold", w: 36, h: 36, radius: "10px" },
+        ButtonPreset { id: "chevron-m", label: "Chevron · Medium", icon: "chevron", w: 27, h: 27, radius: "50%" },
+        ButtonPreset { id: "dl-s", label: "DL badge · Small", icon: "dl", w: 30, h: 22, radius: "11px" },
+        ButtonPreset { id: "dl-m", label: "DL badge · Medium", icon: "dl", w: 38, h: 27, radius: "13px" },
+        ButtonPreset { id: "plus-m", label: "Plus · Medium", icon: "plus", w: 27, h: 27, radius: "10px" },
+    ]
+}
+
+fn def_button_preset() -> String {
+    "arrow-m".to_string()
+}
+
+/// Resolve a preset id to its entry; unknown/empty -> default ("arrow-m").
+pub fn resolve(preset_id: &str) -> &'static ButtonPreset {
+    button_presets()
+        .iter()
+        .find(|p| p.id == preset_id)
+        .unwrap_or_else(|| &button_presets()[1])
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
     // No default here broke whole-state parse (data loss) when absent in old state files.
@@ -292,6 +331,10 @@ pub struct Settings {
     pub capture_min_mb: u64,
     #[serde(default = "def_true")]
     pub ytdlp_auto_update: bool,
+    /// Video-button appearance preset id (see `button_presets`), served to
+    /// browser extensions via native host (button-style.json).
+    #[serde(default = "def_button_preset")]
+    pub button_preset: String,
     /// NNTP (Usenet/NZB) server. Host empty = unconfigured. Creds stored
     /// plain like proxy creds — ponytail: no OS keychain; add keyring when needed.
     #[serde(default)]
@@ -673,6 +716,7 @@ impl Default for Settings {
             capture_exts: String::new(),
             capture_min_mb: 0,
             ytdlp_auto_update: true,
+            button_preset: def_button_preset(),
             nntp_host: String::new(),
             nntp_port: 563,
             nntp_tls: true,
@@ -1444,6 +1488,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(debrid_choice_of(&old), "auto");
+    }
+
+    #[test]
+    fn button_preset_table_has_ten_unique_ids() {
+        let presets = button_presets();
+        assert_eq!(presets.len(), 10);
+        let mut ids: Vec<&str> = presets.iter().map(|p| p.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 10, "preset ids must be unique");
+        for p in presets {
+            assert!(!p.label.is_empty() && !p.icon.is_empty() && !p.radius.is_empty());
+            assert!(p.w > 0 && p.h > 0);
+        }
+    }
+
+    #[test]
+    fn button_preset_resolve_falls_back_to_arrow_m() {
+        let d = resolve("arrow-m");
+        assert_eq!((d.icon, d.w, d.h, d.radius), ("arrow", 27, 27, "50%"));
+        assert_eq!(resolve("bold-l").radius, "10px");
+        assert_eq!(resolve("dl-m").h, 27);
+        // Unknown/empty -> default.
+        assert_eq!(resolve("nope").id, "arrow-m");
+        assert_eq!(resolve("").id, "arrow-m");
+    }
+
+    #[test]
+    fn button_preset_serde_roundtrip_and_old_state_default() {
+        let s = Settings {
+            button_preset: "chevron-m".into(),
+            ..Default::default()
+        };
+        assert_eq!(Settings::default().button_preset, "arrow-m");
+        let back: Settings = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(back.button_preset, "chevron-m");
+        // Old state.json without the field -> default "arrow-m".
+        let mut v = serde_json::to_value(&s).unwrap();
+        v.as_object_mut().unwrap().remove("button_preset");
+        let old: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(old.button_preset, "arrow-m");
     }
 
     #[test]

@@ -415,13 +415,65 @@ async function pollResumeOnce() {
 }
 try {
   chrome.alarms.create("wcPollResume", { periodInMinutes: 0.5 }); // 30s MV3 floor; setInterval unreliable in SW
-  if (chrome.alarms.onAlarm) chrome.alarms.onAlarm.addListener((a) => { if (a && a.name === "wcPollResume") pollResumeOnce().catch(() => {}); });
+  if (chrome.alarms.onAlarm) chrome.alarms.onAlarm.addListener((a) => { if (a && a.name === "wcPollResume") { pollResumeOnce().catch(() => {}); refreshBtnStyle().catch(() => {}); } });
 } catch (e) {}
 try { pollResumeOnce().catch(() => {}); } catch (e) {} // poll on startup; onCreated handles also wake host
+
+// Button appearance: host owns style {icon,w,h,radius}; old/down host replies
+// invalid/missing -> keep last good cache (storage.session survives SW death).
+let wcBtnStyle = null;
+let wcBtnStyleLoaded = false;
+let wcBtnStyleLastTry = 0;
+function validBtnStyle(r) {
+  if (!r || typeof r !== "object") return null;
+  if (typeof r.icon !== "string" || !r.icon) return null;
+  if (typeof r.w !== "number" || !Number.isFinite(r.w) || !(r.w > 0)) return null;
+  if (typeof r.h !== "number" || !Number.isFinite(r.h) || !(r.h > 0)) return null;
+  if (typeof r.radius !== "string") return null;
+  return { icon: r.icon, w: r.w, h: r.h, radius: r.radius };
+}
+async function loadBtnStyle() {
+  if (wcBtnStyleLoaded) return;
+  wcBtnStyleLoaded = true;
+  try {
+    const s = await chrome.storage.session.get(["wcBtnStyle"]);
+    const v = s && validBtnStyle(s.wcBtnStyle);
+    if (v) wcBtnStyle = v;
+  } catch (e) {}
+}
+function broadcastBtnStyle() {
+  try {
+    chrome.tabs.query({}, (tabs) => {
+      for (const t of tabs || []) {
+        if (!t || t.id == null) continue;
+        try { const p = chrome.tabs.sendMessage(t.id, { type: "downloadcraft-button-style", style: wcBtnStyle }); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+      }
+    });
+  } catch (e) {}
+}
+async function refreshBtnStyle(force) {
+  if (!force && Date.now() - wcBtnStyleLastTry < 25000) return wcBtnStyle; // ~30s poll cadence
+  wcBtnStyleLastTry = Date.now();
+  await loadBtnStyle();
+  let v = null;
+  try { v = validBtnStyle(await nativeSend({ type: "getButtonStyle" })); } catch (e) {}
+  if (!v) return wcBtnStyle; // host down/old: keep cache, no broadcast
+  const changed = JSON.stringify(v) !== JSON.stringify(wcBtnStyle);
+  wcBtnStyle = v;
+  try { chrome.storage.session.set({ wcBtnStyle: v }); } catch (e) {}
+  if (changed) broadcastBtnStyle();
+  return wcBtnStyle;
+}
+refreshBtnStyle(true).catch(() => {}); // startup refresh (restores session cache first)
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Legacy stale content scripts may still answer removed ask box: ignore.
   if (msg && msg.type === "downloadcraft-confirm-result") return;
+  if (msg && msg.type === "downloadcraft-get-button-style") {
+    if (wcBtnStyle) sendResponse({ style: wcBtnStyle });
+    else refreshBtnStyle(true).then((s) => sendResponse({ style: s }), () => sendResponse({ style: wcBtnStyle }));
+    return true; // async sendResponse
+  }
   if (msg && msg.type === "getCandidates") {
     loadCandidates().then(() => {
       pruneCandidates();

@@ -1455,7 +1455,16 @@ pub fn is_video_page(url: &str) -> bool {
     };
     let host_match = match h {
         "youtube.com" => {
-            path.starts_with("/watch") || path.starts_with("/shorts/") || path.starts_with("/live/")
+            path.starts_with("/watch")
+                || path.starts_with("/shorts/")
+                || path.starts_with("/live/")
+                || ((seg(1) == "embed" || seg(1) == "v" || seg(1) == "clip")
+                    && !seg(2).is_empty())
+        }
+        "youtube-nocookie.com" => {
+            path.starts_with("/watch")
+                || ((seg(1) == "embed" || seg(1) == "shorts" || seg(1) == "live" || seg(1) == "v")
+                    && !seg(2).is_empty())
         }
         "youtu.be" => path.len() > 1,
         "music.youtube.com" => path.starts_with("/watch"),
@@ -1822,6 +1831,11 @@ mod tests {
             "https://example.com/w/p9jmLXa9q3xYvZk7mNqW2a",
             "https://g1.globo.com/mundo/noticia/2026/10/22/story.ghtml",
             "https://globoplay.globo.com/v/15107769/",
+            "https://www.youtube-nocookie.com/embed/Eo38zL1kLko",
+            "https://www.youtube.com/embed/dQw4w9WgXcQ",
+            "https://www.youtube.com/shorts/DyvaWC4kIYw?feature=share",
+            "https://www.youtube.com/shorts/DyvaWC4kIYw",
+            "https://www.youtube-nocookie.com/shorts/DyvaWC4kIYw",
         ] {
             assert!(is_video_page(page), "page missed: {page}");
         }
@@ -1844,6 +1858,8 @@ mod tests {
             "https://g1.globo.com/",
             "https://g1.globo.com/mundo/",
             "https://globo.com.evil.example/story.ghtml",
+            "https://www.youtube-nocookie.com/",
+            "https://www.youtube-nocookie.com.evil.example/embed/Eo38zL1kLko",
         ] {
             // Note: dailymotion/nicovideo/bilibili hosts are checked above only
             // for their real hosts; v.dailymotion.example must not match.

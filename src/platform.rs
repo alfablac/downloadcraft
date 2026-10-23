@@ -47,6 +47,17 @@ pub fn write_capture_filter(settings: &crate::model::Settings) {
     );
 }
 
+/// Write button-style.json from Settings: native host serves the resolved
+/// video-button preset to extensions (getButtonStyle); app is source of truth.
+pub fn write_button_style(settings: &crate::model::Settings) {
+    let p = crate::model::resolve(&settings.button_preset);
+    let _ = std::fs::create_dir_all(config_dir());
+    let _ = std::fs::write(
+        config_dir().join("button-style.json"),
+        serde_json::json!({"preset": p.id, "icon": p.icon, "w": p.w, "h": p.h, "radius": p.radius}).to_string(),
+    );
+}
+
 /// Startup trace step: always appended (cheap, bounded growth by rotation
 /// at 64KB) so "no window" reports carry last reached step in crash.log.
 pub fn trace(step: &str) {

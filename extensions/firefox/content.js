@@ -83,6 +83,30 @@
       return !!document.querySelector("bs-player[videoid],[data-video-id],[data-videoid],amp-video,[data-globo-video]");
     } catch (e) { return false; }
   }
+  // Embedded player pages: cross-origin iframe content is invisible to this
+  // frame's <video> scan, but the embed src (youtube/youtube-nocookie
+  // /embed/, vimeo player, dailymotion /embed/, globoplay /v/) is itself a
+  // registry "page" URL. Offer it — canonicalized (nocookie embed -> watch
+  // URL) — as intent="page". Deliberately NOT part of pageMediaUrls():
+  // embeds are page offers for yt-dlp, never streams.
+  function embedPageItems() {
+    try {
+      const out = [], seen = new Set();
+      document.querySelectorAll("iframe[src],embed[src],object[data]").forEach((el) => {
+        const raw = el.getAttribute("src") || el.getAttribute("data") || "";
+        if (!raw) return;
+        let abs = "";
+        try { abs = new URL(raw, location.href).href; } catch (e) { return; }
+        if (!/^https?:/.test(abs)) return;
+        const cleaned = cleanPermalink(abs);
+        if (!cleaned || typeof videoPageKind !== "function" || videoPageKind(cleaned) !== "page") return;
+        if (sameUrl(cleaned, location.href) || seen.has(cleaned)) return;
+        seen.add(cleaned);
+        out.push({ url: cleaned, pageUrl: cleaned, intent: "page", label: "▶ Embedded video — webcraft (choose quality / audio / subs)", filename: filenameFromUrl(cleaned), type: "page" });
+      });
+      return out;
+    } catch (e) { return []; }
+  }
   // Toolbar on a non-registry page that still shows media evidence: page is
   // the only yt-dlp handle (blob:/MSE src is useless). Feeds excluded.
   // Registry "page" (e.g. globo .ghtml) is itself proof: player evidence
@@ -93,11 +117,19 @@
       if (!loc || isFeedHome(loc)) return null;
       const kind = typeof videoPageKind === "function" ? videoPageKind(loc) : "other";
       if (kind === "feed") return null;
-      if (kind !== "page" && !allVideos().length && !pageMediaUrls().length && !hasPlayerEvidence()) return null;
+      if (kind !== "page" && !allVideos().length && !pageMediaUrls().length && !hasPlayerEvidence() && !embedPageItems().length) return null;
       return { url: loc, pageUrl: loc, intent: "page", label: "▶ This page — webcraft (choose quality / audio / subs)", filename: filenameFromUrl(loc), type: "page" };
     } catch (e) { return null; }
   }
   function showPanel(anchor, items, note) {
+    // Defensive fallback (Shorts report): on a registry/generic video page
+    // the page item must be reachable even if per-video stream scoping came
+    // up empty (recycled reel element, late permalink, ...). Only the true
+    // dead end (feed, or no media evidence at all) keeps the note.
+    if (!items.length && !note) {
+      const fb = pageItem(null) || genericPageItem() || embedPageItems()[0];
+      if (fb) items = [fb];
+    }
     // Empty: note-only panel, no fake clickable item, no silent return.
     if (!items.length && !note) note = "No streams detected for this video";
     const panel = ensurePanel();
@@ -198,9 +230,24 @@
   // Tracking params stripped everywhere (query may carry video id,
   // e.g. /watch?v= survives only via site-shaped branch below).
   const TRACK_PARAMS = ["fbclid", "gclid", "igshid", "s", "t", "ref", "ref_src", "ref_url", "mc_cid", "mc_eid", "spm", "si", "_hsenc", "_hsmi", "vero_id"];
+  // YouTube embed/player URLs (youtube.com/embed/<id>, youtube-nocookie,
+  // youtu.be/<id>) canonicalize to the watch page yt-dlp knows best.
+  function canonicalVideoPage(u) {
+    try {
+      const x = new URL(String(u || ""), location.href);
+      const h = x.hostname.toLowerCase().replace(/^(www\.|m\.|music\.)/, "");
+      if (h === "youtu.be" || h === "youtube.com" || h === "youtube-nocookie.com") {
+        const id = (typeof videoIdOf === "function" ? videoIdOf(x.href) : "") || "";
+        if (id && (/^\/(embed|v|live|shorts)\//.test(x.pathname) || h === "youtu.be")) return "https://www.youtube.com/watch?v=" + id;
+      }
+    } catch (e) {}
+    return "";
+  }
   function cleanPermalink(u) {
     try {
       if (!u) return "";
+      const canon = canonicalVideoPage(u);
+      if (canon) return canon;
       const x = new URL(u, location.href);
       x.hash = "";
       const stripHost = (re) => { const m = x.pathname.match(re); return m ? x.origin + x.pathname.slice(0, x.pathname.indexOf(m[0]) + m[0].length) : null; };
@@ -317,6 +364,14 @@
         // is not a root/home page; callers gate with isVideoPageUrl.
         const loc = cleanPermalink(location.href);
         return isFeedHome(loc) ? "" : loc;
+      }
+      // Registry "page" (Globo .ghtml, YouTube watch/embed, single-post
+      // pages): the location IS the item — scope-link hunting (related-
+      // article links inside the same <article>) must never win over it.
+      // Feeds/other pages keep the per-card chain below.
+      {
+        const loc = cleanPermalink(location.href);
+        if (typeof videoPageKind === "function" && videoPageKind(loc) === "page" && !isFeedHome(loc)) return loc;
       }
       const multi = allVideos().length > 1;
       // 1a. <a> wrapping video itself (closest crosses shadow hosts too).
@@ -454,6 +509,51 @@
       showPanel(video, items);
     }), video);
   }
+  // Button appearance presets (shared contract with Chromium twin).
+  // Default matches the historic 27px round arrow button; the popup /
+  // background owns the stored preset, this script only validates,
+  // stores, and re-applies it to live buttons.
+  let btnStyle = { icon: "arrow", w: 27, h: 27, radius: "50%" };
+  const BTN_ICONS = ["arrow", "arrow-bold", "chevron", "plus", "dl"];
+  function normalizeBtnStyle(style) {
+    if (!style || typeof style !== "object") return null;
+    const icon = BTN_ICONS.includes(style.icon) ? style.icon : "arrow";
+    const dim = (v, d) => { const n = Number(v); return Number.isFinite(n) ? Math.min(96, Math.max(16, Math.round(n))) : d; };
+    const w = dim(style.w, 27), h = dim(style.h, 27);
+    let radius = "50%";
+    if (typeof style.radius === "string" && style.radius.trim()) radius = style.radius.trim();
+    else if (style.radius != null && style.radius !== "" && Number.isFinite(Number(style.radius))) radius = Number(style.radius) + "px";
+    return { icon, w, h, radius };
+  }
+  function applyBtnStyle(btn) {
+    if (!btn) return;
+    btn.style.width = btnStyle.w + "px";
+    btn.style.height = btnStyle.h + "px";
+    btn.style.borderRadius = btnStyle.radius;
+    if (btnStyle.icon === "dl") {
+      const fs = Math.max(8, Math.round(btnStyle.h * 0.36));
+      btn.innerHTML = '<span style="display:flex;align-items:center;justify-content:center;width:100%;height:100%;font-size:' + fs + 'px;font-weight:700;pointer-events:none">DL</span>';
+      return;
+    }
+    const px = Math.round(Math.min(btnStyle.w, btnStyle.h) * 0.48);
+    const margin = Math.max(0, (btnStyle.h - px) / 2);
+    let sw = "2.4", paths = '<path d="M12 3v11"/><path d="m7 10 5 5 5-5"/><path d="M4 20h16"/>';
+    if (btnStyle.icon === "arrow-bold") sw = "3.6";
+    else if (btnStyle.icon === "chevron") paths = '<path d="m5 8 7 7 7-7"/><path d="m5 13 7 7 7-7"/>';
+    else if (btnStyle.icon === "plus") paths = '<path d="M12 5v14M5 12h14"/>';
+    btn.innerHTML = '<svg width="' + px + '" height="' + px + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="' + sw + '" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:' + margin + 'px auto;pointer-events:none">' + paths + '</svg>';
+  }
+  function applyBtnStyleToAll() {
+    try { btnForEntries.forEach(([, b]) => applyBtnStyle(b)); } catch (e) {}
+    try { cardBtnEntries.forEach(([, b]) => applyBtnStyle(b)); } catch (e) {}
+    try { if (pageBtn) applyBtnStyle(pageBtn); } catch (e) {}
+  }
+  function setBtnStyle(style) {
+    const next = normalizeBtnStyle(style);
+    if (!next) return;
+    btnStyle = next;
+    applyBtnStyleToAll();
+  }
   const btnFor = new WeakMap();
   function fsEl() { return document.fullscreenElement || document.webkitFullscreenElement || null; }
   function inFs(video, fs) {
@@ -505,8 +605,8 @@
     btn.title = "Download video";
     btn.setAttribute("aria-label", "Download video");
     btn.setAttribute("data-downloadcraft-btn", "1");
-    btn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:6.5px auto;pointer-events:none"><path d="M12 3v11"/><path d="m7 10 5 5 5-5"/><path d="M4 20h16"/></svg>';
-    btn.style.cssText = "position:fixed;z-index:2147483647;width:27px;height:27px;border-radius:50%;background:rgba(20,26,25,.72);color:rgba(255,255,255,.92);border:1px solid rgba(255,255,255,.28);box-shadow:0 1px 5px rgba(0,0,0,.35);padding:0;cursor:grab;text-align:center;opacity:0;pointer-events:none;display:none;touch-action:none;user-select:none;-webkit-user-select:none;transform:translateZ(0);font-family:\"Inter\",system-ui,sans-serif;";
+    btn.style.cssText = "position:fixed;z-index:2147483647;background:rgba(20,26,25,.72);color:rgba(255,255,255,.92);border:1px solid rgba(255,255,255,.28);box-shadow:0 1px 5px rgba(0,0,0,.35);padding:0;cursor:grab;text-align:center;opacity:0;pointer-events:none;display:none;touch-action:none;user-select:none;-webkit-user-select:none;transform:translateZ(0);font-family:\"Inter\",system-ui,sans-serif;";
+    applyBtnStyle(btn);
     btn.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); if (btn.dataset.suppressClick) { delete btn.dataset.suppressClick; return; } showForVideo(video); });
 
     // Draggable: press-move >4px drags (persisted offset per video via dataset),
@@ -584,11 +684,14 @@
   function scanVideo(video) {
     if (wired.has(video)) { attachBtn(video); return; }
     wired.add(video);
-    // Button on poster/metadata too: paused X/Reddit videos never fire
-    // `playing`, and loop+muted+autoplay IS the X feed video shape.
-    const isBig = () => { const r = videoRect(video); return r.width >= 120 && r.height >= 68; };
-    const show = () => { if (isBig()) attachBtn(video); };
-    if (isBig() || video.poster || video.readyState >= 1 || video.currentSrc || !video.paused) attachBtn(video);
+    // UNIVERSAL ALWAYS-ON (IDM-style): button for every <video> no matter
+    // the state. attachBtn runs immediately — paused preload=none Reddit
+    // <video>s (no poster/data, src only a property) and property-src-only
+    // videos never passed the old poster/readyState gate, so no button ever
+    // anchored to them. positionBtn's >=120x68 gate still display:none's
+    // undersized elements; seat + rest opacity .42 clickable, .96 hover.
+    attachBtn(video);
+    const show = () => { const btn = btnFor.get(video); if (btn) { positionBtn(video); if (btn.style.display !== "none") { btn.style.opacity = ".96"; btn.style.pointerEvents = "auto"; } } };
     video.addEventListener("loadstart", () => { video._wcFirstPlay = 0; video._wcSeen = Date.now(); video._wcAnchor = null; });
     video.addEventListener("playing", () => { if (!video._wcFirstPlay) { video._wcFirstPlay = Date.now(); anchorFor(video); } show(); });
     video.addEventListener("loadedmetadata", show);
@@ -616,13 +719,100 @@
     walk(root || document);
     return out;
   }
-  function scan() { allVideos().forEach(scanVideo); } // video only: audio via context menu // scanManifests only at click: full innerHTML regex per observer scan = biggest page cost
+  // Feed-card buttons (IDM-style): cards carry only a thumbnail link and
+  // no <video> until hover-preview, so video-keyed buttons never appear on
+  // YouTube home / feeds. A card whose item link is a registry "page" URL
+  // gets a definite button at rest opacity .42 (clickable) rising on hover,
+  // sending intent="page" straight to the app — the watch URL is the
+  // downloadable handle; no panel round-trip. Cards already owning a
+  // <video> keep the per-video button.
+  const cardBtnFor = new WeakMap();
+  const cardBtnEntries = [];
+  function cardItemUrl(scope) {
+    try {
+      const links = [...scope.querySelectorAll('a[href*="/watch?v="],a[href*="/shorts/"],a[href*="youtu.be/"]')];
+      let best = "";
+      for (const a of links) {
+        const h = itemHref(a.getAttribute("href"));
+        if (h && typeof videoPageKind === "function" && videoPageKind(h) === "page") { best = h; break; }
+      }
+      if (!best) return "";
+      // A nested scope owning exactly this link is a deeper card; the outer
+      // scope must not claim it (dense shelves share one big container).
+      const link = links.find((a) => itemHref(a.getAttribute("href")) === best);
+      const inner = link && link.closest ? link.closest("ytd-rich-item-renderer,ytd-video-renderer,ytd-compact-video-renderer,ytd-reel-item-renderer,article,.thing,[data-testid='tweet'],[data-testid='post-container']") : null;
+      if (inner && inner !== scope && link && !link.closest("video")) {
+        // Only defer when the inner card is a distinct element inside scope.
+        if (scope !== inner && scope.contains(inner)) return "";
+      }
+      return best;
+    } catch (e) { return ""; }
+  }
+  function positionCardBtn(btn, scope) {
+    try {
+      const r = scope.getBoundingClientRect();
+      if (r.width < 120 || r.height < 68) { btn.style.display = "none"; return; }
+      btn.style.display = "";
+      btn.style.left = (r.left - 10) + "px";
+      btn.style.top = (r.top - 10) + "px";
+    } catch (e) {}
+  }
+  function attachCardBtn(scope, url) {
+    let btn = cardBtnFor.get(scope);
+    if (btn) { positionCardBtn(btn, scope); return btn; }
+    btn = document.createElement("button");
+    btn.title = "Download video";
+    btn.setAttribute("aria-label", "Download video");
+    btn.setAttribute("data-downloadcraft-btn", "1");
+    btn.setAttribute("data-downloadcraft-card-btn", "1");
+    btn.style.cssText = "position:fixed;z-index:2147483647;background:rgba(20,26,25,.72);color:rgba(255,255,255,.92);border:1px solid rgba(255,255,255,.28);box-shadow:0 1px 5px rgba(0,0,0,.35);padding:0;cursor:pointer;text-align:center;opacity:.42;pointer-events:auto;display:none;touch-action:none;user-select:none;-webkit-user-select:none;transform:translateZ(0);font-family:\"Inter\",system-ui,sans-serif;";
+    applyBtnStyle(btn);
+    btn.addEventListener("mouseenter", () => { btn.style.opacity = ".96"; btn.style.background = "rgba(46,74,69,.94)"; btn.style.borderColor = "rgba(127,179,170,.9)"; });
+    btn.addEventListener("mouseleave", () => { btn.style.opacity = ".42"; btn.style.background = "rgba(20,26,25,.72)"; btn.style.borderColor = "rgba(255,255,255,.28)"; });
+    btn.addEventListener("focus", () => { btn.style.opacity = ".96"; });
+    btn.addEventListener("blur", () => { btn.style.opacity = ".42"; });
+    btn.addEventListener("click", (e) => {
+      e.preventDefault(); e.stopPropagation();
+      const live = cardItemUrl(scope) || url;
+      if (!live) return;
+      api.runtime.sendMessage({ type: "downloadcraft-video-panel", url: live, intent: "page", pageUrl: live, pageTitle: document.title, filename: filenameFromUrl(live), mime: "" });
+    });
+    cardBtnFor.set(scope, btn);
+    cardBtnEntries.push([scope, btn]);
+    (document.body || document.documentElement).appendChild(btn);
+    positionCardBtn(btn, scope);
+    return btn;
+  }
+  function scanCards() {
+    try {
+      const scopes = [...document.querySelectorAll(CARD_SEL)];
+      const seen = new Set();
+      for (const scope of scopes) {
+        // Per-video button already owns this card.
+        if (scope.querySelector("video")) continue;
+        const url = cardItemUrl(scope);
+        if (!url || seen.has(url)) continue;
+        seen.add(url);
+        attachCardBtn(scope, url);
+      }
+    } catch (e) {}
+  }
+  function pruneCardBtns() {
+    for (let i = cardBtnEntries.length - 1; i >= 0; i--) {
+      const [s, b] = cardBtnEntries[i];
+      // Card recycled/removed, or a hover-preview <video> took over the
+      // card: the per-video button owns the UI from then on.
+      if (!s.isConnected || s.querySelector("video")) { b.remove(); cardBtnEntries.splice(i, 1); }
+    }
+  }
+  function repositionCardBtns() { cardBtnEntries.forEach(([s, b]) => positionCardBtn(b, s)); }
+  function scan() { allVideos().forEach(scanVideo); scanCards(); } // video only: audio via context menu // scanManifests only at click: full innerHTML regex per observer scan = biggest page cost
   // Debounced: full-page rescan on every DOM mutation is too expensive.
   let pending = null;
-  const mo = new MutationObserver(() => { if (pending) return; pending = setTimeout(() => { pending = null; scan(); for (let i = btnForEntries.length - 1; i >= 0; i--) { const [v, b] = btnForEntries[i]; if (!v.isConnected) { b.remove(); btnForEntries.splice(i, 1); } } document.querySelectorAll("video, audio").forEach(positionBtn); }, 400); });
-  window.addEventListener("resize", () => document.querySelectorAll("video, audio").forEach(positionBtn), { passive: true });
+  const mo = new MutationObserver(() => { if (pending) return; pending = setTimeout(() => { pending = null; scan(); pruneCardBtns(); for (let i = btnForEntries.length - 1; i >= 0; i--) { const [v, b] = btnForEntries[i]; if (!v.isConnected) { b.remove(); btnForEntries.splice(i, 1); } } document.querySelectorAll("video, audio").forEach(positionBtn); repositionCardBtns(); }, 400); });
+  window.addEventListener("resize", () => { document.querySelectorAll("video, audio").forEach(positionBtn); repositionCardBtns(); }, { passive: true });
   // Capture: IG reels scroll inner snap containers, no window scroll fires.
-  window.addEventListener("scroll", () => document.querySelectorAll("video, audio").forEach(positionBtn), { passive: true, capture: true });
+  window.addEventListener("scroll", () => { document.querySelectorAll("video, audio").forEach(positionBtn); repositionCardBtns(); }, { passive: true, capture: true });
   // Fullscreen: re-host buttons (body <-> fullscreen subtree), stale
   // pre-FS drag coords invalid after viewport resize.
   const onFsChange = () => {
@@ -640,16 +830,16 @@
     try {
       if (pageBtn && pageBtn.isConnected) return;
       if (typeof videoPageKind === "function" ? videoPageKind(location.href) === "feed" : isFeedHome(location.href)) return;
-      if (!hasPlayerEvidence() && !pageMediaUrls().length) return;
+      if (!hasPlayerEvidence() && !pageMediaUrls().length && !embedPageItems().length) return;
       if (allVideos().length) return; // real <video>: per-video button owns UI
-      const item = pageItem(null) || genericPageItem();
+      const item = pageItem(null) || embedPageItems()[0] || genericPageItem();
       if (!item) return;
       const b = document.createElement("button");
       b.title = "Download video with webcraft";
       b.setAttribute("aria-label", "Download video with webcraft");
       b.setAttribute("data-downloadcraft-page-btn", "1");
-      b.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:7px auto;pointer-events:none"><path d="M12 3v11"/><path d="m7 10 5 5 5-5"/><path d="M4 20h16"/></svg>';
-      b.style.cssText = "position:fixed;right:14px;bottom:14px;z-index:2147483647;width:30px;height:30px;border-radius:50%;background:rgba(46,74,69,.94);color:rgba(255,255,255,.95);border:1px solid rgba(127,179,170,.9);box-shadow:0 1px 6px rgba(0,0,0,.4);padding:0;cursor:pointer;opacity:.92;pointer-events:auto;";
+      b.style.cssText = "position:fixed;right:14px;bottom:14px;z-index:2147483647;background:rgba(46,74,69,.94);color:rgba(255,255,255,.95);border:1px solid rgba(127,179,170,.9);box-shadow:0 1px 6px rgba(0,0,0,.4);padding:0;cursor:pointer;opacity:.92;pointer-events:auto;";
+      applyBtnStyle(b);
       b.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); api.runtime.sendMessage({ type: "downloadcraft-video-panel", url: item.url, intent: "page", pageUrl: item.pageUrl, pageTitle: document.title, filename: item.filename, mime: "" }); });
       document.body.appendChild(b);
       pageBtn = b;
@@ -658,7 +848,14 @@
   ensurePageBtn();
   new MutationObserver(() => ensurePageBtn()).observe(document.documentElement, { childList: true, subtree: true });
   scan();
+  // Stored button style: background/popup answers {style:{...}}; apply on
+  // arrival (may land after first buttons already rendered).
+  try {
+    const maybeInit = api.runtime.sendMessage({ type: "downloadcraft-get-button-style" });
+    if (maybeInit && maybeInit.then) maybeInit.then((r) => { if (r && r.style) setBtnStyle(r.style); }, () => {});
+  } catch (e) {}
   api.runtime.onMessage.addListener((msg) => {
+    if (msg && msg.type === "downloadcraft-button-style" && msg.style) { setBtnStyle(msg.style); return; }
     // Sniffed candidates never touch UI: panel opens only on user click.
     if (msg.type === "downloadcraft-confirm" && self === top) ensureConfirm(msg);
     if (msg.type === "downloadcraft-scan") {
@@ -674,7 +871,9 @@
         // shell, or media-evidenced generic page): offer the page itself for
         // yt-dlp — toolbar parity with Chromium. Feeds/empty pages stay silent
         // here; Chromium shows a note-only panel there instead.
-        const pi = pageItem(null) || genericPageItem();
+        // Embedded player pages: embed (nocookie iframe etc.) is the video,
+        // article is just its host page — offer the embed first.
+        const pi = pageItem(null) || embedPageItems()[0] || genericPageItem();
         if (pi) api.runtime.sendMessage({ type: "downloadcraft-video-panel", url: pi.url, intent: "page", pageUrl: pi.pageUrl, pageTitle: document.title, filename: pi.filename, mime: "" });
       }
       return;

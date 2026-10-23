@@ -452,6 +452,7 @@ fn run_gui(initial_urls: Vec<String>, hidden: bool) {
     // Emit capture filter at startup: deleted/restored filter file must not
     // silently disable filtering until user edits Options.
     platform::write_capture_filter(&crate::lock_unpoison(&rt).state.settings);
+    platform::write_button_style(&crate::lock_unpoison(&rt).state.settings);
     platform::trace("capture filter written");
     // CLI/protocol URL = user clicked link: capture modal, not silent task.
     // finalize_capture_tasks applies filename/queue/naming funnel.
