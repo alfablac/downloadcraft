@@ -391,7 +391,36 @@ pub async fn download_url_with_settings(
                 if ctrl.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                     return Err(e);
                 }
-                // fall through to native dispatch
+                // Page intent: yt-dlp is the only handler (native would save
+                // the article HTML as a fake media file — the Globo "no
+                // streams" path). Surface the yt-dlp error; a preserved
+                // sniffed stream (x-page-stream) retries natively below.
+                let page_intent = task
+                    .headers
+                    .get("x-page-intent")
+                    .map(|s| s == "page")
+                    .unwrap_or(false);
+                if page_intent {
+                    match task.headers.get("x-page-stream").cloned() {
+                        Some(stream)
+                            if (stream.starts_with("http://")
+                                || stream.starts_with("https://"))
+                                && !crate::ytdlp::is_video_page(&stream) =>
+                        {
+                            let mut fallback = task.clone();
+                            fallback.url = stream;
+                            fallback.headers.remove("x-ytdlp");
+                            fallback.headers.remove("x-page-stream");
+                            fallback.headers.remove("x-page-intent");
+                            return Box::pin(download_url_with_settings(
+                                client, fallback, ctrl, settings,
+                            ))
+                            .await;
+                        }
+                        _ => return Err(format!("yt-dlp failed: {e}")),
+                    }
+                }
+                // else: fall through to native dispatch
             }
         }
         if task.headers.contains_key("x-ytdlp") && !manifest_intent {

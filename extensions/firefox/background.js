@@ -105,7 +105,7 @@ function isMetaDoc(details) { try { const d = details && (details.documentUrl ||
 function isKnownCdnHost(u) {
   try {
     const h = new URL(u || "").hostname.toLowerCase().replace(/^(www\.|m\.)/, "");
-    return typeof DCRank !== "undefined" && DCRank && typeof DCRank.hostMatchesScope === "function" && ["instagram.com", "facebook.com", "youtube.com", "x.com", "reddit.com", "tiktok.com", "vimeo.com", "twitch.tv", "dailymotion.com", "bilibili.com"].some((ph) => ph !== h && DCRank.hostMatchesScope(ph, h));
+    return typeof DCRank !== "undefined" && DCRank && typeof DCRank.hostMatchesScope === "function" && ["instagram.com", "facebook.com", "youtube.com", "x.com", "reddit.com", "tiktok.com", "vimeo.com", "twitch.tv", "dailymotion.com", "bilibili.com", "globo.com"].some((ph) => ph !== h && DCRank.hostMatchesScope(ph, h));
   } catch (e) { return false; }
 }
 function isMediaIsh(details) {
@@ -264,7 +264,8 @@ function createMenus() {
     browser.contextMenus.create({ id: "downloadcraft-link", title: "Download with webcraft", contexts: ["link"] }, () => void browser.runtime.lastError);
     browser.contextMenus.create({ id: "downloadcraft-media", title: "Download media with webcraft", contexts: ["video", "audio", "image"] }, () => void browser.runtime.lastError);
     browser.contextMenus.create({ id: "downloadcraft-page", title: "Download all links with webcraft", contexts: ["page"] }, () => void browser.runtime.lastError);
-    browser.contextMenus.create({ id: "downloadcraft-grab", title: "Grab site with webcraft", contexts: ["page"] }, () => void browser.runtime.lastError);
+    browser.contextMenus.create({ id: "downloadcraft-grab", title: "Download site with webcraft", contexts: ["page"] }, () => void browser.runtime.lastError);
+    browser.contextMenus.create({ id: "downloadcraft-scrap", title: "Scrap site with webcraft", contexts: ["page"] }, () => void browser.runtime.lastError);
   } catch (e) {}
 }
 browser.runtime.onInstalled.addListener(createMenus);
@@ -275,7 +276,11 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
   else if (info.menuItemId === "downloadcraft-media" && info.srcUrl) safeSend(info.srcUrl, tab).catch(() => {});
   // Stale tab (no content script): fall back to grab-site instead of silent dead click.
   else if (info.menuItemId === "downloadcraft-page" && tab && tab.id) browser.tabs.sendMessage(tab.id, { type: "downloadcraft-grab-all" }).catch(() => { if (tab.url) safeSend("webcraft://grab?url=" + encodeURIComponent(tab.url), tab, { referrer: tab.url, cookieUrl: tab.url }).catch(() => {}); });
-  else if (info.menuItemId === "downloadcraft-grab" && tab && tab.url) safeSend("webcraft://grab?url=" + encodeURIComponent(tab.url), tab, { referrer: tab.url, cookieUrl: tab.url }).catch(() => {});
+  // "Download site" -> Add URL/File dialog prefilled with the page URL
+  // (webcraft://adddial, NOT add?url= which is the IDM capture-confirm modal).
+  else if (info.menuItemId === "downloadcraft-grab" && tab && tab.url) safeSend("webcraft://adddial?url=" + encodeURIComponent(tab.url), tab, { referrer: tab.url, cookieUrl: tab.url }).catch(() => {});
+  // "Scrap site" -> Site Grabber (auto-explore, cookies ride along).
+  else if (info.menuItemId === "downloadcraft-scrap" && tab && tab.url) safeSend("webcraft://grab?url=" + encodeURIComponent(tab.url), tab, { referrer: tab.url, cookieUrl: tab.url }).catch(() => {});
 });
 // Never intercept page-asset downloads (json/js/css) even with download attr.
 function isAssetDownload(item) {

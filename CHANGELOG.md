@@ -2,6 +2,41 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.23.3] - 2026-10-22
+
+### Fixed
+
+- Globo G1 "no streams found": G1 `.ghtml` articles render only
+  `<bs-player videoid="...">` (no `<video>`, no `og:video`) until
+  play, so no per-video button could attach pre-play. Extensions
+  now treat declarative player evidence (`bs-player[videoid]`,
+  `[data-video-id]`, ...) and registry "page" classification as
+  sufficient proof, and add a discreet corner page button that
+  sends the article URL to yt-dlp (`intent=page`). Globo joined
+  the shared site registry (`videoPageKind`/`siteOf`/
+  `hostMatchesScope`: page CDN `video.globo.com`/`glbimg.com`)
+  and the Rust `is_video_page` parity set (`.ghtml`,
+  `globoplay /v/<id>`). The microdata MP4 is evidence only, never
+  an offered stream (it 400s standalone and yt-dlp's GloboArticle
+  crashes claiming `*.globo.com` MP4s).
+- Download button hid while playing: the 2500 ms playing-flash
+  timer hid the button even with the mouse parked over the video,
+  and the non-Meta `mouseover`-only path could never re-show it
+  without an element-boundary crossing. Hover is now unified on
+  all sites: fresh `videoRect()` coordinate test on every pointer
+  event (overlay-proof), tracked pointer/focus/drag state gating
+  every hide path (flash-hide included), `showBtn` repositions
+  first, ResizeObserver tracks play-time resizes, and the non-Meta
+  rest state is discreet yet clickable like Meta's.
+- App hardening: a failed yt-dlp probe on a page-intent task now
+  surfaces `yt-dlp failed: ...` instead of falling through to
+  download the article HTML as a fake media file; a preserved
+  sniffed stream (`x-page-stream`) still retries natively.
+- Sandbox: fixtures for the Globo `<bs-player>` article,
+  stationary-mouse (>2.5 s) hover with a real click, and the
+  overlay-sibling variant; registry tests cover Globo kind/CDN
+  scope/site (chromium + firefox parity).
+
 ## [0.23.2] - 2026-10-22
 
 ### Fixed

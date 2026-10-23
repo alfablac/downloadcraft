@@ -130,7 +130,7 @@ function isMetaDoc(details) { try { const d = details && (details.documentUrl ||
 function isKnownCdnHost(u) {
   try {
     const h = new URL(u || "").hostname.toLowerCase().replace(/^(www\.|m\.)/, "");
-    return typeof hostMatchesScope === "function" && ["instagram.com", "facebook.com", "youtube.com", "x.com", "reddit.com", "tiktok.com", "vimeo.com", "twitch.tv", "dailymotion.com", "bilibili.com"].some((ph) => ph !== h && hostMatchesScope(ph, h));
+    return typeof hostMatchesScope === "function" && ["instagram.com", "facebook.com", "youtube.com", "x.com", "reddit.com", "tiktok.com", "vimeo.com", "twitch.tv", "dailymotion.com", "bilibili.com", "globo.com"].some((ph) => ph !== h && hostMatchesScope(ph, h));
   } catch (e) { return false; }
 }
 function isSniff(details, type) {
@@ -306,7 +306,8 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({ id: "downloadcraft-link", title: "Download with webcraft", contexts: ["link"] });
   chrome.contextMenus.create({ id: "downloadcraft-media", title: "Download media with webcraft", contexts: ["video", "audio", "image"] });
   chrome.contextMenus.create({ id: "downloadcraft-page", title: "Download all links with webcraft", contexts: ["page"] });
-  chrome.contextMenus.create({ id: "downloadcraft-grab", title: "Grab site with webcraft", contexts: ["page"] });
+  chrome.contextMenus.create({ id: "downloadcraft-grab", title: "Download site with webcraft", contexts: ["page"] });
+  chrome.contextMenus.create({ id: "downloadcraft-scrap", title: "Scrap site with webcraft", contexts: ["page"] });
 });
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === "downloadcraft-link" && info.linkUrl) sendDownload(info.linkUrl, tab);
@@ -315,8 +316,12 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   else if (info.menuItemId === "downloadcraft-media" && info.srcUrl) sendDownload(info.srcUrl, tab);
   // Stale tab (no content script): fall back to grab-site instead of silent dead click.
   else if (info.menuItemId === "downloadcraft-page" && tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "downloadcraft-grab-all" }).catch(() => { if (tab.url) sendDownload("webcraft://grab?url=" + encodeURIComponent(tab.url), tab, { referrer: tab.url, cookieUrl: tab.url }); });
+  // "Download site" -> Add URL/File dialog prefilled with the page URL
+  // (webcraft://adddial, NOT add?url= which is the IDM capture-confirm modal).
   // cookieUrl=tab.url: cookies must scope to real page, not webcraft:// pseudo-URL.
-  else if (info.menuItemId === "downloadcraft-grab" && tab && tab.url) sendDownload("webcraft://grab?url=" + encodeURIComponent(tab.url), tab, { referrer: tab.url, cookieUrl: tab.url });
+  else if (info.menuItemId === "downloadcraft-grab" && tab && tab.url) sendDownload("webcraft://adddial?url=" + encodeURIComponent(tab.url), tab, { referrer: tab.url, cookieUrl: tab.url });
+  // "Scrap site" -> Site Grabber (auto-explore, cookies ride along).
+  else if (info.menuItemId === "downloadcraft-scrap" && tab && tab.url) sendDownload("webcraft://grab?url=" + encodeURIComponent(tab.url), tab, { referrer: tab.url, cookieUrl: tab.url });
 });
 // Captured downloads go DIRECTLY to webcraft (its modal is the config box,
 // like IDM). No browser ask box. Filter = webcraft Settings, decided by

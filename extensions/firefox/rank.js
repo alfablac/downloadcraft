@@ -240,7 +240,7 @@
     if (hostIs(h, ["xvideos.com"])) return /\/video/.test(p) ? "page" : "other";
     if (/^\/(w|videos\/(watch|embed))\/[A-Za-z0-9-]{16,}/.test(p)) return "page"; // PeerTube, any host
     // Globo: g1/video pages (.ghtml articles carry embedded video; Rust parity).
-    if (/globo\.com$/.test(h) && /\.ghtml$/.test(p)) return "page";
+    if (/globo\.com$/.test(h) && (/\.ghtml$/.test(p) || /^\/v\/\d+/.test(p))) return "page";
     return "other";
   }
   function isVideoPageUrl2(u) { return videoPageKind(u) === "page"; }
@@ -276,6 +276,7 @@
       [["twitch.tv", "clips.twitch.tv"], ["twitch.tv", "cloudfront.net", "twitchcdn.net"]],
       [["dailymotion.com", "dai.ly"], ["dmcdn.net", "dailymotion.com"]],
       [["bilibili.com"], ["bilivideo.com", "bilivideo.cn", "hdslb.com", "bilibili.com"]],
+      [["globo.com"], ["video.globo.com", "glbimg.com", "globo.com"]],
     ];
     for (var i = 0; i < pairs.length; i++) {
       if (hostIs(ph, pairs[i][0]) && hostIs(uh, pairs[i][1])) return true;
@@ -295,6 +296,7 @@
     if (hostIs(h, ["twitch.tv", "clips.twitch.tv"])) return "twitch";
     if (hostIs(h, ["dailymotion.com"]) || h === "dai.ly") return "dailymotion";
     if (hostIs(h, ["bilibili.com"]) || h === "b23.tv") return "bilibili";
+    if (/globo\.com$/.test(h)) return "globo";
     return "";
   }
 

@@ -73,14 +73,27 @@
     if (kind === "feed") return null;
     return { url: pu, pageUrl: pu, intent: "page", label: "▶ This video — webcraft (choose quality / audio / subs)", filename: filenameFromUrl(pu), type: "page" };
   }
+  // Declarative player evidence with no <video> yet: Globo G1 renders
+  // <bs-player videoid="..."> and only mounts <video> after play. Presence
+  // proves a video lives here even while no element/media URL exists.
+  // Never offer the microdata MP4 (globo vodstreaming): it 400s standalone
+  // and yt-dlp's GloboArticle crashes claiming *.globo.com MP4s.
+  function hasPlayerEvidence() {
+    try {
+      return !!document.querySelector("bs-player[videoid],[data-video-id],[data-videoid],amp-video,[data-globo-video]");
+    } catch (e) { return false; }
+  }
   // Toolbar on a non-registry page that still shows media evidence: page is
   // the only yt-dlp handle (blob:/MSE src is useless). Feeds excluded.
+  // Registry "page" (e.g. globo .ghtml) is itself proof: player evidence
+  // only required off-registry.
   function genericPageItem() {
     try {
       const loc = cleanPermalink(location.href);
       if (!loc || isFeedHome(loc)) return null;
-      if (typeof videoPageKind === "function" && videoPageKind(loc) === "feed") return null;
-      if (!allVideos().length && !pageMediaUrls().length) return null;
+      const kind = typeof videoPageKind === "function" ? videoPageKind(loc) : "other";
+      if (kind === "feed") return null;
+      if (kind !== "page" && !allVideos().length && !pageMediaUrls().length && !hasPlayerEvidence()) return null;
       return { url: loc, pageUrl: loc, intent: "page", label: "▶ This page — webcraft (choose quality / audio / subs)", filename: filenameFromUrl(loc), type: "page" };
     } catch (e) { return null; }
   }
@@ -521,47 +534,44 @@
       btn.style.cursor = "grab"; if (wasDrag) { btn.dataset.suppressClick = "1"; setTimeout(() => delete btn.dataset.suppressClick, 50); }
       if (wasDrag) { e.preventDefault(); e.stopPropagation(); }
     });
-    // Discreet elsewhere: invisible until pointer over video or button itself;
-    // hidden state must not swallow clicks meant for video controls.
-    // Instagram: always semi-visible — hover-only proved undiscoverable there
-    // (overlays + touch); still clickable at rest on IG.
-    const showBtn = () => { btn.style.opacity = ".96"; btn.style.pointerEvents = "auto"; btn.style.background = "rgba(46,74,69,.94)"; btn.style.borderColor = "rgba(127,179,170,.9)"; };
-    const hideBtn = () => { btn.style.background = "rgba(20,26,25,.72)"; btn.style.borderColor = "rgba(255,255,255,.28)"; if (isMeta(location.href)) { btn.style.opacity = ".42"; btn.style.pointerEvents = "auto"; } else { btn.style.opacity = "0"; btn.style.pointerEvents = "none"; } };
-    // Hover on player wrapper: overlays cover <video> (X/YouTube/Instagram).
-    // Delegated mouseover: overlay siblings (IG action rail/gradient) never
-    // fire mouseenter on wrapper/video, so check containment per event.
-    // Coordinate hover only on Meta (overlay-proof): IG/FB/Threads gradient/
-    // action-rail layers are siblings covering video, containment checks
-    // never fire for them. Elsewhere containment hover (pre-0.22.1 shape).
-    // ponytail: per-video mousemove listener, rAF-throttled; ceiling —
-    // one shared pointer router, add when many-video feeds still jank.
-    if (isMeta()) {
-      let hoverRaf = 0;
-      const onHover = (e) => {
-        if (hoverRaf) return;
-        hoverRaf = requestAnimationFrame(() => {
-          hoverRaf = 0;
-          const r = videoRect(video);
-          const inside = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
-          if (e.target === btn || inside) { positionBtn(video); showBtn(); } else hideBtn();
-        });
-      };
-      document.addEventListener("mouseover", onHover, true);
-      document.addEventListener("mousemove", onHover, true);
-    } else {
-      const hoverHost = playerRoot(video);
-      document.addEventListener("mouseover", (e) => { if (e.target === btn || hoverHost.contains(e.target)) showBtn(); else hideBtn(); });
-    }
+    // Unified hover: fresh videoRect() coordinate test on every pointer
+    // event (overlay-proof on all sites — overlay siblings never fire
+    // containment events). Tracked pointerInside/focus/drag state gates
+    // every hide path: the old playing-flash timer hid the button after
+    // 2500ms even with the mouse parked over the video, and the non-Meta
+    // mouseover-only path could never re-show it (no boundary crossing).
+    // Non-Meta rest state is discreet but clickable like Meta's.
+    let pointerInside = false, leaveTimer = null, focused = false;
+    const showBtn = () => { positionBtn(video); btn.style.opacity = ".96"; btn.style.pointerEvents = "auto"; btn.style.background = "rgba(46,74,69,.94)"; btn.style.borderColor = "rgba(127,179,170,.9)"; };
+    const restBtn = () => { btn.style.background = "rgba(20,26,25,.72)"; btn.style.borderColor = "rgba(255,255,255,.28)"; btn.style.opacity = ".42"; btn.style.pointerEvents = "auto"; };
+    const hideBtn = restBtn;
+    const scheduleHide = () => { if (leaveTimer) clearTimeout(leaveTimer); leaveTimer = setTimeout(() => { if (!pointerInside && !focused && !drag) hideBtn(); }, 350); };
+    let hoverRaf = 0, lastEvt = null;
+    const applyHover = () => {
+      hoverRaf = 0;
+      const e = lastEvt; if (!e) return;
+      const r = videoRect(video);
+      const inside = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+      pointerInside = inside || e.target === btn || document.activeElement === btn;
+      if (pointerInside) { if (leaveTimer) { clearTimeout(leaveTimer); leaveTimer = null; } showBtn(); }
+      else scheduleHide();
+    };
+    const onHover = (e) => { lastEvt = e; if (!hoverRaf) hoverRaf = requestAnimationFrame(applyHover); };
+    document.addEventListener("mouseover", onHover, true);
+    document.addEventListener("mousemove", onHover, true);
+    document.addEventListener("mouseleave", () => { pointerInside = false; scheduleHide(); }, true);
+    // Play-time element resizes (theatre mode, quality swap): keep anchor.
+    if (typeof ResizeObserver !== "undefined") { try { new ResizeObserver(() => { if (btn.style.display !== "none") positionBtn(video); }).observe(video); } catch (e) {} }
     // Discoverability: brief reveal on playback start (pointer may sit still
-    // over video, no mousemove fires). Touch/no-hover: also flash on attach.
+    // over video, no mousemove fires). Flash-hide respects pointer state.
     let flashTimer = null;
-    const flashBtn = () => { positionBtn(video); showBtn(); if (flashTimer) clearTimeout(flashTimer); flashTimer = setTimeout(hideBtn, 2500); };
+    const flashBtn = () => { positionBtn(video); showBtn(); if (flashTimer) clearTimeout(flashTimer); flashTimer = setTimeout(() => { if (!pointerInside && !focused && !drag) hideBtn(); }, 2500); };
     video.addEventListener("playing", flashBtn);
     if (window.matchMedia && matchMedia("(hover: none)").matches) { flashBtn(); video.addEventListener("loadedmetadata", flashBtn); video.addEventListener("play", flashBtn); }
-    btn.addEventListener("mouseenter", showBtn);
-    btn.addEventListener("mouseleave", hideBtn);
-    btn.addEventListener("focus", showBtn);
-    btn.addEventListener("blur", hideBtn);
+    btn.addEventListener("mouseenter", () => { pointerInside = true; if (leaveTimer) { clearTimeout(leaveTimer); leaveTimer = null; } showBtn(); });
+    btn.addEventListener("mouseleave", () => { pointerInside = false; scheduleHide(); });
+    btn.addEventListener("focus", () => { focused = true; showBtn(); });
+    btn.addEventListener("blur", () => { focused = false; scheduleHide(); });
 
     btnFor.set(video, btn);
     btnForEntries.push([video, btn]);
@@ -622,6 +632,31 @@
   document.addEventListener("fullscreenchange", onFsChange);
   document.addEventListener("webkitfullscreenchange", onFsChange);
   mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "poster"] });
+  // Declarative-player pages (Globo <bs-player>): no <video> exists until
+  // play, so no per-video button can attach pre-play. Offer the article
+  // page itself to yt-dlp via a discreet corner button instead.
+  let pageBtn = null;
+  function ensurePageBtn() {
+    try {
+      if (pageBtn && pageBtn.isConnected) return;
+      if (typeof videoPageKind === "function" ? videoPageKind(location.href) === "feed" : isFeedHome(location.href)) return;
+      if (!hasPlayerEvidence() && !pageMediaUrls().length) return;
+      if (allVideos().length) return; // real <video>: per-video button owns UI
+      const item = pageItem(null) || genericPageItem();
+      if (!item) return;
+      const b = document.createElement("button");
+      b.title = "Download video with webcraft";
+      b.setAttribute("aria-label", "Download video with webcraft");
+      b.setAttribute("data-downloadcraft-page-btn", "1");
+      b.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:7px auto;pointer-events:none"><path d="M12 3v11"/><path d="m7 10 5 5 5-5"/><path d="M4 20h16"/></svg>';
+      b.style.cssText = "position:fixed;right:14px;bottom:14px;z-index:2147483647;width:30px;height:30px;border-radius:50%;background:rgba(46,74,69,.94);color:rgba(255,255,255,.95);border:1px solid rgba(127,179,170,.9);box-shadow:0 1px 6px rgba(0,0,0,.4);padding:0;cursor:pointer;opacity:.92;pointer-events:auto;";
+      b.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); api.runtime.sendMessage({ type: "downloadcraft-video-panel", url: item.url, intent: "page", pageUrl: item.pageUrl, pageTitle: document.title, filename: item.filename, mime: "" }); });
+      document.body.appendChild(b);
+      pageBtn = b;
+    } catch (e) {}
+  }
+  ensurePageBtn();
+  new MutationObserver(() => ensurePageBtn()).observe(document.documentElement, { childList: true, subtree: true });
   scan();
   api.runtime.onMessage.addListener((msg) => {
     // Sniffed candidates never touch UI: panel opens only on user click.

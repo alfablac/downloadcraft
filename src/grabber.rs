@@ -507,7 +507,7 @@ async fn sp_get_all(
         let resp = req.send().await.map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
             return Err(format!(
-                "SharePoint API HTTP {} for {u} — sign in via browser, use extension Grab site (cookies expire), or paste fresh Cookies",
+                "SharePoint API HTTP {} for {u} — sign in via browser, use extension Scrap site (cookies expire), or paste fresh Cookies",
                 resp.status()
             ));
         }
@@ -648,7 +648,7 @@ impl Crawler {
             } else {
                 errors.join(" · ")
             };
-            return Err(format!("SharePoint listed 0 files ({detail}). For private folders: open folder signed-in in browser, then extension Grab site with webcraft (sends session cookies)."));
+            return Err(format!("SharePoint listed 0 files ({detail}). For private folders: open folder signed-in in browser, then extension Scrap site with webcraft (sends session cookies)."));
         }
         Ok((vec![page_url], files))
     }

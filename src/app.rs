@@ -2265,6 +2265,53 @@ impl DownloadApp {
                 self.show_window(ctx);
             }
         }
+        // Extension "Download site": open Add URL/File dialog prefilled with
+        // the page URL (+referrer/cookies). JSON carries them; txt = legacy.
+        {
+            let pj = crate::platform::config_dir().join("pending-add.json");
+            let pt = crate::platform::config_dir().join("pending-add.txt");
+            let mut pending_add: Option<(String, String, String)> = None;
+            if let Ok(s) = std::fs::read_to_string(&pj) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                    pending_add = v.get("url").and_then(|x| x.as_str()).map(|u| {
+                        (
+                            u.to_string(),
+                            v.get("referrer")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            v.get("cookies")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        )
+                    });
+                    if pending_add.is_some() {
+                        let _ = std::fs::remove_file(&pj);
+                    }
+                }
+            }
+            if pending_add.is_none() {
+                if let Ok(s) = std::fs::read_to_string(&pt) {
+                    let u = s.trim().to_string();
+                    if !u.is_empty() {
+                        let _ = std::fs::remove_file(&pt);
+                        pending_add = Some((u, String::new(), String::new()));
+                    }
+                }
+            }
+            if let Some((u, referrer, cookies)) = pending_add {
+                self.show_window_full(ctx);
+                self.tab = Tab::Downloads;
+                self.add_url = u;
+                self.add_referrer = referrer;
+                self.add_cookies = cookies;
+                self.show_add = true;
+                self.add_just_opened = true;
+                self.add_raise_frames = 90;
+                self.add_focus_done = false;
+            }
+        }
         crate::drain_inbox(&self.rt);
         // Browser capture arrived: reveal window so user sees confirm dialog.
         // Downloaded already-running pages fire no task.start guard — captures
@@ -11428,7 +11475,7 @@ impl DownloadApp {
                 ui::form_label(ui, "Cookies");
                 ui.add(
                     ui::text_field(&mut self.grab_cookies)
-                        .hint_text("name=value; ... (browser Grab site fills this; SharePoint needs it)")
+                        .hint_text("name=value; ... (browser Scrap site fills this; SharePoint needs it)")
                         .password(true)
                         .desired_width(f32::INFINITY),
                 );

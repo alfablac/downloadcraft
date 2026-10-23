@@ -404,13 +404,21 @@ pub fn run_host_handshake(host: &std::path::Path) -> Result<(), String> {
 
 /// Cold-start URL arg -> pending capture task (same IDM confirm modal as
 /// browser inbox captures), instead of silent add_url task. `grab` keeps
-/// inbox side-channel (cookies-less: pending-grab.txt Grabber reads).
-/// Returns None for grab (handled) and empty decodes.
+/// inbox side-channel (cookies-less: pending-grab.txt Grabber reads);
+/// `adddial` likewise (pending-add.txt: Add dialog prefill, NOT a task).
+/// Returns None for grab/adddial (handled) and empty decodes.
 fn cold_start_capture(arg: &str) -> Option<DownloadTask> {
     for scheme in ["webcraft", "downloadcraft"] {
         if let Some(enc) = arg.strip_prefix(&format!("{scheme}://grab?url=")) {
             let _ = std::fs::write(
                 platform::config_dir().join("pending-grab.txt"),
+                url_decode(enc),
+            );
+            return None;
+        }
+        if let Some(enc) = arg.strip_prefix(&format!("{scheme}://adddial?url=")) {
+            let _ = std::fs::write(
+                platform::config_dir().join("pending-add.txt"),
                 url_decode(enc),
             );
             return None;
@@ -653,6 +661,20 @@ pub fn take_inbox_tasks(rt: &Arc<Mutex<Runtime>>) -> Vec<DownloadTask> {
                 }
                 if let Some(enc) = t
                     .url
+                    .strip_prefix("webcraft://adddial?url=")
+                    .or_else(|| t.url.strip_prefix("downloadcraft://adddial?url="))
+                {
+                    // "Download site": Add URL/File dialog prefilled with the
+                    // page URL (+referrer/cookies), NOT a capture task.
+                    let _ = std::fs::write(
+                        platform::config_dir().join("pending-add.json"),
+                        serde_json::json!({"url": url_decode(enc), "referrer": t.referrer, "cookies": t.cookies}).to_string(),
+                    );
+                    let _ = std::fs::remove_file(&p);
+                    continue;
+                }
+                if let Some(enc) = t
+                    .url
                     .strip_prefix("webcraft://add?url=")
                     .or_else(|| t.url.strip_prefix("downloadcraft://add?url="))
                 {
@@ -711,6 +733,12 @@ mod state_tests {
         let _ = std::fs::remove_file(platform::config_dir().join("pending-grab.txt"));
         assert!(cold_start_capture("webcraft://grab?url=https%3A%2F%2Fex.com").is_none());
         let _ = std::fs::remove_file(platform::config_dir().join("pending-grab.txt"));
+        let _ = std::fs::remove_file(platform::config_dir().join("pending-add.txt"));
+        assert!(cold_start_capture("webcraft://adddial?url=https%3A%2F%2Fex.com").is_none());
+        let pending =
+            std::fs::read_to_string(platform::config_dir().join("pending-add.txt")).unwrap();
+        assert_eq!(pending, "https://ex.com");
+        let _ = std::fs::remove_file(platform::config_dir().join("pending-add.txt"));
     }
 
     #[test]

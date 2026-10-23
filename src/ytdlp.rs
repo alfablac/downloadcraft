@@ -1506,6 +1506,11 @@ pub fn is_video_page(url: &str) -> bool {
         }
         "reddit.com" => path.contains("/comments/"),
         "soundcloud.com" => path.matches('/').count() >= 2,
+        // Globo (h already www./m.-stripped; ends_with covers g1./ge. subs):
+        // .ghtml articles embed video (GloboArticle extractor); /v/<id> player.
+        _ if h.ends_with("globo.com") => {
+            path.ends_with(".ghtml") || (seg(1) == "v" && is_digits(seg(2), 1))
+        }
         "bilibili.com" => {
             path.starts_with("/video/")
                 || (seg(1) == "bangumi"
@@ -1815,6 +1820,8 @@ mod tests {
             "https://peertube.example/videos/watch/p9jmLXa9q3xYvZk7mNqW2a",
             "https://peertube.example/videos/embed/p9jmLXa9q3xYvZk7mNqW2a",
             "https://example.com/w/p9jmLXa9q3xYvZk7mNqW2a",
+            "https://g1.globo.com/mundo/noticia/2026/10/22/story.ghtml",
+            "https://globoplay.globo.com/v/15107769/",
         ] {
             assert!(is_video_page(page), "page missed: {page}");
         }
@@ -1834,6 +1841,9 @@ mod tests {
             "https://rumble.com/v123",
             "https://example.com/w/short",
             "https://www.bilibili.com/bangumi/play/ep",
+            "https://g1.globo.com/",
+            "https://g1.globo.com/mundo/",
+            "https://globo.com.evil.example/story.ghtml",
         ] {
             // Note: dailymotion/nicovideo/bilibili hosts are checked above only
             // for their real hosts; v.dailymotion.example must not match.

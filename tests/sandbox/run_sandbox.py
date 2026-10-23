@@ -108,11 +108,15 @@ class Fixture:
     url: str
     html: str
     expect_buttons: int
-    activation: str = "button"  # "button" | "scan"
+    # "button" (JS click) | "scan" (toolbar message) | "hover" (real mouse,
+    # stationary >2.5s, then real click) | "pagebtn" (corner page button).
+    activation: str = "button"
     button_index: int = 0
     panel_text: str | None = None  # click panel item containing this; None = first
     # Acceptable (intent, url) pairs for the captured download payload.
     acceptable: list = field(default_factory=list)
+    expect_page_btn: bool = False  # [data-downloadcraft-page-btn="1"] present
+    overlay: bool = False  # hover fixture: sibling overlay covers the video
 
 
 YOUTUBE_WATCH = "https://www.youtube.com/watch?v=SandboxVid1"
@@ -123,6 +127,12 @@ FEED_PAGE_B = "https://www.youtube.com/watch?v=FeedVideoB2"
 TIKTOK_PAGE = "https://www.tiktok.com/@sandbox.creator/video/7298765432101234567"
 OG_PAGE = "https://blog.example.test/posts/sandbox-og-story"
 OG_STREAM = "https://cdn.example.test/media/og-only-movie.mp4"
+GLOBO_PAGE = (
+    "https://g1.globo.com/mundo/noticia/2026/10/22/parlamentares-dos-eua-"
+    "cobram-explicacoes-de-zuckerberg-sobre-acoes-da-meta.ghtml"
+)
+HOVER_PAGE = "https://videos.example.test/title/sandbox-hover-1"
+HOVER_OVERLAY_PAGE = "https://videos.example.test/title/sandbox-hover-overlay-1"
 
 FIXTURES: list[Fixture] = [
     # (a) YouTube-like watch page, direct <video src> (googlevideo-shaped).
@@ -228,6 +238,72 @@ FIXTURES: list[Fixture] = [
         panel_text="og-only-movie.mp4",
         acceptable=[("stream", OG_STREAM), ("page", OG_PAGE)],
     ),
+    # (g) Globo G1 article: <bs-player videoid> only, no <video>, no
+    # og:video, no scripts. The page corner button must offer the article
+    # URL itself to yt-dlp (intent=page); the microdata MP4 is evidence
+    # only and must never be offered as a stream.
+    Fixture(
+        fid="g-globo-bs-player",
+        name="globo g1 .ghtml <bs-player> only, page button",
+        url=GLOBO_PAGE,
+        html=page_html(
+            "Parlamentares dos EUA cobram explicações - g1",
+            '<article><h1>Parlamentares dos EUA cobram explicações</h1>'
+            '<bs-player videoid="15107769" subscriber-only="false" auth="false"></bs-player>'
+            '<p itemprop="associatedMedia" itemscope>'
+            '<meta itemprop="contentUrl" content="https://s01.video.glbimg.com/x720/15107769.mp4">'
+            "</p><p>Texto da notícia.</p></article>",
+        ),
+        expect_buttons=0,
+        expect_page_btn=True,
+        activation="pagebtn",
+        acceptable=[("page", GLOBO_PAGE)],
+    ),
+    # (h) Hover regression: real mouse, canvas MediaStream playback,
+    # stationary pointer > 2.5 s (past the old playing-flash hide), then
+    # a real mouse click must still hit the button and open the panel.
+    Fixture(
+        fid="h-hover-stationary",
+        name="non-Meta video: stationary hover >2.5s, real click",
+        url=HOVER_PAGE,
+        html=page_html(
+            "Sandbox Hover",
+            '<div id="wrap" style="position:relative;width:640px;height:360px;margin:24px">'
+            '<canvas id="paint" width="640" height="360" style="display:none"></canvas>'
+            '<video id="hv" muted playsinline '
+            'style="display:block;width:640px;height:360px"></video></div>'
+            "<script>(function(){var c=document.getElementById('paint'),x=c.getContext('2d');"
+            "x.fillStyle='#234';x.fillRect(0,0,640,360);"
+            "var v=document.getElementById('hv');try{v.srcObject=c.captureStream(5);}catch(e){}"
+            "v.play().catch(function(){});})();</script>",
+        ),
+        expect_buttons=1,
+        activation="hover",
+        acceptable=[("page", HOVER_PAGE), ("stream", GENERIC_STREAM)],
+    ),
+    # (i) Same as (h) but an overlay sibling covers the video: coordinate
+    # hover must still reveal the button (containment checks never fire).
+    Fixture(
+        fid="i-hover-overlay",
+        name="non-Meta video + overlay sibling: stationary hover, real click",
+        url=HOVER_OVERLAY_PAGE,
+        html=page_html(
+            "Sandbox Hover Overlay",
+            '<div id="wrap" style="position:relative;width:640px;height:360px;margin:24px">'
+            '<canvas id="paint" width="640" height="360" style="display:none"></canvas>'
+            '<video id="hv" muted playsinline '
+            'style="display:block;width:640px;height:360px"></video>'
+            '<div id="cover" style="position:absolute;inset:0;z-index:5"></div></div>'
+            "<script>(function(){var c=document.getElementById('paint'),x=c.getContext('2d');"
+            "x.fillStyle='#234';x.fillRect(0,0,640,360);"
+            "var v=document.getElementById('hv');try{v.srcObject=c.captureStream(5);}catch(e){}"
+            "v.play().catch(function(){});})();</script>",
+        ),
+        expect_buttons=1,
+        activation="hover",
+        overlay=True,
+        acceptable=[("page", HOVER_OVERLAY_PAGE), ("stream", GENERIC_STREAM)],
+    ),
 ]
 
 
@@ -290,8 +366,80 @@ def run_fixture(browser, fixture: Fixture, rank_js: str, content_js: str) -> Res
                 buttons=buttons,
             )
 
+        # Corner page button (declarative-player pages, e.g. Globo).
+        if fixture.expect_page_btn:
+            page.wait_for_selector(
+                '[data-downloadcraft-page-btn="1"]', state="attached", timeout=5000
+            )
+
         # Activate: click the per-video button, or simulate the toolbar scan.
-        if fixture.activation == "button":
+        if fixture.activation == "pagebtn":
+            page.click('[data-downloadcraft-page-btn="1"]', timeout=5000)
+            page.wait_for_function(
+                "() => window.__wcSent.some((m) => m && m.type === 'downloadcraft-video-panel')",
+                timeout=5000,
+            )
+            payload = page.evaluate(
+                """() => {
+                  const hits = window.__wcSent.filter((m) => m && m.type === 'downloadcraft-video-panel');
+                  return hits.length ? hits[hits.length - 1] : null;
+                }"""
+            )
+            got = (payload.get("intent") or "stream", payload.get("url") or "")
+            ok = got in [tuple(x) for x in fixture.acceptable]
+            return Result(
+                fixture, ok,
+                f"pagebtn payload intent={got[0]} url={got[1]}"
+                + ("" if ok else f" not in acceptable {fixture.acceptable}"),
+                buttons=buttons, payload=payload,
+            )
+        if fixture.activation == "hover":
+            # Real mouse: park over the video, let playback run past the old
+            # 2500 ms flash-hide, assert button still visible/clickable and
+            # topmost at its point, then a real mouse click must open panel.
+            btn_box = page.evaluate(
+                """() => {
+                  const b = document.querySelector('[data-downloadcraft-btn="1"]');
+                  if (!b) return null;
+                  const r = b.getBoundingClientRect();
+                  return {x: r.x, y: r.y, w: r.width, h: r.height};
+                }"""
+            )
+            if not btn_box:
+                return Result(fixture, False, "hover: button missing", buttons=buttons)
+            video_box = page.evaluate(
+                """() => {
+                  const v = document.querySelector('video');
+                  const r = v.getBoundingClientRect();
+                  return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+                }"""
+            )
+            page.mouse.move(video_box["x"], video_box["y"], steps=5)
+            page.wait_for_timeout(400)
+            page.evaluate("() => document.querySelector('video').play().catch(() => {})")
+            # Stationary pointer: no further mouse events for >2500 ms.
+            page.wait_for_timeout(3000)
+            state = page.evaluate(
+                """() => {
+                  const b = document.querySelector('[data-downloadcraft-btn="1"]');
+                  const cs = getComputedStyle(b);
+                  const r = b.getBoundingClientRect();
+                  const top = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+                  return {opacity: parseFloat(cs.opacity), pe: cs.pointerEvents,
+                          top: top === b, disp: cs.display};
+                }"""
+            )
+            if not (state["opacity"] > 0.9 and state["pe"] == "auto" and state["top"]):
+                return Result(
+                    fixture, False,
+                    f"hover: after 3s stationary opacity={state['opacity']} "
+                    f"pointerEvents={state['pe']} topmost={state['top']} disp={state['disp']}",
+                    buttons=buttons,
+                )
+            cx = btn_box["x"] + btn_box["w"] / 2
+            cy = btn_box["y"] + btn_box["h"] / 2
+            page.mouse.click(cx, cy)
+        elif fixture.activation == "button":
             clicked = page.evaluate(
                 """(idx) => {
                   const b = document.querySelectorAll('[data-downloadcraft-btn="1"]')[idx];

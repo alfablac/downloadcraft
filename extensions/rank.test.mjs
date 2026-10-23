@@ -205,6 +205,9 @@ const kindCases = [
   ["rumble /vXXXX=page", "https://rumble.com/v1a2b3c", "page"],
   // PeerTube: /w/<16+ chars> on any host
   ["peertube /w/<16+ chars>=page (arbitrary host)", "https://videos.example.org/w/abcdefghijklmnop", "page"],
+  ["globo .ghtml article=page", "https://g1.globo.com/mundo/noticia/2026/10/22/story.ghtml", "page"],
+  ["globoplay /v/<id>=page", "https://globoplay.globo.com/v/15107769/", "page"],
+  ["globo section=other", "https://g1.globo.com/mundo/", "other"],
 ];
 for (const [name, u, want] of kindCases) {
   assert.equal(videoPageKind(u), want, "videoPageKind " + name);
@@ -231,7 +234,10 @@ const scopeCases = [
   ["youtube.com->googlevideo", "youtube.com", "rr1---sn-abc.googlevideo.com", true],
   ["x.com->twimg", "x.com", "video.twimg.com", true],
   ["reddit.com->v.redd.it", "reddit.com", "v.redd.it", true],
+  ["g1.globo.com->video.globo.com", "g1.globo.com", "video.globo.com", true],
+  ["g1.globo.com->glbimg.com", "g1.globo.com", "s01.video.glbimg.com", true],
   ["cross-site: instagram page vs googlevideo", "instagram.com", "rr1---sn-abc.googlevideo.com", false],
+  ["cross-site: globo page vs googlevideo", "g1.globo.com", "rr1---sn-abc.googlevideo.com", false],
 ];
 for (const [name, ph, uh, want] of scopeCases) {
   assert.equal(hostMatchesScope(ph, uh), want, "hostMatchesScope " + name);
@@ -241,6 +247,7 @@ const siteCases = [
   ["threads.net->threads", "https://www.threads.net/@someuser/post/DAbc123XyZ", "threads"],
   ["m.youtube.com->youtube", "https://m.youtube.com/watch?v=dQw4w9WgXcQ", "youtube"],
   ["fb.watch->facebook", "https://fb.watch/AbC123XyZ/", "facebook"],
+  ["g1.globo.com->globo", "https://g1.globo.com/mundo/noticia/2026/10/22/story.ghtml", "globo"],
 ];
 for (const [name, u, want] of siteCases) {
   assert.equal(siteOf(u), want, "siteOf " + name);
