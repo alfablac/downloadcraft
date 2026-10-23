@@ -69,7 +69,9 @@ const MEDIA_PATH = /\.(mpd|m3u8|mp4|webm|ts|m4s)($|[?#])/i;
 const MEDIA_TYPES = new Set(["media", "xmlhttprequest", "other", "object"]);
 function isMediaIsh(details) {
   // Record only media-ish requests; full <all_urls> recording bloats TTL map
-  // with page/API traffic element matcher never needs.
+  // with page/API traffic element matcher never needs. Known registry-CDN
+  // hosts record too (MSE fetch arrives as other/fetch off MEDIA_TYPES).
+  if (isKnownCdnHost(details.url)) return true;
   if (details.type && MEDIA_TYPES.has(details.type)) return true;
   try { return MEDIA_PATH.test(new URL(details.url || "").pathname); } catch (e) { return MEDIA_PATH.test(String(details.url || "")); }
 }
@@ -118,27 +120,43 @@ async function loadCandidates() {
   } catch (e) {}
 }
 const SNIFF_TYPES = new Set(["application/dash+xml", "application/x-mpegurl", "application/vnd.apple.mpegurl", "application/x-mpegurl", "video/vnd.mpeg.dash.mpd", "video/mpegurl", "video/x-mpegurl", "application/mpegurl"]);
-const IG_CDN_RE = /(^|\.)(cdninstagram\.com|fbcdn\.net)$/i;
-const IG_PAGE_RE = /(^|\.)instagram\.com$/i;
-function isIgCdnUrl(u) { try { return IG_CDN_RE.test(new URL(u).hostname); } catch (e) { return /cdninstagram\.com|fbcdn\.net/i.test(String(u || "")); } }
-function isIgDoc(details) { try { const d = details && (details.documentUrl || details.initiator || details.originUrl || ""); if (!d) return false; return IG_PAGE_RE.test(new URL(d).hostname); } catch (e) { return false; } }
+const META_CDN_RE = /(^|\.)(cdninstagram\.com|fbcdn\.net)$/i;
+const META_PAGE_RE = /(^|\.)(instagram\.com|facebook\.com|threads\.net|threads\.com)$/i;
+function isMetaCdnUrl(u) { try { return META_CDN_RE.test(new URL(u).hostname); } catch (e) { return /cdninstagram\.com|fbcdn\.net/i.test(String(u || "")); } }
+function isMetaDoc(details) { try { const d = details && (details.documentUrl || details.initiator || details.originUrl || ""); if (!d) return false; return META_PAGE_RE.test(new URL(d).hostname); } catch (e) { return false; } }
+// Known registry-CDN hostname (hostMatchesScope same-host pairs): media CDN
+// pair of a listed site. isMediaIsh keeps these recorded even when the
+// request type falls outside MEDIA_TYPES (MSE fetch arrives as other/fetch).
+function isKnownCdnHost(u) {
+  try {
+    const h = new URL(u || "").hostname.toLowerCase().replace(/^(www\.|m\.)/, "");
+    return typeof hostMatchesScope === "function" && ["instagram.com", "facebook.com", "youtube.com", "x.com", "reddit.com", "tiktok.com", "vimeo.com", "twitch.tv", "dailymotion.com", "bilibili.com"].some((ph) => ph !== h && hostMatchesScope(ph, h));
+  } catch (e) { return false; }
+}
 function isSniff(details, type) {
   const url = details.url || "";
   let path = "";
   try { path = new URL(url).pathname.toLowerCase(); } catch (e) { path = String(url).split(/[?#]/)[0].toLowerCase(); }
-  // pathname only: query-string ext false-rejects signed IG URLs
+  // pathname only: query-string ext false-rejects signed Meta URLs
   // (?x=.js / ?token=xx.css). Page assets rejected by real path suffix.
   if (/\.(json|js|mjs|css|html?|map)$/i.test(path)) return false; // page assets
   const ft = String(details.type || "");
-  const igCdn = isIgCdnUrl(url);
-  const igDoc = isIgDoc(details);
-  // IG progressive (extension-less, video/mp4, type=fetch/xhr/other) and
-  // IG DASH (extension-less .mpd via fetch, application/dash+xml or
-  // octet-stream): accept IG-CDN regardless of request type. Request-type
+  const igCdn = isMetaCdnUrl(url);
+  const igDoc = isMetaDoc(details);
+  const knownCdn = isKnownCdnHost(url);
+  // Meta progressive (extension-less, video/mp4, type=fetch/xhr/other) and
+  // Meta DASH (extension-less .mpd via fetch, application/dash+xml or
+  // octet-stream): accept Meta CDN regardless of request type. Request-type
   // allowlist was root cause: MSE fetch arrives as xmlhttprequest/fetch, not media.
   if (igCdn && (type.startsWith("video/") || type.startsWith("audio/") || SNIFF_TYPES.has(type))) return true;
   if (igCdn && (type === "application/octet-stream" || !type) && (igDoc || ft === "media" || ft === "xmlhttprequest" || ft === "fetch" || ft === "other" || ft === "object" || ft === "")) return true;
   if (igCdn && igDoc && (path.endsWith(".mpd") || path.endsWith(".m3u8"))) return true;
+  // Known registry-CDN hosts (googlevideo/twimg/...): same sniff allowances
+  // as Meta for sniff types, and octet-stream media (no .mpd branch: that
+  // needs a listed page doc; other CDN manifests still land via the .mpd /
+  // SNIFF_TYPES branches below).
+  if (knownCdn && SNIFF_TYPES.has(type)) return true;
+  if (knownCdn && (type === "application/octet-stream" || !type) && (ft === "media" || ft === "xmlhttprequest" || ft === "fetch" || ft === "other" || ft === "object" || ft === "")) return true;
   if (path.endsWith(".mpd") || path.endsWith(".m3u8")) return true;
   // Extension fallback: DASH/HLS/full mp4 served without usable Content-Type.
   if (!type || type === "application/octet-stream") {
@@ -148,7 +166,7 @@ function isSniff(details, type) {
   if (SNIFF_TYPES.has(type)) return true;
   if (type.startsWith("video/") || type.startsWith("audio/")) {
     // Segments pollute panel (X twimg / Reddit DASH floods cap); only
-    // manifests/full media belong. IG-CDN exempted by branches above.
+    // manifests/full media belong. Meta CDN exempted by branches above.
     try { const seg = new URL(url).pathname.split("/").pop() || ""; if (/^(seg|segment|chunk|frag)[-_]?\d|\.m4s$|[-_]\d+\.(ts|m4s)$/i.test(seg)) return false; } catch (e) {}
     return true;
   }
@@ -419,15 +437,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // frame only, never tier — else cross-frame timing hands this video
         // another video's streams when srcs/postId/streamId matched nothing.
         if (!pool.length && senderFrame != null && typeof matchRecordsForElement === "function") pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null, noTiming: true }, Date.now());
-          // IG host-scoped fallback (background-only): CDN URLs never carry
-          // shortcode, MSE src is blob:, timing anchored at firstPlay misses
-          // preloads. pageHost from sender.tab.url (trusted bg, not msg).
+          // Host-scoped fallback (background-only): CDN URLs never carry the
+          // page id on Meta/YouTube/X/Reddit/TikTok/..., MSE src is blob:,
+          // timing misses preloads. pageHost = sender.tab.url hostname
+          // (trusted bg, not msg); hostMatchesScope maps it to its CDN pair.
           // noTiming likewise: hostExtra is window-bound itself; plain timing
-          // must not widen into other frames on IG feeds.
+          // must not widen into other frames on feeds.
           if (!pool.length && typeof matchRecordsForElement === "function") {
             let ph = "";
             try { ph = new URL((sender.tab && sender.tab.url) || "").hostname.toLowerCase(); } catch (e) {}
-            if (/(^|\.)instagram\.com$/.test(ph)) pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null, noTiming: true, pageHost: "instagram.com" }, Date.now(), [...candidates.values()]);
+            if (ph) pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null, noTiming: true, pageHost: ph }, Date.now(), [...candidates.values()]);
           }
       } else {
         pool = [...candidates.values()].filter((c) => tabId == null || c.tabId === tabId);
@@ -443,7 +462,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // to yt-dlp page (else manifest choice lost). Only cookies scope passes.
   if (msg && msg.type === "downloadcraft-video-panel") { sendDownload(msg.url, sender.tab, { filename: msg.filename, mime: msg.mime, referrer: msg.referrer || msg.pageUrl, pageTitle: msg.pageTitle, pageUrl: msg.intent === "page" ? msg.pageUrl : undefined, cookieUrl: msg.pageUrl, intent: msg.intent }).then(sendResponse, (e) => sendResponse({ type: "error", error: String((e && e.message) || e) })); return true; }
 });
-// Toolbar click -> content scan (unchanged); IG fallback lives in getCandidates above.
+// Toolbar click -> content scan (unchanged); host-scoped fallback lives in getCandidates above.
 chrome.action.onClicked.addListener((tab) => { if (tab && tab.id) chrome.tabs.sendMessage(tab.id, { type: "downloadcraft-scan" }).catch(() => {}); });
 // SPA pushState nav (url-only change) must NOT wipe candidates: IG preloads
 // media before user opens reel; only real loading nav to a new URL purges.

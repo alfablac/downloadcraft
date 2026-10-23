@@ -1448,17 +1448,36 @@ pub fn is_video_page(url: &str) -> bool {
     let path = u.path().to_ascii_lowercase();
     let h = host.strip_prefix("www.").unwrap_or(&host);
     let h = h.strip_prefix("m.").unwrap_or(h);
-    match h {
+    let segs: Vec<&str> = path.split('/').collect();
+    let seg = |i: usize| segs.get(i).copied().unwrap_or("");
+    let is_digits = |s: &str, min: usize| {
+        s.len() >= min && !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+    };
+    let host_match = match h {
         "youtube.com" => {
             path.starts_with("/watch") || path.starts_with("/shorts/") || path.starts_with("/live/")
         }
         "youtu.be" => path.len() > 1,
         "music.youtube.com" => path.starts_with("/watch"),
-        "vimeo.com" => path.chars().nth(1).is_some_and(|c| c.is_ascii_digit()),
-        "dailymotion.com" => path.starts_with("/video/"),
+        "vimeo.com" => {
+            path.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+                || (seg(1) == "video" && is_digits(seg(2), 5))
+                || ((seg(1) == "channels" || seg(1) == "groups")
+                    && !seg(2).is_empty()
+                    && (is_digits(seg(3), 5)
+                        || (seg(3) == "videos" && is_digits(seg(4), 5))))
+        }
+        "dailymotion.com" => {
+            path.starts_with("/video/")
+                || (seg(1) == "embed" && seg(2) == "video" && !seg(3).is_empty())
+        }
         "dai.ly" => path.len() > 1,
-        "twitch.tv" => path.starts_with("/videos/"),
-        "tiktok.com" => path.contains("/video/"),
+        "twitch.tv" => {
+            path.starts_with("/videos/")
+                || (!seg(1).is_empty() && seg(2) == "clip" && !seg(3).is_empty())
+        }
+        "clips.twitch.tv" => path.len() > 1 && !seg(1).is_empty(),
+        "tiktok.com" => path.contains("/video/") || path.contains("/photo/"),
         "instagram.com" => {
             ["/reel/", "/reels/", "/p/", "/tv/"]
                 .iter()
@@ -1472,12 +1491,61 @@ pub fn is_video_page(url: &str) -> bool {
                 || path.contains("/videos/")
                 || path.starts_with("/watch")
                 || path.starts_with("/reel/")
+                || (seg(1) == "share"
+                    && (seg(2) == "r" || seg(2) == "v")
+                    && !seg(3).is_empty())
+        }
+        "threads.net" | "threads.com" => {
+            seg(1).starts_with('@')
+                && seg(1).len() > 1
+                && seg(2) == "post"
+                && seg(3).len() >= 5
+                && seg(3)
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         }
         "reddit.com" => path.contains("/comments/"),
         "soundcloud.com" => path.matches('/').count() >= 2,
-        "bilibili.com" => path.starts_with("/video/"),
+        "bilibili.com" => {
+            path.starts_with("/video/")
+                || (seg(1) == "bangumi"
+                    && seg(2) == "play"
+                    && ["ep", "ss"].iter().any(|pre| {
+                        seg(3)
+                            .strip_prefix(pre)
+                            .is_some_and(|rest| is_digits(rest, 1))
+                    }))
+        }
+        "nicovideo.jp" => {
+            seg(1) == "watch" && {
+                let id = seg(2);
+                let rest = ["sm", "nm", "so", "lv"]
+                    .iter()
+                    .find_map(|pre| id.strip_prefix(pre))
+                    .unwrap_or(id);
+                is_digits(rest, 1)
+            }
+        }
+        "rumble.com" => {
+            let rest = path
+                .strip_prefix("/embed/")
+                .unwrap_or_else(|| path.strip_prefix('/').unwrap_or(&path));
+            rest.strip_prefix('v').is_some_and(|id| {
+                id.len() >= 4 && id.bytes().take(4).all(|b| b.is_ascii_alphanumeric())
+            })
+        }
         _ => false,
+    };
+    if host_match {
+        return true;
     }
+    // PeerTube, any host: /w/<id>, /videos/watch/<id>, /videos/embed/<id>.
+    let pt_id_ok =
+        |s: &str| s.len() >= 16 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    (seg(1) == "w" && pt_id_ok(seg(2)))
+        || (seg(1) == "videos"
+            && (seg(2) == "watch" || seg(2) == "embed")
+            && pt_id_ok(seg(3)))
 }
 
 #[cfg(test)]
@@ -1721,6 +1789,56 @@ mod tests {
         assert!(!is_video_page("https://www.youtube.com/feed/subscriptions"));
         assert!(!is_video_page("https://vimeo.com/about"));
         assert!(!is_video_page("not a url"));
+        // Parity widenings (mirror rank.js videoPageKind).
+        for page in [
+            "https://www.threads.net/@someuser/post/C8xAbCdEfG/",
+            "https://www.threads.com/@someuser/post/C8xAbCdEfGh",
+            "https://www.facebook.com/share/r/1aBcDeFgHiJ/",
+            "https://www.facebook.com/share/v/1aBcDeFgHiJ/",
+            "https://www.facebook.com/reel/123456789",
+            "https://www.twitch.tv/somechannel/clip/FunnySlug123",
+            "https://clips.twitch.tv/FunnySlug123",
+            "https://www.tiktok.com/@someuser/photo/7331234567890123456",
+            "https://www.tiktok.com/@someuser/video/7331234567890123456",
+            "https://vimeo.com/channels/staffpicks/12345678",
+            "https://vimeo.com/groups/someproj/videos/12345678",
+            "https://vimeo.com/video/12345",
+            "https://www.dailymotion.com/embed/video/x8abc12",
+            "https://www.bilibili.com/bangumi/play/ep123456",
+            "https://www.bilibili.com/bangumi/play/ss12345",
+            "https://www.nicovideo.jp/watch/sm12345678",
+            "https://www.nicovideo.jp/watch/12345678",
+            "https://www.nicovideo.jp/watch/lv1234567",
+            "https://rumble.com/v1a2b3c-example-title.html",
+            "https://rumble.com/embed/v1a2b3c/",
+            "https://peertube.example/w/p9jmLXa9q3xYvZk7mNqW2a",
+            "https://peertube.example/videos/watch/p9jmLXa9q3xYvZk7mNqW2a",
+            "https://peertube.example/videos/embed/p9jmLXa9q3xYvZk7mNqW2a",
+            "https://example.com/w/p9jmLXa9q3xYvZk7mNqW2a",
+        ] {
+            assert!(is_video_page(page), "page missed: {page}");
+        }
+        for not_page in [
+            "https://www.threads.net/",
+            "https://www.threads.net/@someuser",
+            "https://www.twitch.tv/directory",
+            "https://www.twitch.tv/directory/category/fortnite",
+            "https://vimeo.com/channels",
+            "https://vimeo.com/channels/staffpicks",
+            "https://vimeo.com/groups/someproj",
+            "https://www.facebook.com/groups/123456789/",
+            "https://www.facebook.com/share/",
+            "https://v.dailymotion.example/embed/video/x8abc12",
+            "https://www.nicovideo.jp/watch/smx123",
+            "https://www.nicovideo.jp/watch/nm",
+            "https://rumble.com/v123",
+            "https://example.com/w/short",
+            "https://www.bilibili.com/bangumi/play/ep",
+        ] {
+            // Note: dailymotion/nicovideo/bilibili hosts are checked above only
+            // for their real hosts; v.dailymotion.example must not match.
+            assert!(!is_video_page(not_page), "non-page matched: {not_page}");
+        }
         for feed in [
             "https://x.com/home",
             "https://x.com/",

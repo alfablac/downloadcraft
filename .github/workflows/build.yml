@@ -48,6 +48,11 @@ jobs:
           curl -sL -o /tmp/appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x /tmp/appimagetool && sudo mv /tmp/appimagetool /usr/local/bin/appimagetool || true
           appimagetool --version || true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+      - name: Test (Node)
+        run: node extensions/rank.test.mjs
       - name: Test
         run: cargo test --all-targets
       - name: Clippy

@@ -95,14 +95,24 @@ const RECORD_TTL_MS = 10 * 60 * 1000;
 const RECORD_MAX = 500;
 const MEDIA_PATH = /\.(mpd|m3u8|mp4|webm|ts|m4s)($|[?#])/i;
 const MEDIA_TYPES = new Set(["media", "xmlhttprequest", "fetch", "other", "object"]);
-const IG_CDN_RE = /(^|\.)(cdninstagram\.com|fbcdn\.net)$/i;
-const IG_PAGE_RE = /(^|\.)instagram\.com$/i;
-function isIgCdnUrl(u) { try { return IG_CDN_RE.test(new URL(u).hostname); } catch (e) { return /cdninstagram\.com|fbcdn\.net/i.test(String(u || "")); } }
-function isIgDoc(details) { try { const d = details && (details.documentUrl || details.initiator || details.originUrl || ""); if (!d) return false; return IG_PAGE_RE.test(new URL(d).hostname); } catch (e) { return false; } }
+const META_CDN_RE = /(^|\.)(cdninstagram\.com|fbcdn\.net)$/i;
+const META_PAGE_RE = /(^|\.)(instagram\.com|facebook\.com|threads\.net|threads\.com)$/i;
+function isMetaCdnUrl(u) { try { return META_CDN_RE.test(new URL(u).hostname); } catch (e) { return /cdninstagram\.com|fbcdn\.net/i.test(String(u || "")); } }
+function isMetaDoc(details) { try { const d = details && (details.documentUrl || details.initiator || details.originUrl || ""); if (!d) return false; return META_PAGE_RE.test(new URL(d).hostname); } catch (e) { return false; } }
+// Known registry-CDN hostname (hostMatchesScope same-host pairs): media CDN
+// pair of a listed site. isMediaIsh keeps these recorded even when the
+// request type falls outside MEDIA_TYPES (MSE fetch arrives as other/fetch).
+function isKnownCdnHost(u) {
+  try {
+    const h = new URL(u || "").hostname.toLowerCase().replace(/^(www\.|m\.)/, "");
+    return typeof DCRank !== "undefined" && DCRank && typeof DCRank.hostMatchesScope === "function" && ["instagram.com", "facebook.com", "youtube.com", "x.com", "reddit.com", "tiktok.com", "vimeo.com", "twitch.tv", "dailymotion.com", "bilibili.com"].some((ph) => ph !== h && DCRank.hostMatchesScope(ph, h));
+  } catch (e) { return false; }
+}
 function isMediaIsh(details) {
   // Record only media-ish requests; full <all_urls> recording bloats TTL map
   // with page/API traffic element matcher never needs.
-  if (isIgCdnUrl(details.url)) return true;
+  if (isMetaCdnUrl(details.url)) return true;
+  if (isKnownCdnHost(details.url)) return true;
   if (details.type && MEDIA_TYPES.has(details.type)) return true;
   try { return MEDIA_PATH.test(new URL(details.url || "").pathname); } catch (e) { return MEDIA_PATH.test(String(details.url || "")); }
 }
@@ -169,7 +179,9 @@ function captureDecision(details) {
   const fname = filenameFromDisp(disp, details.url);
   const isStream = STREAM_TYPES.has(type) || ext === "m3u8" || ext === "mpd";
   const isMedia = type.startsWith("video/") || type.startsWith("audio/") || PANEL_EXTS.has(ext);
-  const igSniff = isIgCdnUrl(details.url) && (type.startsWith("video/") || type.startsWith("audio/") || STREAM_TYPES.has(type) || type === "application/octet-stream" || !type || urlPath.endsWith(".mpd") || urlPath.endsWith(".m3u8"));
+  // Meta CDN sniff (IG/FB/Threads share cdninstagram/fbcdn) + known registry
+  // CDN pairs (googlevideo/twimg/...) via the same sniff allowances.
+  const igSniff = (isMetaCdnUrl(details.url) || isKnownCdnHost(details.url)) && (type.startsWith("video/") || type.startsWith("audio/") || STREAM_TYPES.has(type) || type === "application/octet-stream" || !type || urlPath.endsWith(".mpd") || urlPath.endsWith(".m3u8"));
   if (isStream || isMedia || igSniff) return { url: details.url, type: type || (ext === "mpd" ? "application/dash+xml" : "application/x-mpegurl"), tabId: details.tabId, kind: "panel" };
   const isAttach = disp.startsWith("attachment");
   // NB: nearly all application/* is JSON/JS API traffic. Requiring real file
@@ -358,12 +370,15 @@ browser.runtime.onMessage.addListener((msg, sender) => {
       // frame only, never tier — else cross-frame timing hands this video
       // another video's streams when srcs/postId/streamId matched nothing.
       if (!pool.length && senderFrame != null && typeof matchRecordsForElement === "function") pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null, noTiming: true }, Date.now());
-      // IG host-scoped fallback (background-only): see Chromium. noTiming
+      // Site host-scoped fallback (background-only): see Chromium.
+      // Scope the tab's media to the page's own site: the registry
+      // pairs page hosts with their CDN hosts (Meta->cdninstagram/
+      // fbcdn, YouTube->googlevideo, X->twimg, ...). noTiming
       // likewise: hostExtra is window-bound itself.
       if (!pool.length && typeof matchRecordsForElement === "function") {
         let ph = "";
         try { ph = new URL((sender.tab && sender.tab.url) || "").hostname.toLowerCase(); } catch (e) {}
-        if (/(^|\.)instagram\.com$/.test(ph)) pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null, noTiming: true, pageHost: "instagram.com" }, Date.now(), [...candidates.values()]);
+        if (ph) pool = matchRecordsForElement([...byUrl.values()], { ...el, frameId: null, noTiming: true, pageHost: ph }, Date.now(), [...candidates.values()]);
       }
     } else {
       // No frame filter: player frame != sniffer frame on embeds drops all.

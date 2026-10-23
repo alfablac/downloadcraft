@@ -161,11 +161,9 @@
         if (e.tabId != null && r.tabId != null && r.tabId !== e.tabId) return;
         try {
           var h = new URL(r.url).hostname.toLowerCase();
-          // IG page (instagram.com) serves media from cdninstagram/fbcdn:
-          // pageHost scope must accept CDN pair, not just subdomains.
-          var igPair = (hostScope === "instagram.com" || hostScope.endsWith(".instagram.com"))
-            && /(^|\.)(cdninstagram\.com|fbcdn\.net)$/.test(h);
-          if (!igPair && h !== hostScope && !h.endsWith("." + hostScope)) return;
+          // Page host serves media from its CDN pair (instagram->cdninstagram/
+          // fbcdn, youtube->googlevideo, x->twimg, reddit->v.redd.it, ...).
+          if (!hostMatchesScope(hostScope, h)) return;
         } catch (err) { return; }
         if (!(r.time && r.time >= e.since - 2000 && r.time <= e.since + 45000)) return;
         extra.push(r);
@@ -207,8 +205,105 @@
     return hostExtra();
   }
 
+  // ---- yt-dlp site registry (single source; Node-tested) ----
+  // Mirrors src/ytdlp.rs is_video_page + research overrides. `page` = URL
+  // is a single video item: offer it to yt-dlp (intent=page). `feed` = never
+  // a single item (home/explore/channel/grid): only per-video anchors count.
+  // `cdns` = media hosts for host-scoped element correlation (blob:/MSE
+  // players whose CDN urls carry no page id). Sites not listed fall back to
+  // generic: page ok when it carries a <video>, item link, or media meta.
+  function hostIs(h, list) { return list.some(function (d) { return h === d || h.endsWith("." + d); }); }
+  function videoPageKind(u) {
+    var x; try { x = new URL(String(u || "")); } catch (e) { return "other"; }
+    if (!/^https?:$/.test(x.protocol)) return "other";
+    var h = x.hostname.toLowerCase().replace(/^(www\.|m\.|music\.)/, "");
+    var p = x.pathname.toLowerCase();
+    var ytId = (p === "/watch" && (x.searchParams.get("v") || "").length >= 6)
+      || /^\/(shorts|live|embed|v)\/[A-Za-z0-9_-]{6,}/.test(p) || /^\/clip\/[A-Za-z0-9_-]{6,}/.test(p);
+    if (h === "youtu.be" || h === "youtube-nocookie.com") return p.length > 1 ? "page" : "other";
+    if (h === "youtube.com") return ytId ? "page" : (/^\/(feed|results|playlist|channel|@|c\/|user\/)/.test(p) || p === "/" ? "feed" : "other");
+    if (hostIs(h, ["instagram.com"])) return /^\/(reel|reels|p|tv)\/[A-Za-z0-9_-]{5,}|\/stories\/[^/]+\/\d+/.test(p) ? "page" : (/^\/(explore|reels|direct|accounts)/.test(p) || p === "/" ? "feed" : "other");
+    if (hostIs(h, ["facebook.com"]) || h === "fb.watch") return (h === "fb.watch" && p.length > 1) || /^\/watch\/?(\?|$)/.test(p + x.search) && (x.searchParams.get("v") || "").length >= 1 || /^\/(reel|share\/[rv]|[^/]+\/videos?)\//.test(p) || /\/videos?\/\d+/.test(p) ? "page" : (/^\/(home|feed|watch$|reel$|marketplace|gaming|groups|events)/.test(p.replace(/\/$/, "")) || p === "/" ? "feed" : "other");
+    if (hostIs(h, ["threads.net", "threads.com"])) return /^\/@[^/]+\/post\/[A-Za-z0-9_-]{5,}/.test(p) ? "page" : (p === "/" ? "feed" : "other");
+    if (hostIs(h, ["tiktok.com"]) || h === "vm.tiktok.com" || h === "vt.tiktok.com") return /\/@(.[^/]*)\/(video|photo)\/\d{5,}|\/(video|photo)\/\d{5,}|\/t\/[A-Za-z0-9]+/.test(p) || /^(vm|vt)\.tiktok\.com$/.test(h) && p.length > 1 ? "page" : (/^\/(foryou|following|explore|discover|live|tag|music)/.test(p) || p === "/" ? "feed" : "other");
+    if (hostIs(h, ["twitter.com", "x.com"])) return /\/status\/\d+/.test(p) ? "page" : (/^\/(home|explore|notifications|messages|search|i\/(flow|bookmarks))/.test(p) || p === "/" ? "feed" : "other");
+    if (hostIs(h, ["reddit.com"]) || h === "redd.it" || h === "v.redd.it") return /\/comments\/[a-z0-9]+/.test(p) || h !== "reddit.com" && p.length > 1 ? "page" : (p === "/" || /^\/(r\/[^/]+\/?|hot|new|top|best)/.test(p) ? "feed" : "other");
+    if (hostIs(h, ["vimeo.com"])) return /^\/\d{5,}([/?]|$)|\/(channels|groups)\/[^/]+\/(videos\/)?\d{5,}|\/video\/\d{5,}/.test(p) ? "page" : (["/", "/watch", "/feed", "/categories", "/channels", "/search"].includes(p.replace(/\/$/, "") || "/") ? "feed" : "other");
+    if (hostIs(h, ["twitch.tv"]) || h === "clips.twitch.tv") return /^\/videos\/\d+/.test(p) || /^\/[^/]+\/clip\/[A-Za-z0-9_-]+/.test(p) || h === "clips.twitch.tv" && p.length > 1 || /^\/[^/]+\/?$/.test(p) && !/^\/(directory|following|search|settings|subscriptions)/.test(p) ? "page" : (/^\/(directory|following|search|settings|subscriptions)/.test(p) || p === "/" ? "feed" : "other");
+    if (hostIs(h, ["dailymotion.com"]) || h === "dai.ly" || h === "geo.dailymotion.com") return /\/(video|embed\/video)\/[a-z0-9]+/.test(p) || h === "dai.ly" && p.length > 1 ? "page" : (p === "/" ? "feed" : "other");
+    if (hostIs(h, ["bilibili.com"]) || h === "b23.tv") return /\/video\/(bv[0-9a-z]{8,}|av\d+)|\/bangumi\/play\/(ep|ss)\d+/.test(p) || h === "b23.tv" && p.length > 1 ? "page" : (/^\/(v\/|dynamic|read|account)/.test(p) || p === "/" ? "feed" : "other");
+    if (hostIs(h, ["nicovideo.jp"])) return /\/watch\/(sm|nm|so|lv)?\d+/.test(p) ? "page" : "other";
+    if (hostIs(h, ["soundcloud.com"]) || h === "on.soundcloud.com") return p.split("/").filter(Boolean).length >= 2 && !/^\/(discover|stream|you|search|upload|charts)/.test(p) ? "page" : (/^\/(discover|stream|you|search|upload|charts)/.test(p) || p === "/" ? "feed" : "other");
+    if (hostIs(h, ["rumble.com"])) return /^\/(embed\/)?v[0-9a-z]{4,}/.test(p) ? "page" : (p === "/" ? "feed" : "other");
+    if (hostIs(h, ["odysee.com", "lbry.tv"])) return /\/[^:]*:[0-9a-f]{6,}/.test(p) ? "page" : (p === "/" ? "feed" : "other");
+    if (hostIs(h, ["pornhub.com"])) return /view_video\.php/.test(p) ? "page" : "other";
+    if (hostIs(h, ["xvideos.com"])) return /\/video/.test(p) ? "page" : "other";
+    if (/^\/(w|videos\/(watch|embed))\/[A-Za-z0-9-]{16,}/.test(p)) return "page"; // PeerTube, any host
+    // Globo: g1/video pages (.ghtml articles carry embedded video; Rust parity).
+    if (/globo\.com$/.test(h) && /\.ghtml$/.test(p)) return "page";
+    return "other";
+  }
+  function isVideoPageUrl2(u) { return videoPageKind(u) === "page"; }
+  function videoIdOf(u) {
+    var s = String(u || "");
+    var m = s.match(/\/status\/(\d+)|\/comments\/([a-z0-9]{5,})|[?&]v=([A-Za-z0-9_-]{6,})|youtu\.be\/([A-Za-z0-9_-]{6,})|\/shorts\/([A-Za-z0-9_-]{6,})|\/(?:reel|reels|p|tv)\/([A-Za-z0-9_-]{5,})|\/stories\/[^/]+\/(\d+)|\/post\/([A-Za-z0-9_-]{5,})|\/video\/(BV[0-9A-Za-z]{8,}|\d{5,}|[a-z0-9]{3,})|\/videos\/(\d{5,})|\/videos?\/(\d{5,})|\/clip\/([A-Za-z0-9_-]{5,})|clips\.twitch\.tv\/([A-Za-z0-9_-]{5,})|v\.redd\.it\/([a-z0-9]{5,})|dai\.ly\/([a-z0-9]{3,})|\/watch\/((?:sm|nm|so|lv)?\d{5,})/i);
+    if (m) { for (var i = 1; i < m.length; i++) if (m[i]) return m[i]; }
+    // Host-scoped bare-id shapes: vimeo.com/123, fb.watch/CODE, vm.tiktok.
+    try {
+      var x = new URL(s); var h = x.hostname.toLowerCase();
+      if (hostIs(h.replace(/^(www\.|m\.)/, ""), ["vimeo.com"])) { var vm = x.pathname.match(/^\/(\d{5,})/) || x.pathname.match(/\/(?:channels|groups)\/[^/]+\/(?:videos\/)?(\d{5,})/); if (vm) return vm[1]; }
+      if (hostIs(h.replace(/^(www\.|m\.)/, ""), ["facebook.com"])) { var fs = x.pathname.match(/\/share\/[rv]\/([A-Za-z0-9_-]{5,})/); if (fs) return fs[1]; }
+      if (h === "fb.watch" || h === "vm.tiktok.com" || h === "vt.tiktok.com" || h === "b23.tv" || h === "redd.it") { var seg = x.pathname.split("/").filter(Boolean)[0]; if (seg) return seg; }
+      if (/tiktok\.com$/i.test(h)) { var tk = x.pathname.match(/\/(?:video|photo)\/(\d{5,})/); if (tk) return tk[1]; }
+    } catch (e) {}
+    return "";
+  }
+  // Host-scoped correlation pairs: page host -> accepted media hosts.
+  // cdninstagram/fbcdn serve instagram, facebook AND threads; googlevideo
+  // serves youtube; twimg serves x; v.redd.it serves reddit.
+  function hostMatchesScope(pageHost, urlHost) {
+    var ph = String(pageHost || "").toLowerCase().replace(/^(www\.|m\.)/, "");
+    var uh = String(urlHost || "").toLowerCase();
+    if (!ph || !uh) return false;
+    if (uh === ph || uh.endsWith("." + ph)) return true;
+    var pairs = [
+      [["instagram.com", "facebook.com", "threads.net", "threads.com"], ["cdninstagram.com", "fbcdn.net"]],
+      [["youtube.com", "youtu.be", "youtube-nocookie.com"], ["googlevideo.com", "youtube.com", "youtu.be"]],
+      [["twitter.com", "x.com"], ["twimg.com", "twitter.com", "x.com"]],
+      [["reddit.com", "redd.it"], ["v.redd.it", "redd.it", "redditmedia.com"]],
+      [["tiktok.com"], ["tiktokcdn.com", "tiktokcdn-us.com", "ibytedtos.com", "byteoversea.com", "tiktok.com"]],
+      [["vimeo.com"], ["vimeocdn.com", "vimeo.com"]],
+      [["twitch.tv", "clips.twitch.tv"], ["twitch.tv", "cloudfront.net", "twitchcdn.net"]],
+      [["dailymotion.com", "dai.ly"], ["dmcdn.net", "dailymotion.com"]],
+      [["bilibili.com"], ["bilivideo.com", "bilivideo.cn", "hdslb.com", "bilibili.com"]],
+    ];
+    for (var i = 0; i < pairs.length; i++) {
+      if (hostIs(ph, pairs[i][0]) && hostIs(uh, pairs[i][1])) return true;
+    }
+    return false;
+  }
+  function siteOf(u) {
+    var h = ""; try { h = new URL(String(u || "")).hostname.toLowerCase().replace(/^(www\.|m\.|music\.)/, ""); } catch (e) { return ""; }
+    if (h === "youtu.be" || hostIs(h, ["youtube.com", "youtube-nocookie.com"])) return "youtube";
+    if (hostIs(h, ["instagram.com"])) return "instagram";
+    if (hostIs(h, ["facebook.com"]) || h === "fb.watch") return "facebook";
+    if (hostIs(h, ["threads.net", "threads.com"])) return "threads";
+    if (hostIs(h, ["tiktok.com"]) || h === "vm.tiktok.com" || h === "vt.tiktok.com") return "tiktok";
+    if (hostIs(h, ["twitter.com", "x.com"])) return "x";
+    if (hostIs(h, ["reddit.com", "redd.it", "v.redd.it"])) return "reddit";
+    if (hostIs(h, ["vimeo.com"])) return "vimeo";
+    if (hostIs(h, ["twitch.tv", "clips.twitch.tv"])) return "twitch";
+    if (hostIs(h, ["dailymotion.com"]) || h === "dai.ly") return "dailymotion";
+    if (hostIs(h, ["bilibili.com"]) || h === "b23.tv") return "bilibili";
+    return "";
+  }
+
   g.rankCandidates = rankCandidates;
   g.matchRecordsForElement = matchRecordsForElement;
-  g.DCRank = { rankCandidates: rankCandidates, kindOf: kindOf, canonicalUrl: canonicalUrl, matchRecordsForElement: matchRecordsForElement };
+  g.videoPageKind = videoPageKind;
+  g.videoIdOf = videoIdOf;
+  g.hostMatchesScope = hostMatchesScope;
+  g.siteOf = siteOf;
+  g.DCRank = { rankCandidates: rankCandidates, kindOf: kindOf, canonicalUrl: canonicalUrl, matchRecordsForElement: matchRecordsForElement, videoPageKind: videoPageKind, videoIdOf: videoIdOf, hostMatchesScope: hostMatchesScope, siteOf: siteOf };
   if (typeof module !== "undefined" && module.exports) module.exports = g.DCRank;
 })(typeof globalThis !== "undefined" ? globalThis : this);

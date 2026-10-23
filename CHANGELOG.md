@@ -2,6 +2,33 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.23.2] - 2026-10-22
+
+### Fixed
+
+- Multi-site video capture: extensions previously special-cased
+  Instagram only, so videos on Facebook, Threads, Twitch clips,
+  TikTok, Vimeo channels and others got no button or a wrong URL.
+  A shared yt-dlp site registry (`videoPageKind`/`videoIdOf`/
+  `hostMatchesScope`/`siteOf` in `rank.js`, byte-identical in both
+  extensions) now classifies pages as single-video vs feed for
+  YouTube, Instagram, Facebook, Threads, TikTok, X, Reddit, Vimeo,
+  Twitch, Dailymotion, Bilibili, NicoNico, SoundCloud, Rumble,
+  Odysee and PeerTube; the per-video button sends that video's page
+  URL to yt-dlp (`intent=page`), falling back to the sniffed
+  manifest/direct stream correlated per site CDN (Meta→cdninstagram/
+  fbcdn, YouTube→googlevideo, X→twimg, Reddit→v.redd.it, ...).
+  Toolbar click on any non-feed page with a video now also offers
+  the page to yt-dlp in both browsers.
+- Rust `is_video_page` widened for the same shapes (Threads posts,
+  Facebook share links, Twitch clips, TikTok photos, Vimeo
+  channel/group URLs, Dailymotion embeds, Bilibili bangumi,
+  NicoNico, Rumble, PeerTube) for paste/legacy routing parity.
+- Local sandbox (`tests/sandbox/run_sandbox.py`, Playwright +
+  request interception on fake hosts) exercises YouTube/Instagram/
+  generic/feed/TikTok/og:video fixtures end-to-end; CI now runs
+  `node extensions/rank.test.mjs`.
+
 ## [0.23.1] - 2026-10-22
 
 ### Fixed
