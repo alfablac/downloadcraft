@@ -13,6 +13,7 @@
   <img alt="Version" src="https://img.shields.io/badge/version-0.24.0-blue">
   <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">
   <img alt="Language" src="https://img.shields.io/badge/built%20with-Rust%20%2B%20egui-orange">
+  <a href="https://addons.mozilla.org/en-US/firefox/addon/webcraft/"><img alt="Firefox Add-on" src="https://img.shields.io/badge/Firefox-Add--on%20on%20AMO-FF7139?logo=firefoxbrowser&logoColor=white"></a>
 </p>
 
 ---
