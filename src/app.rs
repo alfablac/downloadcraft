@@ -1169,6 +1169,11 @@ impl DownloadApp {
     }
 
     fn make_tray(visible: bool) -> Option<TrayNav> {
+        // Linux: tray-icon/muda need GTK initialized on this thread (else panic).
+        #[cfg(target_os = "linux")]
+        if gtk::init().is_err() {
+            return None;
+        }
         // Tray icon: same PNG as window/.exe icon (was code-generated solid blue square).
         let data =
             eframe::icon_data::from_png_bytes(include_bytes!("../assets/webcraft.png")).ok()?;
@@ -2153,6 +2158,13 @@ impl DownloadApp {
             crate::lock_unpoison(&self.rt)
                 .controls
                 .retain(|id, _| handles.get(id).is_some_and(|h| !h.is_finished()));
+        }
+        // Linux: pump GTK so the appindicator tray renders and delivers menu events.
+        #[cfg(target_os = "linux")]
+        if gtk::is_initialized_main_thread() {
+            while gtk::events_pending() {
+                gtk::main_iteration_do(false);
+            }
         }
         // Tray menu events (cheap, event-driven): Toggle / Add URL/File / Quit.
         // Dead while MenuEvent handler is set (handler consumes channel),
