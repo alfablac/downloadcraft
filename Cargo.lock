@@ -7436,6 +7436,7 @@ dependencies = [
  "egui",
  "futures-util",
  "getrandom 0.3.4",
+ "gtk",
  "hmac 0.12.1",
  "librqbit",
  "md-5",
